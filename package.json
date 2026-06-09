@@ -1,0 +1,15 @@
+{
+  "name": "auto-video",
+  "version": "0.1.0",
+  "private": true,
+  "description": "auto-video desktop app (Tauri shell + Python sidecar + HTML/JS UI)",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.0",
+    "playwright-core": "^1.60.0"
+  }
+}

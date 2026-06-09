@@ -1,0 +1,27 @@
+# Rust / Tauri
+/src-tauri/target/
+/src-tauri/gen/schemas/
+src-tauri/icon-src.png
+
+# Node
+/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+
+# user-specific runtime data + secrets (the app generates these)
+sidecar/av_keys.json
+sidecar/av_paths.json
+sidecar/ident.json
+sidecar/proxy_cache.json
+sidecar/discover_covers.json
+
+# local Claude tooling
+/.claude/
+
+# misc
+/_archive/
+*.log
+
+src-tauri/icon_src.png
