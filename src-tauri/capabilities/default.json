@@ -3,5 +3,40 @@
   "identifier": "default",
   "description": "Default capability for the main window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "dialog:default",
+    "opener:default",
+    "opener:allow-open-url",
+    "opener:allow-reveal-item-in-dir",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [{ "path": "**" }, { "path": "/**" }]
+    },
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "https://apidd.spthgb.com/*" },
+        { "url": "https://tp.cmastd.com/*" },
+        { "url": "https://*.dmm.co.jp/*" },
+        { "url": "https://pics.dmm.co.jp/*" },
+        { "url": "https://www.mgstage.com/*" },
+        { "url": "https://image.mgstage.com/*" },
+        { "url": "https://sukebei.nyaa.si/*" },
+        { "url": "https://apibay.org/*" },
+        { "url": "https://yts.*/*" },
+        { "url": "https://*.themoviedb.org/*" },
+        { "url": "https://image.tmdb.org/*" },
+        { "url": "https://api.graphql.imdb.com/*" },
+        { "url": "https://api.tvmaze.com/*" },
+        { "url": "https://graphql.anilist.co/*" },
+        { "url": "https://www.javdatabase.com/*" },
+        { "url": "https://r18.dev/*" },
+        { "url": "https://www.javbus.com/*" }
+      ]
+    },
+    "sql:default",
+    "sql:allow-execute"
+  ]
 }

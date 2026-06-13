@@ -3,25 +3,19 @@
 /src-tauri/gen/schemas/
 src-tauri/icon-src.png
 
-# Node
+# Node / Vite
 /node_modules/
-
-# Python
-__pycache__/
-*.pyc
-
-# user-specific runtime data + secrets (the app generates these)
-sidecar/av_keys.json
-sidecar/av_paths.json
-sidecar/ident.json
-sidecar/proxy_cache.json
-sidecar/discover_covers.json
+/dist/
 
 # local Claude tooling
 /.claude/
 
+# recorded scraper fixtures — must NEVER be committed (explicit user requirement)
+/tests/fixtures/
+
 # misc
 /_archive/
 *.log
+.DS_Store
 
 src-tauri/icon_src.png

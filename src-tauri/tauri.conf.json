@@ -4,7 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.plushie.autovideo",
   "build": {
-    "frontendDist": "../ui"
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
   },
   "app": {
     "withGlobalTauri": true,
@@ -12,6 +15,8 @@
       {
         "label": "main",
         "title": "auto-video",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
         "width": 1040,
         "height": 880,
         "minWidth": 900,
@@ -26,18 +31,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": ["app", "dmg", "nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "resources": {
-      "../sidecar/av_proxy.py": "sidecar/av_proxy.py",
-      "../sidecar/av_keys.json": "sidecar/av_keys.json",
-      "../sidecar/av_paths.json": "sidecar/av_paths.json"
-    }
+    ]
   }
 }
