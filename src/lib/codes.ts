@@ -52,24 +52,23 @@ export function isVr(title: string, code: string): boolean {
  */
 export function parseCode(title: string): string {
   const t = title || ""
-  const mu = /FC2[-\s_]?PPV[-\s_]?(\d{6,7})/i.exec(t)
-  if (mu) return "FC2-PPV-" + mu[1]
+  const fc2Match = /FC2[-\s_]?PPV[-\s_]?(\d{6,7})/i.exec(t)
+  if (fc2Match) return "FC2-PPV-" + fc2Match[1]
   // Amateur "maker-prefix" labels: a 3-digit maker prefix is part of the
   // canonical code (459TEN-048, 300MIUM-1380, 200GANA-3386, 230ORECZ-553).
   // Keep it — a static parser cannot re-derive a dropped prefix, so files must
   // be named with it. (?<!\d) stops the prefix grabbing the tail of a longer
   // number; this branch is tried before the generic one below.
-  const ma = /(?<!\d)(\d{3}[A-Za-z]{2,6})[-_\s]?(\d{2,5})/.exec(t)
-  if (ma) return ma[1]!.toUpperCase() + "-" + ma[2]!
-  // label may carry a leading digit (e.g. 3DSVR); keep it only for known VR labels
-  const m = /(\d?[A-Za-z]{2,6})[-_\s]?(\d{2,5})/.exec(t)
-  if (!m) return ""
-  let lab = m[1]!.toUpperCase()
-  const num = m[2]!
-  if (/^\d/.test(lab) && !VR_LABEL_RE.test(lab)) {
-    lab = lab.slice(1)
+  const makerMatch = /(?<!\d)(\d{3}[A-Za-z]{2,6})[-_\s]?(\d{2,5})/.exec(t)
+  if (makerMatch) return makerMatch[1]!.toUpperCase() + "-" + makerMatch[2]!
+  const genericMatch = /(\d?[A-Za-z]{2,6})[-_\s]?(\d{2,5})/.exec(t)
+  if (!genericMatch) return ""
+  let label = genericMatch[1]!.toUpperCase()
+  const num = genericMatch[2]!
+  if (/^\d/.test(label) && !VR_LABEL_RE.test(label)) {
+    label = label.slice(1)
   }
-  return lab + "-" + num
+  return label + "-" + num
 }
 
 /**
@@ -128,9 +127,9 @@ export function parseTvName(name: string): [series: string, se: string] {
       String(parseInt(m[2]!, 10)).padStart(2, "0")
     : ""
   let cut = s.length
-  for (const mk of TV_MARKERS) {
-    const mm = mk.exec(s)
-    if (mm && mm.index < cut) cut = mm.index
+  for (const marker of TV_MARKERS) {
+    const hit = marker.exec(s)
+    if (hit && hit.index < cut) cut = hit.index
   }
   let series = s.slice(0, cut).replace(/[._]/g, " ")
   series = stripChars(series.replace(/\s+/g, " "), " -:.[]")

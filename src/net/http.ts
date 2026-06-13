@@ -80,11 +80,7 @@ export function buildHeaders(opts: HttpOptions = {}): Record<string, string> {
   }
   if (opts.referer) headers["Referer"] = opts.referer
   if (opts.cookie) headers["Cookie"] = opts.cookie
-  if (opts.headers) {
-    for (const [key, value] of Object.entries(opts.headers)) {
-      headers[key] = value
-    }
-  }
+  if (opts.headers) Object.assign(headers, opts.headers)
   return headers
 }
 

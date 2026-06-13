@@ -39,6 +39,10 @@ import {
  * long TTL so a resolved cover survives for a day before re-probing. */
 export const COVER_TTL_SEC = 86_400
 
+/** Default JAV cover aspect ratio (w/h) used when a resolved/cached cover has
+ * none — the portrait DMM jacket ratio the sidecar assumed. */
+const JAV_DEFAULT_AR = 0.72
+
 /** Referer pics.dmm.co.jp / r18 jacket images need. */
 const DMM_REFERER = "https://www.dmm.co.jp/"
 /** Referer javdatabase pages / its webp mirror need. */
@@ -75,17 +79,17 @@ interface R18Detail {
  * raw pics.dmm.co.jp URL (hotlink-protected -> proxy) or NONE.
  */
 export async function r18Cover(code: string): Promise<ResolvedCover> {
-  let j: R18Detail | null
+  let detail: R18Detail | null
   try {
-    j = await httpJson<R18Detail>(
+    detail = await httpJson<R18Detail>(
       `https://r18.dev/videos/vod/movies/detail/-/dvd_id=${code}/json`,
       { referer: "https://r18.dev/", timeoutMs: 15_000 }
     )
   } catch {
     return NONE
   }
-  const ji = j?.images?.jacket_image ?? {}
-  for (const u of [(ji.large ?? "").trim(), (ji.large2 ?? "").trim()]) {
+  const jacket = detail?.images?.jacket_image ?? {}
+  for (const u of [(jacket.large ?? "").trim(), (jacket.large2 ?? "").trim()]) {
     if (!u) continue
     const meta = await probeCover(u, DMM_REFERER)
     if (meta) return { url: u, ar: meta.ar, proxy: true }
@@ -336,11 +340,11 @@ export async function resolveJavCover(
     const hit = await getCachedCover(key, COVER_TTL_SEC)
     if (hit) {
       // Empty cached url = "known to have no cover" (don't re-probe).
-      if (!hit.url) return { url: "", ar: hit.ar || 0.72 }
+      if (!hit.url) return { url: "", ar: hit.ar || JAV_DEFAULT_AR }
       // A stale blob: URL from an older build is dead this session — re-resolve.
       if (!hit.url.startsWith("blob:")) {
         const url = await displayUrl({ url: hit.url, ar: hit.ar, proxy: true })
-        return { url, ar: hit.ar || 0.72 }
+        return { url, ar: hit.ar || JAV_DEFAULT_AR }
       }
     }
   }
@@ -349,14 +353,14 @@ export async function resolveJavCover(
   // session-scoped reference that would be a dead link in the next app run.
   if (isDbAvailable() && !r.url.startsWith("blob:")) {
     try {
-      await setCachedCover(key, r.url, r.ar || 0.72)
+      await setCachedCover(key, r.url, r.ar || JAV_DEFAULT_AR)
     } catch {
       // best-effort
     }
   }
-  if (!r.url) return { url: "", ar: 0.72 }
+  if (!r.url) return { url: "", ar: JAV_DEFAULT_AR }
   const url = r.proxy ? await displayUrl(r) : r.url
-  return { url, ar: r.ar || 0.72 }
+  return { url, ar: r.ar || JAV_DEFAULT_AR }
 }
 
 /**
@@ -430,12 +434,12 @@ export async function resolveCovers(
         const code = x.code || parseCode(x.title || "")
         if (!code) {
           x.cover = ""
-          x.ar = x.ar || 0.72
+          x.ar = x.ar || JAV_DEFAULT_AR
           return
         }
         const r = await resolveJavCover(code, javbusCookie)
         x.cover = r.url
-        x.ar = r.ar || 0.72
+        x.ar = r.ar || JAV_DEFAULT_AR
       })
     )
   }

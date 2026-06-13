@@ -20,7 +20,12 @@ import {
 import { cn } from "@/lib/utils"
 import { fseed } from "@/lib/format"
 import { humanSize } from "@/api/sources/tpb"
-import { planRename, type RenameCat } from "@/lib/rename"
+import {
+  planRename,
+  RENAME_VIDEO_RE,
+  type RenameCat,
+  type RenameOp,
+} from "@/lib/rename"
 import type { Release } from "@/api/types"
 import { usePaths, useSeeders } from "@/state/queries"
 import { useDownloads } from "@/state/downloads"
@@ -39,14 +44,51 @@ interface TorrentFile {
   size: number
 }
 
-const VIDEO_RE = /\.(mkv|mp4|avi|wmv|m4v|ts|mov|flv|iso|rmvb|webm|mpg|mpeg)$/i
-
 function SectionLabel({ children }: { children: string }) {
   return (
     <div className="text-[10.5px] font-semibold tracking-wider text-muted-foreground uppercase">
       {children}
     </div>
   )
+}
+
+/**
+ * Canonical base the downloaded file(s) should be renamed to: JAV code for
+ * ad/vrc, "YEAR.Title" for movies, show name for tv.
+ */
+function renameBase(cat: RenameCat, item: ScoredItem): string {
+  if (cat === "ad" || cat === "vrc") return item.code || item.title
+  if (cat === "mov") return item.year ? `${item.year}.${item.title}` : item.title
+  return item.title
+}
+
+/**
+ * Build the download plan for the picked files: which file indices to fetch
+ * (a real subset only — all/unknown means the whole torrent) and the canonical
+ * renames to apply once it finishes.
+ */
+function buildPlan(
+  item: ScoredItem,
+  files: TorrentFile[] | undefined,
+  picked: ReadonlySet<number>,
+  multiFile: boolean
+): { onlyFiles: number[] | undefined; renames: RenameOp[] | undefined } {
+  const onlyFiles =
+    files && multiFile && picked.size < files.length
+      ? [...picked].sort((a, b) => a - b)
+      : undefined
+  const cat = item.cat as RenameCat
+  const base = renameBase(cat, item)
+  const pickedFiles = files ? files.filter((f) => picked.has(f.index)) : []
+  const renames =
+    pickedFiles.length > 0
+      ? planRename(
+          cat,
+          base,
+          pickedFiles.map((f) => ({ name: f.name, size: f.size }))
+        )
+      : undefined
+  return { onlyFiles, renames }
 }
 
 export function DownloadDialog({ item, onClose }: DownloadDialogProps) {
@@ -100,7 +142,7 @@ export function DownloadDialog({ item, onClose }: DownloadDialogProps) {
   // Default selection: the video files (else everything) whenever the list loads.
   useEffect(() => {
     if (!files) return
-    const vids = files.filter((f) => VIDEO_RE.test(f.name)).map((f) => f.index)
+    const vids = files.filter((f) => RENAME_VIDEO_RE.test(f.name)).map((f) => f.index)
     setPicked(new Set(vids.length > 0 ? vids : files.map((f) => f.index)))
   }, [files])
   const toggleFile = (i: number) =>
@@ -117,11 +159,11 @@ export function DownloadDialog({ item, onClose }: DownloadDialogProps) {
   const destLabel = dest || "Downloads/auto-video"
   const searching = item !== null && seedQ.isFetching && seedQ.data === undefined
 
-  const sd = seedQ.data
+  const seed = seedQ.data
   const subLine = !item
     ? ""
-    : sd && sd.releases.length > 0
-      ? `${item.sub} · ${sd.count} live releases (${Object.entries(sd.sources)
+    : seed && seed.releases.length > 0
+      ? `${item.sub} · ${seed.count} live releases (${Object.entries(seed.sources)
           .map(([k, v]) => `${k} ${v}`)
           .join(" · ")})`
       : `${item.sub} · from ${providerLabel(item.src)}`
@@ -129,31 +171,7 @@ export function DownloadDialog({ item, onClose }: DownloadDialogProps) {
   const onStart = async () => {
     if (!item || !sel?.magnet || starting || nothingPicked) return
     setStarting(true)
-    // Pass the picked indices only when it's a real subset; all/unknown = whole torrent.
-    const onlyFiles =
-      files && multiFile && picked.size < files.length
-        ? [...picked].sort((a, b) => a - b)
-        : undefined
-    // Canonical base the downloaded file(s) should be renamed to: JAV code for
-    // ad/vrc, "YEAR.Title" for movies, show name for tv.
-    const cat = item.cat as RenameCat
-    const base =
-      cat === "ad" || cat === "vrc"
-        ? item.code || item.title
-        : cat === "mov"
-          ? item.year
-            ? `${item.year}.${item.title}`
-            : item.title
-          : item.title
-    const pickedFiles = files ? files.filter((f) => picked.has(f.index)) : []
-    const renames =
-      pickedFiles.length > 0
-        ? planRename(
-            cat,
-            base,
-            pickedFiles.map((f) => ({ name: f.name, size: f.size }))
-          )
-        : undefined
+    const { onlyFiles, renames } = buildPlan(item, files, picked, multiFile)
     const ok = await startDownload({
       magnet: sel.magnet,
       dest,

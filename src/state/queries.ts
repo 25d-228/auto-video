@@ -166,13 +166,13 @@ export interface MetaArgs {
 
 /** JAV metadata (jatitle / cast / date / runtime). Disabled until cid or code exists. */
 export function useMeta({ cid, code, cat }: MetaArgs) {
-  const cidv = cid ?? ""
-  const codev = code ?? ""
+  const cidStr = cid ?? ""
+  const codeStr = code ?? ""
   return useQuery({
-    queryKey: qk.meta(cidv, codev, cat ?? ""),
+    queryKey: qk.meta(cidStr, codeStr, cat ?? ""),
     queryFn: () =>
-      meta({ cid: cidv || undefined, code: codev || undefined, cat }),
-    enabled: cidv !== "" || codev !== "",
+      meta({ cid: cidStr || undefined, code: codeStr || undefined, cat }),
+    enabled: cidStr !== "" || codeStr !== "",
     staleTime: Infinity,
     gcTime: HOUR_MS,
   })

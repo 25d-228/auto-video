@@ -25,7 +25,7 @@ export interface RenameOp {
   to: string
 }
 
-const RENAME_VIDEO_RE = /\.(mkv|mp4|avi|wmv|m4v|ts|mov|flv|iso|rmvb|webm|mpg|mpeg)$/i
+export const RENAME_VIDEO_RE = /\.(mkv|mp4|avi|wmv|m4v|ts|mov|flv|iso|rmvb|webm|mpg|mpeg)$/i
 /** Fraction of the largest video below which a video is treated as a sample/extra. */
 const MAIN_VIDEO_MIN_FRACTION = 0.15
 

@@ -18,6 +18,10 @@ struct DlEntry {
 struct DlManager(Mutex<HashMap<String, DlEntry>>);
 
 // ------------------------------------------------------------------ downloads
+/// The `state` value the frontend treats as "finished"; also the literal the
+/// polling loop watches for. Spelled once so it can't drift between producers.
+const DL_STATE_DONE: &str = "done";
+
 #[derive(Clone, serde::Serialize)]
 struct DlProgress {
     id: String,
@@ -46,7 +50,7 @@ fn dl_progress(id: &str, title: &str, dest: &str, handle: &Arc<librqbit::Managed
     let state = match st.state {
         S::Error => "error",
         S::Paused => "paused",
-        _ if st.finished => "done",
+        _ if st.finished => DL_STATE_DONE,
         _ => "downloading", // Initializing | Live
     };
     DlProgress {
@@ -157,6 +161,70 @@ struct RenamePair {
     to: String,
 }
 
+/// Resolve the output folder: the requested dir (created if needed), else
+/// ~/Downloads/auto-video.
+fn resolve_out_dir(app: &tauri::AppHandle, dest: &str) -> Result<PathBuf, String> {
+    if !dest.trim().is_empty() {
+        let p = PathBuf::from(dest);
+        if std::fs::create_dir_all(&p).is_ok() {
+            return Ok(p);
+        }
+    }
+    let d = app.path().download_dir().map_err(|e| e.to_string())?;
+    let p = d.join("auto-video");
+    let _ = std::fs::create_dir_all(&p);
+    Ok(p)
+}
+
+/// The shared librqbit session, creating it on the first download of this run.
+async fn get_or_init_session(
+    app: &tauri::AppHandle,
+    out: &Path,
+) -> Result<Arc<librqbit::Session>, String> {
+    let sess = app.state::<DlSession>();
+    let mut g = sess.0.lock().await;
+    if g.is_none() {
+        let s = librqbit::Session::new(out.to_path_buf())
+            .await
+            .map_err(|e| e.to_string())?;
+        *g = Some(s);
+    }
+    Ok(g.as_ref().unwrap().clone())
+}
+
+/// Canonicalize the downloaded file names once a download finishes: stop the
+/// torrent so librqbit releases the files, rename per the plan, then drop the
+/// management entry. A no-op (and leaves the entry) when there are no renames.
+async fn apply_renames(app: &tauri::AppHandle, id: &str, dest_out: &str, renames: Option<&Vec<RenamePair>>) {
+    let Some(plan) = renames.filter(|p| !p.is_empty()) else { return };
+    let session = app.state::<DlSession>().0.lock().await.clone();
+    let torrent_id = app
+        .state::<DlManager>()
+        .0
+        .lock()
+        .unwrap()
+        .get(id)
+        .map(|e| e.handle.id());
+    if let (Some(session), Some(torrent_id)) = (session, torrent_id) {
+        let _ = session
+            .delete(librqbit::api::TorrentIdOrHash::Id(torrent_id), false)
+            .await;
+    }
+    for pair in plan {
+        let src = Path::new(dest_out).join(&pair.from);
+        let dst = Path::new(dest_out).join(&pair.to);
+        if !(src.exists() && !dst.exists()) {
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(&src, &dst);
+    }
+    // Torrent removed + files renamed: drop the management entry.
+    app.state::<DlManager>().0.lock().unwrap().remove(id);
+}
+
 #[tauri::command]
 async fn start_download(
     app: tauri::AppHandle,
@@ -176,46 +244,21 @@ async fn start_download(
     // stall for a low-seeder magnet. The frontend already shows an optimistic
     // entry; any failure comes back as a "download-progress" event (state="error").
     tauri::async_runtime::spawn(async move {
-        // Resolve the output folder (requested dir, else ~/Downloads/auto-video).
-        let out = {
-            let mut chosen: Option<PathBuf> = None;
-            if !dest.trim().is_empty() {
-                let p = PathBuf::from(&dest);
-                if std::fs::create_dir_all(&p).is_ok() {
-                    chosen = Some(p);
-                }
-            }
-            match chosen {
-                Some(p) => p,
-                None => match app.path().download_dir() {
-                    Ok(d) => {
-                        let p = d.join("auto-video");
-                        let _ = std::fs::create_dir_all(&p);
-                        p
-                    }
-                    Err(e) => {
-                        emit_dl_error(&app, &id, &title, &dest, e.to_string());
-                        return;
-                    }
-                },
+        let out = match resolve_out_dir(&app, &dest) {
+            Ok(out) => out,
+            Err(e) => {
+                emit_dl_error(&app, &id, &title, &dest, e);
+                return;
             }
         };
         let dest_out = out.to_string_lossy().into_owned();
 
-        // Lazily create the librqbit session (first download in this run only).
-        let session = {
-            let sess = app.state::<DlSession>();
-            let mut g = sess.0.lock().await;
-            if g.is_none() {
-                match librqbit::Session::new(out.clone()).await {
-                    Ok(s) => *g = Some(s),
-                    Err(e) => {
-                        emit_dl_error(&app, &id, &title, &dest_out, e.to_string());
-                        return;
-                    }
-                }
+        let session = match get_or_init_session(&app, &out).await {
+            Ok(s) => s,
+            Err(e) => {
+                emit_dl_error(&app, &id, &title, &dest_out, e);
+                return;
             }
-            g.as_ref().unwrap().clone()
         };
 
         let opts = librqbit::AddTorrentOptions {
@@ -264,45 +307,17 @@ async fn start_download(
                 }
             };
             let payload = dl_progress(&id, &title, &dest_out, &handle);
-            let done = payload.state == "done";
+            let done = payload.state == DL_STATE_DONE;
             // Re-check membership right before emitting in case a cancel raced us.
             if !app.state::<DlManager>().0.lock().unwrap().contains_key(&id) {
                 break;
             }
             if done {
-                // Canonicalize the downloaded file names: stop the torrent so
-                // librqbit releases the files, then rename per the plan.
-                if let Some(plan) = renames.as_ref().filter(|p| !p.is_empty()) {
-                    let session = app.state::<DlSession>().0.lock().await.clone();
-                    let tid = app
-                        .state::<DlManager>()
-                        .0
-                        .lock()
-                        .unwrap()
-                        .get(&id)
-                        .map(|e| e.handle.id());
-                    if let (Some(session), Some(tid)) = (session, tid) {
-                        let _ = session
-                            .delete(librqbit::api::TorrentIdOrHash::Id(tid), false)
-                            .await;
-                    }
-                    for pair in plan {
-                        let src = std::path::Path::new(&dest_out).join(&pair.from);
-                        let dst = std::path::Path::new(&dest_out).join(&pair.to);
-                        if src.exists() && !dst.exists() {
-                            if let Some(parent) = dst.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            let _ = std::fs::rename(&src, &dst);
-                        }
-                    }
-                    // Torrent removed + files renamed: drop the management entry.
-                    app.state::<DlManager>().0.lock().unwrap().remove(&id);
-                }
+                apply_renames(&app, &id, &dest_out, renames.as_ref()).await;
             }
             let _ = app.emit("download-progress", payload);
             if done {
-                // Stop polling; (entry stays in the map unless we renamed above).
+                // Done: entry stays in the map unless the rename branch above removed it.
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(1200)).await;

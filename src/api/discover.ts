@@ -62,12 +62,12 @@ export function resolveList(
   if (!entry) {
     entry = providers[0] // category default provider
   }
-  const src = entry ? entry.provider : ""
-  const lists = entry ? entry.lists : []
+  if (!entry) return { source: "", list: "" }
+  const lists = entry.lists
   if (list && (lists as readonly string[]).includes(list)) {
-    return { source: src, list }
+    return { source: entry.provider, list }
   }
-  return { source: src, list: lists.length > 0 ? lists[0]! : "" }
+  return { source: entry.provider, list: lists.length > 0 ? lists[0]! : "" }
 }
 
 /**
@@ -248,9 +248,7 @@ export async function discover(
     const sub = ((wantVr ? "VR · " : "") + code).replace(/^[\s·]+|[\s·]+$/g, "")
     // Strip the aggregator-internal fields like the Python _clean (which drops
     // every "_"-prefixed key and "vr"; `magnet` is intentionally kept).
-    const { vr: _vr, _rawtitle, _downloads: _dl, ...item } = x
-    void _vr
-    void _dl
+    const { vr: _omitVr, _rawtitle, _downloads: _omitDl, ...item } = x
     item.cat = cat
     item.sub = sub || (_rawtitle || "").slice(0, 30)
     out.push(item)

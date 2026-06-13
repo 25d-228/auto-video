@@ -13,12 +13,13 @@ export function fseed(n: number): string {
 export function fmtBytes(bytes: number): string {
   let b = bytes || 0
   const units = ["B", "KB", "MB", "GB", "TB"]
+  const oneDecimalFrom = units.indexOf("GB") // GB and up keep one decimal
   let i = 0
   while (b >= 1024 && i < units.length - 1) {
     b /= 1024
     i++
   }
-  return (i >= 3 ? b.toFixed(1) : String(Math.round(b))) + " " + units[i]
+  return (i >= oneDecimalFrom ? b.toFixed(1) : String(Math.round(b))) + " " + units[i]
 }
 
 /** Days-ago -> "just now" / "1 day ago" / "12 days ago" / "3 mo ago". */

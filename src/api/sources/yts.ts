@@ -11,7 +11,7 @@
  * Network goes through src/net/http.ts (Rust-backed fetch, bypasses CORS).
  * The parsers are pure so they can be unit-tested against a recorded fixture.
  */
-import { httpJson, HttpError } from "@/net/http"
+import { httpJson } from "@/net/http"
 import { getCached, setCached, isDbAvailable } from "@/state/db"
 import type { DiscoverItem, Release } from "@/api/types"
 
@@ -91,15 +91,16 @@ export type YtsSort =
  * BitTorrent trackers appended to every synthesised magnet, mirroring the
  * Python `TRACKERS` constant (YTS torrents carry only an info-hash).
  */
-const YTS_TRACKERS = [
+// Python encodes each tracker with `urllib.parse.quote` (default safe='/'), so
+// the `/` stays raw — quotePlusName reproduces that exactly.
+const TRACKERS = [
   "udp://tracker.opentrackr.org:1337/announce",
   "udp://open.demonii.com:1337/announce",
   "udp://tracker.openbittorrent.com:6969/announce",
   "udp://exodus.desync.com:6969/announce",
 ]
-// Python encodes each tracker with `urllib.parse.quote` (default safe='/'), so
-// the `/` stays raw — quotePlusName reproduces that exactly.
-const TRACKERS = YTS_TRACKERS.map((t) => "&tr=" + quotePlusName(t)).join("")
+  .map((t) => "&tr=" + quotePlusName(t))
+  .join("")
 
 /** TTL for a cached movie listing (matches the sidecar's LIST_TTL = 300s). */
 const LIST_TTL_SEC = 300
@@ -269,12 +270,9 @@ async function fetchMoviesPage(
       const j = await httpJson<YtsListResponse>(url)
       const movies = j?.data?.movies
       if (j?.status === "ok" && movies && movies.length > 0) return movies
-    } catch (e) {
+    } catch {
       // A dead mirror / non-2xx / JSON parse error -> try the next mirror.
-      if (!(e instanceof HttpError) && !(e instanceof SyntaxError)) {
-        // Unexpected error type: still fall through to the next mirror, but do
-        // not let it escape (the Python helper swallows all fetch errors).
-      }
+      // (The Python helper likewise swallows all fetch errors.)
     }
   }
   return null

@@ -263,7 +263,7 @@ export async function allPaths(): Promise<Partial<Record<Cat, string>>> {
 
 // ------------------------------------------------------------------ TTL caches
 
-/** Seconds → ms helper kept local so the TTL math reads clearly. */
+/** Current Unix time in whole seconds — kept local so the TTL math reads clearly. */
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
 }
@@ -413,10 +413,10 @@ export async function allDownloads(): Promise<DownloadRow[]> {
       renames: string | null
     }[]
   >("SELECT id, magnet, dest, title, only_files, renames FROM downloads ORDER BY added_at ASC")
-  const parse = <T>(s: string | null): T | undefined => {
-    if (!s) return undefined
+  const parseJsonColumn = <T>(raw: string | null): T | undefined => {
+    if (!raw) return undefined
     try {
-      return JSON.parse(s) as T
+      return JSON.parse(raw) as T
     } catch {
       return undefined
     }
@@ -426,8 +426,8 @@ export async function allDownloads(): Promise<DownloadRow[]> {
     magnet: r.magnet,
     dest: r.dest,
     title: r.title,
-    onlyFiles: parse<number[]>(r.only_files),
-    renames: parse<DownloadRename[]>(r.renames),
+    onlyFiles: parseJsonColumn<number[]>(r.only_files),
+    renames: parseJsonColumn<DownloadRename[]>(r.renames),
   }))
 }
 

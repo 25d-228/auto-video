@@ -59,23 +59,23 @@ function dmmSort(list: string): string {
  * no trailing alpha-run + number can be found.
  */
 export function dmmCidToCode(cid: string): string {
-  let c = (cid || "").toLowerCase()
-  c = c.replace(/^n_\d+/, "") // n_NNNN maker prefix
-  c = c.replace(/(btk|tk)$/, "") // trailing media tag
-  const m = /([a-z]+)(\d+)$/.exec(c) // last alpha-run + trailing number
+  let cid_ = (cid || "").toLowerCase()
+  cid_ = cid_.replace(/^n_\d+/, "") // n_NNNN maker prefix
+  cid_ = cid_.replace(/(btk|tk)$/, "") // trailing media tag
+  const m = /([a-z]+)(\d+)$/.exec(cid_) // last alpha-run + trailing number
   if (!m) return ""
-  let lab = m[1]!
-  let num = m[2]!
+  let label = m[1]!
+  let number = m[2]!
   for (const head of ["k9", "c9", "tk", "tn"]) {
     // peel a glued 2-char maker head if a real label remains
-    if (lab.startsWith(head) && lab.length - head.length >= 3 && lab.length - head.length <= 6) {
-      lab = lab.slice(head.length)
+    if (label.startsWith(head) && label.length - head.length >= 3 && label.length - head.length <= 6) {
+      label = label.slice(head.length)
       break
     }
   }
-  num = num.replace(/^0+/, "") || "0"
-  if (num.length < 3) num = num.padStart(3, "0")
-  return lab.toUpperCase() + "-" + num
+  number = number.replace(/^0+/, "") || "0"
+  if (number.length < 3) number = number.padStart(3, "0")
+  return label.toUpperCase() + "-" + number
 }
 
 // ---------------------------------------------------------------- cid variants (cover probing)
@@ -154,18 +154,18 @@ export function imgDims(b: Uint8Array): [number, number] | null {
   // JPEG: scan SOF markers
   if (b[0] === 0xff && b[1] === 0xd8) {
     let i = 2
-    const n = b.length
-    while (i < n - 9) {
+    const len = b.length
+    while (i < len - 9) {
       if (b[i] !== 0xff) {
         i += 1
         continue
       }
-      const mk = b[i + 1]!
-      if (mk >= 0xc0 && mk <= 0xcf && mk !== 0xc4 && mk !== 0xc8 && mk !== 0xcc) {
+      const marker = b[i + 1]!
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
         return [be16(b, i + 7), be16(b, i + 5)]
       }
-      const seg = be16(b, i + 2)
-      i += 2 + seg
+      const segLen = be16(b, i + 2)
+      i += 2 + segLen
     }
     return null
   }
@@ -405,12 +405,16 @@ export async function fetchDmm(vr: boolean, list: DmmList): Promise<DiscoverItem
   // jacket (front+back, ~1.49) so DMM matches the other adult sources, falling
   // back to `ps` when a title has no `pl`. The true aspect ratio is measured
   // from the fetched bytes so the card box matches the cover (no crop).
+  const resolveCover = async (coverUrl: string): Promise<{ url: string; ar: number } | null> => {
+    const plUrl = coverUrl.replace(/ps(\.jpe?g)(\?.*)?$/i, "pl$1$2")
+    return (
+      (plUrl !== coverUrl ? await dmmBlobCover(plUrl) : null) ??
+      (await dmmBlobCover(coverUrl))
+    )
+  }
   await Promise.all(
     items.map(async ({ item, coverUrl }) => {
-      const plUrl = coverUrl.replace(/ps(\.jpe?g)(\?.*)?$/i, "pl$1$2")
-      const got =
-        (plUrl !== coverUrl ? await dmmBlobCover(plUrl) : null) ??
-        (await dmmBlobCover(coverUrl))
+      const got = await resolveCover(coverUrl)
       if (got) {
         item.cover = got.url
         item.ar = got.ar

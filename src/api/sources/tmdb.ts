@@ -289,25 +289,23 @@ export function pickMatch(
   title: string,
   year: string
 ): TmdbResult | null {
+  const titleNames = (m: TmdbResult) => [m.title, m.name, m.original_title, m.original_name]
   for (const m of results) {
     const dt = yearOf(m)
     const okYear = !year || (Boolean(dt) && Math.abs(Number(dt) - Number(year)) <= 1)
-    const names = [m.title, m.name, m.original_title, m.original_name]
-    const okTitle = names.some((x) => titleMatch(title, x))
+    const okTitle = titleNames(m).some((x) => titleMatch(title, x))
     if (okYear && okTitle) return m
   }
   const top = results[0]
-  if (top) {
-    const names = [top.title, top.name, top.original_title, top.original_name]
-    if (names.some((x) => titleMatch(title, x))) return top
-    // Year-anchored fallback: a precise title search whose top hit lands on the
-    // requested year is trustworthy even when TMDB only stores a romanized name
-    // that won't title-match the query (e.g. "パーフェクトブルー" is listed solely
-    // as "PERFECT BLUE"). Guarded by the year so it can't grab an unrelated hit.
-    if (year) {
-      const dt = yearOf(top)
-      if (dt && Math.abs(Number(dt) - Number(year)) <= 1) return top
-    }
+  if (!top) return null
+  if (titleNames(top).some((x) => titleMatch(title, x))) return top
+  // Year-anchored fallback: a precise title search whose top hit lands on the
+  // requested year is trustworthy even when TMDB only stores a romanized name
+  // that won't title-match the query (e.g. "パーフェクトブルー" is listed solely
+  // as "PERFECT BLUE"). Guarded by the year so it can't grab an unrelated hit.
+  if (year) {
+    const dt = yearOf(top)
+    if (dt && Math.abs(Number(dt) - Number(year)) <= 1) return top
   }
   return null
 }

@@ -74,9 +74,9 @@ export function LibraryDetail({
 
   if (!item) return null
 
-  const jm = jav ? metaQ.data : undefined
-  const date = (jav ? jm?.date : art.titleMeta?.date) || itemDate(item)
-  const runtime = (jav ? jm?.runtime : art.titleMeta?.runtime) || ""
+  const javMeta = jav ? metaQ.data : undefined
+  const date = (jav ? javMeta?.date : art.titleMeta?.date) || itemDate(item)
+  const runtime = (jav ? javMeta?.runtime : art.titleMeta?.runtime) || ""
 
   const facts: DetailFact[] = []
   if (date) facts.push({ label: "Date", value: date })
@@ -91,10 +91,10 @@ export function LibraryDetail({
   if (!jav && art.titleMeta?.cast) {
     sections.push({ label: "Cast", chips: splitChips(art.titleMeta.cast) })
   }
-  if (jav && (jm?.cast_ja || jm?.cast)) {
+  if (jav && (javMeta?.cast_ja || javMeta?.cast)) {
     sections.push({
       label: "出演 · Cast",
-      chips: splitChips(jm?.cast_ja || jm?.cast),
+      chips: splitChips(javMeta?.cast_ja || javMeta?.cast),
     })
   }
 
@@ -147,9 +147,9 @@ export function LibraryDetail({
         </>
       }
     >
-      {jav && jm?.jatitle && (
+      {jav && javMeta?.jatitle && (
         <div className="mt-2 text-xs leading-snug text-muted-foreground">
-          {jm.jatitle}
+          {javMeta.jatitle}
         </div>
       )}
       {note !== "" && (

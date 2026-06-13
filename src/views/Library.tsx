@@ -106,9 +106,9 @@ export default function Library() {
         )
       : catItems
     return [...filtered].sort((a, b) => {
-      let k = rank === "release" ? itemDate(a).localeCompare(itemDate(b)) : 0
-      if (k === 0) k = a.title.localeCompare(b.title)
-      return dir === "desc" ? -k : k
+      let cmp = rank === "release" ? itemDate(a).localeCompare(itemDate(b)) : 0
+      if (cmp === 0) cmp = a.title.localeCompare(b.title)
+      return dir === "desc" ? -cmp : cmp
     })
   }, [catItems, q, rank, dir])
 

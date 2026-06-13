@@ -150,17 +150,17 @@ export async function fetchMgstage(
   const html = await mgGet(url)
   const parsed = parseMgstageList(html)
 
+  const resolveCoverUrl = async (rawUrl: string): Promise<string> => {
+    try {
+      return await coverObjectUrl(rawUrl, { referer: MGSTAGE_REFERER })
+    } catch {
+      return ""
+    }
+  }
+
   // Resolve each wide-jacket cover blob in parallel (independent fetches).
   const items = await Promise.all(
-    parsed.map(async (p, i) => {
-      let coverUrl = ""
-      try {
-        coverUrl = await coverObjectUrl(p.cover, { referer: MGSTAGE_REFERER })
-      } catch {
-        coverUrl = ""
-      }
-      return toDiscoverItem(p, i, vr, coverUrl)
-    })
+    parsed.map(async (p, i) => toDiscoverItem(p, i, vr, await resolveCoverUrl(p.cover)))
   )
   return items
 }
@@ -265,15 +265,10 @@ export async function mgstageCover(code: string): Promise<MgstageCover> {
 }
 
 /**
- * Fetch a product-detail page. Returns the HTML, or null when the request fails
- * or MGStage redirected the request away from `path` (a missing product redirects
- * to the home page rather than 404). plugin-http follows redirects, so we use the
- * Response URL to detect that the final landing still matches the product path.
- *
- * We need the final URL, which httpText hides, so we issue the request via fetch
- * directly through httpText and fall back to a same-path assumption: because
- * httpText does not surface the redirected URL, we instead detect the redirect by
- * the page NOT containing the product path in its product-detail link/markup.
+ * Fetch a product-detail page. Returns the HTML, or null on request failure /
+ * when MGStage redirected away (a missing product redirects to the home page
+ * rather than 404). httpText does not expose the final URL, so we detect the
+ * redirect by the returned page no longer containing the requested product `path`.
  */
 async function fetchProductDetail(path: string): Promise<string | null> {
   let html: string

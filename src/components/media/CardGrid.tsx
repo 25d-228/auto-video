@@ -177,15 +177,15 @@ export function Pager({
   const win = 2
   const lo = Math.max(1, page - win)
   const hi = Math.min(pageCount, page + win)
-  const mid: (number | "gap")[] = []
+  const pages: (number | "gap")[] = []
   if (lo > 1) {
-    mid.push(1)
-    if (lo > 2) mid.push("gap")
+    pages.push(1)
+    if (lo > 2) pages.push("gap")
   }
-  for (let i = lo; i <= hi; i++) mid.push(i)
+  for (let i = lo; i <= hi; i++) pages.push(i)
   if (hi < pageCount) {
-    if (hi < pageCount - 1) mid.push("gap")
-    mid.push(pageCount)
+    if (hi < pageCount - 1) pages.push("gap")
+    pages.push(pageCount)
   }
   return (
     <div className={cn("flex items-center gap-2 pt-3", className)}>
@@ -199,7 +199,7 @@ export function Pager({
         </PagerButton>
       </div>
       <div className="flex items-center gap-1">
-        {mid.map((m, i) =>
+        {pages.map((m, i) =>
           m === "gap" ? (
             <span key={`gap-${i}`} className="px-1 text-xs text-muted-foreground">
               …

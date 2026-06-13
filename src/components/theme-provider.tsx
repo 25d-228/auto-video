@@ -32,13 +32,15 @@ function loadTheme(): Theme {
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [theme, setThemeState] = useState<Theme>(loadTheme)
 
-  const resolvedTheme = theme === "system" ? systemTheme() : theme
+  const resolve = (t: Theme): "dark" | "light" =>
+    t === "system" ? systemTheme() : t
+
+  const resolvedTheme = resolve(theme)
 
   useEffect(() => {
     const root = window.document.documentElement
     const apply = () => {
-      const next = theme === "system" ? systemTheme() : theme
-      root.classList.toggle("dark", next === "dark")
+      root.classList.toggle("dark", resolve(theme) === "dark")
     }
     apply()
     // follow OS changes while in "system" mode

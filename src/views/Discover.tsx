@@ -5,7 +5,7 @@
  * rank, show-count, refresh) -> ranked grid with lazy live seeder badges ->
  * detail panel -> download dialog.
  */
-import { useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { Loader2, RefreshCw } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
@@ -113,6 +113,11 @@ export default function Discover() {
   const gridBoxRef = useRef<HTMLDivElement>(null)
   const perPage = useFitPageSize(gridBoxRef, feedKey)
   const pager = usePager(pool, perPage)
+  // Reset to page 1 whenever the pool identity changes (see Library.tsx).
+  const { setPage } = pager
+  useEffect(() => {
+    setPage(1)
+  }, [cat, source, list, effRank, limit, setPage])
 
   const providerOptions = providersFor(cat)
   const listOptions = listsFor(cat, source)
@@ -128,7 +133,6 @@ export default function Discover() {
     setSelByCat((prev) => ({ ...prev, [next]: defaultSelection(next) }))
     setRank("popularity")
     closePanels()
-    pager.setPage(1)
   }
 
   // switching provider resets the list to that provider's first list
@@ -139,7 +143,6 @@ export default function Discover() {
       [cat]: { source: provider, list: defaultListFor(cat, provider) },
     }))
     closePanels()
-    pager.setPage(1)
   }
 
   const switchList = (next: string) => {
@@ -148,17 +151,6 @@ export default function Discover() {
       [cat]: { ...prev[cat], list: next as ListId },
     }))
     closePanels()
-    pager.setPage(1)
-  }
-
-  const switchRank = (next: Rank) => {
-    setRank(next)
-    pager.setPage(1)
-  }
-
-  const switchLimit = (next: number) => {
-    setLimit(next)
-    pager.setPage(1)
   }
 
   const onRefresh = () => {
@@ -214,7 +206,7 @@ export default function Discover() {
         {ranks.length > 1 && (
           <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
             Rank by
-            <Select value={effRank} onValueChange={(v) => switchRank(v as Rank)}>
+            <Select value={effRank} onValueChange={(v) => setRank(v as Rank)}>
               <SelectTrigger size="sm" className="text-xs" aria-label="Rank by">
                 <SelectValue />
               </SelectTrigger>
@@ -234,7 +226,7 @@ export default function Discover() {
           <SegControl
             options={LIMIT_OPTIONS}
             value={limit}
-            onChange={switchLimit}
+            onChange={setLimit}
           />
         </span>
 

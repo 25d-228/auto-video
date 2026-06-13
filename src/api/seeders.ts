@@ -62,10 +62,7 @@ function unescapeHtml(s: string): string {
 
 // ----------------------------------------------------------------- javdb
 
-interface JdbSearchData {
-  movies?: { id?: string; number?: string }[]
-}
-interface JdbSearchEnvelope {
+interface JdbSearch {
   movies?: { id?: string; number?: string }[]
 }
 
@@ -79,7 +76,7 @@ interface JdbSearchEnvelope {
  * search lookup here is strictly more capable while staying within the same API.
  */
 async function javdbSlugForCode(code: string): Promise<string> {
-  const data = await javdbApi<JdbSearchData & JdbSearchEnvelope>(
+  const data = await javdbApi<JdbSearch>(
     `/api/v2/search?q=${encodeURIComponent(code)}`
   )
   const movies = data?.movies ?? []
@@ -132,12 +129,12 @@ export async function seedersJavbus(
     ck,
     "https://www.javbus.com/"
   )
-  const g = /gid\s*=\s*(\d+)/.exec(page)
-  if (!g) return []
-  const u = /\buc\s*=\s*(\d+)/.exec(page)
-  const aj = await jbGet(
-    `https://www.javbus.com/ajax/uncledatoolsbyajax.php?gid=${g[1]}&lang=en&img=&uc=${
-      u ? u[1] : "0"
+  const gidMatch = /gid\s*=\s*(\d+)/.exec(page)
+  if (!gidMatch) return []
+  const ucMatch = /\buc\s*=\s*(\d+)/.exec(page)
+  const ajaxHtml = await jbGet(
+    `https://www.javbus.com/ajax/uncledatoolsbyajax.php?gid=${gidMatch[1]}&lang=en&img=&uc=${
+      ucMatch ? ucMatch[1] : "0"
     }&floor=`,
     ck,
     `https://www.javbus.com/${code}`
@@ -146,19 +143,19 @@ export async function seedersJavbus(
   const seen = new Set<string>()
   const re = /magnet:\?xt=urn:btih:([0-9a-fA-F]+)[^"'\s<]*/g
   let m: RegExpExecArray | null
-  while ((m = re.exec(aj)) !== null) {
-    const ih = m[1]!.toLowerCase()
-    if (seen.has(ih)) continue
-    seen.add(ih)
-    const seg = aj.slice(m.index, m.index + 500)
-    const szm = /(\d+(?:\.\d+)?\s*[GM]B)/.exec(seg)
+  while ((m = re.exec(ajaxHtml)) !== null) {
+    const infohash = m[1]!.toLowerCase()
+    if (seen.has(infohash)) continue
+    seen.add(infohash)
+    const segment = ajaxHtml.slice(m.index, m.index + 500)
+    const sizeMatch = /(\d+(?:\.\d+)?\s*[GM]B)/.exec(segment)
     out.push({
       name: code,
       source: "JavBus",
       seeders: 0,
-      size: szm ? szm[1]! : "",
+      size: sizeMatch ? sizeMatch[1]! : "",
       magnet: unescapeHtml(m[0]),
-      quality: quality(seg),
+      quality: quality(segment),
     })
   }
   return out

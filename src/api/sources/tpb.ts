@@ -21,6 +21,7 @@ import { httpJson } from "@/net/http"
 import { getCached, setCached, isDbAvailable } from "@/state/db"
 import type { DiscoverItem, DiscoverMode, Release } from "@/api/types"
 import { parseTvName } from "@/lib/codes"
+import { quality } from "@/api/sources/sukebei"
 
 /** apibay TV category id (the Python's `category:205`). */
 const TV_CATEGORY = 205
@@ -89,15 +90,6 @@ const TRACKERS = [
 ]
   .map((t) => "&tr=" + pyQuote(t))
   .join("")
-
-/** Python: _quality(name) — first matching resolution token, uppercased. */
-function quality(name: string): string {
-  const n = (name || "").toLowerCase()
-  for (const q of ["2160p", "4k", "8k", "1080p", "720p", "480p"]) {
-    if (n.includes(q)) return q.toUpperCase()
-  }
-  return ""
-}
 
 /** Python: _magnet(ih, name). */
 function buildMagnet(infoHash: string, name: string): string {

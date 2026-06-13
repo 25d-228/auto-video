@@ -475,7 +475,6 @@ export async function discover(cat: Cat, list: string): Promise<DiscoverItem[]> 
   if (cat === "vrc") {
     return javdbTags({ tagId: VR_TAG_ID, sortBy: "release", orderBy: "desc", limit: 24 })
   }
-  // 'ad' (and any other cat): the Most Viewed list, windowed by the list id.
   const period: JavdbPeriod =
     list === "weekly" || list === "monthly" || list === "daily" ? list : "daily"
   return javdbPlayback("all", period)

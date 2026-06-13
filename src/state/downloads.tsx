@@ -51,6 +51,24 @@ export interface DownloadEntry {
   error?: string
 }
 
+/** Base fields shared by an entry and its error variant. */
+type DownloadEntryBase = Pick<DownloadEntry, "id" | "title" | "dest">
+
+/** An "error" entry that keeps any progress already shown for this id. */
+function errorEntry(
+  prev: Record<string, DownloadEntry>,
+  base: DownloadEntryBase,
+  e: unknown
+): DownloadEntry {
+  return {
+    ...base,
+    progress: prev[base.id]?.progress ?? 0,
+    speedMbps: 0,
+    state: "error",
+    error: String(e),
+  }
+}
+
 export interface StartDownloadArgs {
   magnet: string
   /** Destination folder; the Rust side falls back to ~/Downloads/auto-video. */
@@ -159,47 +177,40 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     if (!isTauri() || resumedRef.current) return
     resumedRef.current = true
     let cancelled = false
-    void allDownloads()
-      .then((rows) => {
-        for (const r of rows) {
-          if (cancelled) return
-          cancelledIds.current.delete(r.id)
-          setDownloads((prev) =>
-            prev[r.id]
-              ? prev
-              : {
-                  ...prev,
-                  [r.id]: {
-                    id: r.id,
-                    title: r.title,
-                    progress: 0,
-                    speedMbps: 0,
-                    state: "downloading",
-                    dest: r.dest,
-                  },
-                }
-          )
-          void invoke("start_download", {
-            magnet: r.magnet,
-            dest: r.dest,
-            id: r.id,
-            title: r.title,
-            onlyFiles: r.onlyFiles,
-            renames: r.renames,
-          }).catch((e) => {
-            setDownloads((prev) => ({
+    const resumeRow = (r: Awaited<ReturnType<typeof allDownloads>>[number]) => {
+      cancelledIds.current.delete(r.id)
+      // optimistic entry so the sidebar reacts before the first progress event
+      setDownloads((prev) =>
+        prev[r.id]
+          ? prev
+          : {
               ...prev,
               [r.id]: {
                 id: r.id,
                 title: r.title,
-                progress: prev[r.id]?.progress ?? 0,
+                progress: 0,
                 speedMbps: 0,
-                state: "error",
+                state: "downloading",
                 dest: r.dest,
-                error: String(e),
               },
-            }))
-          })
+            }
+      )
+      void invoke("start_download", {
+        magnet: r.magnet,
+        dest: r.dest,
+        id: r.id,
+        title: r.title,
+        onlyFiles: r.onlyFiles,
+        renames: r.renames,
+      }).catch((e) => {
+        setDownloads((prev) => ({ ...prev, [r.id]: errorEntry(prev, r, e) }))
+      })
+    }
+    void allDownloads()
+      .then((rows) => {
+        for (const r of rows) {
+          if (cancelled) return
+          resumeRow(r)
         }
       })
       .catch(() => {})
@@ -230,15 +241,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       } catch (e) {
         setDownloads((prev) => ({
           ...prev,
-          [id]: {
-            id,
-            title,
-            progress: prev[id]?.progress ?? 0,
-            speedMbps: 0,
-            state: "error",
-            dest,
-            error: String(e),
-          },
+          [id]: errorEntry(prev, { id, title, dest }, e),
         }))
         notify(`Download failed: ${String(e)}`)
         return false

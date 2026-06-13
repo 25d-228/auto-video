@@ -151,66 +151,66 @@ export default function Dashboard() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
-      <div className="mb-3.5 grid grid-cols-3 gap-3">
-        <StatTile
-          label="Active downloads"
-          value={active.length}
-          sub={
-            active.length > 0
-              ? `${totalSpeedMbps.toFixed(1)} MB/s combined`
-              : list.length > 0
-                ? "downloads complete"
-                : "queue is idle"
-          }
-        />
-        <StatTile
-          label="Files in library"
-          value={filesTotal ?? "—"}
-          sub={disks ? "across 4 categories" : statsFallback}
-        />
-        <StatTile
-          label="Folders online"
-          value={onlineCount !== undefined ? `${onlineCount} / 4` : "—"}
-          sub={
-            offlineCats === undefined
-              ? statsFallback
-              : offlineCats.length === 0
-                ? "all folders online"
-                : `${offlineCats.map((c) => c.label).join(", ")} offline`
-          }
-        />
-      </div>
+        <div className="mb-3.5 grid grid-cols-3 gap-3">
+          <StatTile
+            label="Active downloads"
+            value={active.length}
+            sub={
+              active.length > 0
+                ? `${totalSpeedMbps.toFixed(1)} MB/s combined`
+                : list.length > 0
+                  ? "downloads complete"
+                  : "queue is idle"
+            }
+          />
+          <StatTile
+            label="Files in library"
+            value={filesTotal ?? "—"}
+            sub={disks ? "across 4 categories" : statsFallback}
+          />
+          <StatTile
+            label="Folders online"
+            value={onlineCount !== undefined ? `${onlineCount} / 4` : "—"}
+            sub={
+              offlineCats === undefined
+                ? statsFallback
+                : offlineCats.length === 0
+                  ? "all folders online"
+                  : `${offlineCats.map((c) => c.label).join(", ")} offline`
+            }
+          />
+        </div>
 
-      <div className="grid grid-cols-2 items-start gap-3">
-        <Card className="gap-0 px-4 py-3.5">
-          <div className="mb-1.5 text-[12.5px] font-semibold">Storage</div>
-          {statsQuery.isError && (
-            <div className="mb-1 text-[11px] text-muted-foreground">
-              Sidecar not reachable — live disk stats unavailable.
-            </div>
-          )}
-          {CATS.map((c) => (
-            <DiskRow
-              key={c.cat}
-              label={c.label}
-              disk={disks?.[c.cat] ?? OFFLINE_DISK}
-            />
-          ))}
-        </Card>
+        <div className="grid grid-cols-2 items-start gap-3">
+          <Card className="gap-0 px-4 py-3.5">
+            <div className="mb-1.5 text-[12.5px] font-semibold">Storage</div>
+            {statsQuery.isError && (
+              <div className="mb-1 text-[11px] text-muted-foreground">
+                Sidecar not reachable — live disk stats unavailable.
+              </div>
+            )}
+            {CATS.map((c) => (
+              <DiskRow
+                key={c.cat}
+                label={c.label}
+                disk={disks?.[c.cat] ?? OFFLINE_DISK}
+              />
+            ))}
+          </Card>
 
-        <Card className="gap-0 px-4 py-3.5">
-          <div className="mb-1.5 text-[12.5px] font-semibold">
-            Active downloads
-          </div>
-          {list.length > 0 ? (
-            list.map((d) => <DownloadRow key={d.id} entry={d} />)
-          ) : (
-            <div className="py-1 text-[11px] text-muted-foreground">
-              No downloads yet
+          <Card className="gap-0 px-4 py-3.5">
+            <div className="mb-1.5 text-[12.5px] font-semibold">
+              Active downloads
             </div>
-          )}
-        </Card>
-      </div>
+            {list.length > 0 ? (
+              list.map((d) => <DownloadRow key={d.id} entry={d} />)
+            ) : (
+              <div className="py-1 text-[11px] text-muted-foreground">
+                No downloads yet
+              </div>
+            )}
+          </Card>
+        </div>
       </div>
     </section>
   )

@@ -60,10 +60,10 @@ export function DiscoverDetail({
   const cs = itemState(it, owned, downloads)
   const meta = jav ? metaQ.data : undefined
 
-  const sd = seedQ.data
-  const seedSources = sd ? Object.keys(sd.sources) : []
-  const seedValue = sd
-    ? `▲ ${fseed(sd.topSeed || 0)}${seedSources.length > 0 ? ` (${seedSources.join("/")})` : ""}`
+  const seed = seedQ.data
+  const seedSources = seed ? Object.keys(seed.sources) : []
+  const seedValue = seed
+    ? `▲ ${fseed(seed.topSeed || 0)}${seedSources.length > 0 ? ` (${seedSources.join("/")})` : ""}`
     : `▲ ${fseed(it.seeders)}`
 
   const date = meta?.date || it.date || ""
