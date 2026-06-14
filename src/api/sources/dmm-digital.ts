@@ -96,6 +96,22 @@ const SEARCH_Q =
   ` result { contents { id title packageImage { largeUrl } } } } }`
 
 /**
+ * Sample/preview images for a digital content id (raw awsimgsrc large URLs).
+ * The mono/dvd detail-page scrape (dmmPreviews) can't resolve digital cids like
+ * vrkm01577, so the digital VR cards use this instead.
+ */
+export async function dmmDigitalPreviews(cid: string): Promise<string[]> {
+  const safe = (cid || "").replace(/[^a-z0-9_]/gi, "")
+  if (!safe) return []
+  const d = await gql<{ ppvContent?: { sampleImages?: { largeImageUrl?: string }[] } | null }>(
+    `{ ppvContent(id: "${safe}") { sampleImages { largeImageUrl } } }`
+  )
+  return (d?.ppvContent?.sampleImages ?? [])
+    .map((s) => s.largeImageUrl || "")
+    .filter(Boolean)
+}
+
+/**
  * Digital VR feed for a Discover list id:
  *   trending  -> SALES_BEST_SELLERS · monthly -> SALES_MONTHLY   (ppvContentRanking)
  *   newest    -> RELEASE_DATE       · top_rated -> REVIEW_RANK_SCORE (legacySearchPPV)

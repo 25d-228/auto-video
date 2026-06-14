@@ -11,6 +11,7 @@
  */
 import { coverObjectUrl } from "@/net/http"
 import { dmmPreviews } from "@/api/sources/dmm"
+import { dmmDigitalPreviews } from "@/api/sources/dmm-digital"
 import { javdbPreviews, javdbSearch } from "@/api/sources/javdb"
 import { mgstagePreviews } from "@/api/sources/mgstage"
 import type { DiscoverItem } from "@/api/types"
@@ -38,8 +39,11 @@ async function rawPreviews(item: DiscoverItem): Promise<string[]> {
   switch ((item.src || "").toLowerCase()) {
     case "javdb":
       return javdbPreviews(item.id)
-    case "dmm":
-      return dmmPreviews(item.id.replace(/^dmm_/, ""))
+    case "dmm": {
+      const cid = item.id.replace(/^dmm_/, "")
+      // VR = digital cids (vrkm…) -> GraphQL sampleImages; Adult = mono/dvd scrape.
+      return item.cat === "vrc" ? dmmDigitalPreviews(cid) : dmmPreviews(cid)
+    }
     case "mgstage":
       return mgstagePreviews(item.code || item.title)
     case "sukebei":
