@@ -21,6 +21,8 @@
         { "url": "https://tp.cmastd.com/*" },
         { "url": "https://*.dmm.co.jp/*" },
         { "url": "https://pics.dmm.co.jp/*" },
+        { "url": "https://api.video.dmm.co.jp/*" },
+        { "url": "https://awsimgsrc.dmm.co.jp/*" },
         { "url": "https://www.mgstage.com/*" },
         { "url": "https://image.mgstage.com/*" },
         { "url": "https://sukebei.nyaa.si/*" },

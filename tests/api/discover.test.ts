@@ -423,6 +423,15 @@ describe("listing cache (listing_cached port)", () => {
     expect(out.map((x) => x.id)).toEqual(["fresh"])
   })
 
+  it("re-fetches a prior-session EMPTY cache hit (transient/fixed failure)", async () => {
+    vi.mocked(isDbAvailable).mockReturnValue(true)
+    vi.mocked(getCached).mockResolvedValue([]) // empty result cached by a prior process
+    vi.mocked(fetchTmdbTrending).mockResolvedValue([di({ id: "fresh" })])
+    const out = await discover("mov", "tmdb", "trending")
+    expect(fetchTmdbTrending).toHaveBeenCalled()
+    expect(out.map((x) => x.id)).toEqual(["fresh"])
+  })
+
   it("serves a prior-session cache hit when covers are raw URLs (no blobs)", async () => {
     vi.mocked(isDbAvailable).mockReturnValue(true)
     vi.mocked(getCached).mockResolvedValue([di({ id: "cached", cover: "https://img/p.jpg" })])

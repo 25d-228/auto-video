@@ -147,9 +147,13 @@ async function cachedListing(
       // Legacy entries were a bare array (no session tag).
       const sid = Array.isArray(hit) ? "" : hit.sid
       const items = Array.isArray(hit) ? hit : hit.data
-      const deadBlobs =
-        sid !== SESSION_TAG && items.some((x) => x.cover.startsWith("blob:"))
-      if (!deadBlobs) return items
+      // A prior-session hit is stale if it carries dead blob: covers (session-
+      // local object URLs) OR is empty — an empty result from another process
+      // may be a transient/now-fixed failure, so re-verify it this session.
+      const stale =
+        sid !== SESSION_TAG &&
+        (items.length === 0 || items.some((x) => x.cover.startsWith("blob:")))
+      if (!stale) return items
     }
   }
   const data = (await fn()) || []
