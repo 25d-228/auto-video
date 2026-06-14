@@ -159,6 +159,10 @@ async fn apply_renames(app: &tauri::AppHandle, id: &str, dest_out: &str, renames
         lt::remove(&lt_id, false);
         // Give libtorrent a moment to flush + close the files before moving them.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // When files are deselected, libtorrent keeps a hidden ".<hash>.parts"
+        // file (boundary pieces of the unwanted files). The selected files are
+        // fully flushed by now, so drop it instead of leaving cruft in the dest.
+        let _ = std::fs::remove_file(Path::new(dest_out).join(format!(".{lt_id}.parts")));
     }
     for pair in plan {
         let src = Path::new(dest_out).join(&pair.from);

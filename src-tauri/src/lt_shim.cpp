@@ -23,6 +23,7 @@
 
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert.hpp>
+#include <libtorrent/alert_types.hpp>
 #include <libtorrent/download_priority.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/file_storage.hpp>
@@ -66,8 +67,11 @@ std::string id_of(lt::info_hash_t const& ih) {
   return ih.has_v1() ? to_hex(ih.v1) : to_hex(ih.v2);
 }
 
-// Apply file selection (priority 0 for deselected) and resume. Caller holds g_mu.
+// Apply file selection (priority 0 for deselected). Called the instant metadata
+// arrives (metadata_received_alert) — before any payload piece is written — so
+// deselected files are never created on disk. Caller holds g_mu.
 void apply_selection(Entry& e) {
+  if (e.applied) return;
   auto ti = e.handle.torrent_file();
   if (!ti) return;
   int n = ti->num_files();
@@ -79,7 +83,6 @@ void apply_selection(Entry& e) {
     }
     e.handle.prioritize_files(prios);
   }
-  if (!e.user_paused) e.handle.resume();
   e.applied = true;
 }
 
@@ -89,13 +92,37 @@ bool lt_init() {
   std::lock_guard<std::mutex> lk(g_mu);
   if (g_ses) return true;
   lt::settings_pack sp;
-  // We poll status instead of consuming alerts, so keep the alert queue empty.
-  sp.set_int(lt::settings_pack::alert_mask, 0);
+  // status_notification carries metadata_received_alert, which we use to apply
+  // the file selection the moment metadata arrives.
+  sp.set_int(lt::settings_pack::alert_mask, lt::alert_category::status);
   sp.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6881");
   try {
     g_ses = std::make_unique<lt::session>(sp);
   } catch (...) {
     return false;
+  }
+  // Apply file selection the instant metadata arrives. wait_for_alert returns as
+  // soon as the alert is posted, so prioritize_files lands within milliseconds —
+  // before any payload piece round-trip completes — keeping deselected files off
+  // disk. (paused/upload_mode/stop_when_ready all block or pre-empt the metadata
+  // fetch on magnets in this build, so the torrent must run normally and be
+  // constrained right after metadata instead.)
+  {
+    lt::session* ses = g_ses.get();
+    std::thread([ses] {
+      for (;;) {
+        ses->wait_for_alert(std::chrono::seconds(1));
+        std::vector<lt::alert*> alerts;
+        ses->pop_alerts(&alerts);
+        for (auto* a : alerts) {
+          auto* m = lt::alert_cast<lt::metadata_received_alert>(a);
+          if (!m) continue;
+          std::lock_guard<std::mutex> lk(g_mu);
+          auto it = g_torrents.find(id_of(m->handle.info_hashes()));
+          if (it != g_torrents.end()) apply_selection(it->second);
+        }
+      }
+    }).detach();
   }
   return true;
 }
@@ -107,9 +134,13 @@ rust::String lt_add(rust::Str magnet, rust::Str save_path,
   lt::add_torrent_params atp = lt::parse_magnet_uri(std::string(magnet), ec);
   if (ec) return rust::String("");
   atp.save_path = std::string(save_path);
-  // Start paused; selection + resume happen once metadata is known (lt_status),
-  // so nothing is written to deselected files before priorities are set.
-  atp.flags |= lt::torrent_flags::paused;
+  // parse_magnet_uri defaults the flags to include `paused`; clear it so the
+  // torrent actually runs and fetches metadata (paused = no peer/DHT activity =
+  // dead-lock at 0%). No upload_mode/stop_when_ready: both block or pre-empt the
+  // metadata fetch on magnets in this build. The file selection is applied the
+  // instant metadata arrives (see the alert thread in lt_init), before any
+  // payload is written. auto_managed off so we control start/stop.
+  atp.flags &= ~lt::torrent_flags::paused;
   atp.flags &= ~lt::torrent_flags::auto_managed;
   std::string id = id_of(atp.info_hashes);
 
@@ -152,8 +183,10 @@ rust::Vec<LtFile> lt_list_files(rust::Str magnet, std::uint32_t timeout_ms) {
     std::error_code fec;
     std::filesystem::create_directories(tmp, fec);
     atp.save_path = tmp.string();
-    atp.flags |= lt::torrent_flags::upload_mode; // fetch metadata, write no data
-    atp.flags &= ~lt::torrent_flags::paused;     // must run to fetch metadata
+    // Run normally to fetch metadata; no payload is written during the
+    // metadata phase, and we remove the torrent (delete_files) the instant
+    // metadata lands. (upload_mode/stop_when_ready block the metadata fetch.)
+    atp.flags &= ~lt::torrent_flags::paused; // must run to fetch metadata
     th = g_ses->add_torrent(std::move(atp), ec);
     if (ec || !th.is_valid()) return out;
     temporary = true;
