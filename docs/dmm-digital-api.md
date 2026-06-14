@@ -10,6 +10,12 @@ physical discs like `ovvr616`).
 ## Endpoint
 - `POST https://api.video.dmm.co.jp/graphql`
 - `Content-Type: application/json`, body `{"query": "...", "variables": {...}}`
+- **WAF gotcha:** the server 403s any request whose `Origin` header is present and
+  NOT a dmm origin. curl (no Origin) gets 200, but the Tauri webview auto-sends
+  `Origin: tauri://localhost` → 403. Send `Origin: https://video.dmm.co.jp` (the
+  app sets this + a matching Referer in dmm-digital.ts). Also allowlist the host
+  in capabilities (two-label subdomain isn't matched by `*.dmm.co.jp`). Covers on
+  awsimgsrc.dmm.co.jp do NOT WAF on Origin (200 regardless).
 - Not persisted-query locked (arbitrary queries accepted). Introspection is OFF,
   but every operation/enum/field is in the public Next.js bundles at
   `https://assets.video.dmm.co.jp/_next/static/chunks/*` (the endpoint constant is

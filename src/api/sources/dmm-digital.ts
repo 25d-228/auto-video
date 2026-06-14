@@ -34,7 +34,13 @@ async function gql<T>(query: string, variables?: Record<string, unknown>): Promi
   try {
     const r = await httpJson<{ data?: T }>(DMM_GQL, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        // The DMM WAF 403s any non-dmm Origin (the webview's tauri:// origin);
+        // present the SPA's own origin so the request is accepted.
+        Origin: "https://video.dmm.co.jp",
+        Referer: "https://video.dmm.co.jp/",
+      },
       body: JSON.stringify({ query, variables }),
       timeoutMs: 15_000,
     })
