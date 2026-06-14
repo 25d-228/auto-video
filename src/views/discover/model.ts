@@ -106,7 +106,9 @@ export const DISC_CATALOG: Record<Cat, readonly CatalogProvider[]> = {
   ad: [
     // JavDB Adult = the Censored ranking (/api/v1/rankings?type=0) per window.
     { provider: "javdb", lists: ["daily", "weekly", "monthly"] },
-    { provider: "dmm", lists: ["trending", "newest", "top_rated"] },
+    // DMM Adult: in-list sorts + the dedicated best-seller ranking pages
+    // (monthly/daily are distinct from "trending"=sort=ranking).
+    { provider: "dmm", lists: ["trending", "newest", "top_rated", "monthly", "daily"] },
     // MGStage ranking windows (day/week/month/popular); "total" serves no
     // products so it is omitted. Each window returns ~50 distinct items.
     { provider: "mgstage", lists: ["weekly", "monthly", "daily", "popular"] },
@@ -116,7 +118,9 @@ export const DISC_CATALOG: Record<Cat, readonly CatalogProvider[]> = {
     },
   ],
   vrc: [
-    { provider: "dmm", lists: ["trending", "newest", "top_rated"] },
+    // DMM VR = the digital GraphQL rankings (real streaming VR, not the obscure
+    // physical-disc HTML floor): trending=best-sellers, monthly=this-month.
+    { provider: "dmm", lists: ["trending", "monthly", "newest", "top_rated"] },
     {
       provider: "sukebei",
       lists: ["most_seeded", "newest", "most_downloaded"],

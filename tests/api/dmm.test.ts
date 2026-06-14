@@ -121,6 +121,17 @@ describe("dmmListUrl", () => {
       "https://www.dmm.co.jp/mono/dvd/-/list/=/article=keyword/id=6793/sort=ranking/"
     )
   })
+  it("maps Adult best-seller ranking lists to the /ranking/ pages", () => {
+    expect(dmmListUrl(false, "monthly")).toBe(
+      "https://www.dmm.co.jp/mono/dvd/-/ranking/=/term=monthly/"
+    )
+    expect(dmmListUrl(false, "daily")).toBe(
+      "https://www.dmm.co.jp/mono/dvd/-/ranking/=/term=daily/"
+    )
+    expect(dmmListUrl(false, "weekly")).toBe(
+      "https://www.dmm.co.jp/mono/dvd/-/ranking/=/term=week/"
+    )
+  })
 })
 
 describe("parseDmmList", () => {

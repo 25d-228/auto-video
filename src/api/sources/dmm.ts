@@ -363,8 +363,22 @@ function toDiscoverItem(it: DmmListItem, vr: boolean, added: number): DiscoverIt
   }
 }
 
-/** Build the listing URL for a (vr, sort) combination. Exported for testing. */
+/**
+ * Adult (non-VR) best-seller ranking pages, keyed by list id. These dedicated
+ * /ranking/ pages are real numbered best-sellers, distinct from the in-list
+ * `sort=ranking` ("trending"). `term` must precede other segments or DMM 301s.
+ */
+const DMM_RANK_TERMS: Record<string, string> = {
+  daily: "daily",
+  weekly: "week",
+  monthly: "monthly",
+}
+
+/** Build the listing URL for a (vr, list) combination. Exported for testing. */
 export function dmmListUrl(vr: boolean, list: string): string {
+  if (!vr && DMM_RANK_TERMS[list]) {
+    return `https://www.dmm.co.jp/mono/dvd/-/ranking/=/term=${DMM_RANK_TERMS[list]}/`
+  }
   const sort = dmmSort(list)
   if (vr) {
     return `https://www.dmm.co.jp/mono/dvd/-/list/=/article=keyword/id=${DMM_VR_KEYWORD}/sort=${sort}/`
@@ -382,7 +396,7 @@ export function dmmListUrl(vr: boolean, list: string): string {
  * whose cover fails to load are dropped (the sidecar keeps only items with a
  * cover). Covers are resolved in parallel.
  */
-export async function fetchDmm(vr: boolean, list: DmmList): Promise<DiscoverItem[]> {
+export async function fetchDmm(vr: boolean, list: string): Promise<DiscoverItem[]> {
   const url = dmmListUrl(vr, list)
   let html: string
   try {

@@ -18,10 +18,8 @@
  *     octet-stream so they're proxied to blob: URLs post-cache (coverObjectUrl).
  *   - mgstage/sukebei: resolve a portrait cover by code, then drop coverless.
  */
-import {
-  fetchDmm,
-  type DmmList,
-} from "@/api/sources/dmm"
+import { fetchDmm } from "@/api/sources/dmm"
+import { fetchDmmDigitalVr } from "@/api/sources/dmm-digital"
 import { fetchImdbChart, type ImdbSort } from "@/api/sources/imdb"
 import {
   discover as javdbDiscover,
@@ -231,8 +229,16 @@ export async function discover(
   const cookie = await javbusCookie()
 
   if (src === "dmm") {
-    // FANZA/DMM scrape: cover comes verbatim off the listing page, no resolve pass.
-    const data = await cachedListing(key, fresh, () => fetchDmm(wantVr, lst as DmmList))
+    if (wantVr) {
+      // VR: the digital GraphQL API (real streaming-VR rankings) — covers are raw
+      // awsimgsrc URLs, proxied to blob: AFTER the cache so SQLite keeps raw URLs.
+      const data = await cachedListing(key, fresh, () => fetchDmmDigitalVr(lst))
+      await proxyCovers(data)
+      return keepCovered(data, n)
+    }
+    // Adult: the mono/dvd HTML floor (sort lists + best-seller ranking pages);
+    // covers come verbatim off the page (resolved inside fetchDmm).
+    const data = await cachedListing(key, fresh, () => fetchDmm(false, lst))
     return keepCovered(data, n)
   }
 

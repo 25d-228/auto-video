@@ -13,6 +13,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 // keeps the real tmdbPath — a pure list-id -> API-path mapper — so the routing
 // assertions below also pin the _tmdb_path port.)
 vi.mock("@/api/sources/dmm", () => ({ fetchDmm: vi.fn(async () => []) }))
+vi.mock("@/api/sources/dmm-digital", () => ({ fetchDmmDigitalVr: vi.fn(async () => []) }))
 vi.mock("@/api/sources/imdb", () => ({ fetchImdbChart: vi.fn(async () => []) }))
 vi.mock("@/api/sources/javdb", () => ({ discover: vi.fn(async () => []) }))
 vi.mock("@/api/sources/mgstage", () => ({ fetchMgstage: vi.fn(async () => []) }))
@@ -46,6 +47,7 @@ import { resolveCovers } from "@/api/covers"
 import { discover, resolveList } from "@/api/discover"
 import { coverObjectUrl } from "@/net/http"
 import { fetchDmm } from "@/api/sources/dmm"
+import { fetchDmmDigitalVr } from "@/api/sources/dmm-digital"
 import { fetchImdbChart } from "@/api/sources/imdb"
 import { discover as javdbDiscover } from "@/api/sources/javdb"
 import { fetchMgstage } from "@/api/sources/mgstage"
@@ -98,6 +100,7 @@ beforeEach(() => {
   vi.mocked(resolveCovers).mockImplementation(async () => {})
   vi.mocked(coverObjectUrl).mockImplementation(async (url) => "blob:" + url)
   vi.mocked(fetchDmm).mockResolvedValue([])
+  vi.mocked(fetchDmmDigitalVr).mockResolvedValue([])
   vi.mocked(fetchImdbChart).mockResolvedValue([])
   vi.mocked(javdbDiscover).mockResolvedValue([])
   vi.mocked(fetchMgstage).mockResolvedValue([])
@@ -239,9 +242,9 @@ describe("discover ad/vrc routing", () => {
     expect(javdbDiscover).toHaveBeenCalledWith("ad", "daily", {})
   })
 
-  it("vrc default -> dmm trending; vrc javdb -> the VR browser path with opts", async () => {
+  it("vrc default -> dmm digital VR trending; vrc javdb -> the VR browser path with opts", async () => {
     await discover("vrc", "", "")
-    expect(fetchDmm).toHaveBeenCalledWith(true, "trending")
+    expect(fetchDmmDigitalVr).toHaveBeenCalledWith("trending")
     await discover("vrc", "javdb", "newest", 50, false, {
       year: "2024",
       month: "6",
