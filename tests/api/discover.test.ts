@@ -114,7 +114,7 @@ describe("resolveList (_resolve_list port)", () => {
   it("defaults to the category's first provider and its first list", () => {
     expect(resolveList("mov", "", "")).toEqual({ source: "tmdb", list: "trending" })
     expect(resolveList("tv", "", "")).toEqual({ source: "tmdb", list: "trending" })
-    expect(resolveList("ad", "", "")).toEqual({ source: "javdb", list: "weekly" })
+    expect(resolveList("ad", "", "")).toEqual({ source: "javdb", list: "daily" })
     expect(resolveList("vrc", "", "")).toEqual({ source: "dmm", list: "trending" })
   })
 
@@ -234,16 +234,25 @@ describe("discover tv routing", () => {
 // -------------------------------------------------------------- adult / VR
 
 describe("discover ad/vrc routing", () => {
-  it("ad default -> javdb weekly (Most Viewed)", async () => {
+  it("ad default -> javdb daily (Censored ranking)", async () => {
     await discover("ad", "", "")
-    expect(javdbDiscover).toHaveBeenCalledWith("ad", "weekly")
+    expect(javdbDiscover).toHaveBeenCalledWith("ad", "daily", {})
   })
 
-  it("vrc default -> dmm trending; vrc javdb -> the VR tag browser path", async () => {
+  it("vrc default -> dmm trending; vrc javdb -> the VR browser path with opts", async () => {
     await discover("vrc", "", "")
     expect(fetchDmm).toHaveBeenCalledWith(true, "trending")
-    await discover("vrc", "javdb", "newest")
-    expect(javdbDiscovered()).toEqual(["vrc", "newest"])
+    await discover("vrc", "javdb", "newest", 50, false, {
+      year: "2024",
+      month: "6",
+      sortBy: "score",
+      orderBy: "desc",
+    })
+    expect(javdbDiscovered()).toEqual([
+      "vrc",
+      "newest",
+      { year: "2024", month: "6", sortBy: "score", orderBy: "desc" },
+    ])
   })
 
   it("dmm ad lists pass straight through", async () => {
@@ -282,7 +291,7 @@ describe("discover ad/vrc routing", () => {
     // BEFORE proxyCovers turns the cmastd URL into a blob.
     let coverAtCacheWrite = "unset"
     vi.mocked(setCached).mockImplementation(async (_table, _key, value) => {
-      coverAtCacheWrite = (value as DiscoverItem[])[0]!.cover
+      coverAtCacheWrite = (value as { data: DiscoverItem[] }).data[0]!.cover
     })
     const live = await discover("ad", "javdb", "daily")
     expect(coverAtCacheWrite).toBe("https://tp.cmastd.com/x.jpg") // raw cmastd, cached
@@ -390,9 +399,33 @@ describe("listing cache (listing_cached port)", () => {
     const rows = [di({ id: "a" }), di({ id: "b", cover: "" })]
     vi.mocked(fetchTmdbTrending).mockResolvedValue(rows)
     const out = await discover("mov", "tmdb", "trending")
-    // raw (pre-filter) listing is what's cached
-    expect(setCached).toHaveBeenCalledWith("listing_cache", "mov|tmdb|trending", rows)
+    // raw (pre-filter) listing is what's cached, tagged with the session id
+    expect(setCached).toHaveBeenCalledWith("listing_cache", "mov|tmdb|trending", {
+      sid: expect.any(String),
+      data: rows,
+    })
     expect(out.map((x) => x.id)).toEqual(["a"])
+  })
+
+  it("re-fetches a prior-session cache hit carrying dead blob: covers", async () => {
+    vi.mocked(isDbAvailable).mockReturnValue(true)
+    // a hit written by a PRIOR process (legacy bare-array, no session tag) whose
+    // blob: object URL is dead after the restart -> must be treated as a miss
+    vi.mocked(getCached).mockResolvedValue([di({ id: "stale", cover: "blob:dead" })])
+    vi.mocked(fetchTmdbTrending).mockResolvedValue([
+      di({ id: "fresh", cover: "https://img/p.jpg" }),
+    ])
+    const out = await discover("mov", "tmdb", "trending")
+    expect(fetchTmdbTrending).toHaveBeenCalled() // re-fetched, not served dead
+    expect(out.map((x) => x.id)).toEqual(["fresh"])
+  })
+
+  it("serves a prior-session cache hit when covers are raw URLs (no blobs)", async () => {
+    vi.mocked(isDbAvailable).mockReturnValue(true)
+    vi.mocked(getCached).mockResolvedValue([di({ id: "cached", cover: "https://img/p.jpg" })])
+    const out = await discover("mov", "tmdb", "trending")
+    expect(fetchTmdbTrending).not.toHaveBeenCalled() // raw URLs survive a restart
+    expect(out.map((x) => x.id)).toEqual(["cached"])
   })
 
   it("fresh=true bypasses the read but still writes", async () => {

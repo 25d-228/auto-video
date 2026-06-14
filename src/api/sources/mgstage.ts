@@ -290,3 +290,41 @@ async function fetchProductDetail(path: string): Promise<string | null> {
   if (!html.includes(path)) return null
   return html
 }
+
+// ---------------------------------------------------------------- preview images
+
+/**
+ * Pure parser: pull this product's own sample images
+ * (image.mgstage.com/.../cap_e_N_<code>.jpg) from a product detail page,
+ * de-duped and ordered by N. The `cap_e_*_<code>` filter drops the
+ * related-product thumbnails (`pf_t1_*`) that also appear on the page.
+ */
+export function parseMgstagePreviews(html: string, code: string): string[] {
+  if (!html || !code) return []
+  const lc = code.toLowerCase()
+  const re = new RegExp(
+    `(?:https?:)?//image\\.mgstage\\.com/[^"' ]+?/cap_e_(\\d+)_${lc}\\.jpg`,
+    "gi"
+  )
+  const seen = new Set<string>()
+  const out: { url: string; n: number }[] = []
+  let m: RegExpExecArray | null
+  while ((m = re.exec(html)) !== null) {
+    let url = m[0]
+    if (url.startsWith("//")) url = "https:" + url
+    url = url.replace(/^http:/, "https:")
+    if (seen.has(url)) continue
+    seen.add(url)
+    out.push({ url, n: parseInt(m[1]!, 10) })
+  }
+  return out.sort((a, b) => a.n - b.n).map((x) => x.url)
+}
+
+/** Fetch an MGStage product's sample images (raw image.mgstage URLs). */
+export async function mgstagePreviews(code: string): Promise<string[]> {
+  if (!code) return []
+  const html = await mgGet(
+    `https://www.mgstage.com/product/product_detail/${code}/`
+  )
+  return parseMgstagePreviews(html, code)
+}

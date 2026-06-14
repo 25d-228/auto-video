@@ -18,6 +18,7 @@ import {
   dmmListUrl,
   imgDims,
   parseDmmList,
+  parseDmmPreviews,
 } from "@/api/sources/dmm"
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures")
@@ -208,5 +209,47 @@ describe("coverMeta", () => {
     // 7000 bytes of non-image data -> imgDims null -> default ar
     const blob = new Uint8Array(7000)
     expect(coverMeta(blob)).toEqual({ ar: 0.72 })
+  })
+})
+
+describe("parseDmmPreviews", () => {
+  // Real FANZA detail markup uses pics.dmm.co.jp/digital/video/<cid>/<cid>-N.jpg
+  const html = `
+    <img src="https://pics.dmm.co.jp/digital/video/ovvr616/ovvr616ps.jpg">
+    <a href="https://pics.dmm.co.jp/digital/video/ovvr616/ovvr616-2.jpg">
+    <a href="https://pics.dmm.co.jp/digital/video/ovvr616/ovvr616-10.jpg">
+    <a href="https://pics.dmm.co.jp/digital/video/ovvr616/ovvr616-1.jpg">
+    <a href="https://pics.dmm.co.jp/digital/video/ovvr616/ovvr616-2.jpg">
+    <a href="https://pics.dmm.co.jp/digital/video/other999/other999-1.jpg">
+  `
+  it("returns this cid's LARGE samples (jp- infix), deduped and ordered by N", () => {
+    expect(parseDmmPreviews(html, "ovvr616")).toEqual([
+      "https://pics.dmm.co.jp/digital/video/ovvr616/ovvr616jp-1.jpg",
+      "https://pics.dmm.co.jp/digital/video/ovvr616/ovvr616jp-2.jpg",
+      "https://pics.dmm.co.jp/digital/video/ovvr616/ovvr616jp-10.jpg",
+    ])
+  })
+
+  it("does not match the ps cover or another product's samples", () => {
+    const urls = parseDmmPreviews(html, "ovvr616")
+    expect(urls.some((u) => u.includes("ps.jpg"))).toBe(false)
+    expect(urls.some((u) => u.includes("other999"))).toBe(false)
+  })
+
+  it("falls back to the largest gallery when the listing cid differs (2D mono)", () => {
+    // Physical mono products: listing cid k9snos258, samples under snos00258.
+    const html2d = `
+      <a href="https://pics.dmm.co.jp/digital/video/snos00258/snos00258-1.jpg">
+      <a href="https://pics.dmm.co.jp/digital/video/snos00258/snos00258-2.jpg">
+      <img src="https://pics.dmm.co.jp/mono/movie/adult/k9snos258/k9snos258ps.jpg">
+    `
+    expect(parseDmmPreviews(html2d, "k9snos258")).toEqual([
+      "https://pics.dmm.co.jp/digital/video/snos00258/snos00258jp-1.jpg",
+      "https://pics.dmm.co.jp/digital/video/snos00258/snos00258jp-2.jpg",
+    ])
+  })
+
+  it("returns [] for empty html", () => {
+    expect(parseDmmPreviews("", "ovvr616")).toEqual([])
   })
 })

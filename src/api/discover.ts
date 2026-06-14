@@ -115,14 +115,24 @@ function keepCovered(items: DiscoverItem[], n: number): DiscoverItem[] {
   return out
 }
 
+/** A cached listing tagged with the process that produced it (see SESSION_TAG). */
+type CachedListing = { sid: string; data: DiscoverItem[] }
+
+/**
+ * Per-process tag stamped into every cached listing. dmm/mgstage covers are
+ * `blob:` object URLs local to the webview document, so they die when the app
+ * restarts; a listing cached by a PRIOR process must be re-fetched rather than
+ * served with dead blobs (which render as blank cards). Entries that carry only
+ * raw http(s) covers (tmdb/javdb/sukebei) stay valid across a restart.
+ */
+const SESSION_TAG = `${Date.now()}.${Math.random().toString(36).slice(2)}`
+
 /**
  * Run `fn` behind the 300s listing cache (port of listing_cached). The cache key
  * is "<cat>|<src>|<lst>". `fresh` bypasses the cache. Caching is best-effort and
- * only active inside Tauri (isDbAvailable()); elsewhere it's a live fetch.
- *
- * NOTE: cached items may carry session-local blob: cover URLs (dmm/mgstage);
- * within a session the cache is correct, matching how the sidecar cached its
- * /img proxy URLs.
+ * only active inside Tauri (isDbAvailable()); elsewhere it's a live fetch. A
+ * prior-session hit that still carries session-local blob: covers is treated as
+ * a miss and re-fetched, so dmm/mgstage covers can't go blank after a restart.
  */
 async function cachedListing(
   key: string,
@@ -130,13 +140,24 @@ async function cachedListing(
   fn: () => Promise<DiscoverItem[]>
 ): Promise<DiscoverItem[]> {
   if (!fresh && isDbAvailable()) {
-    const hit = await getCached<DiscoverItem[]>("listing_cache", key, LIST_TTL_SEC)
-    if (hit) return hit
+    const hit = await getCached<CachedListing | DiscoverItem[]>(
+      "listing_cache",
+      key,
+      LIST_TTL_SEC
+    )
+    if (hit) {
+      // Legacy entries were a bare array (no session tag).
+      const sid = Array.isArray(hit) ? "" : hit.sid
+      const items = Array.isArray(hit) ? hit : hit.data
+      const deadBlobs =
+        sid !== SESSION_TAG && items.some((x) => x.cover.startsWith("blob:"))
+      if (!deadBlobs) return items
+    }
   }
   const data = (await fn()) || []
   if (isDbAvailable()) {
     try {
-      await setCached("listing_cache", key, data)
+      await setCached("listing_cache", key, { sid: SESSION_TAG, data })
     } catch {
       // best-effort
     }
@@ -153,12 +174,21 @@ async function cachedListing(
  * @param n      max items to return (default 50)
  * @param fresh  bypass the 300s listing cache
  */
+/** Extra per-provider controls (currently the JavDB VR year/month/sort selectors). */
+export interface DiscoverOpts {
+  year?: string
+  month?: string
+  sortBy?: string
+  orderBy?: "desc" | "asc"
+}
+
 export async function discover(
   cat: Cat,
   source: string,
   list: string,
   n = 50,
-  fresh = false
+  fresh = false,
+  opts: DiscoverOpts = {}
 ): Promise<DiscoverItem[]> {
   const resolved = resolveList(cat, (source || "").toLowerCase(), (list || "").toLowerCase())
   const src = resolved.source
@@ -207,13 +237,18 @@ export async function discover(
   }
 
   if (src === "javdb") {
-    // javdb source ships cmastd covers. ad -> Most Viewed for the list window;
-    // vrc -> the VR tag browser (tag 212). The cmastd CDN "encrypts" the jacket
-    // with a trivial single-byte XOR (first byte = key); coverObjectUrl now
-    // decodes it (isCmastdCover/decryptCmastd), so we use the REAL javdb jacket
-    // directly — a better match than the by-code FANZA cascade. Proxy AFTER the
-    // cache so SQLite keeps the raw cmastd URLs, not session-local blob: URLs.
-    const data = await cachedListing(key, fresh, () => javdbDiscover(cat, lst))
+    // javdb source ships cmastd covers. ad -> the Censored ranking for the list
+    // window (daily/weekly/monthly); vrc -> the Categories→Censored VR browser
+    // (tag 212) filtered by the chosen year/month and ordered by the chosen
+    // sort. The cmastd CDN "encrypts" the jacket with a trivial single-byte XOR;
+    // coverObjectUrl decodes it, so we use the REAL javdb jacket directly. Proxy
+    // AFTER the cache so SQLite keeps the raw cmastd URLs, not blob: URLs.
+    // The vrc selection lives in opts (not the list id), so it's part of the key.
+    const jkey =
+      cat === "vrc"
+        ? `${key}|${opts.year ?? ""}|${opts.month ?? ""}|${opts.sortBy ?? ""}|${opts.orderBy ?? ""}`
+        : key
+    const data = await cachedListing(jkey, fresh, () => javdbDiscover(cat, lst, opts))
     await proxyCovers(data)
     return keepCovered(data, n)
   }

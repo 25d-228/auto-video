@@ -7,6 +7,7 @@ import {
   mgstageIds,
   parseMgstageCovers,
   parseMgstageList,
+  parseMgstagePreviews,
 } from "@/api/sources/mgstage"
 
 // Parser tests run against LIVE responses captured once with curl and saved
@@ -130,5 +131,36 @@ describe("mgstageIds (leading-zero padding variants)", () => {
   it("returns the code unchanged when it does not split", () => {
     expect(mgstageIds("FC2-PPV")).toEqual(["FC2-PPV"])
     expect(mgstageIds("")).toEqual([""])
+  })
+})
+
+describe("parseMgstagePreviews", () => {
+  // Real product markup: this product's samples are cap_e_N_<code>.jpg; the
+  // pf_t1_* are related-product thumbs and another code's cap_e_* must not leak.
+  const html = `
+    <img src="https://image.mgstage.com/images/shirouto/siro/5683/pf_t1_siro-5637.jpg">
+    <a href="https://image.mgstage.com/images/shirouto/siro/5683/cap_e_2_siro-5683.jpg">
+    <a href="https://image.mgstage.com/images/shirouto/siro/5683/cap_e_10_siro-5683.jpg">
+    <a href="https://image.mgstage.com/images/shirouto/siro/5683/cap_e_0_siro-5683.jpg">
+    <a href="https://image.mgstage.com/images/shirouto/siro/5683/cap_e_2_siro-5683.jpg">
+    <a href="https://image.mgstage.com/images/prestige/abf/123/cap_e_0_abf-123.jpg">
+  `
+  it("returns the product's own samples, deduped and ordered by N", () => {
+    expect(parseMgstagePreviews(html, "SIRO-5683")).toEqual([
+      "https://image.mgstage.com/images/shirouto/siro/5683/cap_e_0_siro-5683.jpg",
+      "https://image.mgstage.com/images/shirouto/siro/5683/cap_e_2_siro-5683.jpg",
+      "https://image.mgstage.com/images/shirouto/siro/5683/cap_e_10_siro-5683.jpg",
+    ])
+  })
+
+  it("excludes related-product thumbs (pf_t1_) and other codes' samples", () => {
+    const urls = parseMgstagePreviews(html, "SIRO-5683")
+    expect(urls.some((u) => u.includes("pf_t1_"))).toBe(false)
+    expect(urls.some((u) => u.includes("abf-123"))).toBe(false)
+  })
+
+  it("returns [] for empty input", () => {
+    expect(parseMgstagePreviews("", "SIRO-5683")).toEqual([])
+    expect(parseMgstagePreviews(html, "")).toEqual([])
   })
 })

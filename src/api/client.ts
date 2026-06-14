@@ -18,6 +18,7 @@ import { normalizeCodeNum } from "@/lib/codes"
 import {
   discover as buildDiscover,
   resolveList,
+  type DiscoverOpts,
 } from "@/api/discover"
 import { metaLookup, titleLookup } from "@/api/meta"
 import { seeders as buildSeeders } from "@/api/seeders"
@@ -82,6 +83,8 @@ export interface DiscoverParams {
   n?: number
   /** Bypass the 5-minute listing cache. */
   fresh?: boolean
+  /** Per-provider controls (JavDB VR year/month/sort). */
+  opts?: DiscoverOpts
 }
 
 /**
@@ -98,7 +101,7 @@ export async function discover(
   const source = (params.source ?? "").toLowerCase()
   const list = (params.list ?? "").toLowerCase()
   try {
-    const items = await buildDiscover(cat, source, list, n, fresh)
+    const items = await buildDiscover(cat, source, list, n, fresh, params.opts ?? {})
     const resolved = resolveList(cat, source, list)
     return {
       ok: true,

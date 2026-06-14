@@ -431,3 +431,56 @@ export async function fetchDmm(vr: boolean, list: DmmList): Promise<DiscoverItem
   })
   return kept
 }
+
+// ---------------------------------------------------------------- preview images
+
+/**
+ * Pure parser: pull a FANZA detail page's sample-image gallery, de-duped and
+ * ordered by N, upgraded to the large variant.
+ *
+ * Samples live at `pics.dmm.co.jp/.../<sampleCid>/<sampleCid>-N.jpg` — note the
+ * sample cid is NOT the listing cid for physical products (mono `k9snos258` →
+ * samples under the digital cid `snos00258`). Related items on the page only
+ * show a cover (no `-N` gallery), so we match the dir==filename-prefix gallery
+ * pattern and keep the group for the listing `cid` if present, else the largest
+ * gallery (the page's main product). Each thumbnail (`<cid>-N.jpg`, ~120×90) is
+ * upgraded to the full sample (`<cid>jp-N.jpg`, ~600×800).
+ */
+export function parseDmmPreviews(html: string, cid: string): string[] {
+  if (!html) return []
+  const re =
+    /(?:https?:)?\/\/pics\.dmm\.co\.jp\/[^"' ]*?\/([a-z0-9_]+)\/\1-(\d+)\.jpg/gi
+  const groups = new Map<string, { url: string; n: number }[]>()
+  let m: RegExpExecArray | null
+  while ((m = re.exec(html)) !== null) {
+    const sampleCid = m[1]!.toLowerCase()
+    const n = parseInt(m[2]!, 10)
+    let url = m[0]
+    if (url.startsWith("//")) url = "https:" + url
+    url = url.replace(/^http:/, "https:")
+    const arr = groups.get(sampleCid) ?? []
+    if (!arr.some((x) => x.n === n)) arr.push({ url, n })
+    groups.set(sampleCid, arr)
+  }
+  if (groups.size === 0) return []
+  const chosen =
+    groups.get((cid || "").toLowerCase()) ??
+    [...groups.values()].sort((a, b) => b.length - a.length)[0]!
+  return chosen
+    .sort((a, b) => a.n - b.n)
+    .map((x) => x.url.replace(/-(\d+)\.jpg$/i, "jp-$1.jpg"))
+}
+
+/** Fetch a FANZA product's sample images (raw pics URLs). `cid` from the listing. */
+export async function dmmPreviews(cid: string): Promise<string[]> {
+  if (!cid) return []
+  try {
+    const html = await httpText(
+      `https://www.dmm.co.jp/mono/dvd/-/detail/=/cid=${cid}/`,
+      { referer: DMM_REFERER, cookie: DMM_AGE_COOKIE, timeoutMs: 15_000 }
+    )
+    return parseDmmPreviews(html, cid)
+  } catch {
+    return []
+  }
+}

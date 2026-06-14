@@ -17,18 +17,23 @@ endpoint list for the app's backend; it supersedes the guesses in `sidecar/av_pr
 - `GET /api/v1/movies/latest?type=all&filter_by=can_play&sort_by=update&page=1&limit=9` — newest releases.
 - `GET /api/v1/movies/recommend?period=-1` — home recommendations.
 - `GET /api/v1/movies/top?start_rank=1&type=all&type_value=&ignore_watched=false&page=1&limit=25` — TOP250.
-- `GET /api/v1/rankings?type=0&period=daily` — rankings. `type` 0/… selects censored/uncensored/western; `period` = daily|weekly|monthly.
+- `GET /api/v1/rankings?type=0&period=daily` — rankings. **`type` 0=Censored · 1=Uncensored · 2=Western · 3=FC2** (verified live; invalid/extra types fall back to 0). `period` = daily|weekly|monthly (yearly/year silently fall back to daily). Used for **Adult→JavDB = the Censored ranking (type=0)** per window.
 - `GET /api/v1/rankings/playback?filter_by=all&period=daily` — **"Most Viewed" / HotWatching** (most-played). `filter_by` = all|high_score; `period` = daily|weekly|monthly. **Verified working.**
 - `GET /api/v1/movies/tags?filter_by=<SEL>&filter_by_tags=&sort_by=release&order_by=desc&page=1&limit=24` — the
   filtered movie browser (Categories). See the `filter_by` selector below.
 
-### The `filter_by` selector (colon-delimited)
-Format `0:<kind>:<v1>:<v2>:<v3>:<v4>:<v5>` (positions after the kind vary).
-- Default / all: `0:t:m::::`
-- By actor: `0:a:<actorSlug>`  (kind `a`)
-- **By tag (e.g. VR): `0:t:m:<TAGID>:::`** — the tag id goes in the **4th field**. (NOT `filter_by_tags`, which was empty in every capture.)
-  - **VR = tag id `212`** → `filter_by=0:t:m:212:::` → returns KAVR/SAVR/SIVR/MDVR/… **Verified working.**
-- `sort_by` = release|update|… ; `order_by` = desc|asc ; paginate with `page` + `limit`.
+### The `filter_by` selector (colon-delimited) — 7 fields, verified live
+Format `<cat>:t:m:<genre>:<year>:<?>:<month>` (split on `:` → 7 fields):
+- field 0 `<cat>` = the **Categories tab**: `0`=Censored · `1`=Uncensored · `2`=Western · `3`=FC2 (Carton too). VR genre only exists under Censored (`0`).
+- fields 1–2 `t:m` = constant prefix (tag / movie).
+- field 3 `<genre>` = a Genre tag id (e.g. **VR=212**, Solowork=28, Classic=175 …).
+- field 4 `<year>` = a Year tag (`2001`–`2026`); empty = all years.
+- field 5 = unused/other group (left empty).
+- field 6 `<month>` = a Month tag (`1`–`12`); empty = all months.
+- Default / all: `0:t:m::::` · by actor: `0:a:<actorSlug>`.
+- Examples (all verified): VR newest = `0:t:m:212:::` · VR 2024 = `0:t:m:212:2024::` · **VR 2024 June = `0:t:m:212:2024::6`** · VR June (any year) = `0:t:m:212:::6`.
+- **`sort_by` tokens** (verified distinct): `release` (+`order_by=desc|asc`), `update`, `score`, `hit`, `want_watch_count`, `watched_count`. (`views`/`want`/`watched` are ignored — use the exact tokens above.) Paginate with `page` + `limit`.
+- **Adult→VR→JavDB** uses this: Categories→Censored + Genre VR, with year/month/sort selectors → `0:t:m:212:<year>::<month>`.
 
 ## Tag taxonomy
 - `GET /api/v2/tags?type=0` → groups with `category_id` + `tags[{id,name}]`:

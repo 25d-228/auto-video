@@ -2,7 +2,7 @@
  * Discover view — live trending feeds per category, ported from the old
  * renderDisc/discPaint (git show HEAD:ui-src/engine.js) onto the shared
  * media components. Toolbar (category chips, per-category provider + list,
- * rank, show-count, refresh) -> ranked grid with lazy live seeder badges ->
+ * show-count, refresh) -> source-ordered grid with lazy live seeder badges ->
  * detail panel -> download dialog.
  */
 import { useEffect, useMemo, useRef, useState } from "react"
@@ -24,32 +24,33 @@ import {
   usePager,
 } from "@/components/media"
 import { cn } from "@/lib/utils"
-import type { Cat } from "@/api/types"
+import type { Cat, DiscoverItem } from "@/api/types"
 import { useDiscover, useLibrary } from "@/state/queries"
 import { useDownloads } from "@/state/downloads"
 import {
-  availableRanks,
   CAT_OPTIONS,
+  DEFAULT_JAVDB_VR,
+  JAVDB_MONTH_OPTIONS,
+  JAVDB_SORT_OPTIONS,
+  JAVDB_YEAR_OPTIONS,
   LIMIT_OPTIONS,
-  RANK_OPTIONS,
   defaultListFor,
   defaultSelection,
-  ingest,
   itemState,
+  javdbVrOpts,
   listIsRecency,
   listsFor,
   ownedKeys,
   providerLabel,
   providersFor,
-  sortList,
+  type JavdbVrSel,
   type ListId,
   type ProviderId,
-  type Rank,
-  type ScoredItem,
 } from "./discover/model"
 import { DiscoverCard } from "./discover/DiscoverCard"
 import { DiscoverDetail } from "./discover/DiscoverDetail"
 import { DownloadDialog } from "./discover/DownloadDialog"
+import { PreviewLightbox } from "./discover/PreviewLightbox"
 
 interface Selection {
   source: ProviderId
@@ -68,7 +69,6 @@ function initialSelByCat(): Record<Cat, Selection> {
 
 export default function Discover() {
   const [cat, setCat] = useState<Cat>("mov")
-  const [rank, setRank] = useState<Rank>("popularity")
   const [limit, setLimit] = useState(25)
   const [selByCat, setSelByCat] = useState<Record<Cat, Selection>>(
     initialSelByCat
@@ -78,14 +78,22 @@ export default function Discover() {
   const [freshKeys, setFreshKeys] = useState<ReadonlySet<string>>(
     () => new Set()
   )
-  const [selected, setSelected] = useState<ScoredItem | null>(null)
-  const [dlItem, setDlItem] = useState<ScoredItem | null>(null)
+  const [selected, setSelected] = useState<DiscoverItem | null>(null)
+  const [dlItem, setDlItem] = useState<DiscoverItem | null>(null)
+  const [previewItem, setPreviewItem] = useState<DiscoverItem | null>(null)
+  // JavDB VR uses Year/Month/Sort selectors instead of a single list.
+  const [javdbVr, setJavdbVr] = useState<JavdbVrSel>(DEFAULT_JAVDB_VR)
 
   const { source, list } = selByCat[cat]
-  const feedKey = `${cat}|${source}|${list}`
+  const isJavdbVr = cat === "vrc" && source === "javdb"
+  const vrOpts = isJavdbVr ? javdbVrOpts(javdbVr) : undefined
+  // For JavDB VR the feed identity is the year/month/sort, not the list id.
+  const feedKey = isJavdbVr
+    ? `${cat}|${source}|${javdbVr.year}|${javdbVr.month}|${javdbVr.sort}`
+    : `${cat}|${source}|${list}`
   const isFresh = freshKeys.has(feedKey)
 
-  const query = useDiscover(cat, source, list, 100, isFresh)
+  const query = useDiscover(cat, source, list, 100, isFresh, vrOpts)
   const libraryQ = useLibrary()
   const { downloads } = useDownloads()
 
@@ -94,20 +102,12 @@ export default function Discover() {
     [libraryQ.data]
   )
 
-  // Only offer ranks that actually reorder this pool; when just "popularity"
-  // applies (DMM/MGStage carry no seeders or ratings, so every rank produces
-  // the same order) the control hides. effRank clamps a now-inapplicable
-  // selection (e.g. "seeders" after switching to DMM) back to popularity.
-  const ranks = useMemo(
-    () => availableRanks(query.data?.items ?? []),
-    [query.data]
+  // No client-side re-ranking: every feed is shown in its source/server order
+  // (rankings, most-viewed, newest, JavDB VR sort, …), just capped to `limit`.
+  const pool = useMemo(
+    () => (query.data?.items ?? []).slice(0, limit),
+    [query.data, limit]
   )
-  const effRank = ranks.includes(rank) ? rank : "popularity"
-
-  const pool = useMemo(() => {
-    const items = query.data?.items ?? []
-    return sortList(ingest(items), effRank).slice(0, limit)
-  }, [query.data, effRank, limit])
 
   // Fixed-height, non-scrolling card area: page size = however many covers fit.
   const gridBoxRef = useRef<HTMLDivElement>(null)
@@ -117,7 +117,7 @@ export default function Discover() {
   const { setPage } = pager
   useEffect(() => {
     setPage(1)
-  }, [cat, source, list, effRank, limit, setPage])
+  }, [cat, source, list, limit, javdbVr.year, javdbVr.month, javdbVr.sort, setPage])
 
   const providerOptions = providersFor(cat)
   const listOptions = listsFor(cat, source)
@@ -126,12 +126,12 @@ export default function Discover() {
   const closePanels = () => {
     setSelected(null)
     setDlItem(null)
+    setPreviewItem(null)
   }
 
   const switchCat = (next: Cat) => {
     setCat(next)
     setSelByCat((prev) => ({ ...prev, [next]: defaultSelection(next) }))
-    setRank("popularity")
     closePanels()
   }
 
@@ -153,6 +153,12 @@ export default function Discover() {
     closePanels()
   }
 
+  // JavDB VR year/month/sort change ("" sentinel "all" maps back to all).
+  const setVr = (patch: Partial<JavdbVrSel>) => {
+    setJavdbVr((prev) => ({ ...prev, ...patch }))
+    closePanels()
+  }
+
   const onRefresh = () => {
     closePanels()
     pager.setPage(1)
@@ -163,7 +169,7 @@ export default function Discover() {
     }
   }
 
-  const showAdded = listIsRecency(list) || effRank === "recency"
+  const showAdded = listIsRecency(list)
 
   return (
     <section className="flex h-full min-h-0 flex-col p-5">
@@ -190,35 +196,66 @@ export default function Discover() {
           </SelectContent>
         </Select>
 
-        <Select value={list} onValueChange={switchList}>
-          <SelectTrigger size="sm" className="text-xs" aria-label="List">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {listOptions.map((l) => (
-              <SelectItem key={l.value} value={l.value}>
-                {l.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-
-        {ranks.length > 1 && (
-          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            Rank by
-            <Select value={effRank} onValueChange={(v) => setRank(v as Rank)}>
-              <SelectTrigger size="sm" className="text-xs" aria-label="Rank by">
+        {isJavdbVr ? (
+          <>
+            <Select
+              value={javdbVr.year || "all"}
+              onValueChange={(v) => setVr({ year: v === "all" ? "" : v })}
+            >
+              <SelectTrigger size="sm" className="text-xs" aria-label="Year">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {RANK_OPTIONS.filter((r) => ranks.includes(r.value)).map((r) => (
-                  <SelectItem key={r.value} value={r.value}>
-                    {r.label}
+                {JAVDB_YEAR_OPTIONS.map((o) => (
+                  <SelectItem key={o.value || "all"} value={o.value || "all"}>
+                    {o.label}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
-          </span>
+
+            <Select
+              value={javdbVr.month || "all"}
+              onValueChange={(v) => setVr({ month: v === "all" ? "" : v })}
+            >
+              <SelectTrigger size="sm" className="text-xs" aria-label="Month">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {JAVDB_MONTH_OPTIONS.map((o) => (
+                  <SelectItem key={o.value || "all"} value={o.value || "all"}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            <Select value={javdbVr.sort} onValueChange={(v) => setVr({ sort: v })}>
+              <SelectTrigger size="sm" className="text-xs" aria-label="Sort">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {JAVDB_SORT_OPTIONS.map((o) => (
+                  <SelectItem key={o.value} value={o.value}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </>
+        ) : (
+          <Select value={list} onValueChange={switchList}>
+            <SelectTrigger size="sm" className="text-xs" aria-label="List">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {listOptions.map((l) => (
+                <SelectItem key={l.value} value={l.value}>
+                  {l.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         )}
 
         <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -271,6 +308,7 @@ export default function Discover() {
                   showAdded={showAdded}
                   onOpen={() => setSelected(it)}
                   onDownload={() => setDlItem(it)}
+                  onPreview={() => setPreviewItem(it)}
                 />
               ))}
             </CardGrid>
@@ -295,8 +333,10 @@ export default function Discover() {
           setSelected(null)
           setDlItem(it)
         }}
+        onPreview={(it) => setPreviewItem(it)}
       />
       <DownloadDialog item={dlItem} onClose={() => setDlItem(null)} />
+      <PreviewLightbox item={previewItem} onClose={() => setPreviewItem(null)} />
     </section>
   )
 }

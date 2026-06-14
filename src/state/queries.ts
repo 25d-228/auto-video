@@ -22,7 +22,9 @@ import {
   stats,
   tvLookup,
 } from "@/api/client"
-import type { Cat } from "@/api/types"
+import type { DiscoverOpts } from "@/api/discover"
+import { fetchPreviews } from "@/api/previews"
+import type { Cat, DiscoverItem } from "@/api/types"
 
 export const LISTING_STALE_MS = 5 * 60 * 1000
 const HOUR_MS = 60 * 60 * 1000
@@ -30,8 +32,14 @@ const HOUR_MS = 60 * 60 * 1000
 /** Query keys (exported so views can invalidate/prefetch). */
 export const qk = {
   all: ["sidecar"] as const,
-  discover: (cat: Cat, source: string, list: string, n: number, fresh: boolean) =>
-    ["sidecar", "discover", cat, source, list, n, fresh] as const,
+  discover: (
+    cat: Cat,
+    source: string,
+    list: string,
+    n: number,
+    fresh: boolean,
+    optsKey = ""
+  ) => ["sidecar", "discover", cat, source, list, n, fresh, optsKey] as const,
   seeders: (cat: Cat, title: string, code: string, year: string) =>
     ["sidecar", "seeders", cat, title, code, year] as const,
   library: () => ["sidecar", "library"] as const,
@@ -41,6 +49,7 @@ export const qk = {
   meta: (cid: string, code: string, cat: Cat | "") =>
     ["sidecar", "meta", cid, code, cat] as const,
   cover: (code: string) => ["sidecar", "cover", code] as const,
+  previews: (id: string) => ["sidecar", "previews", id] as const,
   titleLookup: (tv: boolean, title: string, year: string) =>
     ["sidecar", "lookup", tv ? "tv" : "movie", title, year] as const,
 }
@@ -57,11 +66,14 @@ export function useDiscover(
   source: string,
   list: string,
   n = 100,
-  fresh = false
+  fresh = false,
+  opts: DiscoverOpts = {}
 ) {
+  const optsKey = `${opts.year ?? ""}|${opts.month ?? ""}|${opts.sortBy ?? ""}|${opts.orderBy ?? ""}`
   return useQuery({
-    queryKey: qk.discover(cat, source, list, n, fresh),
-    queryFn: () => discover({ cat, source, list, n, fresh: fresh || undefined }),
+    queryKey: qk.discover(cat, source, list, n, fresh, optsKey),
+    queryFn: () =>
+      discover({ cat, source, list, n, fresh: fresh || undefined, opts }),
     staleTime: LISTING_STALE_MS,
   })
 }
@@ -104,6 +116,20 @@ export function useLibrary() {
     queryKey: qk.library(),
     queryFn: library,
     staleTime: LISTING_STALE_MS,
+  })
+}
+
+/**
+ * Sample/preview images for a Discover item (javdb/dmm/mgstage), resolved to
+ * blob: URLs. Lazily fetched only while the detail panel is open.
+ */
+export function usePreviews(item: DiscoverItem | null) {
+  return useQuery({
+    queryKey: qk.previews(item?.id ?? ""),
+    queryFn: () => fetchPreviews(item),
+    enabled: !!item,
+    staleTime: LISTING_STALE_MS,
+    retry: false,
   })
 }
 

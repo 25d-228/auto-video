@@ -12,10 +12,12 @@ import {
   type DetailFact,
   type DetailSection,
 } from "@/components/media"
+import type { DiscoverItem } from "@/api/types"
+import { hasPreviews } from "@/api/previews"
 import { fseed } from "@/lib/format"
 import { useMeta, useSeeders } from "@/state/queries"
 import { isTauri, useDownloads } from "@/state/downloads"
-import { itemState, providerLabel, stateLabel, type ScoredItem } from "./model"
+import { itemState, providerLabel, stateLabel } from "./model"
 
 /** Open a URL in the OS default browser, never in the app webview. */
 async function openSourceLink(url: string) {
@@ -29,10 +31,11 @@ async function openSourceLink(url: string) {
 
 export interface DiscoverDetailProps {
   /** null while closed; the last item keeps rendering for the slide-out. */
-  item: ScoredItem | null
+  item: DiscoverItem | null
   owned: ReadonlySet<string>
   onClose: () => void
-  onDownload: (item: ScoredItem) => void
+  onDownload: (item: DiscoverItem) => void
+  onPreview: (item: DiscoverItem) => void
 }
 
 export function DiscoverDetail({
@@ -40,9 +43,10 @@ export function DiscoverDetail({
   owned,
   onClose,
   onDownload,
+  onPreview,
 }: DiscoverDetailProps) {
   // keep the last opened item mounted so the close transition can play
-  const [last, setLast] = useState<ScoredItem | null>(item)
+  const [last, setLast] = useState<DiscoverItem | null>(item)
   if (item && item !== last) setLast(item)
   const it = item ?? last
 
@@ -104,8 +108,17 @@ export function DiscoverDetail({
       facts={facts}
       sections={sections}
       actions={
-        cs.state === "new" ? (
-          <Button onClick={() => onDownload(it)}>Download…</Button>
+        hasPreviews(it.src) || cs.state === "new" ? (
+          <div className="flex flex-col gap-2">
+            {hasPreviews(it.src) && (
+              <Button variant="secondary" onClick={() => onPreview(it)}>
+                Preview
+              </Button>
+            )}
+            {cs.state === "new" && (
+              <Button onClick={() => onDownload(it)}>Download…</Button>
+            )}
+          </div>
         ) : undefined
       }
     >

@@ -105,6 +105,7 @@ export interface JavdbDetail {
     series_name?: string | null
     tags?: { id: string; name: string }[] | null
     actors?: { id: string; name: string }[] | null
+    preview_images?: { thumb_url?: string; large_url?: string }[] | null
   }
 }
 
@@ -290,11 +291,15 @@ export async function javdbPlayback(
 
 /** Options for the filtered movie browser (`/api/v1/movies/tags`). */
 export interface JavdbTagsOpts {
-  /** Category tag id placed in the 4th `filter_by` field (VR = "212"). */
+  /** Category tag id placed in the genre `filter_by` field (VR = "212"). */
   tagId?: string
+  /** Year tag ("2024") for the year `filter_by` field; "" / undefined = all years. */
+  year?: string
+  /** Month tag ("6") for the month `filter_by` field; "" / undefined = all months. */
+  month?: string
   /** Actor slug — builds `filter_by=0:a:<slug>` instead of the tag form. */
   actorSlug?: string
-  /** release|update|… (default "release"). */
+  /** release|update|score|hit|want_watch_count|watched_count (default "release"). */
   sortBy?: string
   /** desc|asc (default "desc"). */
   orderBy?: "desc" | "asc"
@@ -306,15 +311,19 @@ export interface JavdbTagsOpts {
 
 /**
  * Filtered movie browser — `/api/v1/movies/tags`. Builds the colon-delimited
- * `filter_by` selector per docs/javdb-api.md:
+ * `filter_by` selector per docs/javdb-api.md (7 fields
+ * `0:t:m:<genre>:<year>::<month>`, verified live):
  *   - actor:  `0:a:<actorSlug>`
- *   - tag:    `0:t:m:<tagId>:::`  (e.g. VR = tag id "212")
+ *   - tag:    `0:t:m:<tagId>:<year>::<month>`  (genre=field 4, year=field 5,
+ *             month=field 7; e.g. VR 2024 June = `0:t:m:212:2024::6`)
  *   - default: `0:t:m::::`
  * The category is 'vrc' when browsing the VR tag (212), else 'ad'.
  */
 export async function javdbTags(opts: JavdbTagsOpts = {}): Promise<DiscoverItem[]> {
   const {
     tagId,
+    year = "",
+    month = "",
     actorSlug,
     sortBy = "release",
     orderBy = "desc",
@@ -323,7 +332,7 @@ export async function javdbTags(opts: JavdbTagsOpts = {}): Promise<DiscoverItem[
   } = opts
   let filterBy: string
   if (actorSlug) filterBy = `0:a:${actorSlug}`
-  else if (tagId) filterBy = `0:t:m:${tagId}:::`
+  else if (tagId) filterBy = `0:t:m:${tagId}:${year}::${month}`
   else filterBy = FILTER_ALL
   const cat: Cat = tagId === VR_TAG_ID ? "vrc" : "ad"
   const data = await javdbApi<MoviesData>(
@@ -400,6 +409,17 @@ export async function javdbDetail(slug: string): Promise<JavdbDetail | null> {
   return javdbApi<JavdbDetail>(`/api/v4/movies/${slug}?from_rankings=false`)
 }
 
+/**
+ * Sample/preview images for a slug (raw tp.cmastd.com URLs, large variant) from
+ * the detail payload's `preview_images`. cmastd is single-byte-XOR encrypted, so
+ * callers route these through coverObjectUrl to decode + display.
+ */
+export async function javdbPreviews(slug: string): Promise<string[]> {
+  const detail = await javdbDetail(slug)
+  const imgs = detail?.movie?.preview_images ?? []
+  return imgs.map((i) => i.large_url || i.thumb_url || "").filter(Boolean)
+}
+
 /** Raw movie hit from `/api/v2/search`. */
 interface JavdbSearchData {
   movies?: { id?: string; number?: string }[]
@@ -459,23 +479,53 @@ export async function javdbTagsTaxonomy(): Promise<JavdbTagGroup[]> {
 
 // --------------------------------------------------------------- discover helper
 
+/** Extra VR-browser controls threaded from the Discover toolbar (year/month/sort). */
+export interface JavdbDiscoverOpts {
+  /** Year tag ("2024"); "" = all years. */
+  year?: string
+  /** Month tag ("6"); "" = all months. */
+  month?: string
+  /** sort_by token (release|update|score|hit|want_watch_count|watched_count). */
+  sortBy?: string
+  /** desc|asc (release only). */
+  orderBy?: "desc" | "asc"
+}
+
 /**
  * Map a Discover catalog (cat, list) selection to the right javdb call.
  *
- *   ad:  weekly | monthly | daily -> playback (Most Viewed) for that window
- *        most_viewed                -> playback all/daily
- *   vrc: anything                   -> the VR tag browser (tag 212)
+ *   ad:  daily | weekly | monthly -> the Censored ranking for that window
+ *                                    (`/api/v1/rankings?type=0`).
+ *   vrc: the Categories→Censored browser with Genre=VR (tag 212), filtered by
+ *        the chosen year/month and ordered by the chosen sort (Image #4/#5).
  *
- * 'ad' lists use the VERIFIED rankings/playback ("Most Viewed") endpoint; the
- * window is taken from the list id (weekly/monthly/daily). 'vrc' uses the real
- * tag browser (filter_by=0:t:m:212:::), replacing the old studio-label search
- * workaround. Coverless rows are already dropped by the mappers.
+ * Coverless rows are already dropped by the mappers.
  */
-export async function discover(cat: Cat, list: string): Promise<DiscoverItem[]> {
+export async function discover(
+  cat: Cat,
+  list: string,
+  opts: JavdbDiscoverOpts = {}
+): Promise<DiscoverItem[]> {
   if (cat === "vrc") {
-    return javdbTags({ tagId: VR_TAG_ID, sortBy: "release", orderBy: "desc", limit: 24 })
+    // The tags endpoint hard-caps at 50 items per page (the `limit` param is
+    // ignored above 50), so page through it to fill the grid (~100 = 2 pages).
+    const base = {
+      tagId: VR_TAG_ID,
+      year: opts.year,
+      month: opts.month,
+      sortBy: opts.sortBy ?? "release",
+      orderBy: opts.orderBy ?? "desc",
+      limit: 50,
+    }
+    const out: DiscoverItem[] = []
+    for (let page = 1; page <= 2; page++) {
+      const items = await javdbTags({ ...base, page })
+      if (items.length === 0) break // past the last page
+      out.push(...items)
+    }
+    return out
   }
   const period: JavdbPeriod =
     list === "weekly" || list === "monthly" || list === "daily" ? list : "daily"
-  return javdbPlayback("all", period)
+  return javdbRankings(0, period)
 }

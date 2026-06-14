@@ -4,17 +4,20 @@
  * current page, so the gate naturally fetches per-page.
  */
 import { MediaCard, MediaCardAction } from "@/components/media"
+import type { DiscoverItem } from "@/api/types"
+import { hasPreviews } from "@/api/previews"
 import { fseed, relAdded } from "@/lib/format"
-import { defAr, providerLabel, type CardState, type ScoredItem } from "./model"
+import { defAr, providerLabel, type CardState } from "./model"
 import { useGatedSeeders } from "./useGatedSeeders"
 
 export interface DiscoverCardProps {
-  item: ScoredItem
+  item: DiscoverItem
   cardState: CardState
   /** Append "· N days ago" to the sub line (Newest mode / recency rank). */
   showAdded: boolean
   onOpen: () => void
   onDownload: () => void
+  onPreview: () => void
 }
 
 export function DiscoverCard({
@@ -23,6 +26,7 @@ export function DiscoverCard({
   showAdded,
   onOpen,
   onDownload,
+  onPreview,
 }: DiscoverCardProps) {
   const seedQ = useGatedSeeders(item)
   const live = seedQ.data
@@ -39,7 +43,7 @@ export function DiscoverCard({
   return (
     <MediaCard
       title={item.title}
-      sub={item.sub + (showAdded ? ` · ${relAdded(item.added)}` : "")}
+      sub={item.sub + (showAdded ? ` · ${relAdded(item.added ?? 0)}` : "")}
       cover={item.cover || undefined}
       ar={item.ar || defAr(item.cat)}
       source={providerLabel(item.src)}
@@ -47,8 +51,15 @@ export function DiscoverCard({
       progress={cardState.progress}
       seedBadge={<span title={seedTitle}>▲ {fseed(seeders)}</span>}
       action={
-        cardState.state === "new" ? (
-          <MediaCardAction onClick={onDownload}>Download</MediaCardAction>
+        hasPreviews(item.src) || cardState.state === "new" ? (
+          <div className="flex flex-col items-center gap-1.5">
+            {hasPreviews(item.src) && (
+              <MediaCardAction onClick={onPreview}>Preview</MediaCardAction>
+            )}
+            {cardState.state === "new" && (
+              <MediaCardAction onClick={onDownload}>Download</MediaCardAction>
+            )}
+          </div>
         ) : undefined
       }
       onClick={onOpen}

@@ -261,18 +261,31 @@ describe("discover() catalog mapping", () => {
     expect(decodeURIComponent(url)).toContain("filter_by=0:t:m:212:::")
   })
 
-  it("ad weekly -> playback Most Viewed for that window", async () => {
+  it("vrc + year/month/sort -> filter_by=0:t:m:212:<year>::<month> and sort_by", async () => {
+    serve({ movies: [] })
+    await discover("vrc", "newest", {
+      year: "2024",
+      month: "6",
+      sortBy: "score",
+      orderBy: "desc",
+    })
+    const url = decodeURIComponent(mockedHttpJson.mock.calls[0][0] as string)
+    expect(url).toContain("filter_by=0:t:m:212:2024::6")
+    expect(url).toContain("sort_by=score")
+  })
+
+  it("ad weekly -> Censored ranking (type=0) for that window", async () => {
     serve({ movies: [] })
     await discover("ad", "weekly")
     const url = mockedHttpJson.mock.calls[0][0] as string
-    expect(url).toContain("/api/v1/rankings/playback?filter_by=all&period=weekly")
+    expect(url).toContain("/api/v1/rankings?type=0&period=weekly")
   })
 
-  it("ad most_viewed (unknown window) -> playback daily", async () => {
+  it("ad unknown window -> Censored ranking, daily", async () => {
     serve({ movies: [] })
     await discover("ad", "most_viewed")
     const url = mockedHttpJson.mock.calls[0][0] as string
-    expect(url).toContain("period=daily")
+    expect(url).toContain("/api/v1/rankings?type=0&period=daily")
   })
 })
 

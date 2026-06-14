@@ -1,57 +1,44 @@
 /**
  * Unit tests for the Discover view model helpers (src/views/discover/model.ts).
- * Focused on availableRanks — the "make options meaningful" rule that offers a
- * Rank option only when it reorders the pool differently from one already on
- * offer (ordering-based dedupe, not just "does the data have seeders/ratings").
+ * Discover shows every feed in its source order (no client-side re-ranking), so
+ * the only model logic with branches left is the in-library detection.
  */
 import { describe, expect, it } from "vitest"
-import type { DiscoverItem } from "@/api/types"
-import { availableRanks } from "@/views/discover/model"
+import type { DiscoverItem, LibraryItem } from "@/api/types"
+import { itemState, ownedKeys } from "@/views/discover/model"
 
-/** Minimal item — availableRanks reads id/seeders/rating (added defaults to feed pos). */
-const mk = (id: string, seeders: number, rating: number) =>
-  ({ id, seeders, rating } as DiscoverItem)
+describe("ownedKeys / itemState in-library detection", () => {
+  const lib = (code: string, fname: string): LibraryItem =>
+    ({ code, fname, title: "" }) as LibraryItem
+  const disc = (code: string): DiscoverItem =>
+    ({ id: `d_${code}`, code, title: code }) as DiscoverItem
 
-describe("availableRanks", () => {
-  it("offers only popularity for an empty pool", () => {
-    expect(availableRanks([])).toEqual(["popularity"])
+  it("matches a zero-padded on-disk JAV code against an unpadded feed code", () => {
+    // disk "AJVR-00306-A.mp4" -> parseCode "AJVR-00306"; JavDB feed "AJVR-306".
+    const owned = ownedKeys([lib("AJVR-00306", "AJVR-00306-A.mp4")])
+    expect(itemState(disc("AJVR-306"), owned, {}).state).toBe("library")
   })
 
-  it("collapses to popularity when no seeders or ratings (DMM/MGStage)", () => {
+  it("matches when the feed code is padded and the disk code is not", () => {
+    const owned = ownedKeys([lib("SIVR-476", "SIVR-476.mp4")])
+    expect(itemState(disc("SIVR-00476"), owned, {}).state).toBe("library")
+  })
+
+  it("still flags a genuinely-absent code as new", () => {
+    const owned = ownedKeys([lib("AJVR-00306", "AJVR-00306-A.mp4")])
+    expect(itemState(disc("SIVR-999"), owned, {}).state).toBe("new")
+  })
+
+  it("matches on an exact uppercased title (movies/TV)", () => {
+    const owned = ownedKeys([
+      { code: "", fname: "GoodFellas.mkv", title: "GoodFellas" } as LibraryItem,
+    ])
     expect(
-      availableRanks([mk("a", 0, 0), mk("b", 0, 0), mk("c", 0, 0)])
-    ).toEqual(["popularity"])
-  })
-
-  it("collapses to popularity when seeders are uniform (javdb VR, tpb trending)", () => {
-    // Every item reports the same seeder count -> popularity/seeders/recency all
-    // produce the feed order, so the control is pointless. This is the bug the
-    // user hit on VR -> JavDB -> newest (uniform magnet count of 1).
-    expect(
-      availableRanks([mk("a", 1, 0), mk("b", 1, 0), mk("c", 1, 0)])
-    ).toEqual(["popularity"])
-  })
-
-  it("adds rating when it reorders the pool (tmdb/imdb)", () => {
-    // seeders all 0 -> popularity == seeders == recency == feed; ratings reorder.
-    expect(
-      availableRanks([mk("a", 0, 5), mk("b", 0, 9), mk("c", 0, 7)])
-    ).toEqual(["popularity", "rating"])
-  })
-
-  it("adds recency when it differs from popularity (seeders shift the score)", () => {
-    // c's seeders push it to the top of popularity (and seeders), so recency
-    // (pure feed order) is a distinct ordering and is offered.
-    expect(
-      availableRanks([mk("a", 0, 0), mk("b", 0, 0), mk("c", 100, 0)])
-    ).toEqual(["popularity", "recency"])
-  })
-
-  it("keeps results in canonical RANK_OPTIONS order with popularity first", () => {
-    const ranks = availableRanks([mk("a", 0, 0), mk("b", 0, 9), mk("c", 100, 0)])
-    expect(ranks[0]).toBe("popularity")
-    const canonical = ["popularity", "seeders", "recency", "rating"]
-    const idx = ranks.map((r) => canonical.indexOf(r))
-    expect(idx).toEqual([...idx].sort((x, y) => x - y)) // strictly increasing
+      itemState(
+        { id: "m1", code: "", title: "GoodFellas" } as DiscoverItem,
+        owned,
+        {}
+      ).state
+    ).toBe("library")
   })
 })

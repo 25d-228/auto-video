@@ -26,14 +26,14 @@ import {
   type RenameCat,
   type RenameOp,
 } from "@/lib/rename"
-import type { Release } from "@/api/types"
+import type { DiscoverItem, Release } from "@/api/types"
 import { usePaths, useSeeders } from "@/state/queries"
 import { useDownloads } from "@/state/downloads"
-import { providerLabel, type ScoredItem } from "./model"
+import { providerLabel } from "./model"
 
 export interface DownloadDialogProps {
   /** null = closed. */
-  item: ScoredItem | null
+  item: DiscoverItem | null
   onClose: () => void
 }
 
@@ -56,7 +56,7 @@ function SectionLabel({ children }: { children: string }) {
  * Canonical base the downloaded file(s) should be renamed to: JAV code for
  * ad/vrc, "YEAR.Title" for movies, show name for tv.
  */
-function renameBase(cat: RenameCat, item: ScoredItem): string {
+function renameBase(cat: RenameCat, item: DiscoverItem): string {
   if (cat === "ad" || cat === "vrc") return item.code || item.title
   if (cat === "mov") return item.year ? `${item.year}.${item.title}` : item.title
   return item.title
@@ -68,7 +68,7 @@ function renameBase(cat: RenameCat, item: ScoredItem): string {
  * renames to apply once it finishes.
  */
 function buildPlan(
-  item: ScoredItem,
+  item: DiscoverItem,
   files: TorrentFile[] | undefined,
   picked: ReadonlySet<number>,
   multiFile: boolean
