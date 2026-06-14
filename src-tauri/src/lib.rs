@@ -1,20 +1,19 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tauri::{Emitter, Manager};
-use tokio::sync::Mutex as AsyncMutex;
 
-/// The librqbit BitTorrent session (created lazily on first download).
-struct DlSession(AsyncMutex<Option<Arc<librqbit::Session>>>);
+mod lt;
 
-/// One managed download: the librqbit handle plus the metadata every event carries.
+/// One managed download: the libtorrent info-hash id plus the metadata every
+/// event carries. The id reaches the torrent in the global libtorrent session.
 struct DlEntry {
-    handle: Arc<librqbit::ManagedTorrent>,
+    lt_id: String,
     title: String,
     dest: String,
 }
-/// id -> managed download. Keeps torrent handles reachable so they can be
-/// paused/resumed/cancelled; removal from this map is what stops the polling loop.
+/// our download id -> managed download. Removal from this map is what stops the
+/// polling loop (and signals a cancel to a still-running download).
 struct DlManager(Mutex<HashMap<String, DlEntry>>);
 
 // ------------------------------------------------------------------ downloads
@@ -35,32 +34,27 @@ struct DlProgress {
     error: Option<String>,
 }
 
-/// Snapshot the torrent's current stats into a contract-shaped event payload.
-fn dl_progress(id: &str, title: &str, dest: &str, handle: &Arc<librqbit::ManagedTorrent>) -> DlProgress {
-    use librqbit::TorrentStatsState as S;
-    let st = handle.stats();
-    let total = st.total_bytes.max(1);
-    let progress = (st.progress_bytes as f64 / total as f64).clamp(0.0, 1.0);
-    // st.live is None while paused/initializing/errored, so speed naturally reads 0 then.
-    let speed_mbps = st
-        .live
-        .as_ref()
-        .map(|l| l.download_speed.mbps)
-        .unwrap_or(0.0);
-    let state = match st.state {
-        S::Error => "error",
-        S::Paused => "paused",
-        _ if st.finished => DL_STATE_DONE,
-        _ => "downloading", // Initializing | Live
+/// Snapshot a torrent's current libtorrent status into the event payload shape.
+fn dl_progress(id: &str, lt_id: &str, title: &str, dest: &str) -> DlProgress {
+    let st = lt::status(lt_id);
+    // Unknown to the session (already removed) or finished both read as "done"
+    // so the polling loop ends.
+    let (state, error) = if !st.valid || st.finished {
+        (DL_STATE_DONE.to_owned(), None)
+    } else if st.state == "error" {
+        ("error".to_owned(), (!st.error.is_empty()).then(|| st.error.clone()))
+    } else {
+        (st.state.clone(), None)
     };
     DlProgress {
         id: id.to_owned(),
         title: title.to_owned(),
-        progress,
-        speed_mbps,
-        state: state.to_owned(),
+        progress: st.progress.clamp(0.0, 1.0),
+        // libtorrent reports bytes/sec; the UI shows MB/s.
+        speed_mbps: st.download_rate as f64 / 1_048_576.0,
+        state,
         dest: dest.to_owned(),
-        error: st.error,
+        error,
     }
 }
 
@@ -82,60 +76,37 @@ fn emit_dl_error(app: &tauri::AppHandle, id: &str, title: &str, dest: &str, msg:
     );
 }
 
-/// Clone the managed entry for `id`, or explain that it isn't managed.
-fn dl_entry(app: &tauri::AppHandle, id: &str) -> Result<(Arc<librqbit::ManagedTorrent>, String, String), String> {
+/// Clone the managed entry's (lt_id, title, dest), or explain it isn't managed.
+fn dl_entry(app: &tauri::AppHandle, id: &str) -> Result<(String, String, String), String> {
     let mgr = app.state::<DlManager>();
     let g = mgr.0.lock().unwrap();
     g.get(id)
-        .map(|e| (e.handle.clone(), e.title.clone(), e.dest.clone()))
+        .map(|e| (e.lt_id.clone(), e.title.clone(), e.dest.clone()))
         .ok_or_else(|| format!("unknown download id: {id}"))
 }
 
-/// The lazily-created session, or an error if no download ever started.
-async fn current_session(sess: &DlSession) -> Result<Arc<librqbit::Session>, String> {
-    sess.0
-        .lock()
-        .await
-        .clone()
-        .ok_or_else(|| "no active download session".to_string())
-}
-
 #[tauri::command]
-async fn pause_download(
-    app: tauri::AppHandle,
-    sess: tauri::State<'_, DlSession>,
-    id: String,
-) -> Result<(), String> {
-    let (handle, title, dest) = dl_entry(&app, &id)?;
-    let session = current_session(&sess).await?;
-    session.pause(&handle).await.map_err(|e| e.to_string())?;
-    // Immediate event on state change (stats now report Paused).
-    let _ = app.emit("download-progress", dl_progress(&id, &title, &dest, &handle));
+async fn pause_download(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let (lt_id, title, dest) = dl_entry(&app, &id)?;
+    lt::pause(&lt_id);
+    let _ = app.emit("download-progress", dl_progress(&id, &lt_id, &title, &dest));
     Ok(())
 }
 
 #[tauri::command]
-async fn resume_download(
-    app: tauri::AppHandle,
-    sess: tauri::State<'_, DlSession>,
-    id: String,
-) -> Result<(), String> {
-    let (handle, title, dest) = dl_entry(&app, &id)?;
-    let session = current_session(&sess).await?;
-    session.unpause(&handle).await.map_err(|e| e.to_string())?;
-    // Immediate event on state change (stats now report Initializing/Live).
-    let _ = app.emit("download-progress", dl_progress(&id, &title, &dest, &handle));
+async fn resume_download(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let (lt_id, title, dest) = dl_entry(&app, &id)?;
+    lt::resume(&lt_id);
+    let _ = app.emit("download-progress", dl_progress(&id, &lt_id, &title, &dest));
     Ok(())
 }
 
 #[tauri::command]
 async fn cancel_download(
     app: tauri::AppHandle,
-    sess: tauri::State<'_, DlSession>,
     id: String,
     delete_files: bool,
 ) -> Result<(), String> {
-    let session = current_session(&sess).await?;
     // Remove from the map first: the polling loop checks membership before every
     // emit, so no further events fire for this id once the entry is gone.
     let entry = app
@@ -145,12 +116,7 @@ async fn cancel_download(
         .unwrap()
         .remove(&id)
         .ok_or_else(|| format!("unknown download id: {id}"))?;
-    let torrent_id = librqbit::api::TorrentIdOrHash::Id(entry.handle.id());
-    if let Err(e) = session.delete(torrent_id, delete_files).await {
-        // Deletion failed: restore the entry so the download stays manageable.
-        app.state::<DlManager>().0.lock().unwrap().insert(id, entry);
-        return Err(e.to_string());
-    }
+    lt::remove(&entry.lt_id, delete_files);
     Ok(())
 }
 
@@ -176,39 +142,23 @@ fn resolve_out_dir(app: &tauri::AppHandle, dest: &str) -> Result<PathBuf, String
     Ok(p)
 }
 
-/// The shared librqbit session, creating it on the first download of this run.
-async fn get_or_init_session(
-    app: &tauri::AppHandle,
-    out: &Path,
-) -> Result<Arc<librqbit::Session>, String> {
-    let sess = app.state::<DlSession>();
-    let mut g = sess.0.lock().await;
-    if g.is_none() {
-        let s = librqbit::Session::new(out.to_path_buf())
-            .await
-            .map_err(|e| e.to_string())?;
-        *g = Some(s);
-    }
-    Ok(g.as_ref().unwrap().clone())
-}
-
-/// Canonicalize the downloaded file names once a download finishes: stop the
-/// torrent so librqbit releases the files, rename per the plan, then drop the
-/// management entry. A no-op (and leaves the entry) when there are no renames.
+/// Canonicalize the downloaded file names once a download finishes: remove the
+/// torrent from the session (keeping the files) so libtorrent closes its
+/// handles, rename per the plan, then drop the management entry. A no-op (and
+/// leaves the entry) when there are no renames.
 async fn apply_renames(app: &tauri::AppHandle, id: &str, dest_out: &str, renames: Option<&Vec<RenamePair>>) {
     let Some(plan) = renames.filter(|p| !p.is_empty()) else { return };
-    let session = app.state::<DlSession>().0.lock().await.clone();
-    let torrent_id = app
+    let lt_id = app
         .state::<DlManager>()
         .0
         .lock()
         .unwrap()
         .get(id)
-        .map(|e| e.handle.id());
-    if let (Some(session), Some(torrent_id)) = (session, torrent_id) {
-        let _ = session
-            .delete(librqbit::api::TorrentIdOrHash::Id(torrent_id), false)
-            .await;
+        .map(|e| e.lt_id.clone());
+    if let Some(lt_id) = lt_id {
+        lt::remove(&lt_id, false);
+        // Give libtorrent a moment to flush + close the files before moving them.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     for pair in plan {
         let src = Path::new(dest_out).join(&pair.from);
@@ -253,60 +203,40 @@ async fn start_download(
         };
         let dest_out = out.to_string_lossy().into_owned();
 
-        let session = match get_or_init_session(&app, &out).await {
-            Ok(s) => s,
-            Err(e) => {
-                emit_dl_error(&app, &id, &title, &dest_out, e);
-                return;
-            }
-        };
+        if !lt::init() {
+            emit_dl_error(&app, &id, &title, &dest_out, "failed to start libtorrent session".into());
+            return;
+        }
 
-        let opts = librqbit::AddTorrentOptions {
-            output_folder: Some(dest_out.clone()),
-            overwrite: true,
-            // Only the user-picked files (None/empty -> everything).
-            only_files: only_files.filter(|v| !v.is_empty()),
-            ..Default::default()
-        };
-        let handle = match session
-            .add_torrent(librqbit::AddTorrent::from_url(&magnet), Some(opts))
-            .await
-        {
-            Ok(resp) => match resp.into_handle() {
-                Some(h) => h,
-                None => {
-                    emit_dl_error(&app, &id, &title, &dest_out, "no torrent handle".into());
-                    return;
-                }
-            },
-            Err(e) => {
-                emit_dl_error(&app, &id, &title, &dest_out, e.to_string());
-                return;
-            }
-        };
+        // Only the user-picked file indices (None/empty -> all files). Deselected
+        // files get priority 0 in the shim, so libtorrent never creates them.
+        let only: Vec<u32> = only_files
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| i as u32)
+            .collect();
+        let lt_id = lt::add(&magnet, &dest_out, &only);
+        if lt_id.is_empty() {
+            emit_dl_error(&app, &id, &title, &dest_out, "failed to add torrent (bad magnet?)".into());
+            return;
+        }
 
-        // Register the handle for management (pause/resume/cancel) before polling.
+        // Register for management (pause/resume/cancel) before polling.
         app.state::<DlManager>().0.lock().unwrap().insert(
             id.clone(),
             DlEntry {
-                handle,
+                lt_id: lt_id.clone(),
                 title: title.clone(),
                 dest: dest_out.clone(),
             },
         );
 
         loop {
-            // Read the handle through the map each tick; a missing entry means the
-            // download was cancelled, so exit without emitting anything more.
-            let handle = {
-                let mgr = app.state::<DlManager>();
-                let g = mgr.0.lock().unwrap();
-                match g.get(&id) {
-                    Some(e) => e.handle.clone(),
-                    None => break,
-                }
-            };
-            let payload = dl_progress(&id, &title, &dest_out, &handle);
+            // A missing entry means the download was cancelled: stop quietly.
+            if !app.state::<DlManager>().0.lock().unwrap().contains_key(&id) {
+                break;
+            }
+            let payload = dl_progress(&id, &lt_id, &title, &dest_out);
             let done = payload.state == DL_STATE_DONE;
             // Re-check membership right before emitting in case a cancel raced us.
             if !app.state::<DlManager>().0.lock().unwrap().contains_key(&id) {
@@ -335,54 +265,29 @@ struct TorrentFile {
     size: u64,
 }
 
-/// Resolve a torrent's file list WITHOUT downloading (librqbit list_only), so
-/// the UI can let the user choose which files to fetch. For a .torrent the
-/// metadata is embedded (instant); for a bare magnet it must be fetched from
-/// peers/DHT, so this is bounded by a timeout.
+/// Resolve a torrent's file list WITHOUT downloading the data (libtorrent
+/// metadata-only / upload_mode), so the UI can let the user choose which files
+/// to fetch. For a bare magnet the metadata must be fetched from peers/DHT, so
+/// the shim is bounded by a timeout; it BLOCKS, hence spawn_blocking.
 #[tauri::command]
-async fn list_torrent_files(
-    app: tauri::AppHandle,
-    magnet: String,
-) -> Result<Vec<TorrentFile>, String> {
-    // Reuse (or lazily create) the session; the output folder is irrelevant here.
-    let session = {
-        let sess = app.state::<DlSession>();
-        let mut g = sess.0.lock().await;
-        if g.is_none() {
-            let base = app
-                .path()
-                .download_dir()
-                .map_err(|e| e.to_string())?
-                .join("auto-video");
-            let _ = std::fs::create_dir_all(&base);
-            let s = librqbit::Session::new(base).await.map_err(|e| e.to_string())?;
-            *g = Some(s);
-        }
-        g.as_ref().unwrap().clone()
-    };
-    let opts = librqbit::AddTorrentOptions {
-        list_only: true,
-        ..Default::default()
-    };
-    let fut = session.add_torrent(librqbit::AddTorrent::from_url(&magnet), Some(opts));
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(45), fut)
-        .await
-        .map_err(|_| "timed out reading torrent metadata (no peers?)".to_string())?
-        .map_err(|e| e.to_string())?;
-    match resp {
-        librqbit::AddTorrentResponse::ListOnly(r) => {
-            let details = r.info.iter_file_details().map_err(|e| e.to_string())?;
-            Ok(details
-                .enumerate()
-                .map(|(index, d)| TorrentFile {
-                    index,
-                    name: d.filename.to_string().unwrap_or_else(|_| format!("file {index}")),
-                    size: d.len,
-                })
-                .collect())
-        }
-        _ => Err("unexpected response while listing files".to_string()),
+async fn list_torrent_files(magnet: String) -> Result<Vec<TorrentFile>, String> {
+    if !lt::init() {
+        return Err("failed to start libtorrent session".to_string());
     }
+    let files = tauri::async_runtime::spawn_blocking(move || lt::list_files(&magnet, 45_000))
+        .await
+        .map_err(|e| e.to_string())?;
+    if files.is_empty() {
+        return Err("timed out reading torrent metadata (no peers?)".to_string());
+    }
+    Ok(files
+        .into_iter()
+        .map(|f| TorrentFile {
+            index: f.index as usize,
+            name: f.path,
+            size: f.size,
+        })
+        .collect())
 }
 
 // ------------------------------------------------------------------ os integration
@@ -591,7 +496,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
-        .manage(DlSession(AsyncMutex::new(None)))
         .manage(DlManager(Mutex::new(HashMap::new())))
         .setup(|app| {
             // Initial traffic-light alignment for the main window (macOS only).
@@ -631,155 +535,4 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running auto-video");
-}
-
-// ------------------------------------------------------------------ download tests
-// Offline, deterministic checks of the librqbit behaviour the download commands
-// rely on: (1) re-adding a torrent over existing on-disk files RESUMES from them
-// (the core of "continue after restart"); (2) cancel-with-delete removes files
-// (the core of "abort"). No network: DHT + trackers are disabled and the file is
-// already complete on disk, so the initial hash-check finishes immediately.
-#[cfg(test)]
-mod download_tests {
-    use super::*;
-    use std::io::Write;
-
-    fn fresh_dir(tag: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("av-dltest-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
-
-    fn write_file(path: &Path, byte: u8, len: usize) {
-        let mut f = std::fs::File::create(path).unwrap();
-        let chunk = vec![byte; 64 * 1024];
-        let mut left = len;
-        while left > 0 {
-            let n = left.min(chunk.len());
-            f.write_all(&chunk[..n]).unwrap();
-            left -= n;
-        }
-        f.flush().unwrap();
-    }
-
-    async fn offline_session(dir: &Path) -> Arc<librqbit::Session> {
-        librqbit::Session::new_with_opts(
-            dir.to_path_buf(),
-            librqbit::SessionOptions {
-                disable_dht: true,
-                persistence: None,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-    }
-
-    async fn add_existing(
-        session: &Arc<librqbit::Session>,
-        dir: &Path,
-    ) -> Arc<librqbit::ManagedTorrent> {
-        let file = dir.join("data.bin");
-        let res = librqbit::create_torrent(
-            &file,
-            librqbit::CreateTorrentOptions { name: None, piece_length: Some(65536) },
-        )
-        .await
-        .unwrap();
-        let bytes = res.as_bytes().unwrap();
-        let opts = librqbit::AddTorrentOptions {
-            output_folder: Some(dir.to_string_lossy().into_owned()),
-            overwrite: true,
-            disable_trackers: true,
-            ..Default::default()
-        };
-        session
-            .add_torrent(librqbit::AddTorrent::TorrentFileBytes(bytes), Some(opts))
-            .await
-            .unwrap()
-            .into_handle()
-            .unwrap()
-    }
-
-    /// Re-adding a torrent whose output folder already holds the data resumes to
-    /// 100% from disk (no peers) — the mechanism that lets a download continue.
-    #[tokio::test]
-    async fn readd_over_existing_files_resumes_to_complete() {
-        let dir = fresh_dir("resume");
-        write_file(&dir.join("data.bin"), 0xAB, 2 * 1024 * 1024);
-        let session = offline_session(&dir).await;
-        let handle = add_existing(&session, &dir).await;
-
-        let mut finished = false;
-        for _ in 0..100 {
-            if handle.stats().finished {
-                finished = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let st = handle.stats();
-        assert!(finished, "did not resume from disk: {}/{}", st.progress_bytes, st.total_bytes);
-        assert_eq!(st.progress_bytes, st.total_bytes);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// list_only resolves a multi-file torrent's file list without downloading —
-    /// the data behind the download file-picker.
-    #[tokio::test]
-    async fn list_only_returns_the_file_list() {
-        let dir = fresh_dir("list");
-        write_file(&dir.join("data1.bin"), 0x11, 128 * 1024);
-        write_file(&dir.join("data2.bin"), 0x22, 256 * 1024);
-        let res = librqbit::create_torrent(
-            &dir, // a directory -> multi-file torrent
-            librqbit::CreateTorrentOptions { name: None, piece_length: Some(65536) },
-        )
-        .await
-        .unwrap();
-        let bytes = res.as_bytes().unwrap();
-        let session = offline_session(&dir).await;
-        let opts = librqbit::AddTorrentOptions {
-            list_only: true,
-            disable_trackers: true,
-            ..Default::default()
-        };
-        let resp = session
-            .add_torrent(librqbit::AddTorrent::TorrentFileBytes(bytes), Some(opts))
-            .await
-            .unwrap();
-        match resp {
-            librqbit::AddTorrentResponse::ListOnly(r) => {
-                let names: Vec<String> = r
-                    .info
-                    .iter_file_details()
-                    .unwrap()
-                    .map(|d| d.filename.to_string().unwrap())
-                    .collect();
-                assert_eq!(names.len(), 2, "expected 2 files, got {names:?}");
-                assert!(names.iter().any(|n| n.contains("data1.bin")));
-                assert!(names.iter().any(|n| n.contains("data2.bin")));
-            }
-            _ => panic!("expected ListOnly response"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// cancel_download(delete_files = true) removes the torrent's files from disk.
-    #[tokio::test]
-    async fn cancel_with_delete_removes_files() {
-        let dir = fresh_dir("delete");
-        let file = dir.join("data.bin");
-        write_file(&file, 0xCD, 256 * 1024);
-        let session = offline_session(&dir).await;
-        let handle = add_existing(&session, &dir).await;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        let id = librqbit::api::TorrentIdOrHash::Id(handle.id());
-        session.delete(id, true).await.unwrap();
-        assert!(!file.exists(), "file should be gone after cancel(delete=true)");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }
