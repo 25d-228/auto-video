@@ -17,10 +17,23 @@ struct DlEntry {
 /// polling loop (and signals a cancel to a still-running download).
 struct DlManager(Mutex<HashMap<String, DlEntry>>);
 
+/// Lock the download-management map. The guard borrows from `app` (not the
+/// temporary `State`), so callers can chain map operations directly.
+fn dl_map(app: &tauri::AppHandle) -> std::sync::MutexGuard<'_, HashMap<String, DlEntry>> {
+    app.state::<DlManager>().inner().0.lock().unwrap()
+}
+
 // ------------------------------------------------------------------ downloads
 /// The `state` value the frontend treats as "finished"; also the literal the
 /// polling loop watches for. Spelled once so it can't drift between producers.
 const DL_STATE_DONE: &str = "done";
+
+/// Bytes per MiB. librqbit reports rates/sizes in bytes; the UI shows MB/s.
+const BYTES_PER_MIB: f64 = 1_048_576.0;
+
+/// How long the metadata-only shims (list_torrent_files / save_torrent) wait for
+/// a bare magnet's metadata to arrive from peers/DHT before giving up.
+const METADATA_FETCH_TIMEOUT_MS: u64 = 45_000;
 
 #[derive(Clone, serde::Serialize)]
 struct DlProgress {
@@ -51,7 +64,7 @@ fn dl_progress(id: &str, handle: &dl::Handle, title: &str, dest: &str) -> DlProg
         title: title.to_owned(),
         progress: st.progress.clamp(0.0, 1.0),
         // libtorrent reports bytes/sec; the UI shows MB/s.
-        speed_mbps: st.download_rate as f64 / 1_048_576.0,
+        speed_mbps: st.download_rate as f64 / BYTES_PER_MIB,
         state,
         dest: dest.to_owned(),
         error,
@@ -109,11 +122,7 @@ async fn cancel_download(
 ) -> Result<(), String> {
     // Remove from the map first: the polling loop checks membership before every
     // emit, so no further events fire for this id once the entry is gone.
-    let entry = app
-        .state::<DlManager>()
-        .0
-        .lock()
-        .unwrap()
+    let entry = dl_map(&app)
         .remove(&id)
         .ok_or_else(|| format!("unknown download id: {id}"))?;
     dl::remove(entry.torrent_id, delete_files)
@@ -150,13 +159,7 @@ fn resolve_out_dir(app: &tauri::AppHandle, dest: &str) -> Result<PathBuf, String
 /// leaves the entry) when there are no renames.
 async fn apply_renames(app: &tauri::AppHandle, id: &str, dest_out: &str, renames: Option<&Vec<RenamePair>>) {
     let Some(plan) = renames.filter(|p| !p.is_empty()) else { return };
-    let torrent_id = app
-        .state::<DlManager>()
-        .0
-        .lock()
-        .unwrap()
-        .get(id)
-        .map(|e| e.torrent_id);
+    let torrent_id = dl_map(app).get(id).map(|e| e.torrent_id);
     if let Some(torrent_id) = torrent_id {
         // Remove from the session (keep files) so librqbit releases its handles.
         let _ = dl::remove(torrent_id, false).await;
@@ -175,7 +178,7 @@ async fn apply_renames(app: &tauri::AppHandle, id: &str, dest_out: &str, renames
         let _ = std::fs::rename(&src, &dst);
     }
     // Torrent removed + files renamed: drop the management entry.
-    app.state::<DlManager>().0.lock().unwrap().remove(id);
+    dl_map(app).remove(id);
 }
 
 #[tauri::command]
@@ -218,7 +221,7 @@ async fn start_download(
         };
 
         // Register for management (pause/resume/cancel) before polling.
-        app.state::<DlManager>().0.lock().unwrap().insert(
+        dl_map(&app).insert(
             id.clone(),
             DlEntry {
                 handle: handle.clone(),
@@ -230,13 +233,13 @@ async fn start_download(
 
         loop {
             // A missing entry means the download was cancelled: stop quietly.
-            if !app.state::<DlManager>().0.lock().unwrap().contains_key(&id) {
+            if !dl_map(&app).contains_key(&id) {
                 break;
             }
             let payload = dl_progress(&id, &handle, &title, &dest_out);
             let done = payload.state == DL_STATE_DONE;
             // Re-check membership right before emitting in case a cancel raced us.
-            if !app.state::<DlManager>().0.lock().unwrap().contains_key(&id) {
+            if !dl_map(&app).contains_key(&id) {
                 break;
             }
             if done {
@@ -262,6 +265,12 @@ struct TorrentFile {
     size: u64,
 }
 
+impl From<dl::FileEntry> for TorrentFile {
+    fn from(f: dl::FileEntry) -> Self {
+        TorrentFile { index: f.index, name: f.name, size: f.size }
+    }
+}
+
 /// Set the session-wide max download/upload speed. Inputs are KiB/s from the UI
 /// (0 = unlimited); converted to bytes/sec for librqbit.
 #[tauri::command]
@@ -284,27 +293,20 @@ async fn set_rate_limits(download_kib: i64, upload_kib: i64) -> Result<(), Strin
 /// the shim is bounded by a timeout; it BLOCKS, hence spawn_blocking.
 #[tauri::command]
 async fn list_torrent_files(magnet: String) -> Result<Vec<TorrentFile>, String> {
-    let files = dl::list_files(&magnet, 45_000)
+    let files = dl::list_files(&magnet, METADATA_FETCH_TIMEOUT_MS)
         .await
         .map_err(|e| e.to_string())?;
     if files.is_empty() {
         return Err("timed out reading torrent metadata (no peers?)".to_string());
     }
-    Ok(files
-        .into_iter()
-        .map(|f| TorrentFile {
-            index: f.index,
-            name: f.name,
-            size: f.size,
-        })
-        .collect())
+    Ok(files.into_iter().map(TorrentFile::from).collect())
 }
 
 /// Write the magnet's .torrent file to `out_path` (metadata only — no content is
 /// downloaded). Awaits the metadata fetch from peers.
 #[tauri::command]
 async fn save_torrent(magnet: String, out_path: String) -> Result<(), String> {
-    dl::save_torrent(&magnet, &out_path, 45_000)
+    dl::save_torrent(&magnet, &out_path, METADATA_FETCH_TIMEOUT_MS)
         .await
         .map_err(|e| e.to_string())
 }

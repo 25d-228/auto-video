@@ -30,6 +30,9 @@ use tokio::sync::OnceCell;
 /// re-exported at the crate root, but it is exactly `Arc<ManagedTorrent>`.
 pub type Handle = Arc<ManagedTorrent>;
 
+/// Bytes per MiB. librqbit reports live speed in MiB/s; the UI wants bytes/sec.
+const BYTES_PER_MIB: f64 = 1_048_576.0;
+
 // ----------------------------------------------------------------- session
 
 static SESSION: OnceCell<Arc<Session>> = OnceCell::const_new();
@@ -369,7 +372,7 @@ pub fn status(handle: &Handle) -> Status {
     let download_rate = s
         .live
         .as_ref()
-        .map(|l| (l.download_speed.mbps * 1_048_576.0) as u64)
+        .map(|l| (l.download_speed.mbps * BYTES_PER_MIB) as u64)
         .unwrap_or(0);
     let (state, error) = if matches!(s.state, TorrentStatsState::Error) {
         ("error".to_string(), s.error.clone().unwrap_or_default())
