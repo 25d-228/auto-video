@@ -32,6 +32,12 @@ const APIBAY = "https://apibay.org"
 /** Seconds a listing is cached before re-fetch — matches the sidecar's LIST_TTL. */
 const LIST_TTL = 300
 
+/** Cap on the number of TV rows returned by parseTv. */
+const MAX_TV_ITEMS = 100
+
+/** Aspect ratio assigned to TV DiscoverItems. */
+const TV_POSTER_AR = 0.7
+
 /**
  * One raw apibay torrent row. Every field arrives as a string from q.php and as
  * a string-or-number from the precompiled top100 file, so the numeric fields are
@@ -129,16 +135,16 @@ export function parseTv(arr: unknown, mode: DiscoverMode): DiscoverItem[] {
   }
 
   const out: DiscoverItem[] = []
-  for (const x of rows.slice(0, 100)) {
-    const name = x.name ?? ""
-    const imdb = (x.imdb ?? "").trim()
-    const [series, se] = parseTvName(name)
-    const seeders = toInt(x.seeders)
-    const size = humanSize(toInt(x.size))
-    const tid = String(x.id ?? "").trim()
+  for (const row of rows.slice(0, MAX_TV_ITEMS)) {
+    const name = row.name ?? ""
+    const imdb = (row.imdb ?? "").trim()
+    const [series, seasonEpisode] = parseTvName(name)
+    const seeders = toInt(row.seeders)
+    const size = humanSize(toInt(row.size))
+    const tid = String(row.id ?? "").trim()
 
     // sub = "<SxxEyy> · <imdb>" with empty parts trimmed (Python's .strip(' ·')).
-    const sub = ((se ? se + " · " : "") + (imdb || "")).replace(/^[\s·]+|[\s·]+$/g, "")
+    const sub = ((seasonEpisode ? seasonEpisode + " · " : "") + (imdb || "")).replace(/^[\s·]+|[\s·]+$/g, "")
 
     const item: DiscoverItem = {
       id: `tv_${tid}`,
@@ -146,7 +152,7 @@ export function parseTv(arr: unknown, mode: DiscoverMode): DiscoverItem[] {
       title: series || name,
       sub,
       cover: "",
-      ar: 0.7,
+      ar: TV_POSTER_AR,
       seeders,
       size,
       src: "TPB",

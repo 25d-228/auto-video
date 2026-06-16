@@ -109,8 +109,8 @@ export async function javbusCover(
   code: string,
   cookie: string
 ): Promise<ResolvedCover> {
-  const ck = (cookie || "").trim()
-  if (!ck) return NONE
+  const trimmedCookie = (cookie || "").trim()
+  if (!trimmedCookie) return NONE
   let html = ""
   for (const u of [
     `https://www.javbus.com/${code}`,
@@ -118,7 +118,7 @@ export async function javbusCover(
   ]) {
     try {
       html = await httpText(u, {
-        cookie: ck,
+        cookie: trimmedCookie,
         referer: JAVBUS_REFERER,
         timeoutMs: 20_000,
       })
@@ -131,15 +131,15 @@ export async function javbusCover(
   }
   const m = /<a class="bigImage"[^>]*href="([^"]+)"/.exec(html || "")
   if (!m) return NONE
-  let cov = m[1]!
-  if (cov.startsWith("//")) cov = "https:" + cov
-  else if (cov.startsWith("/")) cov = "https://www.javbus.com" + cov
-  const jb = cov.includes("javbus.com")
-  const meta = await probeCover(cov, jb ? JAVBUS_REFERER : DMM_REFERER)
+  let coverUrl = m[1]!
+  if (coverUrl.startsWith("//")) coverUrl = "https:" + coverUrl
+  else if (coverUrl.startsWith("/")) coverUrl = "https://www.javbus.com" + coverUrl
+  const isJavbusHosted = coverUrl.includes("javbus.com")
+  const meta = await probeCover(coverUrl, isJavbusHosted ? JAVBUS_REFERER : DMM_REFERER)
   if (!meta) return NONE
   // javbus-hosted covers route through the referer proxy; DMM-hosted ones are
   // also hotlink-protected, so both are proxied.
-  return { url: cov, ar: meta.ar, proxy: true }
+  return { url: coverUrl, ar: meta.ar, proxy: true }
 }
 
 // ----------------------------------------------------------------- javdatabase
@@ -166,16 +166,16 @@ export async function javdbCover(code: string): Promise<ResolvedCover> {
     )
   if (m) {
     const cid = m[1]!
-    for (const suf of ["ps", "pl"]) {
-      const url = `https://pics.dmm.co.jp/digital/video/${cid}/${cid}${suf}.jpg`
+    for (const suffix of ["ps", "pl"]) {
+      const url = `https://pics.dmm.co.jp/digital/video/${cid}/${cid}${suffix}.jpg`
       const meta = await probeCover(url, DMM_REFERER)
       if (meta) return { url, ar: meta.ar, proxy: true }
     }
   }
-  const mw = /https:\/\/www\.javdatabase\.com\/covers\/[^"']+?\.webp/.exec(html)
-  if (mw) {
-    const meta = await probeCover(mw[0], JAVDB_DATABASE_REFERER)
-    if (meta) return { url: mw[0], ar: meta.ar, proxy: true }
+  const webpMatch = /https:\/\/www\.javdatabase\.com\/covers\/[^"']+?\.webp/.exec(html)
+  if (webpMatch) {
+    const meta = await probeCover(webpMatch[0], JAVDB_DATABASE_REFERER)
+    if (meta) return { url: webpMatch[0], ar: meta.ar, proxy: true }
   }
   return NONE
 }
@@ -198,14 +198,14 @@ export async function javCover(
   // dmm_cover returns a RAW pics URL (hotlink-protected -> proxy).
   const dmm: DmmCover = await dmmCover(code)
   if (dmm.url) return { url: dmm.url, ar: dmm.ar, proxy: true }
-  const r18 = await r18Cover(code)
-  if (r18.url) return r18
-  const jb = await javbusCover(code, javbusCookie)
-  if (jb.url) return jb
+  const r18Result = await r18Cover(code)
+  if (r18Result.url) return r18Result
+  const javbusResult = await javbusCover(code, javbusCookie)
+  if (javbusResult.url) return javbusResult
   // mgstage_cover returns a RAW image.mgstage.com URL (hotlink-protected ->
   // proxy at display time, with a host-derived Referer).
-  const mg = await mgstageCover(code)
-  if (mg.url) return { url: mg.url, ar: mg.ar, proxy: true }
+  const mgstageResult = await mgstageCover(code)
+  if (mgstageResult.url) return { url: mgstageResult.url, ar: mgstageResult.ar, proxy: true }
   return javdbCover(code)
 }
 
@@ -348,19 +348,19 @@ export async function resolveJavCover(
       }
     }
   }
-  const r = await javCover(code, javbusCookie)
+  const resolved = await javCover(code, javbusCookie)
   // Persist the RAW url + ar (best-effort). Never cache a blob: URL — it is a
   // session-scoped reference that would be a dead link in the next app run.
-  if (isDbAvailable() && !r.url.startsWith("blob:")) {
+  if (isDbAvailable() && !resolved.url.startsWith("blob:")) {
     try {
-      await setCachedCover(key, r.url, r.ar || JAV_DEFAULT_AR)
+      await setCachedCover(key, resolved.url, resolved.ar || JAV_DEFAULT_AR)
     } catch {
       // best-effort
     }
   }
-  if (!r.url) return { url: "", ar: JAV_DEFAULT_AR }
-  const url = r.proxy ? await displayUrl(r) : r.url
-  return { url, ar: r.ar || JAV_DEFAULT_AR }
+  if (!resolved.url) return { url: "", ar: JAV_DEFAULT_AR }
+  const url = resolved.proxy ? await displayUrl(resolved) : resolved.url
+  return { url, ar: resolved.ar || JAV_DEFAULT_AR }
 }
 
 /**

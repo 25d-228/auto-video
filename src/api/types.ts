@@ -1,7 +1,6 @@
 /**
- * Response shapes of the Python sidecar (sidecar/av_proxy.py) on 127.0.0.1:8902.
- * These mirror the JSON the sidecar actually emits — see the handler class `H`
- * and the fetch_* / build_* helpers in av_proxy.py.
+ * Shared API response shapes consumed by src/api/client.ts and the TS
+ * aggregators (discover/seeders/meta/covers/library).
  */
 
 /** Library/category id used across the sidecar. */

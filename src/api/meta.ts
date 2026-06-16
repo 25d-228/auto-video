@@ -118,19 +118,19 @@ export function parseJavdb(html: string, code: string): JavMeta | null {
   const rec: JavMeta = {}
   // <title> CODE - <cast> - JAV Database  (case-insensitive, non-greedy cast)
   const escaped = code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const t = new RegExp(
+  const titleMatch = new RegExp(
     `<title>\\s*${escaped}\\s*-\\s*([\\s\\S]+?)\\s*-\\s*JAV Database`,
     "i"
   ).exec(html)
-  if (t && !t[1].toLowerCase().includes("jav")) rec.cast = t[1].trim()
-  const d = /(\d{4}-\d{2}-\d{2})/.exec(html)
-  if (d) rec.date = d[1]
-  const r = /(\d{2,3})\s*min/i.exec(html)
-  if (r) rec.runtime = `${r[1]} min`
+  if (titleMatch && !titleMatch[1].toLowerCase().includes("jav")) rec.cast = titleMatch[1].trim()
+  const dateMatch = /(\d{4}-\d{2}-\d{2})/.exec(html)
+  if (dateMatch) rec.date = dateMatch[1]
+  const runtimeMatch = /(\d{2,3})\s*min/i.exec(html)
+  if (runtimeMatch) rec.runtime = `${runtimeMatch[1]} min`
   // The page links the FANZA cover by its content id; capture it so metaLookup
   // can pull Japanese cast from r18.dev (javdatabase itself only has romaji).
-  const c = /pics\.dmm\.co\.jp\/(?:digital\/video|mono\/movie)\/([a-z0-9_]+)\//i.exec(html)
-  if (c) rec._cid = c[1]
+  const cidMatch = /pics\.dmm\.co\.jp\/(?:digital\/video|mono\/movie)\/([a-z0-9_]+)\//i.exec(html)
+  if (cidMatch) rec._cid = cidMatch[1]
   return Object.keys(rec).length > 0 ? rec : null
 }
 
@@ -226,8 +226,8 @@ export async function metaLookup(args: MetaArgs): Promise<JavMeta> {
   let rec: JavMeta = (cid ? await fromR18(cid) : null) ?? {}
   if (!rec.cast_ja && code) {
     const jdb = (await fromJavdb(code)) ?? {}
-    const jcid = jdb._cid
-    const r18ViaJdb = jcid ? (await fromR18(jcid)) ?? {} : {}
+    const javdbCid = jdb._cid
+    const r18ViaJdb = javdbCid ? (await fromR18(javdbCid)) ?? {} : {}
     rec = { ...jdb, ...rec, ...r18ViaJdb }
   }
   // Final Japanese-cast fallback: the javdb mobile API (native Japanese actor
@@ -312,13 +312,13 @@ export async function titleLookup(
   year: string,
   opts: { fresh?: boolean } = {}
 ): Promise<TitleLookupResponse> {
-  const t = (title ?? "").trim()
-  const y = (year ?? "").trim()
+  const trimmedTitle = (title ?? "").trim()
+  const trimmedYear = (year ?? "").trim()
 
   if (!(await tmdbKey())) return { ok: false, haskey: false }
-  if (!t) return { ok: false, haskey: true }
+  if (!trimmedTitle) return { ok: false, haskey: true }
 
-  const cacheKey = `${tv ? "tmdbtv:" : "tmdb:"}${t.toLowerCase()}|${y}`
+  const cacheKey = `${tv ? "tmdbtv:" : "tmdb:"}${trimmedTitle.toLowerCase()}|${trimmedYear}`
   const fresh = opts.fresh ?? false
 
   if (!fresh && isDbAvailable()) {
@@ -333,12 +333,12 @@ export async function titleLookup(
   }
 
   // tmdb_lookup(...) or {}  — Python coerces a null lookup to an empty dict.
-  let rec: TitleMeta = (await tmdbLookup(t, y, tv)) ?? {}
+  let rec: TitleMeta = (await tmdbLookup(trimmedTitle, trimmedYear, tv)) ?? {}
 
   // anime fallback: AniList cover when TMDB found none (tv only, no key needed).
   if (tv && !rec.cover) {
-    const c = await anilistCover(t)
-    if (c) rec = { cover: c, ar: 0.69 }
+    const anilistCoverUrl = await anilistCover(trimmedTitle)
+    if (anilistCoverUrl) rec = { cover: anilistCoverUrl, ar: 0.69 }
   }
 
   if (isDbAvailable()) {

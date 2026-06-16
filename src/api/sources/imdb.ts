@@ -35,6 +35,9 @@ export const IMDB_GRAPHQL_URL = "https://api.graphql.imdb.com/"
 /** Listing cache TTL in seconds — matches the sidecar's LIST_TTL. */
 export const LIST_TTL_SEC = 300
 
+/** advancedTitleSearch page size (the `first:` arg in the GraphQL query). */
+const IMDB_SEARCH_FIRST = 60
+
 /** Sort ids accepted by {@link fetchImdbChart} (mirrors the sidecar UI sorts). */
 export type ImdbSort = "popular" | "top_rated" | "most_voted" | "newest"
 
@@ -97,7 +100,9 @@ export function buildImdbQuery(cat: Cat, sort: ImdbSort = "popular"): string {
     ? `,userRatingsConstraint:{ratingsCountRange:{min:${spec.minVotes}}}`
     : ""
   return (
-    "query{advancedTitleSearch(first:60,sort:{sortBy:" +
+    "query{advancedTitleSearch(first:" +
+    IMDB_SEARCH_FIRST +
+    ",sort:{sortBy:" +
     spec.sortBy +
     ",sortOrder:" +
     spec.sortOrder +
@@ -129,35 +134,35 @@ function round1(n: number): number {
 export function parseImdbChart(json: ImdbGqlResponse, cat: Cat): DiscoverItem[] {
   const edges = json?.data?.advancedTitleSearch?.edges ?? []
   const out: DiscoverItem[] = []
-  for (const e of edges) {
-    const t = e?.node?.title
-    if (!t) continue
-    const img = t.primaryImage?.url ?? ""
-    if (!img) continue // Python: `if not img: continue`
-    const yr = t.releaseYear?.year ?? ""
-    const yrStr = yr === "" ? "" : String(yr)
-    const ttid = (t.id ?? "").trim()
-    const rating = round1(t.ratingsSummary?.aggregateRating ?? 0)
+  for (const edge of edges) {
+    const title = edge?.node?.title
+    if (!title) continue
+    const imageUrl = title.primaryImage?.url ?? ""
+    if (!imageUrl) continue // Python: `if not img: continue`
+    const year = title.releaseYear?.year ?? ""
+    const yearText = year === "" ? "" : String(year)
+    const titleId = (title.id ?? "").trim()
+    const rating = round1(title.ratingsSummary?.aggregateRating ?? 0)
     const item: DiscoverItem = {
-      id: `imdb_${t.id ?? ""}`,
+      id: `imdb_${title.id ?? ""}`,
       cat,
-      title: t.titleText?.text ?? "",
-      sub: yrStr,
-      cover: img,
+      title: title.titleText?.text ?? "",
+      sub: yearText,
+      cover: imageUrl,
       ar: 0.675,
       seeders: 0,
       size: "",
       src: "IMDb",
       state: "new",
-      year: yrStr,
+      year: yearText,
       runtime: 0,
       rating,
-      code: t.id ?? "",
+      code: title.id ?? "",
       date: "",
       added: out.length,
     }
-    if (ttid.startsWith("tt")) {
-      item.link = `https://www.imdb.com/title/${ttid}/`
+    if (titleId.startsWith("tt")) {
+      item.link = `https://www.imdb.com/title/${titleId}/`
     }
     out.push(item)
   }

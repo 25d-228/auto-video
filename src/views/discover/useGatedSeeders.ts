@@ -61,8 +61,10 @@ export class FetchGate {
   }
 }
 
+const MAX_CONCURRENT_SEEDER_LOOKUPS = 4
+
 /** One shared gate for all Discover seeder lookups. */
-const seedGate = new FetchGate(4)
+const seedGate = new FetchGate(MAX_CONCURRENT_SEEDER_LOOKUPS)
 
 /**
  * useSeeders, but held behind the shared gate. Pass the page item; the

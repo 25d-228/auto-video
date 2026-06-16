@@ -5,6 +5,11 @@ import { CoverImage } from "./CoverImage"
 /** Card state badge: NEW / ✓ In library / downloading %. */
 export type MediaState = "new" | "library" | "downloading"
 
+/** Cover aspect-ratio placeholder (w/h) used before the image's own ratio is known. */
+const DEFAULT_COVER_ASPECT = 0.7
+/** Cover height in px when the caller doesn't pin one. */
+const DEFAULT_COVER_HEIGHT_PX = 180
+
 export interface MediaCardProps {
   title: string
   /** Sub line under the title, e.g. "2026" or "S02E04". */
@@ -66,8 +71,8 @@ export function MediaCard({
   title,
   sub,
   cover,
-  ar = 0.7,
-  coverHeight = 180,
+  ar = DEFAULT_COVER_ASPECT,
+  coverHeight = DEFAULT_COVER_HEIGHT_PX,
   source,
   state,
   progress,

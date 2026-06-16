@@ -35,7 +35,6 @@ export const VR_LABELS = [
 
 const VR_LABEL_RE = new RegExp(`\\b(${VR_LABELS.join("|")})\\b`, "i")
 
-/** Python: is_vr(title, code) */
 export function isVr(title: string, code: string): boolean {
   const t = title || ""
   // case-sensitive on purpose (matches the Python regex without re.I)
@@ -46,9 +45,9 @@ export function isVr(title: string, code: string): boolean {
 }
 
 /**
- * Python: parse_code(title). Extracts a JAV code like "ABCD-123" from a
- * release title. FC2-PPV ids are normalized; a leading digit on the label
- * (e.g. 3DSVR) survives only for known VR labels.
+ * Extracts a JAV code like "ABCD-123" from a release title. FC2-PPV ids are
+ * normalized; a leading digit on the label (e.g. 3DSVR) survives only for
+ * known VR labels.
  */
 export function parseCode(title: string): string {
   const t = title || ""
@@ -79,10 +78,10 @@ export function parseCode(title: string): string {
  * other multi-segment ids are left untouched.
  */
 export function normalizeCodeNum(code: string): string {
-  const m = /^([A-Za-z0-9]+)-(\d+)$/.exec(code || "")
-  if (!m) return code || ""
-  const n = m[2]!.replace(/^0+/, "") || "0"
-  return `${m[1]}-${n.padStart(3, "0")}`
+  const codeMatch = /^([A-Za-z0-9]+)-(\d+)$/.exec(code || "")
+  if (!codeMatch) return code || ""
+  const n = codeMatch[2]!.replace(/^0+/, "") || "0"
+  return `${codeMatch[1]}-${n.padStart(3, "0")}`
 }
 
 // markers that end the series-name part of a TV release name
@@ -103,7 +102,7 @@ const TV_MARKERS: RegExp[] = [
   /\b720|\b1080|\b2160/i,
 ]
 
-/** Equivalent of Python's str.strip(chars): trim a char set from both ends. */
+/** Trim a char set from both ends (like Python's str.strip(chars)). */
 function stripChars(s: string, chars: string): string {
   let start = 0
   let end = s.length
@@ -113,18 +112,18 @@ function stripChars(s: string, chars: string): string {
 }
 
 /**
- * Python: parse_tv_name(name). Returns [series, se] where se is "SxxEyy"
- * (zero-padded to at least 2 digits) or "". The series name is everything
- * before the earliest marker, with dots/underscores turned into spaces.
+ * Returns [series, se] where se is "SxxEyy" (zero-padded to at least 2 digits)
+ * or "". The series name is everything before the earliest marker, with
+ * dots/underscores turned into spaces.
  */
 export function parseTvName(name: string): [series: string, se: string] {
   const s = name || ""
-  const m = /\bS(\d{1,2})E(\d{1,3})\b/i.exec(s)
-  const se = m
+  const seasonEpisodeMatch = /\bS(\d{1,2})E(\d{1,3})\b/i.exec(s)
+  const se = seasonEpisodeMatch
     ? "S" +
-      String(parseInt(m[1]!, 10)).padStart(2, "0") +
+      String(parseInt(seasonEpisodeMatch[1]!, 10)).padStart(2, "0") +
       "E" +
-      String(parseInt(m[2]!, 10)).padStart(2, "0")
+      String(parseInt(seasonEpisodeMatch[2]!, 10)).padStart(2, "0")
     : ""
   let cut = s.length
   for (const marker of TV_MARKERS) {

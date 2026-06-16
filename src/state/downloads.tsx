@@ -25,6 +25,9 @@ export function isTauri(): boolean {
 
 export type DownloadState = "downloading" | "paused" | "done" | "error"
 
+/** How long the bottom-right toast stays visible. */
+const TOAST_DURATION_MS = 2400
+
 const DOWNLOAD_STATES: readonly string[] = [
   "downloading",
   "paused",
@@ -58,14 +61,14 @@ type DownloadEntryBase = Pick<DownloadEntry, "id" | "title" | "dest">
 function errorEntry(
   prev: Record<string, DownloadEntry>,
   base: DownloadEntryBase,
-  e: unknown
+  cause: unknown
 ): DownloadEntry {
   return {
     ...base,
     progress: prev[base.id]?.progress ?? 0,
     speedMbps: 0,
     state: "error",
-    error: String(e),
+    error: String(cause),
   }
 }
 
@@ -136,7 +139,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   const notify = useCallback((message: string) => {
     setToast(message)
     if (toastTimer.current !== undefined) window.clearTimeout(toastTimer.current)
-    toastTimer.current = window.setTimeout(() => setToast(null), 2400)
+    toastTimer.current = window.setTimeout(() => setToast(null), TOAST_DURATION_MS)
   }, [])
 
   useEffect(() => {

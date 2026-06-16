@@ -52,9 +52,9 @@ export function DiscoverDetail({
 
   const { downloads } = useDownloads()
 
-  const jav = it !== null && (it.cat === "ad" || it.cat === "vrc")
+  const isJav = it !== null && (it.cat === "ad" || it.cat === "vrc")
   const metaQ = useMeta(
-    jav && it ? { cid: cidOf(it.cover), code: it.code, cat: it.cat } : {}
+    isJav && it ? { cid: cidOf(it.cover), code: it.code, cat: it.cat } : {}
   )
   // fetch only while open; usually already cached by the card's badge
   const seedQ = useSeeders(item)
@@ -62,7 +62,7 @@ export function DiscoverDetail({
   if (!it) return null
 
   const cs = itemState(it, owned, downloads)
-  const meta = jav ? metaQ.data : undefined
+  const meta = isJav ? metaQ.data : undefined
 
   const seed = seedQ.data
   const seedSources = seed ? Object.keys(seed.sources) : []
@@ -122,12 +122,12 @@ export function DiscoverDetail({
         ) : undefined
       }
     >
-      {jav && metaQ.isFetching && (
+      {isJav && metaQ.isFetching && (
         <div className="mt-3.5 text-[10.5px] font-semibold tracking-wider text-muted-foreground uppercase">
           fetching Japanese title + cast…
         </div>
       )}
-      {jav && metaQ.isError && (
+      {isJav && metaQ.isError && (
         <div className="mt-3.5 text-[10.5px] font-semibold tracking-wider text-muted-foreground uppercase">
           metadata lookup failed
         </div>

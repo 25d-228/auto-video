@@ -100,6 +100,15 @@ export function buildRequestInit(
   return init
 }
 
+/** Read a response body as text, swallowing any read failure. */
+async function readBodySafe(res: Response): Promise<string | undefined> {
+  try {
+    return await res.text()
+  } catch {
+    return undefined
+  }
+}
+
 /** Run the request and throw {@link HttpError} on transport failure / non-2xx. */
 async function request(url: string, opts: HttpOptions = {}): Promise<Response> {
   let res: Response
@@ -111,12 +120,7 @@ async function request(url: string, opts: HttpOptions = {}): Promise<Response> {
   }
   if (!res.ok) {
     // Pull a bit of the body for diagnostics; ignore failures reading it.
-    let body: string | undefined
-    try {
-      body = await res.text()
-    } catch {
-      body = undefined
-    }
+    const body = await readBodySafe(res)
     throw new HttpError(
       `HTTP ${res.status} ${res.statusText} for ${url}`,
       res.status,
@@ -214,7 +218,6 @@ export async function coverObjectUrl(
   const res = await request(url, { ...opts, referer })
 
   const raw = new Uint8Array(await res.arrayBuffer())
-  // javdb covers are single-byte-XOR "encrypted"; decode to the real image.
   const bytes = isCmastdCover(url) ? decryptCmastd(raw) : raw
 
   // Some CDNs mislabel images as octet-stream; coerce to a sane image type.

@@ -40,12 +40,9 @@ const CATS: readonly ChipOption<Cat>[] = [
   { value: "ad", label: "Adult" },
   { value: "vrc", label: "VR" },
 ]
-const CAT_LABEL: Record<Cat, string> = {
-  mov: "Movies",
-  tv: "TV",
-  ad: "Adult",
-  vrc: "VR",
-}
+const CAT_LABEL = Object.fromEntries(
+  CATS.map((c) => [c.value, c.label])
+) as Record<Cat, string>
 
 type Rank = "alpha" | "release"
 type Dir = "asc" | "desc"
@@ -59,6 +56,8 @@ const DIRS: readonly ChipOption<Dir>[] = [
   { value: "desc", label: "↓ Desc" },
 ]
 
+const SEARCH_DEBOUNCE_MS = 200
+
 
 function EmptyState({ children }: { children: ReactNode }) {
   return (
@@ -71,7 +70,7 @@ function EmptyState({ children }: { children: ReactNode }) {
 export default function Library() {
   const [cat, setCat] = useState<Cat>("mov")
   const [search, setSearch] = useState("")
-  const [q, setQ] = useState("") // debounced copy of `search`
+  const [debouncedSearch, setDebouncedSearch] = useState("")
   const [rank, setRank] = useState<Rank>("alpha")
   const [dir, setDir] = useState<Dir>("asc")
   const [selected, setSelected] = useState<LibraryItem | null>(null)
@@ -86,8 +85,11 @@ export default function Library() {
 
   // debounce the search box into the filter (the old oninput -> libFill)
   useEffect(() => {
-    const t = window.setTimeout(() => setQ(search), 200)
-    return () => window.clearTimeout(t)
+    const timeoutId = window.setTimeout(
+      () => setDebouncedSearch(search),
+      SEARCH_DEBOUNCE_MS
+    )
+    return () => window.clearTimeout(timeoutId)
   }, [search])
 
   const catItems = useMemo(
@@ -97,7 +99,7 @@ export default function Library() {
 
   // the old libFilteredPool(): search on display title or filename, then sort
   const pool = useMemo(() => {
-    const needle = q.trim().toLowerCase()
+    const needle = debouncedSearch.trim().toLowerCase()
     const filtered = needle
       ? catItems.filter(
           (i) =>
@@ -110,7 +112,7 @@ export default function Library() {
       if (cmp === 0) cmp = a.title.localeCompare(b.title)
       return dir === "desc" ? -cmp : cmp
     })
-  }, [catItems, q, rank, dir])
+  }, [catItems, debouncedSearch, rank, dir])
 
   // Fixed-height, non-scrolling card area: page size = however many fit.
   const gridBoxRef = useRef<HTMLDivElement>(null)
@@ -119,12 +121,12 @@ export default function Library() {
   const { setPage } = pager
   useEffect(() => {
     setPage(1)
-  }, [cat, q, rank, dir, setPage])
+  }, [cat, debouncedSearch, rank, dir, setPage])
 
   const changeCat = (next: Cat) => {
     setCat(next)
     setSearch("") // the old app cleared the query on category switch
-    setQ("")
+    setDebouncedSearch("")
     setDetailOpen(false)
   }
 
@@ -194,7 +196,7 @@ export default function Library() {
       </EmptyState>
     )
   } else if (pool.length === 0) {
-    body = <EmptyState>No matches for “{q.trim()}”.</EmptyState>
+    body = <EmptyState>No matches for “{debouncedSearch.trim()}”.</EmptyState>
   } else {
     body = (
       <CardGrid>

@@ -146,8 +146,8 @@ export function DownloadDialog({ item, onClose }: DownloadDialogProps) {
   // Default selection: the video files (else everything) whenever the list loads.
   useEffect(() => {
     if (!files) return
-    const vids = files.filter((f) => RENAME_VIDEO_RE.test(f.name)).map((f) => f.index)
-    setPicked(new Set(vids.length > 0 ? vids : files.map((f) => f.index)))
+    const videoFileIndices = files.filter((f) => RENAME_VIDEO_RE.test(f.name)).map((f) => f.index)
+    setPicked(new Set(videoFileIndices.length > 0 ? videoFileIndices : files.map((f) => f.index)))
   }, [files])
   const toggleFile = (i: number) =>
     setPicked((prev) => {

@@ -91,10 +91,10 @@ async function javbusCookie(): Promise<string> {
  */
 async function proxyCovers(items: DiscoverItem[]): Promise<void> {
   await Promise.all(
-    items.map(async (x) => {
-      if (!x.cover || x.cover.startsWith("blob:")) return
+    items.map(async (item) => {
+      if (!item.cover || item.cover.startsWith("blob:")) return
       try {
-        x.cover = await coverObjectUrl(x.cover)
+        item.cover = await coverObjectUrl(item.cover)
       } catch {
         // keep raw URL; CoverImage shows the placeholder
       }
@@ -105,9 +105,9 @@ async function proxyCovers(items: DiscoverItem[]): Promise<void> {
 /** Keep only items that carry a cover, then cut to `n` (port of the Python list-comp). */
 function keepCovered(items: DiscoverItem[], n: number): DiscoverItem[] {
   const out: DiscoverItem[] = []
-  for (const x of items) {
-    if (!x.cover) continue
-    out.push(x)
+  for (const item of items) {
+    if (!item.cover) continue
+    out.push(item)
     if (out.length >= n) break
   }
   return out
@@ -152,7 +152,7 @@ async function cachedListing(
       // may be a transient/now-fixed failure, so re-verify it this session.
       const stale =
         sid !== SESSION_TAG &&
-        (items.length === 0 || items.some((x) => x.cover.startsWith("blob:")))
+        (items.length === 0 || items.some((item) => item.cover.startsWith("blob:")))
       if (!stale) return items
     }
   }
@@ -167,15 +167,6 @@ async function cachedListing(
   return data
 }
 
-/**
- * Build a Discover feed for the given two-dropdown selection.
- *
- * @param cat    library category: mov | tv | ad | vrc
- * @param source provider id (tmdb/imdb/yts/tpb/javdb/dmm/mgstage/sukebei)
- * @param list   list id within the provider (trending/popular/newest/…)
- * @param n      max items to return (default 50)
- * @param fresh  bypass the 300s listing cache
- */
 /** Extra per-provider controls (the JavDB year/month/sort browser selectors). */
 export interface DiscoverOpts {
   year?: string
@@ -186,6 +177,15 @@ export interface DiscoverOpts {
   mode?: string
 }
 
+/**
+ * Build a Discover feed for the given two-dropdown selection.
+ *
+ * @param cat    library category: mov | tv | ad | vrc
+ * @param source provider id (tmdb/imdb/yts/tpb/javdb/dmm/mgstage/sukebei)
+ * @param list   list id within the provider (trending/popular/newest/…)
+ * @param n      max items to return (default 50)
+ * @param fresh  bypass the 300s listing cache
+ */
 export async function discover(
   cat: Cat,
   source: string,
@@ -259,11 +259,11 @@ export async function discover(
     // Both the VR browser (vrc) and the Adult→Category browser (mode ===
     // "category") are driven by the year/month/sort opts rather than the list
     // id, so fold those (and the mode) into the cache key.
-    const jkey =
+    const javdbCacheKey =
       cat === "vrc" || opts.mode === "category"
         ? `${key}|${opts.mode ?? ""}|${opts.year ?? ""}|${opts.month ?? ""}|${opts.sortBy ?? ""}|${opts.orderBy ?? ""}`
         : key
-    const data = await cachedListing(jkey, fresh, () => javdbDiscover(cat, lst, opts))
+    const data = await cachedListing(javdbCacheKey, fresh, () => javdbDiscover(cat, lst, opts))
     await proxyCovers(data)
     return keepCovered(data, n)
   }
@@ -289,7 +289,7 @@ export async function discover(
     wantVr ? fetchSukebei(lst, "VR", 4) : fetchSukebei(lst, "", 8)
   )) as SukebeiItem[]
   // Split the pool by VR-ness, then assign the real category + sub + cover.
-  const filtered = pool.filter((x) => Boolean(x.vr) === wantVr)
+  const filtered = pool.filter((item) => Boolean(item.vr) === wantVr)
   await resolveCovers(cat, filtered, cookie)
   const out: DiscoverItem[] = []
   for (const x of filtered) {

@@ -73,7 +73,7 @@ export default function Downloads({
     }
   }
 
-  const cancelKeep = async (entry: DownloadEntry) => {
+  const cancelKeepingFiles = async (entry: DownloadEntry) => {
     if (await cancelDownload(entry.id, false)) {
       notify("Download cancelled — files kept")
     }
@@ -113,7 +113,7 @@ export default function Downloads({
                     tauri={tauri}
                     onPause={(e) => void pauseDownload(e.id)}
                     onResume={(e) => void resumeDownload(e.id)}
-                    onCancelKeep={(e) => void cancelKeep(e)}
+                    onCancelKeep={(e) => void cancelKeepingFiles(e)}
                     onCancelDelete={setPendingDelete}
                     onOpenFolder={(e) => void openFolder(e)}
                   />

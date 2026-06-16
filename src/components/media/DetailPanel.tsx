@@ -5,6 +5,8 @@ import { cn } from "@/lib/utils"
 import { Chiplet } from "./ChipRow"
 import { CoverImage } from "./CoverImage"
 
+const DEFAULT_POSTER_ASPECT = 0.67
+
 export interface DetailFact {
   label: string
   value: ReactNode
@@ -117,7 +119,7 @@ export function DetailPanel({
       <div className="flex-1 overflow-y-auto p-3.5">
         <div
           className="w-full overflow-hidden rounded-[10px] border"
-          style={{ aspectRatio: String(measuredAr ?? coverAspect ?? 0.67) }}
+          style={{ aspectRatio: String(measuredAr ?? coverAspect ?? DEFAULT_POSTER_ASPECT) }}
         >
           <CoverImage src={cover} title={title} onRatio={setMeasuredAr} />
         </div>

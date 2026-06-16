@@ -15,6 +15,9 @@ import { dmmCidToCode } from "./dmm"
 
 const DMM_GQL = "https://api.video.dmm.co.jp/graphql"
 
+/** Wide digital jacket (~1600x1000); CoverImage measures the real ratio. */
+const DIGITAL_WIDE_JACKET_AR = 1.6
+
 /** One content node from the digital API (`content.id` is the cid). */
 export interface DigitalContent {
   id: string
@@ -32,7 +35,7 @@ interface SearchData {
 /** POST a GraphQL query; returns the `data` payload or null on any failure. */
 async function gql<T>(query: string, variables?: Record<string, unknown>): Promise<T | null> {
   try {
-    const r = await httpJson<{ data?: T }>(DMM_GQL, {
+    const response = await httpJson<{ data?: T }>(DMM_GQL, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -44,7 +47,7 @@ async function gql<T>(query: string, variables?: Record<string, unknown>): Promi
       body: JSON.stringify({ query, variables }),
       timeoutMs: 15_000,
     })
-    return r?.data ?? null
+    return response?.data ?? null
   } catch {
     return null
   }
@@ -58,19 +61,19 @@ async function gql<T>(query: string, variables?: Record<string, unknown>): Promi
 export function mapDigitalContents(contents: readonly DigitalContent[]): DiscoverItem[] {
   const out: DiscoverItem[] = []
   const seen = new Set<string>()
-  for (const c of contents) {
-    const cid = c.id || ""
+  for (const content of contents) {
+    const cid = content.id || ""
     if (!cid || seen.has(cid)) continue
     seen.add(cid)
     const code = dmmCidToCode(cid)
-    const cover = (c.packageImage?.largeUrl || "").replace(/pl\.jpg(\?.*)?$/i, "ps.jpg$1")
+    const cover = (content.packageImage?.largeUrl || "").replace(/pl\.jpg(\?.*)?$/i, "ps.jpg$1")
     out.push({
       id: "dmm_" + cid,
       cat: "vrc",
       title: code || cid,
       sub: "VR",
       cover,
-      ar: 1.6, // wide digital jacket (~1600x1000); CoverImage measures the real ratio
+      ar: DIGITAL_WIDE_JACKET_AR, // CoverImage measures the real ratio
       seeders: 0,
       size: "",
       src: "DMM",
@@ -101,12 +104,12 @@ const SEARCH_Q =
  * vrkm01577, so the digital VR cards use this instead.
  */
 export async function dmmDigitalPreviews(cid: string): Promise<string[]> {
-  const safe = (cid || "").replace(/[^a-z0-9_]/gi, "")
-  if (!safe) return []
-  const d = await gql<{ ppvContent?: { sampleImages?: { largeImageUrl?: string }[] } | null }>(
-    `{ ppvContent(id: "${safe}") { sampleImages { largeImageUrl } } }`
+  const sanitizedCid = (cid || "").replace(/[^a-z0-9_]/gi, "")
+  if (!sanitizedCid) return []
+  const data = await gql<{ ppvContent?: { sampleImages?: { largeImageUrl?: string }[] } | null }>(
+    `{ ppvContent(id: "${sanitizedCid}") { sampleImages { largeImageUrl } } }`
   )
-  return (d?.ppvContent?.sampleImages ?? [])
+  return (data?.ppvContent?.sampleImages ?? [])
     .map((s) => s.largeImageUrl || "")
     .filter(Boolean)
 }
@@ -119,15 +122,15 @@ export async function dmmDigitalPreviews(cid: string): Promise<string[]> {
 export async function fetchDmmDigitalVr(list: string): Promise<DiscoverItem[]> {
   if (list === "newest" || list === "top_rated") {
     const sort = list === "newest" ? "RELEASE_DATE" : "REVIEW_RANK_SCORE"
-    const d = await gql<SearchData>(SEARCH_Q, {
+    const searchData = await gql<SearchData>(SEARCH_Q, {
       limit: 100,
       floor: "AV",
       sort,
       filter: { contentType: "VR" },
     })
-    return mapDigitalContents(d?.legacySearchPPV?.result?.contents ?? [])
+    return mapDigitalContents(searchData?.legacySearchPPV?.result?.contents ?? [])
   }
   const type = list === "monthly" ? "SALES_MONTHLY" : "SALES_BEST_SELLERS"
-  const d = await gql<RankingData>(RANKING_Q(type))
-  return mapDigitalContents((d?.ppvContentRanking?.items ?? []).map((i) => i.content))
+  const rankingData = await gql<RankingData>(RANKING_Q(type))
+  return mapDigitalContents((rankingData?.ppvContentRanking?.items ?? []).map((i) => i.content))
 }

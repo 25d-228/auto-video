@@ -208,11 +208,14 @@ export const JAVDB_AD_MODE_OPTIONS: readonly { value: JavdbAdMode; label: string
   { value: "category", label: "Category" },
 ]
 
+const JAVDB_NEWEST_YEAR = 2026
+const JAVDB_OLDEST_YEAR = 2001
+
 /** Year options ("" = all years), newest first (2026 → 2001). */
 export const JAVDB_YEAR_OPTIONS: readonly { value: string; label: string }[] = [
   { value: "", label: "All years" },
-  ...Array.from({ length: 2026 - 2001 + 1 }, (_, i) => {
-    const y = String(2026 - i)
+  ...Array.from({ length: JAVDB_NEWEST_YEAR - JAVDB_OLDEST_YEAR + 1 }, (_, i) => {
+    const y = String(JAVDB_NEWEST_YEAR - i)
     return { value: y, label: y }
   }),
 ]
@@ -225,7 +228,7 @@ const MONTH_NAMES = [
 /** Month options ("" = all months); value is the 1–12 month tag id. */
 export const JAVDB_MONTH_OPTIONS: readonly { value: string; label: string }[] = [
   { value: "", label: "All months" },
-  ...MONTH_NAMES.map((nm, i) => ({ value: String(i + 1), label: nm })),
+  ...MONTH_NAMES.map((name, i) => ({ value: String(i + 1), label: name })),
 ]
 
 /** One JavDB VR sort option (Image #5), mapped to the API sort_by/order_by. */

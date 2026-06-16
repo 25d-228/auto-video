@@ -92,9 +92,9 @@ function DiskRow({ label, disk }: { label: string; disk: DiskStats }) {
 // --------------------------------------------------------- download rows
 
 function DownloadRow({ entry }: { entry: DownloadEntry }) {
-  const pct =
+  const percentComplete =
     entry.state === "done" ? 100 : Math.round(entry.progress * 100)
-  const fill =
+  const barColorClass =
     entry.state === "done"
       ? "bg-green-600"
       : entry.state === "error"
@@ -107,8 +107,8 @@ function DownloadRow({ entry }: { entry: DownloadEntry }) {
       </div>
       <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
         <div
-          className={`h-full rounded-full ${fill}`}
-          style={{ width: `${pct}%` }}
+          className={`h-full rounded-full ${barColorClass}`}
+          style={{ width: `${percentComplete}%` }}
         />
       </div>
       <div className="w-24 shrink-0 text-right text-[11px] text-muted-foreground">
@@ -117,7 +117,7 @@ function DownloadRow({ entry }: { entry: DownloadEntry }) {
         ) : entry.state === "error" ? (
           <span className="font-semibold text-red-500">failed</span>
         ) : (
-          `${pct}% · ${entry.speedMbps.toFixed(1)} MB/s`
+          `${percentComplete}% · ${entry.speedMbps.toFixed(1)} MB/s`
         )}
       </div>
     </div>
@@ -141,7 +141,7 @@ export default function Dashboard() {
     offlineCats !== undefined ? CATS.length - offlineCats.length : undefined
 
   // tile subtitle while stats are unavailable
-  const statsFallback = statsQuery.isError ? "stats unavailable" : "loading…"
+  const statsSubtitleFallback = statsQuery.isError ? "stats unavailable" : "loading…"
 
   return (
     <section className="flex h-full min-h-0 flex-col p-5">
@@ -166,14 +166,14 @@ export default function Dashboard() {
           <StatTile
             label="Files in library"
             value={filesTotal ?? "—"}
-            sub={disks ? "across 4 categories" : statsFallback}
+            sub={disks ? `across ${CATS.length} categories` : statsSubtitleFallback}
           />
           <StatTile
             label="Folders online"
-            value={onlineCount !== undefined ? `${onlineCount} / 4` : "—"}
+            value={onlineCount !== undefined ? `${onlineCount} / ${CATS.length}` : "—"}
             sub={
               offlineCats === undefined
-                ? statsFallback
+                ? statsSubtitleFallback
                 : offlineCats.length === 0
                   ? "all folders online"
                   : `${offlineCats.map((c) => c.label).join(", ")} offline`

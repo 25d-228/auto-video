@@ -52,6 +52,9 @@ const KEY_FIELDS: { provider: string; label: string; placeholder: string }[] = [
 /** Fallback when the Tauri shell (and getVersion) is unavailable. */
 const APP_VERSION_FALLBACK = "0.1.0"
 
+/** How long the "Saved"/"Save failed" status stays visible after saving keys. */
+const SAVE_STATUS_FLASH_MS = 2500
+
 const THEME_OPTIONS = [
   { value: "light", label: "Light" },
   { value: "dark", label: "Dark" },
@@ -72,10 +75,10 @@ interface FolderRowProps {
 function FolderRow({ cat, label, saved, tauri, onSave }: FolderRowProps) {
   // null = untouched -> show the helper's stored value
   const [draft, setDraft] = useState<string | null>(null)
-  const [picking, setPicking] = useState(false)
+  const [isPicking, setIsPicking] = useState(false)
 
   const value = draft ?? saved
-  const dirty = draft !== null && draft.trim() !== saved
+  const isDirty = draft !== null && draft.trim() !== saved
 
   const commit = async (path: string) => {
     const trimmed = path.trim()
@@ -84,8 +87,8 @@ function FolderRow({ cat, label, saved, tauri, onSave }: FolderRowProps) {
   }
 
   const browse = async () => {
-    if (!tauri || picking) return
-    setPicking(true)
+    if (!tauri || isPicking) return
+    setIsPicking(true)
     try {
       const picked = await openFolderDialog({
         directory: true,
@@ -98,7 +101,7 @@ function FolderRow({ cat, label, saved, tauri, onSave }: FolderRowProps) {
         await commit(picked)
       }
     } finally {
-      setPicking(false)
+      setIsPicking(false)
     }
   }
 
@@ -113,11 +116,11 @@ function FolderRow({ cat, label, saved, tauri, onSave }: FolderRowProps) {
           <Button
             size="sm"
             className="h-8 flex-none gap-1.5"
-            disabled={!tauri || picking}
+            disabled={!tauri || isPicking}
             onClick={() => void browse()}
           >
             <FolderOpen className="size-3.5" />
-            {picking ? "Choosing…" : "Browse…"}
+            {isPicking ? "Choosing…" : "Browse…"}
           </Button>
         </Hint>
         {/* Show the current folder next to the button when it isn't being
@@ -142,16 +145,16 @@ function FolderRow({ cat, label, saved, tauri, onSave }: FolderRowProps) {
           placeholder={`Absolute path, e.g. /Volumes/Media/${label}`}
           onChange={(e) => setDraft(e.target.value)}
           onBlur={() => {
-            if (dirty) void commit(value)
+            if (isDirty) void commit(value)
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && dirty) void commit(value)
+            if (e.key === "Enter" && isDirty) void commit(value)
           }}
           className="h-7 flex-1 text-[11px]"
         />
       </div>
       <p className="mt-1 ml-16 text-[11px] text-muted-foreground">
-        {dirty ? (
+        {isDirty ? (
           <span className="text-amber-600 dark:text-amber-500">
             Unsaved — press Enter or click away to save
           </span>
@@ -257,7 +260,7 @@ function ProviderKeysCard() {
     if (statusTimer.current !== undefined) {
       window.clearTimeout(statusTimer.current)
     }
-    statusTimer.current = window.setTimeout(() => setStatus(null), 2500)
+    statusTimer.current = window.setTimeout(() => setStatus(null), SAVE_STATUS_FLASH_MS)
   }
 
   const saveAll = async () => {
@@ -337,9 +340,9 @@ function ProviderKeysCard() {
 // ------------------------------------------------------------- download speed
 
 /** A numeric KiB/s field that treats blank / 0 / invalid as "unlimited". */
-function toKib(s: string): number {
-  const n = Math.floor(Number(s))
-  return Number.isFinite(n) && n > 0 ? n : 0
+function parseKibLimit(raw: string): number {
+  const parsed = Math.floor(Number(raw))
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
 }
 
 function DownloadLimitsCard() {
@@ -348,22 +351,24 @@ function DownloadLimitsCard() {
   const keysQuery = useKeys()
   const stored = keysQuery.data
   // undefined = untouched -> show the stored value ("0" renders as blank).
-  const [drafts, setDrafts] = useState<{ dl?: string; ul?: string }>({})
+  const [drafts, setDrafts] = useState<{ download?: string; upload?: string }>(
+    {}
+  )
   const [saving, setSaving] = useState(false)
 
-  const shown = (key: string) => {
+  const storedDisplayValue = (key: string) => {
     const v = stored?.[key] ?? ""
     return v === "0" ? "" : v
   }
-  const dlVal = drafts.dl ?? shown("dlLimitKib")
-  const ulVal = drafts.ul ?? shown("ulLimitKib")
-  const dirty = drafts.dl !== undefined || drafts.ul !== undefined
+  const downloadValue = drafts.download ?? storedDisplayValue("dlLimitKib")
+  const uploadValue = drafts.upload ?? storedDisplayValue("ulLimitKib")
+  const dirty = drafts.download !== undefined || drafts.upload !== undefined
 
   const save = async () => {
     setSaving(true)
     try {
-      const downloadKib = toKib(dlVal)
-      const uploadKib = toKib(ulVal)
+      const downloadKib = parseKibLimit(downloadValue)
+      const uploadKib = parseKibLimit(uploadValue)
       await saveKey("dlLimitKib", String(downloadKib))
       await saveKey("ulLimitKib", String(uploadKib))
       await queryClient.invalidateQueries({ queryKey: qk.keys() })
@@ -415,10 +420,12 @@ function DownloadLimitsCard() {
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
-        {field("Max download", dlVal, (v) =>
-          setDrafts((p) => ({ ...p, dl: v }))
+        {field("Max download", downloadValue, (v) =>
+          setDrafts((p) => ({ ...p, download: v }))
         )}
-        {field("Max upload", ulVal, (v) => setDrafts((p) => ({ ...p, ul: v })))}
+        {field("Max upload", uploadValue, (v) =>
+          setDrafts((p) => ({ ...p, upload: v }))
+        )}
         <div>
           <Button
             size="sm"

@@ -114,34 +114,38 @@ export function parseSukebeiList(
   const rows = tbody[1]!.match(/<tr[^>]*>[\s\S]*?<\/tr>/g)
   if (!rows) return items
 
-  for (const r of rows) {
+  for (const row of rows) {
     // The view link + title: prefer the `title="..."` attribute, fall back to
     // the anchor text (matches the sidecar's two-pattern attempt).
-    const mv =
-      /\/view\/(\d+)"\s+title="([^"]*)"/.exec(r) ??
-      /\/view\/(\d+)"[^>]*>([^<]+)</.exec(r)
-    if (!mv) continue
-    const vid = mv[1]!
-    if (seen.has(vid)) continue
-    seen.add(vid)
-    const title = unescapeHtml(mv[2]!)
+    const viewMatch =
+      /\/view\/(\d+)"\s+title="([^"]*)"/.exec(row) ??
+      /\/view\/(\d+)"[^>]*>([^<]+)</.exec(row)
+    if (!viewMatch) continue
+    const viewId = viewMatch[1]!
+    if (seen.has(viewId)) continue
+    seen.add(viewId)
+    const title = unescapeHtml(viewMatch[2]!)
 
-    const mg = /href="(magnet:[^"]+)"/.exec(r)
-    const magnet = mg ? unescapeHtml(mg[1]!) : ""
+    const magnetMatch = /href="(magnet:[^"]+)"/.exec(row)
+    const magnet = magnetMatch ? unescapeHtml(magnetMatch[1]!) : ""
 
     // nyaa's text-center columns are [Link, Size, Date, Seeders, Leechers,
     // Completed]; size is tds[-5], seeders tds[-3], completed/downloads tds[-1].
-    const tds = [...r.matchAll(/<td class="text-center"[^>]*>([\s\S]*?)<\/td>/g)].map(
+    const centerCells = [...row.matchAll(/<td class="text-center"[^>]*>([\s\S]*?)<\/td>/g)].map(
       (m) => m[1]!
     )
-    const seeders = tds.length >= 3 ? numFromCell(tds[tds.length - 3]!) : 0
-    const downloads = tds.length >= 1 ? numFromCell(tds[tds.length - 1]!) : 0
+    const seeders =
+      centerCells.length >= 3 ? numFromCell(centerCells[centerCells.length - 3]!) : 0
+    const downloads =
+      centerCells.length >= 1 ? numFromCell(centerCells[centerCells.length - 1]!) : 0
     const size =
-      tds.length >= 5 ? tds[tds.length - 5]!.replace(/<[^>]+>/g, "").trim() : ""
+      centerCells.length >= 5
+        ? centerCells[centerCells.length - 5]!.replace(/<[^>]+>/g, "").trim()
+        : ""
 
     const code = parseCode(title)
     items.push({
-      id: `sk_${vid}`,
+      id: `sk_${viewId}`,
       // `cat` is assigned by the aggregator after the vr split; placeholder here.
       cat: "ad",
       title: code || title.slice(0, 48),
@@ -161,7 +165,7 @@ export function parseSukebeiList(
       magnet,
       vr: isVr(title, code),
       // nyaa view page for the item's original listing.
-      link: `${SUKEBEI_BASE}/view/${vid}`,
+      link: `${SUKEBEI_BASE}/view/${viewId}`,
     })
   }
   return items

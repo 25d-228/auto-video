@@ -1,17 +1,9 @@
 /**
- * javdb source — TypeScript port of the sidecar's javdb scraping
- * (sidecar/av_proxy.py: fetch_javdb, fetch_javdb_vr, seeders_javdb,
- * _jdb_link, jdb_api), rebuilt on the CAPTURED mobile API documented in
+ * javdb source — built on the CAPTURED mobile API documented in
  * docs/javdb-api.md.
  *
- * This REPLACES three old sidecar hacks:
- *   - fetch_javdb (the /api/v1/rankings?type=movie&category=c guess),
- *   - the studio-label VR workaround (fetch_javdb_vr over /api/v2/search), and
- *   - seeders_javdb (which needed a JDB_CODE2ID side-table because the old
- *     rankings object exposed no usable magnet key).
- * The new API exposes a real tag browser (VR = tag id 212), a verified
- * "Most Viewed" rankings/playback endpoint, and slug-keyed detail/magnets, so
- * none of those hacks are needed.
+ * The API exposes a real tag browser (VR = tag id 212), a verified
+ * "Most Viewed" rankings/playback endpoint, and slug-keyed detail/magnets.
  *
  * Every request is authenticated with the `jdsignature` header built by
  * signatureHeader() (src/api/javdb/signature.ts) and sent to JAVDB_API_HOST
@@ -19,13 +11,12 @@
  * directly (per docs/javdb-api.md), so we set `cover` to the cover_url verbatim
  * — no per-code studio-cover resolution and no /img proxy needed.
  *
- * Mapping conventions (kept identical to the Python so DiscoverItem consumers
- * don't change):
+ * Mapping conventions:
  *   - cat = 'ad' (default) or 'vrc' (VR feeds / VR-detected titles),
  *   - title = code = the `number` field (e.g. "KAVR-508"),
  *   - cover = cover_url (tp.cmastd.com), ar = 1.48 (javdb jackets are wide),
  *   - seeders = magnets_count (javdb has no seeder counts; this is the magnet
- *     count, exactly as the Python emitted),
+ *     count),
  *   - sub = date = release_date, year = release_date[:4],
  *   - runtime = duration, rating = 0,
  *   - id = slug, link = https://javdb.com/v/<slug>,
@@ -132,6 +123,12 @@ interface TaxonomyData {
 /** VR is category tag id 212 (docs/javdb-api.md). */
 export const VR_TAG_ID = "212"
 
+/** Bytes per MiB — javdb reports magnet sizes in MB, scaled to bytes for humanSize. */
+const BYTES_PER_MIB = 1024 * 1024
+
+/** Aspect ratio for javdb jackets (wide). */
+const JAVDB_JACKET_AR = 1.48
+
 /** javdb ranking windows. */
 export type JavdbPeriod = "daily" | "weekly" | "monthly"
 
@@ -203,45 +200,45 @@ export function javdbLink(slug: string): string {
  * caller already pinned it to 'vrc'. `added` is the feed position.
  */
 export function toDiscoverItem(
-  m: JavdbMovie,
+  movie: JavdbMovie,
   cat: Cat,
   index: number
 ): DiscoverItem {
-  const code = (m.number || "").trim()
-  const date = m.release_date || ""
-  const cover = m.cover_url || m.thumb_url || ""
+  const code = (movie.number || "").trim()
+  const date = movie.release_date || ""
+  const cover = movie.cover_url || movie.thumb_url || ""
   // Promote to vrc when a VR title slips into an 'ad' feed (defensive parity
   // with the Python is_vr check used in fetch_javdb_vr). A caller-pinned 'vrc'
   // always stays 'vrc'.
   const resolvedCat: Cat =
-    cat === "vrc" || isVr(m.title || m.origin_title || "", code) ? "vrc" : cat
+    cat === "vrc" || isVr(movie.title || movie.origin_title || "", code) ? "vrc" : cat
   return {
-    id: m.id,
+    id: movie.id,
     cat: resolvedCat,
     title: code,
     sub: date,
     cover,
-    ar: 1.48,
-    seeders: m.magnets_count ?? 0,
+    ar: JAVDB_JACKET_AR,
+    seeders: movie.magnets_count ?? 0,
     size: "",
     src: "javdb",
     state: "new",
     year: date.slice(0, 4),
-    runtime: m.duration ?? 0,
+    runtime: movie.duration ?? 0,
     rating: 0,
     code,
     date,
     added: index,
-    link: javdbLink(m.id),
+    link: javdbLink(movie.id),
   }
 }
 
 /** Map a movies array to DiscoverItem[], dropping coverless rows (Python parity). */
 function mapMovies(movies: JavdbMovie[], cat: Cat): DiscoverItem[] {
   const out: DiscoverItem[] = []
-  for (const m of movies) {
-    if (!(m.cover_url || m.thumb_url)) continue
-    out.push(toDiscoverItem(m, cat, out.length))
+  for (const movie of movies) {
+    if (!(movie.cover_url || movie.thumb_url)) continue
+    out.push(toDiscoverItem(movie, cat, out.length))
   }
   return out
 }
@@ -450,7 +447,7 @@ export async function javdbMagnets(slug: string): Promise<Release[]> {
     const ih = m.hash || ""
     if (!ih) continue
     const name = m.name || slug
-    const size = humanSize((m.size ?? 0) * 1048576)
+    const size = humanSize((m.size ?? 0) * BYTES_PER_MIB)
     out.push({
       name,
       source: "javdb",

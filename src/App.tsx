@@ -42,6 +42,8 @@ const NAV: { id: ViewId; label: string; icon: typeof Compass }[] = [
   { id: "settings", label: "Settings", icon: SettingsIcon },
 ]
 
+const FOOTER_RECENT_COUNT = 3
+
 function ThemeToggle() {
   const { resolvedTheme, setTheme } = useTheme()
   const next = resolvedTheme === "dark" ? "light" : "dark"
@@ -64,7 +66,7 @@ function ThemeToggle() {
 
 function DownloadsFooter({ onOpen }: { onOpen: () => void }) {
   const { list, active, totalSpeedMbps } = useDownloads()
-  const recent = list.slice(-3)
+  const recent = list.slice(-FOOTER_RECENT_COUNT)
 
   return (
     <button

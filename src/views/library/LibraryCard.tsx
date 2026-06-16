@@ -15,6 +15,8 @@ import {
 } from "@/components/ui/context-menu"
 import { useLibraryArt } from "./useLibraryArt"
 
+const PLACEHOLDER_ASPECT = 0.7
+
 export interface LibraryCardProps {
   item: LibraryItem
   /** False in plain-browser dev — Play/Reveal/Delete are disabled. */
@@ -34,8 +36,8 @@ export function LibraryCard({
   onDelete,
 }: LibraryCardProps) {
   const art = useLibraryArt(item)
-  // the old mk-tag: TV on tv items, VR on vr files; movies stay untagged
-  const tag = item.cat === "tv" ? "TV" : item.vr ? "VR" : undefined
+  // mk-tag origin: TV on tv items, VR on vr files; movies stay untagged
+  const sourceBadge = item.cat === "tv" ? "TV" : item.vr ? "VR" : undefined
 
   return (
     <ContextMenu>
@@ -46,8 +48,8 @@ export function LibraryCard({
             title={item.title}
             sub={item.sub || item.size}
             cover={art.cover}
-            ar={art.cover ? art.ar : 0.7}
-            source={tag}
+            ar={art.cover ? art.ar : PLACEHOLDER_ASPECT}
+            source={sourceBadge}
             onClick={() => onOpen(item)}
             action={
               tauri ? (

@@ -28,6 +28,12 @@ const TMDB_AR = 0.667
 
 const TMDB_API = "https://api.themoviedb.org/3"
 
+/** Max number of pages walked per paged feed (Python loop cap). */
+const MAX_FEED_PAGES = 5
+
+/** Years a match may differ from the requested year and still count. */
+const YEAR_MATCH_TOLERANCE = 1
+
 /** "movie" trending pulls the week window; "tv" pulls the day window (Python). */
 export type TmdbKind = "movie" | "tv"
 
@@ -178,15 +184,15 @@ export function parseFeedPages(
 ): DiscoverItem[] {
   const out: DiscoverItem[] = []
   const seen = new Set<number>()
-  for (const j of pages) {
-    const res = j.results ?? []
-    for (const m of res) {
-      const poster = m.poster_path || ""
+  for (const page of pages) {
+    const results = page.results ?? []
+    for (const result of results) {
+      const poster = result.poster_path || ""
       if (!poster) continue
-      const id = m.id
+      const id = result.id
       if (id === undefined || seen.has(id)) continue
       seen.add(id)
-      out.push(buildItem(m, poster, cat, idPrefix, out.length))
+      out.push(buildItem(result, poster, cat, idPrefix, out.length))
     }
   }
   return out
@@ -203,12 +209,12 @@ async function collectPaged(
   idPrefix: string
 ): Promise<DiscoverItem[]> {
   const pages: TmdbListResponse[] = []
-  for (let page = 1; page <= 5; page++) {
-    const j = (await tmdbGet<TmdbListResponse>(path, { page })) ?? {}
-    const res = j.results ?? []
-    if (res.length === 0) break
-    pages.push(j)
-    if (page >= (j.total_pages ?? 1)) break
+  for (let page = 1; page <= MAX_FEED_PAGES; page++) {
+    const pageResponse = (await tmdbGet<TmdbListResponse>(path, { page })) ?? {}
+    const results = pageResponse.results ?? []
+    if (results.length === 0) break
+    pages.push(pageResponse)
+    if (page >= (pageResponse.total_pages ?? 1)) break
   }
   return parseFeedPages(pages, cat, idPrefix)
 }
@@ -292,7 +298,8 @@ export function pickMatch(
   const titleNames = (m: TmdbResult) => [m.title, m.name, m.original_title, m.original_name]
   for (const m of results) {
     const dt = yearOf(m)
-    const okYear = !year || (Boolean(dt) && Math.abs(Number(dt) - Number(year)) <= 1)
+    const okYear =
+      !year || (Boolean(dt) && Math.abs(Number(dt) - Number(year)) <= YEAR_MATCH_TOLERANCE)
     const okTitle = titleNames(m).some((x) => titleMatch(title, x))
     if (okYear && okTitle) return m
   }
@@ -305,7 +312,7 @@ export function pickMatch(
   // as "PERFECT BLUE"). Guarded by the year so it can't grab an unrelated hit.
   if (year) {
     const dt = yearOf(top)
-    if (dt && Math.abs(Number(dt) - Number(year)) <= 1) return top
+    if (dt && Math.abs(Number(dt) - Number(year)) <= YEAR_MATCH_TOLERANCE) return top
   }
   return null
 }
@@ -318,12 +325,12 @@ export function pickMatch(
  * to 3 names; cast is up to 5 names.
  */
 export function buildMeta(pick: TmdbResult, det: TmdbDetail): TitleMeta {
-  const rec: TitleMeta = { tmdb_id: pick.id }
+  const meta: TitleMeta = { tmdb_id: pick.id }
 
   const poster = det.poster_path || pick.poster_path || ""
   if (poster) {
-    rec.cover = TMDB_IMG + poster
-    rec.ar = TMDB_AR // TMDB posters are 2:3
+    meta.cover = TMDB_IMG + poster
+    meta.ar = TMDB_AR // TMDB posters are 2:3
   }
 
   const date =
@@ -333,30 +340,30 @@ export function buildMeta(pick: TmdbResult, det: TmdbDetail): TitleMeta {
     pick.first_air_date ||
     ""
   if (date) {
-    rec.date = date.slice(0, 10)
-    rec.year = date.slice(0, 4)
+    meta.date = date.slice(0, 10)
+    meta.year = date.slice(0, 4)
   }
 
   // movie runtime, else first tv episode_run_time entry
-  const rt = det.runtime || (det.episode_run_time && det.episode_run_time[0]) || 0
-  if (rt) rec.runtime = `${rt} min`
+  const runtimeMinutes = det.runtime || (det.episode_run_time && det.episode_run_time[0]) || 0
+  if (runtimeMinutes) meta.runtime = `${runtimeMinutes} min`
 
   const genres = (det.genres ?? [])
     .map((g) => g.name)
     .filter((n): n is string => Boolean(n))
-  if (genres.length > 0) rec.genre = genres.slice(0, 3).join(", ")
+  if (genres.length > 0) meta.genre = genres.slice(0, 3).join(", ")
 
   const cast = (det.credits?.cast ?? [])
     .slice(0, 5)
     .map((c) => c.name)
     .filter((n): n is string => Boolean(n))
-  if (cast.length > 0) rec.cast = cast.join(", ")
+  if (cast.length > 0) meta.cast = cast.join(", ")
 
-  const tOut = det.title || det.name || ""
-  if (tOut) rec.tmdb_title = tOut
-  if (det.overview) rec.overview = det.overview
+  const titleText = det.title || det.name || ""
+  if (titleText) meta.tmdb_title = titleText
+  if (det.overview) meta.overview = det.overview
 
-  return rec
+  return meta
 }
 
 /**
@@ -378,31 +385,31 @@ export async function tmdbLookup(
 ): Promise<TitleMeta | null> {
   if (!(await tmdbKey()) || !title) return null
   const kind = tv ? "tv" : "movie"
-  const yk = tv ? "first_air_date_year" : "year"
+  const yearParam = tv ? "first_air_date_year" : "year"
 
   // attempts: (title+year) first when a year is given, then bare title.
   const attempts: Record<string, string>[] = []
-  if (year) attempts.push({ query: title, [yk]: year })
+  if (year) attempts.push({ query: title, [yearParam]: year })
   attempts.push({ query: title })
 
-  let res: TmdbResult[] = []
+  let results: TmdbResult[] = []
   for (const params of attempts) {
-    const j = await tmdbGet<TmdbListResponse>(`search/${kind}`, {
+    const searchResponse = await tmdbGet<TmdbListResponse>(`search/${kind}`, {
       include_adult: "false",
       ...params,
     })
-    res = j?.results ?? []
-    if (res.length > 0) break
+    results = searchResponse?.results ?? []
+    if (results.length > 0) break
   }
-  if (res.length === 0) return null
+  if (results.length === 0) return null
 
-  const pick = pickMatch(res, title, year)
+  const pick = pickMatch(results, title, year)
   if (!pick) return null
 
-  const det =
+  const detail =
     (await tmdbGet<TmdbDetail>(`${kind}/${pick.id}`, {
       append_to_response: "credits",
     })) ?? {}
 
-  return buildMeta(pick, det)
+  return buildMeta(pick, detail)
 }

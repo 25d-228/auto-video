@@ -73,6 +73,11 @@ async function javbusCookie(): Promise<string> {
 
 // ------------------------------------------------------------------ feeds
 
+const MIN_ITEMS = 1
+const MAX_ITEMS = 100
+const DEFAULT_ITEMS = 50
+const TOP_RELEASES_LIMIT = 25
+
 export interface DiscoverParams {
   cat?: Cat
   /** Provider id, e.g. "tmdb", "imdb", "yts", "javdb", "mgstage". */
@@ -96,7 +101,7 @@ export async function discover(
   params: DiscoverParams = {}
 ): Promise<DiscoverResponse> {
   const cat = params.cat ?? "mov"
-  const n = Math.max(1, Math.min(100, params.n ?? 50))
+  const n = Math.max(MIN_ITEMS, Math.min(MAX_ITEMS, params.n ?? DEFAULT_ITEMS))
   const fresh = params.fresh ?? false
   const source = (params.source ?? "").toLowerCase()
   const list = (params.list ?? "").toLowerCase()
@@ -135,7 +140,7 @@ export async function seeders(
   const cat = params.cat ?? "mov"
   try {
     // already deduped + sorted by seeders desc
-    const rels = await buildSeeders(
+    const releases = await buildSeeders(
       cat,
       params.title ?? "",
       params.code ?? "",
@@ -143,15 +148,15 @@ export async function seeders(
     )
     const sources: Record<string, number> = {}
     let totalSeed = 0
-    for (const r of rels) {
-      sources[r.source] = (sources[r.source] ?? 0) + 1
-      totalSeed += r.seeders || 0
+    for (const release of releases) {
+      sources[release.source] = (sources[release.source] ?? 0) + 1
+      totalSeed += release.seeders || 0
     }
     return {
       ok: true,
-      releases: rels.slice(0, 25),
-      count: rels.length,
-      topSeed: rels.length > 0 ? rels[0]!.seeders || 0 : 0,
+      releases: releases.slice(0, TOP_RELEASES_LIMIT),
+      count: releases.length,
+      topSeed: releases.length > 0 ? releases[0]!.seeders || 0 : 0,
       totalSeed,
       sources,
     }
@@ -220,16 +225,17 @@ export async function cover(
 ): Promise<CoverResponse> {
   void fresh
   if (!code) return { ok: false, cover: "", ar: 0 }
-  const jb = await javbusCookie()
-  let r = await resolveJavCover(code, jb)
-  if (!r.url) {
+  const javbusCookieValue = await javbusCookie()
+  let resolved = await resolveJavCover(code, javbusCookieValue)
+  if (!resolved.url) {
     // On-disk codes are sometimes over-padded (e.g. "MIVR-00081"); retry once
     // with the canonical 3-digit form. Fallback-only, so codes that already
     // resolve at their padded form are unaffected.
-    const alt = normalizeCodeNum(code)
-    if (alt && alt !== code) r = await resolveJavCover(alt, jb)
+    const canonicalCode = normalizeCodeNum(code)
+    if (canonicalCode && canonicalCode !== code)
+      resolved = await resolveJavCover(canonicalCode, javbusCookieValue)
   }
-  return { ok: r.url !== "", cover: r.url, ar: r.ar }
+  return { ok: resolved.url !== "", cover: resolved.url, ar: resolved.ar }
 }
 
 export interface TitleLookupParams {

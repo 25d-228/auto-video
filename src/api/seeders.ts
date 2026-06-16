@@ -89,6 +89,8 @@ export async function seedersJavdb(code: string): Promise<Release[]> {
 
 // ----------------------------------------------------------------- javbus
 
+const JAVBUS_BASE = "https://www.javbus.com"
+
 /**
  * Read one javbus URL with the user's verified cookie. Returns "" on failure.
  * Mirrors the sidecar's _jb_get (cookie + optional Referer).
@@ -117,19 +119,19 @@ export async function seedersJavbus(
   const ck = (cookie || "").trim()
   if (!code || !ck) return []
   const page = await jbGet(
-    `https://www.javbus.com/${pyQuote(code)}`,
+    `${JAVBUS_BASE}/${pyQuote(code)}`,
     ck,
-    "https://www.javbus.com/"
+    `${JAVBUS_BASE}/`
   )
   const gidMatch = /gid\s*=\s*(\d+)/.exec(page)
   if (!gidMatch) return []
   const ucMatch = /\buc\s*=\s*(\d+)/.exec(page)
   const ajaxHtml = await jbGet(
-    `https://www.javbus.com/ajax/uncledatoolsbyajax.php?gid=${gidMatch[1]}&lang=en&img=&uc=${
+    `${JAVBUS_BASE}/ajax/uncledatoolsbyajax.php?gid=${gidMatch[1]}&lang=en&img=&uc=${
       ucMatch ? ucMatch[1] : "0"
     }&floor=`,
     ck,
-    `https://www.javbus.com/${code}`
+    `${JAVBUS_BASE}/${code}`
   )
   const out: Release[] = []
   const seen = new Set<string>()

@@ -9,12 +9,12 @@
  * covers). The age gate passes with `age_check_done=1; ckcy=1` cookies and a
  * dmm.co.jp Referer. VR = the mono "VR動画" keyword section (article=keyword/id=6793).
  *
- *   fetchDmm(vr, list)  -> DiscoverItem[]  (cover resolved via coverObjectUrl)
- *   parseDmmList(html, vr) -> DmmListItem[]  (pure parser, raw pics URLs)
+ *   fetchDmm(vr, list)  -> DiscoverItem[]  (cover resolved via dmmBlobCover)
+ *   parseDmmList(html) -> DmmListItem[]  (pure parser, raw pics URLs)
  *   dmmCover(code) -> { url, ar }  (cid variants × floors × suffixes, placeholder-rejected)
  *
  * Covers from pics.dmm.co.jp are hotlink-protected (need a dmm.co.jp Referer), so
- * every cover is fetched through {@link coverObjectUrl} which hands back a `blob:`
+ * every cover is fetched through {@link dmmBlobCover} which hands back a `blob:`
  * URL an <img> can render directly (replacing the sidecar's /img passthrough).
  */
 import type { DiscoverItem } from "@/api/types"
@@ -31,6 +31,9 @@ const DMM_AGE_COOKIE = "age_check_done=1; ckcy=1"
 
 /** Referer every dmm.co.jp / pics.dmm.co.jp request needs. */
 const DMM_REFERER = "https://www.dmm.co.jp/"
+
+/** Wide-jacket (pl) aspect ratio used as the cover placeholder before measuring. */
+const DMM_WIDE_JACKET_AR = 1.48
 
 /**
  * FANZA mono/dvd sort tokens (verified off the page's 並び替え selector):
@@ -59,10 +62,10 @@ function dmmSort(list: string): string {
  * no trailing alpha-run + number can be found.
  */
 export function dmmCidToCode(cid: string): string {
-  let cid_ = (cid || "").toLowerCase()
-  cid_ = cid_.replace(/^n_\d+/, "") // n_NNNN maker prefix
-  cid_ = cid_.replace(/(btk|tk)$/, "") // trailing media tag
-  const m = /([a-z]+)(\d+)$/.exec(cid_) // last alpha-run + trailing number
+  let normalized = (cid || "").toLowerCase()
+  normalized = normalized.replace(/^n_\d+/, "") // n_NNNN maker prefix
+  normalized = normalized.replace(/(btk|tk)$/, "") // trailing media tag
+  const m = /([a-z]+)(\d+)$/.exec(normalized) // last alpha-run + trailing number
   if (!m) return ""
   let label = m[1]!
   let number = m[2]!
@@ -102,22 +105,22 @@ const DMM_PREFIX: Record<string, string> = {
 export function dmmCidVariants(code: string): string[] {
   const m = /^(\d*[A-Za-z]+)-?(\d+)$/.exec(code || "") // allow leading digit (3DSVR)
   if (!m) return []
-  let lab = m[1]!.toLowerCase()
-  const num = m[2]!
-  lab = DMM_ALIAS[lab] ?? lab
+  let label = m[1]!.toLowerCase()
+  const numberPart = m[2]!
+  label = DMM_ALIAS[label] ?? label
   const out = [
-    lab + zfill(num, 5),
-    lab + zfill(num, 3),
-    lab + num,
-    "1" + lab + zfill(num, 5),
-    "1" + lab + zfill(num, 3), // FANZA prepends 1 to e.g. 3DSVR
-    "13" + lab + zfill(num, 5),
-    "13" + lab + zfill(num, 3), // FANZA VR: DSVR -> 13dsvr01911
+    label + zfill(numberPart, 5),
+    label + zfill(numberPart, 3),
+    label + numberPart,
+    "1" + label + zfill(numberPart, 5),
+    "1" + label + zfill(numberPart, 3), // FANZA prepends 1 to e.g. 3DSVR
+    "13" + label + zfill(numberPart, 5),
+    "13" + label + zfill(numberPart, 3), // FANZA VR: DSVR -> 13dsvr01911
   ]
-  const pre = DMM_PREFIX[lab]
-  if (pre) {
+  const makerPrefix = DMM_PREFIX[label]
+  if (makerPrefix) {
     // known maker prefix (h_NNNN) takes priority
-    out.unshift(pre + lab + zfill(num, 5), pre + lab + zfill(num, 3))
+    out.unshift(makerPrefix + label + zfill(numberPart, 5), makerPrefix + label + zfill(numberPart, 3))
   }
   return [...new Set(out)]
 }
@@ -129,19 +132,19 @@ function zfill(s: string, width: number): string {
 
 // ---------------------------------------------------------------- image dimensions
 
-/** Read a big-endian u16 from `b` at offset `i`. */
-function be16(b: Uint8Array, i: number): number {
-  return (b[i]! << 8) | b[i + 1]!
+/** Read a big-endian u16 from `bytes` at offset `offset`. */
+function be16(bytes: Uint8Array, offset: number): number {
+  return (bytes[offset]! << 8) | bytes[offset + 1]!
 }
 
-/** Read a big-endian u32 from `b` at offset `i`. */
-function be32(b: Uint8Array, i: number): number {
-  return ((b[i]! << 24) | (b[i + 1]! << 16) | (b[i + 2]! << 8) | b[i + 3]!) >>> 0
+/** Read a big-endian u32 from `bytes` at offset `offset`. */
+function be32(bytes: Uint8Array, offset: number): number {
+  return ((bytes[offset]! << 24) | (bytes[offset + 1]! << 16) | (bytes[offset + 2]! << 8) | bytes[offset + 3]!) >>> 0
 }
 
-/** Read a little-endian u16 from `b` at offset `i`. */
-function le16(b: Uint8Array, i: number): number {
-  return b[i]! | (b[i + 1]! << 8)
+/** Read a little-endian u16 from `bytes` at offset `offset`. */
+function le16(bytes: Uint8Array, offset: number): number {
+  return bytes[offset]! | (bytes[offset + 1]! << 8)
 }
 
 /**
@@ -149,67 +152,75 @@ function le16(b: Uint8Array, i: number): number {
  * JPEG / PNG / WEBP image. Returns null when the format is unrecognized or the
  * buffer is too short. Exported for the parser test.
  */
-export function imgDims(b: Uint8Array): [number, number] | null {
-  if (!b || b.length < 24) return null
+export function imgDims(bytes: Uint8Array): [number, number] | null {
+  if (!bytes || bytes.length < 24) return null
   // JPEG: scan SOF markers
-  if (b[0] === 0xff && b[1] === 0xd8) {
-    let i = 2
-    const len = b.length
-    while (i < len - 9) {
-      if (b[i] !== 0xff) {
-        i += 1
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let offset = 2
+    const len = bytes.length
+    while (offset < len - 9) {
+      if (bytes[offset] !== 0xff) {
+        offset += 1
         continue
       }
-      const marker = b[i + 1]!
+      const marker = bytes[offset + 1]!
       if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
-        return [be16(b, i + 7), be16(b, i + 5)]
+        return [be16(bytes, offset + 7), be16(bytes, offset + 5)]
       }
-      const segLen = be16(b, i + 2)
-      i += 2 + segLen
+      const segLen = be16(bytes, offset + 2)
+      offset += 2 + segLen
     }
     return null
   }
   // PNG
   if (
-    b[0] === 0x89 &&
-    b[1] === 0x50 &&
-    b[2] === 0x4e &&
-    b[3] === 0x47 &&
-    b[4] === 0x0d &&
-    b[5] === 0x0a &&
-    b[6] === 0x1a &&
-    b[7] === 0x0a
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
   ) {
-    return [be32(b, 16), be32(b, 20)]
+    return [be32(bytes, 16), be32(bytes, 20)]
   }
   // WEBP: "RIFF"...."WEBP"
   if (
-    b[0] === 0x52 &&
-    b[1] === 0x49 &&
-    b[2] === 0x46 &&
-    b[3] === 0x46 &&
-    b[8] === 0x57 &&
-    b[9] === 0x45 &&
-    b[10] === 0x42 &&
-    b[11] === 0x50
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
   ) {
-    const tag = String.fromCharCode(b[12]!, b[13]!, b[14]!, b[15]!)
+    const tag = String.fromCharCode(bytes[12]!, bytes[13]!, bytes[14]!, bytes[15]!)
     if (tag === "VP8X") {
       return [
-        1 + (b[24]! | (b[25]! << 8) | (b[26]! << 16)),
-        1 + (b[27]! | (b[28]! << 8) | (b[29]! << 16)),
+        1 + (bytes[24]! | (bytes[25]! << 8) | (bytes[26]! << 16)),
+        1 + (bytes[27]! | (bytes[28]! << 8) | (bytes[29]! << 16)),
       ]
     }
     if (tag === "VP8 ") {
-      return [le16(b, 26) & 0x3fff, le16(b, 28) & 0x3fff]
+      return [le16(bytes, 26) & 0x3fff, le16(bytes, 28) & 0x3fff]
     }
     if (tag === "VP8L") {
-      const bits = (b[21]! | (b[22]! << 8) | (b[23]! << 16) | (b[24]! << 24)) >>> 0
+      const bits = (bytes[21]! | (bytes[22]! << 8) | (bytes[23]! << 16) | (bytes[24]! << 24)) >>> 0
       return [(bits & 0x3fff) + 1, ((bits >>> 14) & 0x3fff) + 1]
     }
   }
   return null
 }
+
+/** Reject bodies smaller than this — the ps placeholder is ~3.4 KB. */
+const COVER_MIN_BYTES = 6000
+/** Dimensions of the FANZA "now printing" placeholder (~19 KB) to reject. */
+const PLACEHOLDER_W = 590
+const PLACEHOLDER_H = 800
+/** Aspect ratio assumed when image dimensions can't be sniffed. */
+const DEFAULT_COVER_AR = 0.72
 
 /**
  * Port of `_cover_meta(b)` — given fetched image bytes, decide whether this is a
@@ -222,10 +233,10 @@ export function imgDims(b: Uint8Array): [number, number] | null {
  *   - otherwise ar = round(w/h, 3), defaulting to 0.72 when dims are unknown
  */
 export function coverMeta(bytes: Uint8Array): { ar: number } | null {
-  if (!bytes || bytes.length < 6000) return null
+  if (!bytes || bytes.length < COVER_MIN_BYTES) return null
   const d = imgDims(bytes)
-  if (d && d[0] === 590 && d[1] === 800) return null
-  const ar = d && d[1] ? round3(d[0] / d[1]) : 0.72
+  if (d && d[0] === PLACEHOLDER_W && d[1] === PLACEHOLDER_H) return null
+  const ar = d && d[1] ? round3(d[0] / d[1]) : DEFAULT_COVER_AR
   return { ar }
 }
 
@@ -258,9 +269,9 @@ function round3(x: number): number {
 
 // ---------------------------------------------------------------- cover resolution
 
-/** studio video AND amateur floor (POW etc.). Port of DMM_FLOORS. */
+/** studio video AND amateur floor (POW etc.). */
 const DMM_FLOORS = ["digital/video", "digital/amateur"] as const
-/** front portrait, amateur jacket, wide jacket. Port of DMM_SUFFIXES. */
+/** front portrait, amateur jacket, wide jacket. */
 const DMM_SUFFIXES = ["ps", "jp", "pl"] as const
 
 /** A resolved cover: the raw pics.dmm.co.jp URL plus its aspect ratio. */
@@ -334,9 +345,9 @@ export function parseDmmList(html: string): DmmListItem[] {
     if (!code) continue
     if (seen.has(code)) continue
     seen.add(code)
-    let cov = m[2]!
-    if (cov.startsWith("//")) cov = "https:" + cov
-    out.push({ cid, code, coverUrl: cov })
+    let coverUrl = m[2]!
+    if (coverUrl.startsWith("//")) coverUrl = "https:" + coverUrl
+    out.push({ cid, code, coverUrl })
   }
   return out
 }
@@ -349,7 +360,7 @@ function toDiscoverItem(it: DmmListItem, vr: boolean, added: number): DiscoverIt
     title: it.code || it.cid,
     sub: vr ? "VR" : "",
     cover: "", // filled in fetchDmm
-    ar: 1.48, // wide jacket (pl); overwritten with the measured ratio in fetchDmm
+    ar: DMM_WIDE_JACKET_AR, // wide jacket (pl); overwritten with the measured ratio in fetchDmm
     seeders: 0,
     size: "",
     src: "DMM",
@@ -386,6 +397,9 @@ export function dmmListUrl(vr: boolean, list: string): string {
   return `https://www.dmm.co.jp/mono/dvd/-/list/=/sort=${sort}/`
 }
 
+/** Below this length the response is a DMM error/redirect body, not a real listing. */
+const MIN_LISTING_HTML_BYTES = 4000
+
 /**
  * Port of `fetch_dmm(vr, mode)` → DiscoverItem[].
  *
@@ -408,7 +422,7 @@ export async function fetchDmm(vr: boolean, list: string): Promise<DiscoverItem[
   } catch {
     return []
   }
-  if (!html || html.length < 4000) return []
+  if (!html || html.length < MIN_LISTING_HTML_BYTES) return []
 
   const parsed = parseDmmList(html)
   const items = parsed.map((it, i) => ({ item: toDiscoverItem(it, vr, i), coverUrl: it.coverUrl }))

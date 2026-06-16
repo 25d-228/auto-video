@@ -8,6 +8,9 @@
 import type { Cat, LibraryItem, TitleMeta } from "@/api/types"
 import { useCover, useTitleLookup } from "@/state/queries"
 
+/** Poster aspect used when neither the scan nor a lookup supplies one. */
+const DEFAULT_POSTER_ASPECT = 0.72
+
 /** ad/vrc files use the JAV pipeline (code -> cover -> r18 meta). */
 export function isJavCat(cat: Cat): boolean {
   return cat === "ad" || cat === "vrc"
@@ -15,8 +18,8 @@ export function isJavCat(cat: Cat): boolean {
 
 /** Sort key for Rank=Release — the old libDate(): a year found in year||sub. */
 export function itemDate(item: LibraryItem): string {
-  const m = /(19|20)\d{2}/.exec(String(item.year || item.sub || ""))
-  return m ? m[0] : ""
+  const yearMatch = /(19|20)\d{2}/.exec(String(item.year || item.sub || ""))
+  return yearMatch ? yearMatch[0] : ""
 }
 
 /** "a, b / c" -> ["a","b","c"] for Chiplet sections — the old chips(). */
@@ -51,24 +54,24 @@ export function useLibraryArt(item: LibraryItem | null): LibraryArt {
     item != null && !jav ? item.title : undefined,
     item?.year
   )
-  const fallbackAr = item?.ar ?? 0.72
+  const fallbackAr = item?.ar ?? DEFAULT_POSTER_ASPECT
 
   if (jav) {
-    const d = coverQ.data
+    const coverData = coverQ.data
     return {
-      cover: d?.ok ? d.cover : undefined,
-      ar: d?.ok ? d.ar : fallbackAr,
+      cover: coverData?.ok ? coverData.cover : undefined,
+      ar: coverData?.ok ? coverData.ar : fallbackAr,
       pending: coverQ.isLoading,
-      identified: d ? d.ok : undefined,
+      identified: coverData ? coverData.ok : undefined,
     }
   }
-  const d = lookupQ.data
+  const lookupData = lookupQ.data
   return {
-    cover: d?.meta?.cover || undefined,
-    ar: d?.meta?.ar ?? fallbackAr,
-    titleMeta: d?.meta,
-    haskey: d?.haskey,
+    cover: lookupData?.meta?.cover || undefined,
+    ar: lookupData?.meta?.ar ?? fallbackAr,
+    titleMeta: lookupData?.meta,
+    haskey: lookupData?.haskey,
     pending: lookupQ.isLoading,
-    identified: d ? d.ok : undefined,
+    identified: lookupData ? lookupData.ok : undefined,
   }
 }

@@ -1,11 +1,9 @@
 /**
  * SQLite store layer over @tauri-apps/plugin-sql.
  *
- * Phase-2 foundation: this is the eventual replacement for the Python sidecar's
- * JSON side-files (sidecar/av_proxy.py) — av_keys.json, av_paths.json,
- * proxy_cache.json (listings), discover_covers.json (covers), and the scanned
- * library. Nothing here is wired into the app yet; it only ADDS the storage
- * primitives the TS scrapers (next step) will use.
+ * Replaces the Python sidecar's JSON side-files (sidecar/av_proxy.py) —
+ * av_keys.json, av_paths.json, proxy_cache.json (listings),
+ * discover_covers.json (covers), and the scanned library.
  *
  * Schema (all `CREATE TABLE IF NOT EXISTS`):
  *   provider_keys(provider PK, value)            -- keys_store: tmdb/javbus/...

@@ -41,6 +41,7 @@ export function CardGrid({
  * `[data-cardgrid]` element (see {@link CardGrid}).
  */
 const FIT_PROBE = 60
+const FIT_TOLERANCE_PX = 1 // sub-pixel rounding slack
 
 export function useFitPageSize(
   boxRef: RefObject<HTMLElement | null>,
@@ -97,14 +98,14 @@ export function useFitPageSize(
     if (!grid) return
     const cards = Array.from(grid.children) as HTMLElement[]
     if (cards.length === 0) return
-    const limit = box.getBoundingClientRect().bottom + 1
-    let fit = 0
-    for (const c of cards) {
-      if (c.getBoundingClientRect().bottom <= limit) fit++
+    const limit = box.getBoundingClientRect().bottom + FIT_TOLERANCE_PX
+    let fittingCount = 0
+    for (const card of cards) {
+      if (card.getBoundingClientRect().bottom <= limit) fittingCount++
       else break
     }
-    fit = Math.max(1, fit)
-    if (fit < cards.length && fit !== perPage) setPerPage(fit)
+    fittingCount = Math.max(1, fittingCount)
+    if (fittingCount < cards.length && fittingCount !== perPage) setPerPage(fittingCount)
   })
 
   return perPage
@@ -161,6 +162,9 @@ export interface PagerProps {
   className?: string
 }
 
+// ±PAGE_WINDOW numbers shown around the current page.
+const PAGE_WINDOW = 2
+
 /**
  * Numbered jump-to-page pager like the old app's pgNav: prev/next arrows,
  * a window of ±2 numbers around the current page with first/last + ellipsis,
@@ -174,17 +178,16 @@ export function Pager({
   className,
 }: PagerProps) {
   if (pageCount <= 1) return null
-  const win = 2
-  const lo = Math.max(1, page - win)
-  const hi = Math.min(pageCount, page + win)
+  const firstWindowPage = Math.max(1, page - PAGE_WINDOW)
+  const lastWindowPage = Math.min(pageCount, page + PAGE_WINDOW)
   const pages: (number | "gap")[] = []
-  if (lo > 1) {
+  if (firstWindowPage > 1) {
     pages.push(1)
-    if (lo > 2) pages.push("gap")
+    if (firstWindowPage > 2) pages.push("gap")
   }
-  for (let i = lo; i <= hi; i++) pages.push(i)
-  if (hi < pageCount) {
-    if (hi < pageCount - 1) pages.push("gap")
+  for (let i = firstWindowPage; i <= lastWindowPage; i++) pages.push(i)
+  if (lastWindowPage < pageCount) {
+    if (lastWindowPage < pageCount - 1) pages.push("gap")
     pages.push(pageCount)
   }
   return (
@@ -199,22 +202,22 @@ export function Pager({
         </PagerButton>
       </div>
       <div className="flex items-center gap-1">
-        {pages.map((m, i) =>
-          m === "gap" ? (
+        {pages.map((entry, i) =>
+          entry === "gap" ? (
             <span key={`gap-${i}`} className="px-1 text-xs text-muted-foreground">
               …
             </span>
-          ) : m === page ? (
+          ) : entry === page ? (
             <span
-              key={m}
+              key={entry}
               aria-current="page"
               className="flex h-7 min-w-7 items-center justify-center rounded-md bg-primary px-2 text-xs font-medium text-primary-foreground"
             >
-              {m}
+              {entry}
             </span>
           ) : (
-            <PagerButton key={m} onClick={() => onPageChange(m)}>
-              {m}
+            <PagerButton key={entry} onClick={() => onPageChange(entry)}>
+              {entry}
             </PagerButton>
           )
         )}

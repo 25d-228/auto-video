@@ -40,8 +40,8 @@ export function rawCoverUrl(src: string): string {
  */
 export function cidOf(cover: string): string {
   const raw = rawCoverUrl(cover || "") || cover || ""
-  const m = /\/digital\/video\/([^/]+)\//.exec(raw)
-  return m ? m[1] : ""
+  const match = /\/digital\/video\/([^/]+)\//.exec(raw)
+  return match ? match[1] : ""
 }
 
 export interface CoverImageProps {
@@ -66,17 +66,17 @@ export interface CoverImageProps {
  */
 export function CoverImage({ src, title, className, onRatio }: CoverImageProps) {
   const raw = src ? rawCoverUrl(src) : ""
-  const chain = [src ?? "", raw !== src ? raw : ""].filter((u) => u !== "")
+  const fallbackUrls = [src ?? "", raw !== src ? raw : ""].filter((u) => u !== "")
   // reset the fallback chain whenever the cover URL changes
   const [key, setKey] = useState(src)
-  const [idx, setIdx] = useState(0)
+  const [fallbackIndex, setFallbackIndex] = useState(0)
   if (key !== src) {
     setKey(src)
-    setIdx(0)
+    setFallbackIndex(0)
   }
-  const url = idx < chain.length ? chain[idx] : undefined
+  const currentUrl = fallbackIndex < fallbackUrls.length ? fallbackUrls[fallbackIndex] : undefined
 
-  if (!url) {
+  if (!currentUrl) {
     return (
       <div
         className={cn(
@@ -94,10 +94,10 @@ export function CoverImage({ src, title, className, onRatio }: CoverImageProps) 
   return (
     <img
       loading="lazy"
-      src={url}
+      src={currentUrl}
       alt=""
       draggable={false}
-      onError={() => setIdx((i) => i + 1)}
+      onError={() => setFallbackIndex((prev) => prev + 1)}
       onLoad={(e) => {
         const { naturalWidth: w, naturalHeight: h } = e.currentTarget
         if (w > 0 && h > 0) onRatio?.(w / h)

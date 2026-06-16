@@ -24,6 +24,10 @@ import { coverObjectUrl, httpText, HttpError } from "@/net/http"
 const MGSTAGE_COOKIE = "adc=1"
 /** Referer hotlink-protected image.mgstage.com / product pages expect. */
 const MGSTAGE_REFERER = "https://www.mgstage.com/"
+/** Listing aspect ratio (w/h) for VR product cards. */
+const MGSTAGE_VR_AR = 0.72
+/** Listing aspect ratio (w/h) for flat (non-VR) product cards. */
+const MGSTAGE_FLAT_AR = 0.7
 
 /**
  * One product parsed out of a ranking/search page: the product id (as it appears
@@ -89,7 +93,7 @@ function toDiscoverItem(
     title: code,
     sub: vr ? "VR" : "",
     cover: coverUrl,
-    ar: vr ? 0.72 : 0.7,
+    ar: vr ? MGSTAGE_VR_AR : MGSTAGE_FLAT_AR,
     seeders: 0,
     size: "",
     src: "MGStage",
@@ -183,6 +187,9 @@ const MGSTAGE_DEFAULT_AR = 0.72
 
 const MGSTAGE_ID_RE = /^([0-9A-Za-z]+)-?(\d+)$/
 
+/** PRVRSS-007 style: pad the numeric part to 3 digits. */
+const MGSTAGE_ID_PAD_WIDTH = 3
+
 /**
  * Port of `mgstage_ids(code)`. MGStage product ids drop leading zeros
  * (PRVRSS-00007 -> PRVRSS-007), so probe the common paddings:
@@ -192,17 +199,17 @@ const MGSTAGE_ID_RE = /^([0-9A-Za-z]+)-?(\d+)$/
  * Exported for unit testing.
  */
 export function mgstageIds(code: string): string[] {
-  const c = code || ""
-  const m = MGSTAGE_ID_RE.exec(c)
-  if (!m) return [c]
-  const lab = m[1]!.toUpperCase()
-  const num = m[2]!
-  const n = parseInt(num, 10)
+  const rawCode = code || ""
+  const match = MGSTAGE_ID_RE.exec(rawCode)
+  if (!match) return [rawCode]
+  const lab = match[1]!.toUpperCase()
+  const rawDigits = match[2]!
+  const numericValue = parseInt(rawDigits, 10)
   const candidates = [
-    c,
-    `${lab}-${String(n).padStart(3, "0")}`,
-    `${lab}-${n}`,
-    `${lab}-${num}`,
+    rawCode,
+    `${lab}-${String(numericValue).padStart(MGSTAGE_ID_PAD_WIDTH, "0")}`,
+    `${lab}-${numericValue}`,
+    `${lab}-${rawDigits}`,
   ]
   // dict.fromkeys order-preserving dedup
   return Array.from(new Set(candidates))

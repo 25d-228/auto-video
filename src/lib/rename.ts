@@ -28,6 +28,8 @@ export interface RenameOp {
 export const RENAME_VIDEO_RE = /\.(mkv|mp4|avi|wmv|m4v|ts|mov|flv|iso|rmvb|webm|mpg|mpeg)$/i
 /** Fraction of the largest video below which a video is treated as a sample/extra. */
 const MAIN_VIDEO_MIN_FRACTION = 0.15
+/** Char code for 'A', the first multi-disc label suffix. */
+const DISC_LABEL_BASE_CHAR_CODE = 65
 
 function fileExt(name: string): string {
   const m = /\.[^./\\]+$/.exec(name)
@@ -85,6 +87,6 @@ export function planRename(
   // Multi-disc: <base>-A.ext, <base>-B.ext, …
   return sorted.map((v, i) => ({
     from: v.name,
-    to: `${cleanBase}-${String.fromCharCode(65 + i)}${fileExt(v.name)}`,
+    to: `${cleanBase}-${String.fromCharCode(DISC_LABEL_BASE_CHAR_CODE + i)}${fileExt(v.name)}`,
   }))
 }

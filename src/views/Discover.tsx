@@ -54,6 +54,11 @@ import { DiscoverDetail } from "./discover/DiscoverDetail"
 import { DownloadDialog } from "./discover/DownloadDialog"
 import { PreviewLightbox } from "./discover/PreviewLightbox"
 
+// How many items to pull per feed; the pool is later capped to `limit`.
+const FEED_FETCH_LIMIT = 100
+// Default "Show" count until the user picks another LIMIT_OPTIONS value.
+const DEFAULT_SHOW_LIMIT = 25
+
 interface Selection {
   source: ProviderId
   list: ListId
@@ -71,7 +76,7 @@ function initialSelByCat(): Record<Cat, Selection> {
 
 export default function Discover({ active = true }: { active?: boolean }) {
   const [cat, setCat] = useState<Cat>("mov")
-  const [limit, setLimit] = useState(25)
+  const [limit, setLimit] = useState(DEFAULT_SHOW_LIMIT)
   const [selByCat, setSelByCat] = useState<Record<Cat, Selection>>(
     initialSelByCat
   )
@@ -107,7 +112,7 @@ export default function Discover({ active = true }: { active?: boolean }) {
     : `${cat}|${source}|${list}`
   const isFresh = freshKeys.has(feedKey)
 
-  const query = useDiscover(cat, source, list, 100, isFresh, browseOpts)
+  const query = useDiscover(cat, source, list, FEED_FETCH_LIMIT, isFresh, browseOpts)
   const libraryQ = useLibrary()
   const { downloads } = useDownloads()
 

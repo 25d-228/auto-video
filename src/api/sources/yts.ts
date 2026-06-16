@@ -105,6 +105,9 @@ const TRACKERS = [
 /** TTL for a cached movie listing (matches the sidecar's LIST_TTL = 300s). */
 const LIST_TTL_SEC = 300
 
+/** YTS poster aspect ratio (width/height) used for every Discover card. */
+const YTS_POSTER_AR = 0.675
+
 // --------------------------------------------------------------- helpers
 
 /**
@@ -172,34 +175,36 @@ function quotePlusName(s: string): string {
  */
 export function parseMovies(movies: YtsMovie[]): DiscoverItem[] {
   const out: DiscoverItem[] = []
-  for (const m of movies) {
-    const tors = m.torrents ?? []
-    const seeds = tors.length
-      ? Math.max(...tors.map((t) => Math.trunc(Number(t.seeds) || 0)))
+  for (const movie of movies) {
+    const torrents = movie.torrents ?? []
+    const seeds = torrents.length
+      ? Math.max(...torrents.map((t) => Math.trunc(Number(t.seeds) || 0)))
       : 0
-    const size = (tors.length ? tors[0]!.size : "") || ""
-    const rt = Math.trunc(Number(m.runtime) || 0)
-    const yr = m.year ?? ""
-    const sub = rt
-      ? `${yr} · ${Math.trunc(rt / 60)}h ${pad2(rt % 60)}m`
-      : String(yr)
+    const size = (torrents.length ? torrents[0]!.size : "") || ""
+    const runtimeMinutes = Math.trunc(Number(movie.runtime) || 0)
+    const year = movie.year ?? ""
+    const sub = runtimeMinutes
+      ? `${year} · ${Math.trunc(runtimeMinutes / 60)}h ${pad2(
+          runtimeMinutes % 60
+        )}m`
+      : String(year)
     const item: DiscoverItem = {
-      id: `mov_${m.id}`,
+      id: `mov_${movie.id}`,
       cat: "mov",
-      title: m.title || m.title_long || "",
+      title: movie.title || movie.title_long || "",
       sub,
-      cover: m.large_cover_image || "",
-      ar: 0.675,
+      cover: movie.large_cover_image || "",
+      ar: YTS_POSTER_AR,
       seeders: seeds,
       size,
       src: "YTS",
       state: "new",
-      year: yr,
-      runtime: rt,
-      rating: m.rating || 0,
-      code: m.imdb_code || "",
+      year,
+      runtime: runtimeMinutes,
+      rating: movie.rating || 0,
+      code: movie.imdb_code || "",
     }
-    const url = (m.url || "").trim() // YTS movie page url, present in list_movies
+    const url = (movie.url || "").trim() // YTS movie page url, present in list_movies
     if (url) item.link = url
     out.push(item)
   }
@@ -232,20 +237,20 @@ export function parseSeeders(
   year?: string | number
 ): Release[] {
   const out: Release[] = []
-  for (const m of movies) {
-    if (year && m.year && String(m.year) !== String(year)) continue
-    for (const t of m.torrents ?? []) {
-      const ih = t.hash || ""
-      if (!ih) continue
-      const nm = `${m.title_long || title} [${t.quality || ""} ${
+  for (const movie of movies) {
+    if (year && movie.year && String(movie.year) !== String(year)) continue
+    for (const t of movie.torrents ?? []) {
+      const infoHash = t.hash || ""
+      if (!infoHash) continue
+      const releaseName = `${movie.title_long || title} [${t.quality || ""} ${
         t.type || ""
       }]`.trim()
       out.push({
-        name: nm,
+        name: releaseName,
         source: "YTS",
         seeders: Math.trunc(Number(t.seeds) || 0),
         size: t.size || "",
-        magnet: ytsMagnet(ih, nm),
+        magnet: ytsMagnet(infoHash, releaseName),
         quality: t.quality || "",
       })
     }
