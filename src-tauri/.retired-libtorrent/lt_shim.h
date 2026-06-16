@@ -18,7 +18,10 @@ bool lt_init();
 rust::String lt_add(rust::Str magnet, rust::Str save_path,
                     rust::Slice<const std::uint32_t> only_files);
 rust::Vec<LtFile> lt_list_files(rust::Str magnet, std::uint32_t timeout_ms);
+bool lt_save_torrent(rust::Str magnet, rust::Str out_path,
+                     std::uint32_t timeout_ms);
 LtStatus lt_status(rust::Str id);
 void lt_pause(rust::Str id);
 void lt_resume(rust::Str id);
+void lt_set_rate_limits(std::int32_t download_bps, std::int32_t upload_bps);
 void lt_remove(rust::Str id, bool delete_files);

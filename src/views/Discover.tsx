@@ -29,7 +29,8 @@ import { useDiscover, useLibrary } from "@/state/queries"
 import { useDownloads } from "@/state/downloads"
 import {
   CAT_OPTIONS,
-  DEFAULT_JAVDB_VR,
+  DEFAULT_JAVDB_BROWSE,
+  JAVDB_AD_MODE_OPTIONS,
   JAVDB_MONTH_OPTIONS,
   JAVDB_SORT_OPTIONS,
   JAVDB_YEAR_OPTIONS,
@@ -37,13 +38,14 @@ import {
   defaultListFor,
   defaultSelection,
   itemState,
-  javdbVrOpts,
+  javdbBrowseOpts,
   listIsRecency,
   listsFor,
   ownedKeys,
   providerLabel,
   providersFor,
-  type JavdbVrSel,
+  type JavdbAdMode,
+  type JavdbBrowseSel,
   type ListId,
   type ProviderId,
 } from "./discover/model"
@@ -67,7 +69,7 @@ function initialSelByCat(): Record<Cat, Selection> {
   }
 }
 
-export default function Discover() {
+export default function Discover({ active = true }: { active?: boolean }) {
   const [cat, setCat] = useState<Cat>("mov")
   const [limit, setLimit] = useState(25)
   const [selByCat, setSelByCat] = useState<Record<Cat, Selection>>(
@@ -81,19 +83,31 @@ export default function Discover() {
   const [selected, setSelected] = useState<DiscoverItem | null>(null)
   const [dlItem, setDlItem] = useState<DiscoverItem | null>(null)
   const [previewItem, setPreviewItem] = useState<DiscoverItem | null>(null)
-  // JavDB VR uses Year/Month/Sort selectors instead of a single list.
-  const [javdbVr, setJavdbVr] = useState<JavdbVrSel>(DEFAULT_JAVDB_VR)
+  // The JavDB Year/Month/Sort browser — shared by VR and Adult→Category.
+  const [javdbBrowse, setJavdbBrowse] =
+    useState<JavdbBrowseSel>(DEFAULT_JAVDB_BROWSE)
+  // Adult→JavDB toggles between the ranking windows and the category browser.
+  const [javdbAdMode, setJavdbAdMode] = useState<JavdbAdMode>("ranking")
 
   const { source, list } = selByCat[cat]
   const isJavdbVr = cat === "vrc" && source === "javdb"
-  const vrOpts = isJavdbVr ? javdbVrOpts(javdbVr) : undefined
-  // For JavDB VR the feed identity is the year/month/sort, not the list id.
-  const feedKey = isJavdbVr
-    ? `${cat}|${source}|${javdbVr.year}|${javdbVr.month}|${javdbVr.sort}`
+  const isJavdbAd = cat === "ad" && source === "javdb"
+  const isJavdbCategory = isJavdbAd && javdbAdMode === "category"
+  // The year/month/sort browser drives both VR and the Adult→Category feed.
+  const isBrowser = isJavdbVr || isJavdbCategory
+  const browseOpts = isBrowser
+    ? {
+        ...javdbBrowseOpts(javdbBrowse),
+        ...(isJavdbCategory ? { mode: "category" } : {}),
+      }
+    : undefined
+  // For the browser the feed identity is year/month/sort (+ mode), not the list.
+  const feedKey = isBrowser
+    ? `${cat}|${source}|${isJavdbCategory ? "category" : "vr"}|${javdbBrowse.year}|${javdbBrowse.month}|${javdbBrowse.sort}`
     : `${cat}|${source}|${list}`
   const isFresh = freshKeys.has(feedKey)
 
-  const query = useDiscover(cat, source, list, 100, isFresh, vrOpts)
+  const query = useDiscover(cat, source, list, 100, isFresh, browseOpts)
   const libraryQ = useLibrary()
   const { downloads } = useDownloads()
 
@@ -117,7 +131,27 @@ export default function Discover() {
   const { setPage } = pager
   useEffect(() => {
     setPage(1)
-  }, [cat, source, list, limit, javdbVr.year, javdbVr.month, javdbVr.sort, setPage])
+  }, [
+    cat,
+    source,
+    list,
+    limit,
+    javdbAdMode,
+    javdbBrowse.year,
+    javdbBrowse.month,
+    javdbBrowse.sort,
+    setPage,
+  ])
+
+  // Discover stays mounted across tab switches so the category/selectors/page
+  // are remembered, but its dialogs render in a body portal — close them while
+  // the view is hidden so they can't linger over another tab.
+  useEffect(() => {
+    if (active) return
+    setSelected(null)
+    setDlItem(null)
+    setPreviewItem(null)
+  }, [active])
 
   const providerOptions = providersFor(cat)
   const listOptions = listsFor(cat, source)
@@ -153,9 +187,15 @@ export default function Discover() {
     closePanels()
   }
 
-  // JavDB VR year/month/sort change ("" sentinel "all" maps back to all).
-  const setVr = (patch: Partial<JavdbVrSel>) => {
-    setJavdbVr((prev) => ({ ...prev, ...patch }))
+  // JavDB browser year/month/sort change (the "all" sentinel maps back to "").
+  const setBrowse = (patch: Partial<JavdbBrowseSel>) => {
+    setJavdbBrowse((prev) => ({ ...prev, ...patch }))
+    closePanels()
+  }
+
+  // Adult→JavDB Ranking ⇄ Category toggle.
+  const switchAdMode = (next: JavdbAdMode) => {
+    setJavdbAdMode(next)
     closePanels()
   }
 
@@ -196,11 +236,29 @@ export default function Discover() {
           </SelectContent>
         </Select>
 
-        {isJavdbVr ? (
+        {isJavdbAd && (
+          <Select
+            value={javdbAdMode}
+            onValueChange={(v) => switchAdMode(v as JavdbAdMode)}
+          >
+            <SelectTrigger size="sm" className="text-xs" aria-label="Mode">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {JAVDB_AD_MODE_OPTIONS.map((o) => (
+                <SelectItem key={o.value} value={o.value}>
+                  {o.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+
+        {isBrowser ? (
           <>
             <Select
-              value={javdbVr.year || "all"}
-              onValueChange={(v) => setVr({ year: v === "all" ? "" : v })}
+              value={javdbBrowse.year || "all"}
+              onValueChange={(v) => setBrowse({ year: v === "all" ? "" : v })}
             >
               <SelectTrigger size="sm" className="text-xs" aria-label="Year">
                 <SelectValue />
@@ -215,8 +273,8 @@ export default function Discover() {
             </Select>
 
             <Select
-              value={javdbVr.month || "all"}
-              onValueChange={(v) => setVr({ month: v === "all" ? "" : v })}
+              value={javdbBrowse.month || "all"}
+              onValueChange={(v) => setBrowse({ month: v === "all" ? "" : v })}
             >
               <SelectTrigger size="sm" className="text-xs" aria-label="Month">
                 <SelectValue />
@@ -230,7 +288,10 @@ export default function Discover() {
               </SelectContent>
             </Select>
 
-            <Select value={javdbVr.sort} onValueChange={(v) => setVr({ sort: v })}>
+            <Select
+              value={javdbBrowse.sort}
+              onValueChange={(v) => setBrowse({ sort: v })}
+            >
               <SelectTrigger size="sm" className="text-xs" aria-label="Sort">
                 <SelectValue />
               </SelectTrigger>
@@ -335,8 +396,18 @@ export default function Discover() {
         }}
         onPreview={(it) => setPreviewItem(it)}
       />
-      <DownloadDialog item={dlItem} onClose={() => setDlItem(null)} />
-      <PreviewLightbox item={previewItem} onClose={() => setPreviewItem(null)} />
+      {/* These render in a body portal, so the hidden wrapper can't hide them
+          while Discover stays mounted on another tab — gate on `active` so they
+          unmount immediately instead of animating out over the new tab. */}
+      {active && (
+        <>
+          <DownloadDialog item={dlItem} onClose={() => setDlItem(null)} />
+          <PreviewLightbox
+            item={previewItem}
+            onClose={() => setPreviewItem(null)}
+          />
+        </>
+      )}
     </section>
   )
 }

@@ -46,9 +46,9 @@ mod ffi {
 
         /// Add a magnet for download into `save_path`, downloading ONLY the file
         /// indices in `only_files` (empty = all). Returns the info-hash hex id,
-        /// or "" on error. The torrent starts paused; selection + resume are
-        /// applied by the first `lt_status` once metadata is known, so deselected
-        /// files (priority 0) are never created.
+        /// or "" on error. The torrent runs immediately to fetch metadata; the
+        /// file selection is applied the instant metadata arrives (before any
+        /// payload is written), so deselected files (priority 0) are never created.
         fn lt_add(magnet: &str, save_path: &str, only_files: &[u32]) -> String;
 
         /// Resolve a magnet's file list without downloading data (metadata only),
@@ -56,12 +56,20 @@ mod ffi {
         /// from a blocking task.
         fn lt_list_files(magnet: &str, timeout_ms: u32) -> Vec<LtFile>;
 
+        /// Fetch a magnet's metadata and write a .torrent file to `out_path` (no
+        /// payload downloaded). false on timeout/error. BLOCKING.
+        fn lt_save_torrent(magnet: &str, out_path: &str, timeout_ms: u32) -> bool;
+
         /// Current status of a torrent by info-hash id.
         fn lt_status(id: &str) -> LtStatus;
 
         /// User pause / resume (distinct from the internal add-paused state).
         fn lt_pause(id: &str);
         fn lt_resume(id: &str);
+
+        /// Session-wide max rates in bytes/sec (0 = unlimited). No-op until the
+        /// session exists.
+        fn lt_set_rate_limits(download_bps: i32, upload_bps: i32);
 
         /// Remove the torrent from the session, optionally deleting its files.
         fn lt_remove(id: &str, delete_files: bool);
@@ -85,6 +93,11 @@ pub fn list_files(magnet: &str, timeout_ms: u32) -> Vec<LtFile> {
     ffi::lt_list_files(magnet, timeout_ms)
 }
 
+/// Blocking: fetch metadata and write a .torrent file to `out_path` (no payload).
+pub fn save_torrent(magnet: &str, out_path: &str, timeout_ms: u32) -> bool {
+    ffi::lt_save_torrent(magnet, out_path, timeout_ms)
+}
+
 pub fn status(id: &str) -> LtStatus {
     ffi::lt_status(id)
 }
@@ -95,6 +108,11 @@ pub fn pause(id: &str) {
 
 pub fn resume(id: &str) {
     ffi::lt_resume(id)
+}
+
+/// Set session-wide max download/upload rates in bytes/sec (0 = unlimited).
+pub fn set_rate_limits(download_bps: i32, upload_bps: i32) {
+    ffi::lt_set_rate_limits(download_bps, upload_bps)
 }
 
 pub fn remove(id: &str, delete_files: bool) {

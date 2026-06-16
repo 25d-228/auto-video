@@ -131,7 +131,7 @@ export const DISC_CATALOG: Record<Cat, readonly CatalogProvider[]> = {
     // JavDB VR = the Categories→Censored browser with Genre=VR. It has no fixed
     // "list" — the toolbar shows Year/Month/Sort selectors instead (see
     // JAVDB_VR_* below + Discover.tsx). The "newest" id here is a placeholder so
-    // resolveList stays happy; the actual feed is driven by JavdbVrSel/opts.
+    // resolveList stays happy; the actual feed is driven by JavdbBrowseSel/opts.
     { provider: "javdb", lists: ["newest"] },
   ],
 }
@@ -191,11 +191,22 @@ export const LIMIT_OPTIONS: readonly ChipOption<number>[] = [
   { value: 100, label: "100" },
 ]
 
-// ----------------------------------------------------- JavDB VR browser controls
-// JavDB VR (Adult→VR→JavDB) is the Categories→Censored browser with Genre=VR
-// (filter_by `0:t:m:212:<year>::<month>`), so the toolbar shows Year / Month /
-// Sort selectors instead of a single list. Values map to the live API params
-// (see src/api/sources/javdb.ts javdbTags + docs/javdb-api.md).
+// -------------------------------------------------- JavDB year/month browser controls
+// The JavDB browser is the Categories→Censored view, driven by Year / Month /
+// Sort selectors instead of a single list. Two surfaces use it:
+//   - Adult→VR→JavDB:        Genre=VR (filter_by `0:t:m:212:<year>::<month>`).
+//   - Adult→JavDB→Category:  all genres minus the VR set (see javdb.ts discover).
+// Values map to the live API params (see src/api/sources/javdb.ts javdbTags +
+// docs/javdb-api.md).
+
+/** JavDB Adult sub-mode: the ranking windows, or the year/month category browser. */
+export type JavdbAdMode = "ranking" | "category"
+
+/** Adult→JavDB mode toggle options (Ranking = daily/weekly/monthly lists). */
+export const JAVDB_AD_MODE_OPTIONS: readonly { value: JavdbAdMode; label: string }[] = [
+  { value: "ranking", label: "Ranking" },
+  { value: "category", label: "Category" },
+]
 
 /** Year options ("" = all years), newest first (2026 → 2001). */
 export const JAVDB_YEAR_OPTIONS: readonly { value: string; label: string }[] = [
@@ -236,18 +247,18 @@ export const JAVDB_SORT_OPTIONS: readonly JavdbSortOption[] = [
   { value: "watched_count", label: "Most watched", sortBy: "watched_count", orderBy: "desc" },
 ]
 
-/** JavDB VR toolbar selection (year/month/sort). */
-export interface JavdbVrSel {
+/** JavDB browser toolbar selection (year/month/sort) — shared by VR + Category. */
+export interface JavdbBrowseSel {
   year: string
   month: string
   /** A {@link JAVDB_SORT_OPTIONS} value. */
   sort: string
 }
 
-export const DEFAULT_JAVDB_VR: JavdbVrSel = { year: "", month: "", sort: "release_desc" }
+export const DEFAULT_JAVDB_BROWSE: JavdbBrowseSel = { year: "", month: "", sort: "release_desc" }
 
-/** Resolve a {@link JavdbVrSel} into the discover() opts (year/month/sortBy/orderBy). */
-export function javdbVrOpts(sel: JavdbVrSel): {
+/** Resolve a {@link JavdbBrowseSel} into the discover() opts (year/month/sortBy/orderBy). */
+export function javdbBrowseOpts(sel: JavdbBrowseSel): {
   year: string
   month: string
   sortBy: string

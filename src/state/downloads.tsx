@@ -1,5 +1,5 @@
 /**
- * Download queue state over the Rust download commands (librqbit):
+ * Download queue state over the Rust download commands (libtorrent):
  * start_download / pause_download / resume_download / cancel_download.
  * Progress arrives via the Tauri "download-progress" event; in a plain
  * browser (no window.__TAURI__) everything degrades to a toast + no-op.
@@ -16,7 +16,7 @@ import {
 } from "react"
 import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
-import { allDownloads, removeDownload, saveDownload } from "@/state/db"
+import { allDownloads, getKey, removeDownload, saveDownload } from "@/state/db"
 
 /** True when running inside the Tauri shell (withGlobalTauri is on). */
 export function isTauri(): boolean {
@@ -171,8 +171,30 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  // Apply the persisted download/upload speed limits to the libtorrent session
+  // on launch — only when a limit is actually set, so an unlimited config does
+  // not spin up the session early. Settings re-applies on change.
+  useEffect(() => {
+    if (!isTauri()) return
+    void (async () => {
+      try {
+        const [dl, ul] = await Promise.all([
+          getKey("dlLimitKib"),
+          getKey("ulLimitKib"),
+        ])
+        const downloadKib = Number(dl) || 0
+        const uploadKib = Number(ul) || 0
+        if (downloadKib > 0 || uploadKib > 0) {
+          await invoke("set_rate_limits", { downloadKib, uploadKib })
+        }
+      } catch {
+        /* best-effort */
+      }
+    })()
+  }, [])
+
   // Resume downloads that were in flight when the app last quit: re-add each
-  // persisted magnet so librqbit continues from the partial files on disk.
+  // persisted magnet so libtorrent continues from the partial files on disk.
   useEffect(() => {
     if (!isTauri() || resumedRef.current) return
     resumedRef.current = true

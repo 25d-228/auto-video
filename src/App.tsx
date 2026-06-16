@@ -188,7 +188,16 @@ function AppShell() {
       </aside>
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {view === "dashboard" && <Dashboard />}
-        {view === "discover" && <Discover />}
+        {/* Discover stays mounted (just hidden when inactive) so its category,
+            selectors and page are remembered across tab switches. */}
+        <div
+          className={cn(
+            "flex min-h-0 flex-1 flex-col",
+            view !== "discover" && "hidden"
+          )}
+        >
+          <Discover active={view === "discover"} />
+        </div>
         {view === "library" && <Library />}
         {view === "downloads" && (
           <Downloads onGoDiscover={() => setView("discover")} />

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,8 @@
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert.hpp>
 #include <libtorrent/alert_types.hpp>
+#include <libtorrent/bencode.hpp>
+#include <libtorrent/create_torrent.hpp>
 #include <libtorrent/download_priority.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/file_storage.hpp>
@@ -219,6 +222,66 @@ rust::Vec<LtFile> lt_list_files(rust::Str magnet, std::uint32_t timeout_ms) {
   return out;
 }
 
+bool lt_save_torrent(rust::Str magnet, rust::Str out_path,
+                     std::uint32_t timeout_ms) {
+  if (!lt_init()) return false;
+  lt::error_code ec;
+  lt::add_torrent_params atp = lt::parse_magnet_uri(std::string(magnet), ec);
+  if (ec) return false;
+  std::string id = id_of(atp.info_hashes);
+
+  // Reuse an already-managed torrent if this magnet is downloading (its metadata
+  // is already in hand); otherwise add a temporary metadata-only torrent. NEVER
+  // delete_files on a reused (real) handle.
+  lt::torrent_handle th;
+  bool temporary = false;
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_torrents.find(id);
+    if (it != g_torrents.end()) th = it->second.handle;
+  }
+  if (!th.is_valid()) {
+    auto tmp = std::filesystem::temp_directory_path() / "av-lt-meta";
+    std::error_code fec;
+    std::filesystem::create_directories(tmp, fec);
+    atp.save_path = tmp.string();
+    atp.flags &= ~lt::torrent_flags::paused; // run to fetch metadata (no payload)
+    th = g_ses->add_torrent(std::move(atp), ec);
+    if (ec || !th.is_valid()) return false;
+    temporary = true;
+  }
+
+  auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  std::shared_ptr<const lt::torrent_info> ti;
+  for (;;) {
+    ti = th.torrent_file();
+    if (ti && ti->num_files() > 0) break;
+    if (std::chrono::steady_clock::now() >= deadline) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+
+  bool ok = false;
+  if (ti && ti->num_files() > 0) {
+    // Regenerate a .torrent from the fetched info dict, carrying over the
+    // magnet's trackers so the saved file is usable in another client.
+    lt::create_torrent ct(*ti);
+    for (auto const& a : th.trackers()) ct.add_tracker(a.url, a.tier);
+    std::vector<char> buf;
+    lt::bencode(std::back_inserter(buf), ct.generate());
+    std::ofstream f(std::string(out_path), std::ios::binary);
+    if (f) {
+      f.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+      ok = f.good();
+    }
+  }
+
+  if (temporary && g_ses) {
+    g_ses->remove_torrent(th, lt::session::delete_files);
+  }
+  return ok;
+}
+
 LtStatus lt_status(rust::Str id) {
   LtStatus s;
   s.valid = false;
@@ -272,6 +335,16 @@ void lt_resume(rust::Str id) {
   if (it == g_torrents.end()) return;
   it->second.user_paused = false;
   if (it->second.handle.is_valid()) it->second.handle.resume();
+}
+
+void lt_set_rate_limits(std::int32_t download_bps, std::int32_t upload_bps) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!g_ses) return;
+  // 0 = unlimited (libtorrent convention). Applies session-wide to all torrents.
+  lt::settings_pack sp;
+  sp.set_int(lt::settings_pack::download_rate_limit, download_bps);
+  sp.set_int(lt::settings_pack::upload_rate_limit, upload_bps);
+  g_ses->apply_settings(sp);
 }
 
 void lt_remove(rust::Str id, bool delete_files) {

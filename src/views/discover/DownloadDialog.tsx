@@ -8,6 +8,7 @@ import { useEffect, useMemo, useState } from "react"
 import { Check, Loader2 } from "lucide-react"
 import { useQuery } from "@tanstack/react-query"
 import { invoke } from "@tauri-apps/api/core"
+import { save as saveDialog } from "@tauri-apps/plugin-dialog"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -29,6 +30,7 @@ import {
 import type { DiscoverItem, Release } from "@/api/types"
 import { usePaths, useSeeders } from "@/state/queries"
 import { useDownloads } from "@/state/downloads"
+import { getKey, setKey } from "@/state/db"
 import { providerLabel } from "./model"
 
 export interface DownloadDialogProps {
@@ -98,10 +100,12 @@ export function DownloadDialog({ item, onClose }: DownloadDialogProps) {
 
   const [selIdx, setSelIdx] = useState(0)
   const [starting, setStarting] = useState(false)
+  const [savingTorrent, setSavingTorrent] = useState(false)
   const itemId = item?.id
   useEffect(() => {
     setSelIdx(0)
     setStarting(false)
+    setSavingTorrent(false)
   }, [itemId])
 
   const releases = useMemo<Release[]>(() => {
@@ -184,6 +188,43 @@ export function DownloadDialog({ item, onClose }: DownloadDialogProps) {
     if (ok) {
       notify("Download started")
       onClose()
+    }
+  }
+
+  // Save just the .torrent file (metadata only — no content), to load into
+  // another client or archive. Independent of the file picker.
+  const onSaveTorrent = async () => {
+    if (!item || !sel?.magnet || savingTorrent || starting) return
+    if (!tauri) {
+      notify("Saving the .torrent needs the desktop app")
+      return
+    }
+    const base =
+      (item.code || item.title || "download").replace(/[/\\:*?"<>|]+/g, "_").trim() ||
+      "download"
+    setSavingTorrent(true)
+    try {
+      // Default to the directory used last time; fall back to the category
+      // folder on first use.
+      const lastDir = (await getKey("torrentSaveDir").catch(() => null)) ?? ""
+      const baseDir = lastDir || dest
+      const defaultPath = baseDir ? `${baseDir}/${base}.torrent` : `${base}.torrent`
+      const outPath = await saveDialog({
+        title: "Save .torrent file",
+        defaultPath,
+        filters: [{ name: "Torrent", extensions: ["torrent"] }],
+      })
+      if (!outPath) return // cancelled
+      await invoke("save_torrent", { magnet: sel.magnet, outPath })
+      // Remember the chosen directory (strip the trailing /filename) for next time.
+      const dir = outPath.replace(/[/\\][^/\\]*$/, "")
+      if (dir && dir !== outPath) await setKey("torrentSaveDir", dir).catch(() => {})
+      notify("Saved .torrent file")
+      onClose()
+    } catch (e) {
+      notify(`Couldn't save .torrent: ${String(e)}`)
+    } finally {
+      setSavingTorrent(false)
     }
   }
 
@@ -333,11 +374,20 @@ export function DownloadDialog({ item, onClose }: DownloadDialogProps) {
         </div>
 
         <DialogFooter>
+          <Button
+            variant="outline"
+            className="sm:mr-auto"
+            disabled={!tauri || !sel?.magnet || savingTorrent || starting}
+            onClick={() => void onSaveTorrent()}
+            title="Save the .torrent file only — no video is downloaded"
+          >
+            {savingTorrent ? "Saving…" : "Save .torrent"}
+          </Button>
           <Button variant="outline" onClick={onClose}>
             Cancel
           </Button>
           <Button
-            disabled={!tauri || !sel?.magnet || starting || nothingPicked}
+            disabled={!tauri || !sel?.magnet || starting || savingTorrent || nothingPicked}
             onClick={() => void onStart()}
           >
             {starting ? "Starting…" : "Start download"}

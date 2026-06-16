@@ -176,12 +176,14 @@ async function cachedListing(
  * @param n      max items to return (default 50)
  * @param fresh  bypass the 300s listing cache
  */
-/** Extra per-provider controls (currently the JavDB VR year/month/sort selectors). */
+/** Extra per-provider controls (the JavDB year/month/sort browser selectors). */
 export interface DiscoverOpts {
   year?: string
   month?: string
   sortBy?: string
   orderBy?: "desc" | "asc"
+  /** JavDB Adult browser flag: "category" = all-titles-by-window minus VR. */
+  mode?: string
 }
 
 export async function discover(
@@ -254,9 +256,12 @@ export async function discover(
     // coverObjectUrl decodes it, so we use the REAL javdb jacket directly. Proxy
     // AFTER the cache so SQLite keeps the raw cmastd URLs, not blob: URLs.
     // The vrc selection lives in opts (not the list id), so it's part of the key.
+    // Both the VR browser (vrc) and the Adult→Category browser (mode ===
+    // "category") are driven by the year/month/sort opts rather than the list
+    // id, so fold those (and the mode) into the cache key.
     const jkey =
-      cat === "vrc"
-        ? `${key}|${opts.year ?? ""}|${opts.month ?? ""}|${opts.sortBy ?? ""}|${opts.orderBy ?? ""}`
+      cat === "vrc" || opts.mode === "category"
+        ? `${key}|${opts.mode ?? ""}|${opts.year ?? ""}|${opts.month ?? ""}|${opts.sortBy ?? ""}|${opts.orderBy ?? ""}`
         : key
     const data = await cachedListing(jkey, fresh, () => javdbDiscover(cat, lst, opts))
     await proxyCovers(data)

@@ -131,9 +131,6 @@ interface TaxonomyData {
 /** VR is category tag id 212 (docs/javdb-api.md). */
 export const VR_TAG_ID = "212"
 
-/** Default browse `filter_by` (all titles). */
-const FILTER_ALL = "0:t:m::::"
-
 /** javdb ranking windows. */
 export type JavdbPeriod = "daily" | "weekly" | "monthly"
 
@@ -316,7 +313,9 @@ export interface JavdbTagsOpts {
  *   - actor:  `0:a:<actorSlug>`
  *   - tag:    `0:t:m:<tagId>:<year>::<month>`  (genre=field 4, year=field 5,
  *             month=field 7; e.g. VR 2024 June = `0:t:m:212:2024::6`)
- *   - default: `0:t:m::::`
+ * An EMPTY genre field (no tagId) means ALL genres incl. VR — with a year/month
+ * that's the "all titles in that window" feed the Adult→Category browser
+ * subtracts the VR set from; with no year/month it's the plain `0:t:m::::`.
  * The category is 'vrc' when browsing the VR tag (212), else 'ad'.
  */
 export async function javdbTags(opts: JavdbTagsOpts = {}): Promise<DiscoverItem[]> {
@@ -332,8 +331,9 @@ export async function javdbTags(opts: JavdbTagsOpts = {}): Promise<DiscoverItem[
   } = opts
   let filterBy: string
   if (actorSlug) filterBy = `0:a:${actorSlug}`
-  else if (tagId) filterBy = `0:t:m:${tagId}:${year}::${month}`
-  else filterBy = FILTER_ALL
+  // Empty genre (tagId falsy) -> all genres; with year/month set this is the
+  // "all titles in that window" feed. All-empty collapses to `0:t:m::::`.
+  else filterBy = `0:t:m:${tagId ?? ""}:${year}::${month}`
   const cat: Cat = tagId === VR_TAG_ID ? "vrc" : "ad"
   const data = await javdbApi<MoviesData>(
     `/api/v1/movies/tags?filter_by=${encodeURIComponent(filterBy)}` +
@@ -479,7 +479,7 @@ export async function javdbTagsTaxonomy(): Promise<JavdbTagGroup[]> {
 
 // --------------------------------------------------------------- discover helper
 
-/** Extra VR-browser controls threaded from the Discover toolbar (year/month/sort). */
+/** Extra browser controls threaded from the Discover toolbar (year/month/sort). */
 export interface JavdbDiscoverOpts {
   /** Year tag ("2024"); "" = all years. */
   year?: string
@@ -489,15 +489,38 @@ export interface JavdbDiscoverOpts {
   sortBy?: string
   /** desc|asc (release only). */
   orderBy?: "desc" | "asc"
+  /** "category" = the Adult year/month browser (all titles MINUS the VR set). */
+  mode?: string
+}
+
+/**
+ * Page through the filtered browser. The tags endpoint hard-caps at 50 items
+ * per page (the `limit` param is ignored above 50), so fill the grid with 2
+ * pages (~100). Stops early at the last page.
+ */
+async function javdbBrowse(
+  opts: JavdbTagsOpts,
+  pages = 2
+): Promise<DiscoverItem[]> {
+  const out: DiscoverItem[] = []
+  for (let page = 1; page <= pages; page++) {
+    const items = await javdbTags({ ...opts, page, limit: 50 })
+    if (items.length === 0) break // past the last page
+    out.push(...items)
+  }
+  return out
 }
 
 /**
  * Map a Discover catalog (cat, list) selection to the right javdb call.
  *
- *   ad:  daily | weekly | monthly -> the Censored ranking for that window
- *                                    (`/api/v1/rankings?type=0`).
- *   vrc: the Categories→Censored browser with Genre=VR (tag 212), filtered by
- *        the chosen year/month and ordered by the chosen sort (Image #4/#5).
+ *   vrc:           the Categories→Censored browser with Genre=VR (tag 212),
+ *                  filtered by the chosen year/month and ordered by the sort.
+ *   ad + category: ALL titles for the chosen year/month (empty genre) MINUS the
+ *                  VR set for the same window — javdb has no "exclude VR" filter,
+ *                  so the censored 2D feed is all − vr (by movie id).
+ *   ad + ranking:  the Censored ranking for that window (`/api/v1/rankings?type=0`,
+ *                  daily | weekly | monthly).
  *
  * Coverless rows are already dropped by the mappers.
  */
@@ -506,24 +529,31 @@ export async function discover(
   list: string,
   opts: JavdbDiscoverOpts = {}
 ): Promise<DiscoverItem[]> {
+  const browse = {
+    year: opts.year,
+    month: opts.month,
+    sortBy: opts.sortBy ?? "release",
+    orderBy: opts.orderBy ?? "desc",
+  }
   if (cat === "vrc") {
-    // The tags endpoint hard-caps at 50 items per page (the `limit` param is
-    // ignored above 50), so page through it to fill the grid (~100 = 2 pages).
-    const base = {
-      tagId: VR_TAG_ID,
-      year: opts.year,
-      month: opts.month,
-      sortBy: opts.sortBy ?? "release",
-      orderBy: opts.orderBy ?? "desc",
-      limit: 50,
-    }
-    const out: DiscoverItem[] = []
-    for (let page = 1; page <= 2; page++) {
-      const items = await javdbTags({ ...base, page })
-      if (items.length === 0) break // past the last page
-      out.push(...items)
-    }
-    return out
+    return javdbBrowse({ tagId: VR_TAG_ID, ...browse })
+  }
+  if (opts.mode === "category") {
+    // Fetch the whole window (empty genre = all titles incl. VR) and the VR-only
+    // set for the SAME window, then subtract the VR ids. Equal page counts make
+    // the subtraction exact: any VR title within the top-N of "all" is necessarily
+    // within the top-N of "VR" (VR ⊆ all, identical ordering).
+    const [all, vr] = await Promise.all([
+      javdbBrowse(browse),
+      javdbBrowse({ tagId: VR_TAG_ID, ...browse }),
+    ])
+    const vrIds = new Set(vr.map((i) => i.id))
+    // Drop the authoritative tag-212 set by id, AND anything the title/code
+    // heuristic already flagged VR (toDiscoverItem promotes those to cat 'vrc').
+    // The cat guard keeps the feed strictly non-VR even if tag-212 missed a
+    // title — and degrades gracefully if the VR sub-fetch transiently fails
+    // (most VR codes carry a VR label, so isVr still catches them).
+    return all.filter((i) => !vrIds.has(i.id) && i.cat !== "vrc")
   }
   const period: JavdbPeriod =
     list === "weekly" || list === "monthly" || list === "daily" ? list : "daily"

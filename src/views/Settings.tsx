@@ -10,6 +10,7 @@
 import { useEffect, useRef, useState } from "react"
 import { useQueryClient } from "@tanstack/react-query"
 import { getVersion } from "@tauri-apps/api/app"
+import { invoke } from "@tauri-apps/api/core"
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog"
 import { Check, FolderOpen } from "lucide-react"
 import { saveKey, savePath } from "@/api/client"
@@ -333,6 +334,106 @@ function ProviderKeysCard() {
   )
 }
 
+// ------------------------------------------------------------- download speed
+
+/** A numeric KiB/s field that treats blank / 0 / invalid as "unlimited". */
+function toKib(s: string): number {
+  const n = Math.floor(Number(s))
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+function DownloadLimitsCard() {
+  const queryClient = useQueryClient()
+  const { tauri, notify } = useDownloads()
+  const keysQuery = useKeys()
+  const stored = keysQuery.data
+  // undefined = untouched -> show the stored value ("0" renders as blank).
+  const [drafts, setDrafts] = useState<{ dl?: string; ul?: string }>({})
+  const [saving, setSaving] = useState(false)
+
+  const shown = (key: string) => {
+    const v = stored?.[key] ?? ""
+    return v === "0" ? "" : v
+  }
+  const dlVal = drafts.dl ?? shown("dlLimitKib")
+  const ulVal = drafts.ul ?? shown("ulLimitKib")
+  const dirty = drafts.dl !== undefined || drafts.ul !== undefined
+
+  const save = async () => {
+    setSaving(true)
+    try {
+      const downloadKib = toKib(dlVal)
+      const uploadKib = toKib(ulVal)
+      await saveKey("dlLimitKib", String(downloadKib))
+      await saveKey("ulLimitKib", String(uploadKib))
+      await queryClient.invalidateQueries({ queryKey: qk.keys() })
+      if (tauri) {
+        // Apply live; it also re-applies from storage on next launch.
+        try {
+          await invoke("set_rate_limits", { downloadKib, uploadKib })
+        } catch {
+          /* still persisted for next launch */
+        }
+      }
+      setDrafts({})
+      notify("Speed limits saved")
+    } catch {
+      notify("Couldn't save the speed limits.")
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const field = (
+    label: string,
+    value: string,
+    onChange: (v: string) => void
+  ) => (
+    <div className="flex items-center gap-2">
+      <span className="w-28 flex-none text-xs font-medium text-muted-foreground">
+        {label}
+      </span>
+      <Input
+        type="number"
+        min={0}
+        inputMode="numeric"
+        value={value}
+        placeholder="Unlimited"
+        onChange={(e) => onChange(e.target.value)}
+        className="h-8 w-32 text-xs"
+      />
+      <span className="text-[11px] text-muted-foreground">KB/s</span>
+    </div>
+  )
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Download speed</CardTitle>
+        <CardDescription>
+          Caps apply to all torrents combined. Leave blank (or 0) for unlimited.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {field("Max download", dlVal, (v) =>
+          setDrafts((p) => ({ ...p, dl: v }))
+        )}
+        {field("Max upload", ulVal, (v) => setDrafts((p) => ({ ...p, ul: v })))}
+        <div>
+          <Button
+            size="sm"
+            className="h-8"
+            disabled={saving || !dirty}
+            onClick={() => void save()}
+          >
+            {saving ? "Saving…" : "Save limits"}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
 // ---------------------------------------------------------------- appearance
 
 function AppearanceCard() {
@@ -428,11 +529,16 @@ export default function Settings() {
           Folders, providers and appearance
         </span>
       </div>
-      <div className="flex min-h-0 max-w-xl flex-1 flex-col gap-3 overflow-y-auto pb-5">
-        <LibraryFoldersCard />
-        <ProviderKeysCard />
-        <AppearanceCard />
-        <AboutCard />
+      {/* Full-width scroll container so the scrollbar sits at the window edge;
+          the cards stay capped at max-w-xl and left-aligned inside it. */}
+      <div className="min-h-0 flex-1 overflow-y-auto pb-5">
+        <div className="flex max-w-xl flex-col gap-3">
+          <LibraryFoldersCard />
+          <ProviderKeysCard />
+          <DownloadLimitsCard />
+          <AppearanceCard />
+          <AboutCard />
+        </div>
       </div>
     </section>
   )
