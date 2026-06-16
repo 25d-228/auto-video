@@ -63,7 +63,7 @@ fn dl_progress(id: &str, handle: &dl::Handle, title: &str, dest: &str) -> DlProg
         id: id.to_owned(),
         title: title.to_owned(),
         progress: st.progress.clamp(0.0, 1.0),
-        // libtorrent reports bytes/sec; the UI shows MB/s.
+        // librqbit reports bytes/sec; the UI shows MB/s.
         speed_mbps: st.download_rate as f64 / BYTES_PER_MIB,
         state,
         dest: dest.to_owned(),
@@ -154,7 +154,7 @@ fn resolve_out_dir(app: &tauri::AppHandle, dest: &str) -> Result<PathBuf, String
 }
 
 /// Canonicalize the downloaded file names once a download finishes: remove the
-/// torrent from the session (keeping the files) so libtorrent closes its
+/// torrent from the session (keeping the files) so librqbit closes its
 /// handles, rename per the plan, then drop the management entry. A no-op (and
 /// leaves the entry) when there are no renames.
 async fn apply_renames(app: &tauri::AppHandle, id: &str, dest_out: &str, renames: Option<&Vec<RenamePair>>) {
@@ -287,9 +287,9 @@ async fn set_rate_limits(download_kib: i64, upload_kib: i64) -> Result<(), Strin
         .map_err(|e| e.to_string())
 }
 
-/// Resolve a torrent's file list WITHOUT downloading the data (libtorrent
-/// metadata-only / upload_mode), so the UI can let the user choose which files
-/// to fetch. For a bare magnet the metadata must be fetched from peers/DHT, so
+/// Resolve a torrent's file list WITHOUT downloading the data (metadata-only),
+/// so the UI can let the user choose which files to fetch. For a bare magnet the
+/// metadata must be fetched from peers/DHT, so
 /// the shim is bounded by a timeout; it BLOCKS, hence spawn_blocking.
 #[tauri::command]
 async fn list_torrent_files(magnet: String) -> Result<Vec<TorrentFile>, String> {

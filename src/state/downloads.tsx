@@ -1,5 +1,5 @@
 /**
- * Download queue state over the Rust download commands (libtorrent):
+ * Download queue state over the Rust download commands (librqbit):
  * start_download / pause_download / resume_download / cancel_download.
  * Progress arrives via the Tauri "download-progress" event; in a plain
  * browser (no window.__TAURI__) everything degrades to a toast + no-op.
@@ -174,7 +174,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  // Apply the persisted download/upload speed limits to the libtorrent session
+  // Apply the persisted download/upload speed limits to the librqbit session
   // on launch — only when a limit is actually set, so an unlimited config does
   // not spin up the session early. Settings re-applies on change.
   useEffect(() => {
@@ -197,7 +197,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   // Resume downloads that were in flight when the app last quit: re-add each
-  // persisted magnet so libtorrent continues from the partial files on disk.
+  // persisted magnet so librqbit continues from the partial files on disk.
   useEffect(() => {
     if (!isTauri() || resumedRef.current) return
     resumedRef.current = true
