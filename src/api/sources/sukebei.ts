@@ -18,8 +18,13 @@
  */
 import type { DiscoverItem, Release } from "@/api/types"
 import { isVr, parseCode } from "@/lib/codes"
+import { quality } from "@/lib/quality"
 import { httpText } from "@/net/http"
 import { getCached, isDbAvailable, setCached } from "@/state/db"
+
+// Re-exported for callers that historically imported it from this module
+// (tpb.ts, the seeders helpers, the sukebei unit test).
+export { quality }
 
 /** sukebei view-page / Referer host. */
 const SUKEBEI_BASE = "https://sukebei.nyaa.si"
@@ -87,18 +92,6 @@ function unescapeHtml(s: string): string {
 function numFromCell(x: string): number {
   const n = parseInt(x.replace(/[^\d]/g, ""), 10)
   return Number.isNaN(n) ? 0 : n
-}
-
-/**
- * Derive a coarse quality label from a release name (Python _quality): first of
- * 2160p/4K/8K/1080p/720p/480p found, uppercased; "" when none present.
- */
-export function quality(name: string): string {
-  const n = (name || "").toLowerCase()
-  for (const q of ["2160p", "4k", "8k", "1080p", "720p", "480p"]) {
-    if (n.includes(q)) return q.toUpperCase()
-  }
-  return ""
 }
 
 // ----------------------------------------------------------------- parser

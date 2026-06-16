@@ -21,6 +21,7 @@ import { seedersYts } from "@/api/sources/yts"
 import type { Cat, Release } from "@/api/types"
 import { getKey, isDbAvailable } from "@/state/db"
 import { httpText } from "@/net/http"
+import { quality } from "@/lib/quality"
 
 // ----------------------------------------------------------------- helpers
 
@@ -32,15 +33,6 @@ import { httpText } from "@/net/http"
  */
 function pyQuote(s: string): string {
   return encodeURIComponent(s ?? "").replace(/%2F/g, "/")
-}
-
-/** Port of _quality(name): first of 2160p/4K/8K/1080p/720p/480p found, uppercased. */
-function quality(name: string): string {
-  const n = (name || "").toLowerCase()
-  for (const q of ["2160p", "4k", "8k", "1080p", "720p", "480p"]) {
-    if (n.includes(q)) return q.toUpperCase()
-  }
-  return ""
 }
 
 /** Minimal HTML-entity unescape for the few refs javbus emits in magnet links. */

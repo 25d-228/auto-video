@@ -38,6 +38,7 @@ import {
   signatureHeader,
 } from "@/api/javdb/signature"
 import type { Cat, DiscoverItem, Release } from "@/api/types"
+import { quality } from "@/lib/quality"
 import { isVr } from "@/lib/codes"
 
 // --------------------------------------------------------------- API envelope
@@ -186,15 +187,6 @@ export function humanSize(bytes: number): string {
 /** Port of _magnet(ih, name): build a magnet URI with the tracker tail. */
 function buildMagnet(infohash: string, name: string): string {
   return `magnet:?xt=urn:btih:${infohash}&dn=${encodeURIComponent(name || "")}${TRACKERS}`
-}
-
-/** Port of _quality(name): pick a resolution token from a name, "" if none. */
-function quality(name: string): string {
-  const n = (name || "").toLowerCase()
-  for (const q of ["2160p", "4k", "8k", "1080p", "720p", "480p"]) {
-    if (n.includes(q)) return q.toUpperCase()
-  }
-  return ""
 }
 
 /** The public web permalink for a slug (Python _jdb_link). */

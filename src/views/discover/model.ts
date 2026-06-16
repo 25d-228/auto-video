@@ -278,10 +278,6 @@ export function providerLabel(provider: string): string {
   return PROVIDER_LABELS[provider as ProviderId] ?? provider
 }
 
-export function listLabel(list: string): string {
-  return LIST_LABELS[list as ListId] ?? list
-}
-
 /** Default poster aspect ratio per category (old defAr). */
 export function defAr(cat: Cat): number {
   return cat === "mov" ? 0.675 : cat === "tv" ? 0.7 : 0.72
