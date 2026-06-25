@@ -1,19 +1,22 @@
 /**
- * FANZA digital video rankings via the public GraphQL API (api.video.dmm.co.jp).
- * No auth / cookies / referer needed (see docs/dmm-digital-api.md). This is the
- * ONLY source of a real digital VR ranking — the scrapable mono/dvd VR floor
- * (fetchDmm) only carries obscure physical discs (ovvr…), while this returns the
- * popular streaming VR titles (vrkm/sivr/dsvr…).
+ * FANZA digital video via the public GraphQL API (api.video.dmm.co.jp). No auth /
+ * cookies / referer needed (see docs/dmm-digital-api.md). It serves two Discover
+ * feeds: the digital VR ranking (vrc) — the ONLY source of real streaming VR (the
+ * scrapable mono/dvd VR floor carries only obscure physical discs like ovvr…) —
+ * and the non-VR digital AV feed (ad, contentType TWO_DIMENSION).
  *
  * Covers are raw awsimgsrc.dmm.co.jp URLs (hotlink-protected → a dmm Referer,
  * derived automatically by coverObjectUrl). discover() proxies them to blob:
  * URLs AFTER the listing cache, so SQLite keeps the raw URLs.
  */
-import type { DiscoverItem } from "@/api/types"
+import type { Cat, DiscoverItem } from "@/api/types"
 import { httpJson } from "@/net/http"
 import { dmmCidToCode } from "./dmm"
 
 const DMM_GQL = "https://api.video.dmm.co.jp/graphql"
+
+/** Digital floor content filter: VR titles vs 2D (non-VR) titles. */
+type DigitalContentType = "VR" | "TWO_DIMENSION"
 
 /** Wide digital jacket (~1600x1000); CoverImage measures the real ratio. */
 const DIGITAL_WIDE_JACKET_AR = 1.6
@@ -54,11 +57,15 @@ async function gql<T>(query: string, variables?: Record<string, unknown>): Promi
 }
 
 /**
- * Map digital content nodes to VR DiscoverItems. Cover = the smaller `ps` jacket
- * (the API hands back the ~600 KB `pl`; `ps` is ~half that, fine for the grid).
- * Pure (no network) so it can be unit-tested.
+ * Map digital content nodes to DiscoverItems for `cat` (vrc default, or ad for the
+ * non-VR digital feed). Cover = the smaller `ps` jacket (the API hands back the
+ * ~600 KB `pl`; `ps` is ~half that, fine for the grid). Pure (no network) so it
+ * can be unit-tested.
  */
-export function mapDigitalContents(contents: readonly DigitalContent[]): DiscoverItem[] {
+export function mapDigitalContents(
+  contents: readonly DigitalContent[],
+  cat: Cat = "vrc"
+): DiscoverItem[] {
   const out: DiscoverItem[] = []
   const seen = new Set<string>()
   for (const content of contents) {
@@ -69,9 +76,9 @@ export function mapDigitalContents(contents: readonly DigitalContent[]): Discove
     const cover = (content.packageImage?.largeUrl || "").replace(/pl\.jpg(\?.*)?$/i, "ps.jpg$1")
     out.push({
       id: "dmm_" + cid,
-      cat: "vrc",
+      cat,
       title: code || cid,
-      sub: "VR",
+      sub: cat === "vrc" ? "VR" : "",
       cover,
       ar: DIGITAL_WIDE_JACKET_AR, // CoverImage measures the real ratio
       seeders: 0,
@@ -89,8 +96,8 @@ export function mapDigitalContents(contents: readonly DigitalContent[]): Discove
   return out
 }
 
-const RANKING_Q = (type: string) =>
-  `{ ppvContentRanking(floor: AV, type: ${type}, limit: 100, contentType: VR) ` +
+const RANKING_Q = (type: string, contentType: DigitalContentType) =>
+  `{ ppvContentRanking(floor: AV, type: ${type}, limit: 100, contentType: ${contentType}) ` +
   `{ items { content { id title packageImage { largeUrl } } } } }`
 
 const SEARCH_Q =
@@ -115,22 +122,48 @@ export async function dmmDigitalPreviews(cid: string): Promise<string[]> {
 }
 
 /**
- * Digital VR feed for a Discover list id:
- *   trending  -> SALES_BEST_SELLERS · monthly -> SALES_MONTHLY   (ppvContentRanking)
- *   newest    -> RELEASE_DATE       · top_rated -> REVIEW_RANK_SCORE (legacySearchPPV)
+ * Digital feed for a Discover list id, for one contentType (VR or 2D) + category.
+ * Search axis (legacySearchPPV):
+ *   popular   -> RECOMMENDED   (exactly the website's /av/list/?sort=suggest — verified
+ *                               against the SPA's own legacySearchPPV call)
+ *   newest    -> RELEASE_DATE  · top_rated -> REVIEW_RANK_SCORE
+ * Ranking axis (ppvContentRanking):
+ *   trending  -> SALES_BEST_SELLERS · monthly  -> SALES_MONTHLY
  */
-export async function fetchDmmDigitalVr(list: string): Promise<DiscoverItem[]> {
-  if (list === "newest" || list === "top_rated") {
-    const sort = list === "newest" ? "RELEASE_DATE" : "REVIEW_RANK_SCORE"
+async function fetchDmmDigital(
+  contentType: DigitalContentType,
+  list: string,
+  cat: Cat
+): Promise<DiscoverItem[]> {
+  if (list === "popular" || list === "newest" || list === "top_rated") {
+    const sort =
+      list === "newest"
+        ? "RELEASE_DATE"
+        : list === "top_rated"
+          ? "REVIEW_RANK_SCORE"
+          : "RECOMMENDED" // popular = the website's おすすめ/suggest default
     const searchData = await gql<SearchData>(SEARCH_Q, {
       limit: 100,
       floor: "AV",
       sort,
-      filter: { contentType: "VR" },
+      filter: { contentType },
     })
-    return mapDigitalContents(searchData?.legacySearchPPV?.result?.contents ?? [])
+    return mapDigitalContents(searchData?.legacySearchPPV?.result?.contents ?? [], cat)
   }
   const type = list === "monthly" ? "SALES_MONTHLY" : "SALES_BEST_SELLERS"
-  const rankingData = await gql<RankingData>(RANKING_Q(type))
-  return mapDigitalContents((rankingData?.ppvContentRanking?.items ?? []).map((i) => i.content))
+  const rankingData = await gql<RankingData>(RANKING_Q(type, contentType))
+  return mapDigitalContents(
+    (rankingData?.ppvContentRanking?.items ?? []).map((i) => i.content),
+    cat
+  )
+}
+
+/** Digital VR feed (contentType VR) — the vrc FANZA source. */
+export function fetchDmmDigitalVr(list: string): Promise<DiscoverItem[]> {
+  return fetchDmmDigital("VR", list, "vrc")
+}
+
+/** Digital non-VR AV feed (contentType TWO_DIMENSION) — the ad FANZA source. */
+export function fetchDmmDigitalAv(list: string): Promise<DiscoverItem[]> {
+  return fetchDmmDigital("TWO_DIMENSION", list, "ad")
 }

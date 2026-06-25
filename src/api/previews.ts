@@ -3,14 +3,13 @@
  * source sites show on a product page. Lazily fetched when the detail panel
  * opens (NOT for Library items). Supported sources:
  *   - javdb:   the detail payload's preview_images (tp.cmastd.com)
- *   - dmm:     the FANZA detail page (pics.dmm.co.jp/.../<cid>-N.jpg)
+ *   - dmm:     FANZA digital sample images via the GraphQL API (awsimgsrc.dmm.co.jp)
  *   - mgstage: the product detail page (image.mgstage.com/.../cap_e_N_<code>.jpg)
  * Every image is hotlink-protected (and cmastd is XOR-encrypted), so each raw
  * URL is routed through {@link coverObjectUrl} (referer + cmastd decode) into a
  * displayable blob: URL.
  */
 import { coverObjectUrl } from "@/net/http"
-import { dmmPreviews } from "@/api/sources/dmm"
 import { dmmDigitalPreviews } from "@/api/sources/dmm-digital"
 import { javdbPreviews, javdbSearch } from "@/api/sources/javdb"
 import { mgstagePreviews } from "@/api/sources/mgstage"
@@ -39,11 +38,9 @@ async function rawPreviews(item: DiscoverItem): Promise<string[]> {
   switch ((item.src || "").toLowerCase()) {
     case "javdb":
       return javdbPreviews(item.id)
-    case "dmm": {
-      const cid = item.id.replace(/^dmm_/, "")
-      // VR = digital cids (vrkm…) -> GraphQL sampleImages; Adult = mono/dvd scrape.
-      return item.cat === "vrc" ? dmmDigitalPreviews(cid) : dmmPreviews(cid)
-    }
+    case "dmm":
+      // FANZA digital cids (sone…/vrkm…) -> GraphQL sampleImages (item.id="dmm_<cid>").
+      return dmmDigitalPreviews(item.id.replace(/^dmm_/, ""))
     case "mgstage":
       return mgstagePreviews(item.code || item.title)
     case "sukebei":

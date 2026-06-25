@@ -30,7 +30,12 @@ physical discs like `ovvr616`).
   - **`content.id` IS the cid** (e.g. `vrkm01577`, `sivr00490`) — directly usable.
   - Covers: `packageImage.largeUrl` = `https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/<cid>/...`.
 - **`legacySearchPPV(floor, sort, filter{contentType,...}, limit, offset)`** — search/browse.
-  - `sort`: `SALES_RANK_SCORE` | `RELEASE_DATE` | `REVIEW_RANK_SCORE` | `PRICE_MIN` | `PRICE_MAX` | `NAME_ASC`
+  - `sort`: `RECOMMENDED` | `SALES_RANK_SCORE` | `RELEASE_DATE` | `REVIEW_RANK_SCORE` | `PRICE_MIN` | `PRICE_MAX` | `NAME_ASC`
+  - **`RECOMMENDED` is what the website's `/av/list/?sort=suggest` uses** (the SPA's
+    `/av/list/` page chunk maps the `sort` query param via `Rj`, defaulting to
+    `recommended`; `media_type` → `contentType` via `RM`: `2d`→`TWO_DIMENSION`,
+    `vr`→`VR`). Verified live: `RECOMMENDED` returns a list distinct from
+    `SALES_RANK_SCORE`. This is the FANZA Discover provider's `popular` list.
   - `filter.contentType: VR` etc.; `includeExplicit: true`.
   - Returns `result { contents { id title } }`.
 - ~90 other named queries exist (FloorTopVr, ContentRankingPage, AvSearch,

@@ -12,8 +12,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 // Mock every dependency BEFORE importing the module under test. (The tmdb mock
 // keeps the real tmdbPath — a pure list-id -> API-path mapper — so the routing
 // assertions below also pin the _tmdb_path port.)
-vi.mock("@/api/sources/dmm", () => ({ fetchDmm: vi.fn(async () => []) }))
-vi.mock("@/api/sources/dmm-digital", () => ({ fetchDmmDigitalVr: vi.fn(async () => []) }))
+vi.mock("@/api/sources/dmm-digital", () => ({
+  fetchDmmDigitalVr: vi.fn(async () => []),
+  fetchDmmDigitalAv: vi.fn(async () => []),
+}))
 vi.mock("@/api/sources/imdb", () => ({ fetchImdbChart: vi.fn(async () => []) }))
 vi.mock("@/api/sources/javdb", () => ({ discover: vi.fn(async () => []) }))
 vi.mock("@/api/sources/mgstage", () => ({ fetchMgstage: vi.fn(async () => []) }))
@@ -46,8 +48,7 @@ vi.mock("@/net/http", () => ({
 import { resolveCovers } from "@/api/covers"
 import { discover, resolveList } from "@/api/discover"
 import { coverObjectUrl } from "@/net/http"
-import { fetchDmm } from "@/api/sources/dmm"
-import { fetchDmmDigitalVr } from "@/api/sources/dmm-digital"
+import { fetchDmmDigitalAv, fetchDmmDigitalVr } from "@/api/sources/dmm-digital"
 import { fetchImdbChart } from "@/api/sources/imdb"
 import { discover as javdbDiscover } from "@/api/sources/javdb"
 import { fetchMgstage } from "@/api/sources/mgstage"
@@ -99,8 +100,8 @@ beforeEach(() => {
   vi.mocked(getKey).mockResolvedValue("")
   vi.mocked(resolveCovers).mockImplementation(async () => {})
   vi.mocked(coverObjectUrl).mockImplementation(async (url) => "blob:" + url)
-  vi.mocked(fetchDmm).mockResolvedValue([])
   vi.mocked(fetchDmmDigitalVr).mockResolvedValue([])
+  vi.mocked(fetchDmmDigitalAv).mockResolvedValue([])
   vi.mocked(fetchImdbChart).mockResolvedValue([])
   vi.mocked(javdbDiscover).mockResolvedValue([])
   vi.mocked(fetchMgstage).mockResolvedValue([])
@@ -118,7 +119,7 @@ describe("resolveList (_resolve_list port)", () => {
     expect(resolveList("mov", "", "")).toEqual({ source: "tmdb", list: "trending" })
     expect(resolveList("tv", "", "")).toEqual({ source: "tmdb", list: "trending" })
     expect(resolveList("ad", "", "")).toEqual({ source: "javdb", list: "daily" })
-    expect(resolveList("vrc", "", "")).toEqual({ source: "dmm", list: "trending" })
+    expect(resolveList("vrc", "", "")).toEqual({ source: "dmmdv", list: "popular" })
   })
 
   it("passes a valid (source, list) through unchanged", () => {
@@ -242,9 +243,9 @@ describe("discover ad/vrc routing", () => {
     expect(javdbDiscover).toHaveBeenCalledWith("ad", "daily", {})
   })
 
-  it("vrc default -> dmm digital VR trending; vrc javdb -> the VR browser path with opts", async () => {
+  it("vrc default -> FANZA digital VR suggest; vrc javdb -> the VR browser path with opts", async () => {
     await discover("vrc", "", "")
-    expect(fetchDmmDigitalVr).toHaveBeenCalledWith("trending")
+    expect(fetchDmmDigitalVr).toHaveBeenCalledWith("popular") // vrc default = FANZA suggest (RECOMMENDED)
     await discover("vrc", "javdb", "newest", 50, false, {
       year: "2024",
       month: "6",
@@ -258,9 +259,19 @@ describe("discover ad/vrc routing", () => {
     ])
   })
 
-  it("dmm ad lists pass straight through", async () => {
+  it("ad FANZA (dmmdv) -> the 2D fetcher; vrc FANZA -> the VR fetcher (suggest split)", async () => {
+    await discover("ad", "dmmdv", "popular")
+    expect(fetchDmmDigitalAv).toHaveBeenCalledWith("popular")
+    expect(fetchDmmDigitalVr).not.toHaveBeenCalled()
+    vi.mocked(fetchDmmDigitalAv).mockClear()
+    await discover("vrc", "dmmdv", "popular")
+    expect(fetchDmmDigitalVr).toHaveBeenCalledWith("popular")
+    expect(fetchDmmDigitalAv).not.toHaveBeenCalled()
+  })
+
+  it("the dropped 'dmm' provider falls back to the ad default (javdb daily)", async () => {
     await discover("ad", "dmm", "top_rated")
-    expect(fetchDmm).toHaveBeenCalledWith(false, "top_rated")
+    expect(javdbDiscover).toHaveBeenCalledWith("ad", "daily", {})
   })
 
   it("javdb: cmastd covers decode through coverObjectUrl (no resolve pass)", async () => {

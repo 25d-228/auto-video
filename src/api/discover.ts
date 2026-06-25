@@ -13,13 +13,12 @@
  * Cover policy (mirrors the Python):
  *   - mov: TMDB / IMDb / YTS all ship a poster; just drop the rare coverless row.
  *   - tv (tmdb/imdb): ship a poster. tv (tpb): no cover -> resolveCovers('tv').
- *   - dmm: cover comes verbatim off the listing page (no resolve pass).
+ *   - dmmdv (FANZA): raw awsimgsrc covers proxied to blob: AFTER the cache.
  *   - javdb: the source ships cmastd cover URLs; cmastd serves them as
  *     octet-stream so they're proxied to blob: URLs post-cache (coverObjectUrl).
  *   - mgstage/sukebei: resolve a portrait cover by code, then drop coverless.
  */
-import { fetchDmm } from "@/api/sources/dmm"
-import { fetchDmmDigitalVr } from "@/api/sources/dmm-digital"
+import { fetchDmmDigitalAv, fetchDmmDigitalVr } from "@/api/sources/dmm-digital"
 import { fetchImdbChart, type ImdbSort } from "@/api/sources/imdb"
 import {
   discover as javdbDiscover,
@@ -181,7 +180,7 @@ export interface DiscoverOpts {
  * Build a Discover feed for the given two-dropdown selection.
  *
  * @param cat    library category: mov | tv | ad | vrc
- * @param source provider id (tmdb/imdb/yts/tpb/javdb/dmm/mgstage/sukebei)
+ * @param source provider id (tmdb/imdb/yts/tpb/javdb/dmmdv/mgstage/sukebei)
  * @param list   list id within the provider (trending/popular/newest/…)
  * @param n      max items to return (default 50)
  * @param fresh  bypass the 300s listing cache
@@ -234,17 +233,15 @@ export async function discover(
   const wantVr = cat === "vrc"
   const cookie = await javbusCookie()
 
-  if (src === "dmm") {
-    if (wantVr) {
-      // VR: the digital GraphQL API (real streaming-VR rankings) — covers are raw
-      // awsimgsrc URLs, proxied to blob: AFTER the cache so SQLite keeps raw URLs.
-      const data = await cachedListing(key, fresh, () => fetchDmmDigitalVr(lst))
-      await proxyCovers(data)
-      return keepCovered(data, n)
-    }
-    // Adult: the mono/dvd HTML floor (sort lists + best-seller ranking pages);
-    // covers come verbatim off the page (resolved inside fetchDmm).
-    const data = await cachedListing(key, fresh, () => fetchDmm(false, lst))
+  if (src === "dmmdv") {
+    // FANZA: the digital streaming catalog via the GraphQL API (legacySearchPPV /
+    // ppvContentRanking). vrc -> VR titles, ad -> 2D titles; "popular" is the
+    // website's /av/list/?sort=suggest (sort RECOMMENDED). Covers are raw awsimgsrc
+    // URLs → proxied to blob: AFTER the cache so SQLite keeps raw URLs.
+    const data = await cachedListing(key, fresh, () =>
+      wantVr ? fetchDmmDigitalVr(lst) : fetchDmmDigitalAv(lst)
+    )
+    await proxyCovers(data)
     return keepCovered(data, n)
   }
 
