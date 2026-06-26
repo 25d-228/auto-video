@@ -1,19 +1,11 @@
 /**
- * HTTP wrapper for the TypeScript scrapers.
+ * HTTP wrapper for the scrapers. Wraps `@tauri-apps/plugin-http`'s `fetch`,
+ * which runs the request through Rust: that bypasses the webview's CORS wall
+ * and lets us set arbitrary request headers (Referer / Cookie / a spoofed
+ * User-Agent).
  *
- * This is the foundation for Phase 2 (replacing the Python sidecar). It wraps
- * `@tauri-apps/plugin-http`'s `fetch`, which runs the request through Rust:
- * that bypasses the webview's CORS wall and lets us set arbitrary request
- * headers (Referer / Cookie / a spoofed User-Agent), which is the whole reason
- * the Python sidecar existed.
- *
- * The plugin transparently handles gzip, so callers never deal with
- * Content-Encoding. Non-2xx responses are surfaced as a typed {@link HttpError}.
- *
- * `coverObjectUrl` replaces the sidecar's `/img` proxy: it fetches image bytes
- * (with a Referer for hotlink-protected hosts like pics.dmm.co.jp /
- * image.mgstage.com / javbus / cmastd) and hands back a `blob:` object URL an
- * `<img>` element can render directly.
+ * The plugin handles gzip transparently, so callers never deal with
+ * Content-Encoding. Non-2xx responses surface as a typed {@link HttpError}.
  */
 import { fetch } from "@tauri-apps/plugin-http"
 
@@ -63,18 +55,17 @@ export class HttpError extends Error {
 }
 
 /**
- * Build the header bag for a request from the high-level options. Exported for
- * unit testing the assembly logic without touching the network.
+ * Build the header bag for a request. Exported for testing.
  *
- * Precedence (lowest → highest): default UA, then referer/cookie/userAgent,
- * then any explicit `headers` (so a caller can always override).
+ * Precedence (lowest to highest): default UA, then referer/cookie/userAgent,
+ * then any explicit `headers` so a caller can always override.
  */
 export function buildHeaders(opts: HttpOptions = {}): Record<string, string> {
   const headers: Record<string, string> = {
     "User-Agent": opts.userAgent ?? DEFAULT_USER_AGENT,
     // No explicit Accept-Encoding: with the plugin's `unsafe-headers` feature
     // the header would actually reach reqwest, and a manually-set
-    // Accept-Encoding DISABLES reqwest's automatic gzip decompression —
+    // Accept-Encoding disables reqwest's automatic gzip decompression, so
     // every body would come back as raw gzip bytes. Left unset, reqwest
     // negotiates compression and decodes transparently.
   }
@@ -161,17 +152,22 @@ export async function httpBytes(
 
 // ---------------------------------------------------------------- cover proxy
 
+// javdb's cover/preview CDN rotates its host (tp.cmastd.com, tp.spfcas.com, and so
+// on), so match the stable `tp.` host prefix rather than a fixed domain. Keep the
+// http allowlist in capabilities/default.json (tp.*.com) in sync.
+const JAVDB_CDN_RE = /^https?:\/\/tp\.[^/]+\//i
+
 /**
- * Derive the Referer a hotlink-protected image host expects, mirroring the
- * sidecar's `/img` host→referer map. Returns undefined when no special
- * Referer is required. Exported for testing.
+ * Derive the Referer a hotlink-protected image host expects. Returns undefined
+ * when no special Referer is required. Exported for testing.
  */
 export function refererForImage(url: string): string | undefined {
   if (url.includes("dmm.co.jp")) return "https://www.dmm.co.jp/"
   if (url.includes("javdatabase")) return "https://www.javdatabase.com/"
   if (url.includes("javbus")) return "https://www.javbus.com/"
   if (url.includes("mgstage")) return "https://www.mgstage.com/"
-  if (url.includes("cmastd") || url.includes("javdb")) return "https://javdb.com/"
+  if (JAVDB_CDN_RE.test(url) || url.includes("cmastd") || url.includes("javdb"))
+    return "https://javdb.com/"
   if (url.includes("yts")) return "https://yts.mx/"
   return undefined
 }
@@ -180,13 +176,12 @@ export function refererForImage(url: string): string | undefined {
 const coverCache = new Map<string, string>()
 
 /**
- * javdb's cover CDN (tp.cmastd.com) serves images under a trivial single-byte
- * XOR: the FIRST byte of the payload is the key, and every subsequent byte is
- * `byte ^ key`. Decoding it yields the real JPEG/PNG/GIF. (Reverse-engineered
- * from the official app — see memory/javdb-cover-encryption-re.md.)
+ * javdb's cover CDN (the rotating tp.* host) serves images under a trivial
+ * single-byte XOR: the first byte of the payload is the key, every subsequent
+ * byte is `byte ^ key`. Decoding yields the JPEG.
  */
 export function isCmastdCover(url: string): boolean {
-  return url.includes("cmastd.com")
+  return JAVDB_CDN_RE.test(url) || url.includes("cmastd.com")
 }
 
 /** Decrypt a cmastd payload: drop the key byte, XOR the rest with it. */
@@ -200,9 +195,9 @@ export function decryptCmastd(data: Uint8Array): Uint8Array {
 
 /**
  * Fetch image bytes (with a hotlink-bypassing Referer) and return a `blob:`
- * object URL that an `<img>` can render directly. Replaces the sidecar `/img`
- * passthrough. Results are cached by source URL; call {@link revokeCover} (or
- * {@link revokeAllCovers}) to release the underlying blob.
+ * object URL that an `<img>` can render directly. Results are cached by source
+ * URL; call {@link revokeCover} (or {@link revokeAllCovers}) to release the
+ * underlying blob.
  *
  * If `opts.referer` is omitted, a host-appropriate Referer is derived via
  * {@link refererForImage}.

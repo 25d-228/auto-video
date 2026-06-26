@@ -14,13 +14,12 @@ export interface MediaCardProps {
   title: string
   /** Sub line under the title, e.g. "2026" or "S02E04". */
   sub?: ReactNode
-  /** Cover URL (possibly proxied via the sidecar /img endpoint). */
+  /** Cover URL (possibly proxied via /img). */
   cover?: string
   /**
-   * Cover aspect ratio (w/h) used for the card's width *before* the image
-   * loads — a per-source placeholder. Once the cover decodes, the card snaps
-   * to the image's own intrinsic ratio (see CoverImage's onRatio), so every
-   * cover shows at its original proportions.
+   * Cover aspect ratio (w/h) for the card's width before the image loads, a
+   * per-source placeholder. Once the cover decodes the card snaps to the
+   * image's intrinsic ratio (see CoverImage's onRatio).
    */
   ar?: number
   /** Cover height in px; cards sharing a grid should share it. */
@@ -29,7 +28,7 @@ export interface MediaCardProps {
   source?: string
   /** Omit for no state badge. */
   state?: MediaState
-  /** 0..1 — shown when state is "downloading". */
+  /** 0..1, shown when state is "downloading". */
   progress?: number
   /** Bottom-left seeder badge content, e.g. `▲ ${fseed(n)}` (lazy-fillable slot). */
   seedBadge?: ReactNode
@@ -61,11 +60,9 @@ function StateBadge({ state, progress }: { state: MediaState; progress?: number 
 }
 
 /**
- * Poster card per the approved prototype: cover with gradient scrim, state
- * badge (top-left), seeder badge (bottom-left), hover action, then a
- * truncated title + sub line with a source tag.
- *
- * Width is natural: `round(coverHeight * ar)` — lay cards out with CardGrid.
+ * Poster card: cover with gradient scrim, state badge (top-left), seeder badge
+ * (bottom-left), hover action, then a truncated title + sub line with a source
+ * tag. Width is natural: round(coverHeight * ar). Lay out with CardGrid.
  */
 export function MediaCard({
   title,
@@ -107,7 +104,7 @@ export function MediaCard({
           className="absolute inset-0"
           onRatio={setMeasuredAr}
         />
-        {/* prototype .cover:after scrim */}
+        {/* scrim */}
         <div className="pointer-events-none absolute inset-0 z-[1] bg-[linear-gradient(180deg,rgba(0,0,0,.18),rgba(0,0,0,0)_35%,rgba(0,0,0,0)_60%,rgba(0,0,0,.35))]" />
         {state && <StateBadge state={state} progress={progress} />}
         {seedBadge != null && (
@@ -139,9 +136,8 @@ export function MediaCard({
 }
 
 /**
- * The prototype's white hover pill (.dlb), e.g.
- * `<MediaCardAction onClick={…}>↓ Download</MediaCardAction>`.
- * Clicks do not bubble to the card's onClick.
+ * White hover pill, e.g. `<MediaCardAction onClick={…}>↓ Download</MediaCardAction>`.
+ * Clicks don't bubble to the card's onClick.
  */
 export function MediaCardAction({
   className,

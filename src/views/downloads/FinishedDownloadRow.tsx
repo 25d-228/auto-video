@@ -1,7 +1,7 @@
 /**
- * One settled download. Done rows get a green check plus Open folder /
- * Reveal in Finder (both Tauri-gated); errored rows go red with the
- * failure message. Remove-from-list is local-only, so always enabled.
+ * One settled download. Done rows show Open folder / Reveal in Finder (both
+ * Tauri-gated); errored rows go red with the failure message. Remove is
+ * local-only, so always enabled.
  */
 import { CircleAlert, CircleCheck, FolderOpen, FolderSearch, X } from "lucide-react"
 import { Button } from "@/components/ui/button"

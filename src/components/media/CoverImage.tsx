@@ -2,9 +2,8 @@ import { useState } from "react"
 import { cn } from "@/lib/utils"
 
 /**
- * Deterministic 32-bit string hash — the old engine's `h()`. Drives the
- * hue of the no-art placeholder so the same title always gets the same
- * gradient as the old app.
+ * Deterministic 32-bit string hash. Seeds the placeholder gradient hue so the
+ * same title always gets the same color.
  */
 export function titleHash(s: string): number {
   let n = 0
@@ -12,16 +11,16 @@ export function titleHash(s: string): number {
   return n
 }
 
-/** The old engine's no-art gradient: two hsl stops 40° apart, seeded by title. */
+/** No-art gradient: two hsl stops 40° apart, seeded by title. */
 export function placeholderGradient(title: string): string {
   const x = titleHash(title || "")
   return `linear-gradient(160deg,hsl(${x % 360},34%,42%),hsl(${(x + 40) % 360},34%,26%))`
 }
 
 /**
- * If `src` is a sidecar-proxied cover (`…/img?u=<original>`), return the
- * decoded original URL so it can be retried directly when the proxy fails.
- * Returns "" for non-proxied URLs.
+ * If `src` is a proxied cover (`/img?u=<original>`), return the decoded
+ * original URL so it can be retried directly when the proxy fails. Returns ""
+ * for non-proxied URLs.
  */
 export function rawCoverUrl(src: string): string {
   if (!src.includes("/img?")) return ""
@@ -34,9 +33,9 @@ export function rawCoverUrl(src: string): string {
 }
 
 /**
- * The DMM content id hiding in a cover URL — the old engine's cidOf().
- * Proxied covers (`/img?u=…`) are decoded first so the path segments are
- * visible. Returns "" when there is no /digital/video/<cid>/ segment.
+ * Extract the DMM content id from a cover URL. Proxied covers (`/img?u=…`) are
+ * decoded first so the path segments are visible. Returns "" when there is no
+ * /digital/video/<cid>/ segment.
  */
 export function cidOf(cover: string): string {
   const raw = rawCoverUrl(cover || "") || cover || ""
@@ -45,7 +44,7 @@ export function cidOf(cover: string): string {
 }
 
 export interface CoverImageProps {
-  /** Cover URL; may be proxied via the sidecar /img endpoint. Empty/undefined -> placeholder. */
+  /** Cover URL; may be proxied via the /img endpoint. Empty/undefined -> placeholder. */
   src?: string
   /** Title shown inside the gradient placeholder (and used as its hash seed). */
   title: string
@@ -53,16 +52,15 @@ export interface CoverImageProps {
   className?: string
   /**
    * Fired once the real image decodes, with its intrinsic aspect ratio (w/h).
-   * Lets the card size to the cover's *original* proportions regardless of
-   * source. Not fired for the gradient placeholder.
+   * Lets the card size to the cover's original proportions. Not fired for the
+   * placeholder.
    */
   onRatio?: (ar: number) => void
 }
 
 /**
- * Lazy cover image with the old app's fallback chain:
- * proxied URL -> raw original URL (data-raw equivalent) -> hue-gradient
- * placeholder with the title text.
+ * Lazy cover image with a fallback chain: proxied URL -> raw original URL ->
+ * gradient placeholder with the title text.
  */
 export function CoverImage({ src, title, className, onRatio }: CoverImageProps) {
   const raw = src ? rawCoverUrl(src) : ""

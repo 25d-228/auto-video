@@ -50,7 +50,7 @@ export interface DownloadEntry {
   state: DownloadState
   /** Destination folder the torrent writes into. */
   dest: string
-  /** Failure message — from the event payload, or local when start_download rejects. */
+  /** Failure message, from the event payload or local when start_download rejects. */
   error?: string
 }
 
@@ -105,7 +105,7 @@ export interface DownloadsApi {
   active: DownloadEntry[]
   /** Combined speed of currently-downloading entries (MB/s). */
   totalSpeedMbps: number
-  /** False in plain-browser dev — hide/disable Tauri-only actions. */
+  /** False in plain-browser dev; hide/disable Tauri-only actions. */
   tauri: boolean
   /** Resolves true if the download was handed to librqbit; false (with a toast) otherwise. */
   startDownload: (args: StartDownloadArgs) => Promise<boolean>
@@ -131,7 +131,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   const [toast, setToast] = useState<string | null>(null)
   const toastTimer = useRef<number | undefined>(undefined)
   const [tauri] = useState(isTauri)
-  // ids cancelled locally — late in-flight progress events for them are ignored
+  // ids cancelled locally; late in-flight progress events for them are ignored
   const cancelledIds = useRef<Set<string>>(new Set())
   // guard so the resume-on-launch pass runs at most once
   const resumedRef = useRef(false)
@@ -175,8 +175,8 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   // Apply the persisted download/upload speed limits to the librqbit session
-  // on launch — only when a limit is actually set, so an unlimited config does
-  // not spin up the session early. Settings re-applies on change.
+  // on launch, but only when a limit is actually set, so an unlimited config
+  // does not spin up the session early. Settings re-applies on change.
   useEffect(() => {
     if (!isTauri()) return
     void (async () => {

@@ -1,8 +1,8 @@
 /**
- * Library view — the React port of the old engine's renderLib()/libFill():
- * category chips, debounced title/filename search, Title|Release rank with
- * direction, a paged grid of lazily-covered cards, a right detail panel and
- * the OS actions (Play / Reveal in Finder / Delete to Trash) under Tauri.
+ * Library view: category chips, debounced title/filename search, Title|Release
+ * rank with direction, a paged grid of lazily-covered cards, a right detail
+ * panel and the OS actions (Play / Reveal in Finder / Delete to Trash) under
+ * Tauri.
  */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { useQueryClient } from "@tanstack/react-query"
@@ -83,7 +83,7 @@ export default function Library() {
   const queryClient = useQueryClient()
   const tauri = isTauri()
 
-  // debounce the search box into the filter (the old oninput -> libFill)
+  // debounce the search box into the filter
   useEffect(() => {
     const timeoutId = window.setTimeout(
       () => setDebouncedSearch(search),
@@ -97,7 +97,7 @@ export default function Library() {
     [libQ.data, cat]
   )
 
-  // the old libFilteredPool(): search on display title or filename, then sort
+  // search on display title or filename, then sort
   const pool = useMemo(() => {
     const needle = debouncedSearch.trim().toLowerCase()
     const filtered = needle
@@ -125,7 +125,7 @@ export default function Library() {
 
   const changeCat = (next: Cat) => {
     setCat(next)
-    setSearch("") // the old app cleared the query on category switch
+    setSearch("") // clear the query on category switch
     setDebouncedSearch("")
     setDetailOpen(false)
   }

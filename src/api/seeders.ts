@@ -1,18 +1,16 @@
 /**
- * Seeders aggregator — TypeScript port of the sidecar's build_seeders()
- * (sidecar/av_proxy.py). Gathers real release rows for the Download dialog from
- * every relevant source, dedups by torrent infohash, and sorts by seeders desc.
+ * Seeders aggregator. Gathers release rows for the Download dialog from every
+ * relevant source, dedups by torrent infohash, sorts by seeders desc.
  *
- * Source routing matches the Python exactly:
+ * Source routing:
  *   - ad / vrc : sukebei + javdb (app-API magnets) + javbus (gated, user cookie)
  *   - mov      : apibay + yts
  *   - tv       : apibay
  *
- * Each source is best-effort: a network failure in one never sinks the others
- * (the Python wrapped javdb/javbus/yts in try/except and apibay/sukebei degrade
- * to []). The javdb step needs a code -> slug lookup the source module does not
- * expose, so it is implemented here against the same signed app API the javdb
- * source uses (javdbApi), then handed to javdbMagnets(slug).
+ * Each source is best-effort: a network failure in one never sinks the others.
+ * The javdb step needs a code -> slug lookup the source module doesn't expose,
+ * so it's done here against the same signed app API (javdbApi), then handed to
+ * javdbMagnets(slug).
  */
 import { javdbApi, javdbMagnets } from "@/api/sources/javdb"
 import { seedersSukebei } from "@/api/sources/sukebei"
@@ -26,10 +24,9 @@ import { quality } from "@/lib/quality"
 // ----------------------------------------------------------------- helpers
 
 /**
- * Reproduce Python's urllib.parse.quote (default safe="/"): percent-encode every
- * byte except unreserved + "/". encodeURIComponent over-encodes "/", so we
- * un-escape just that one sequence back to a literal slash. (Used for the javbus
- * product-page path; every magnet here comes verbatim from its source.)
+ * Percent-encode every byte except unreserved + "/". encodeURIComponent
+ * over-encodes "/", so un-escape just that one sequence back to a literal slash.
+ * (Used for the javbus product-page path.)
  */
 function pyQuote(s: string): string {
   return encodeURIComponent(s ?? "").replace(/%2F/g, "/")
@@ -62,10 +59,6 @@ interface JdbSearch {
  * Resolve a JAV code to its javdb slug via the signed app-API search
  * (`/api/v2/search?q=<code>`), preferring an exact `number` match. Returns "" on
  * no hit / network error.
- *
- * NOTE: the sidecar's seeders_javdb relied on JDB_CODE2ID, a map filled lazily
- * from ranking feeds, so it only resolved codes already seen in a feed. The
- * search lookup here is strictly more capable while staying within the same API.
  */
 async function javdbSlugForCode(code: string): Promise<string> {
   const data = await javdbApi<JdbSearch>(
@@ -79,7 +72,7 @@ async function javdbSlugForCode(code: string): Promise<string> {
   return (pick?.id || "").trim()
 }
 
-/** Port of seeders_javdb(code): code -> slug -> app-API magnets. [] on miss. */
+/** code -> slug -> app-API magnets. [] on miss. */
 export async function seedersJavdb(code: string): Promise<Release[]> {
   if (!code) return []
   const slug = await javdbSlugForCode(code)
@@ -91,10 +84,7 @@ export async function seedersJavdb(code: string): Promise<Release[]> {
 
 const JAVBUS_BASE = "https://www.javbus.com"
 
-/**
- * Read one javbus URL with the user's verified cookie. Returns "" on failure.
- * Mirrors the sidecar's _jb_get (cookie + optional Referer).
- */
+/** Read one javbus URL with the user's cookie. Returns "" on failure. */
 async function jbGet(url: string, cookie: string, ref?: string): Promise<string> {
   try {
     return await httpText(url, {
@@ -107,10 +97,9 @@ async function jbGet(url: string, cookie: string, ref?: string): Promise<string>
 }
 
 /**
- * Port of seeders_javbus(code). javbus lists magnets (with sizes, no seeder
- * counts) via a gid/uc ajax endpoint behind the user's javbus cookie. The ajax
- * repeats each magnet across cells, so dedup by hash. Returns [] without a
- * cookie or when the product page has no gid.
+ * javbus lists magnets (with sizes, no seeder counts) via a gid/uc ajax endpoint
+ * behind the user's javbus cookie. The ajax repeats each magnet across cells, so
+ * dedup by hash. Returns [] without a cookie or when the product page has no gid.
  */
 export async function seedersJavbus(
   code: string,
@@ -164,9 +153,8 @@ function btih(magnet: string): string {
 }
 
 /**
- * Dedup by infohash (lowercased) — falling back to the release name when a row
- * has no hash — then sort by seeders desc. Pure (no network); exported for tests.
- * Port of the build_seeders tail (seen/uniq + sort).
+ * Dedup by infohash (lowercased), falling back to the release name when a row has
+ * no hash, then sort by seeders desc. Pure (no network); exported for tests.
  */
 export function dedupeSort(rels: Release[]): Release[] {
   const seen = new Set<string>()
@@ -197,12 +185,12 @@ async function javbusCookie(): Promise<string> {
 // ----------------------------------------------------------------- public
 
 /**
- * Aggregate real releases for one Discover item, for the Download dialog.
+ * Aggregate releases for one Discover item, for the Download dialog.
  *
- * @param cat   library category — picks the source set.
+ * @param cat   library category; picks the source set.
  * @param title display title (used as the apibay/sukebei query when no code).
- * @param code  JAV code (ad/vrc) — preferred query for the JAV sources.
- * @param year  release year (mov) — appended to the apibay query and filters YTS.
+ * @param code  JAV code (ad/vrc); preferred query for the JAV sources.
+ * @param year  release year (mov); appended to the apibay query and filters YTS.
  * @returns deduped Release[] sorted by seeders desc.
  */
 export async function seeders(
@@ -217,7 +205,7 @@ export async function seeders(
     const q = code || title
     // sukebei degrades to [] on failure internally.
     rels.push(...(await seedersSukebei(q)))
-    // javdb + javbus are best-effort (the Python wrapped each in try/except).
+    // javdb + javbus are best-effort.
     const cookie = await javbusCookie()
     const [jdb, jb] = await Promise.all([
       seedersJavdb(q).catch(() => [] as Release[]),
@@ -234,7 +222,7 @@ export async function seeders(
       try {
         rels.push(...(await seedersYts(title, year)))
       } catch {
-        // best-effort, matches the Python try/except around seeders_yts
+        // best-effort
       }
     }
   }

@@ -1,7 +1,6 @@
 /**
- * One Discover grid cell: MediaCard plus the lazily-upgraded seeder badge
- * (old discCard + the discPaint loadSeeds pass). Mounted only for the
- * current page, so the gate naturally fetches per-page.
+ * One Discover grid cell: MediaCard plus a lazily-upgraded seeder badge.
+ * Mounted only for the current page, so the gate fetches per-page.
  */
 import { MediaCard, MediaCardAction } from "@/components/media"
 import type { DiscoverItem } from "@/api/types"

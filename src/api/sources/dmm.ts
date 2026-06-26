@@ -1,21 +1,15 @@
 /**
- * FANZA / DMM source — TypeScript port of the Python sidecar's DMM scraper
- * (sidecar/av_proxy.py: fetch_dmm, dmm_cover, dmm_cid_to_code, dmm_cid_variants,
- * img_dims, _cover_meta, _dmm_get).
+ * FANZA / DMM source.
  *
  * The FANZA digital/videoa floor is now a JS SPA with no server-rendered
  * products, so we scrape the physical-video floor www.dmm.co.jp/mono/dvd which
  * still serves full HTML listings (same adult catalog, same pics.dmm.co.jp
  * covers). The age gate passes with `age_check_done=1; ckcy=1` cookies and a
- * dmm.co.jp Referer. VR = the mono "VR動画" keyword section (article=keyword/id=6793).
- *
- *   fetchDmm(vr, list)  -> DiscoverItem[]  (cover resolved via dmmBlobCover)
- *   parseDmmList(html) -> DmmListItem[]  (pure parser, raw pics URLs)
- *   dmmCover(code) -> { url, ar }  (cid variants × floors × suffixes, placeholder-rejected)
+ * dmm.co.jp Referer. VR is the mono "VR動画" keyword section (article=keyword/id=6793).
  *
  * Covers from pics.dmm.co.jp are hotlink-protected (need a dmm.co.jp Referer), so
- * every cover is fetched through {@link dmmBlobCover} which hands back a `blob:`
- * URL an <img> can render directly (replacing the sidecar's /img passthrough).
+ * every cover is fetched through dmmBlobCover, which returns a `blob:` URL an
+ * <img> can render directly.
  */
 import type { DiscoverItem } from "@/api/types"
 import { httpBytes, httpText } from "@/net/http"
@@ -36,9 +30,9 @@ const DMM_REFERER = "https://www.dmm.co.jp/"
 const DMM_WIDE_JACKET_AR = 1.48
 
 /**
- * FANZA mono/dvd sort tokens (verified off the page's 並び替え selector):
+ * FANZA mono/dvd sort tokens (the page's 並び替え selector):
  *   ranking=人気順 (trending) · date=発売日順 (newest) · review_rank=評価順 (top_rated).
- * Unknown values fall back to `ranking`, matching the Python `.get(mode, 'ranking')`.
+ * Unknown values fall back to `ranking`.
  */
 const DMM_SORTS: Record<DmmList, string> = {
   trending: "ranking",
@@ -53,9 +47,7 @@ function dmmSort(list: string): string {
 // ---------------------------------------------------------------- cid → code
 
 /**
- * Port of `dmm_cid_to_code(cid)`.
- *
- * The FANZA cid carries maker noise glued before the real LABEL+NUMBER
+ * The FANZA cid carries maker noise glued before the real label+number
  * (k9snos258, tkipzz855, n_1428ss154, n_709maraa244tk, ovvr616). Peel it to a
  * best-effort printed code (display title only; the cover is taken verbatim
  * from the page so an imperfect code never breaks the image). Returns "" when
@@ -83,12 +75,12 @@ export function dmmCidToCode(cid: string): string {
 
 // ---------------------------------------------------------------- cid variants (cover probing)
 
-/** printed-label → FANZA cid label (extend over time). Port of DMM_ALIAS. */
+/** printed-label → FANZA cid label (extend over time). */
 const DMM_ALIAS: Record<string, string> = { ebon: "ebod" }
 
 /**
- * Known FANZA maker prefixes (the h_NNNN before the label) that are NOT derivable
- * from the code. Small maintained table. Port of DMM_PREFIX.
+ * Known FANZA maker prefixes (the h_NNNN before the label) that aren't derivable
+ * from the code. Small maintained table.
  */
 const DMM_PREFIX: Record<string, string> = {
   ccvr: "h_1270",
@@ -97,10 +89,9 @@ const DMM_PREFIX: Record<string, string> = {
 }
 
 /**
- * Port of `dmm_cid_variants(code)`. Builds the candidate FANZA cid strings to
- * probe for a cover, given a printed code like "ABCD-123" (a leading digit on
- * the label is allowed, e.g. 3DSVR). Returns a de-duplicated list (insertion
- * order preserved).
+ * Build the candidate FANZA cid strings to probe for a cover, given a printed
+ * code like "ABCD-123" (a leading digit on the label is allowed, e.g. 3DSVR).
+ * Returns a de-duplicated list (insertion order preserved).
  */
 export function dmmCidVariants(code: string): string[] {
   const m = /^(\d*[A-Za-z]+)-?(\d+)$/.exec(code || "") // allow leading digit (3DSVR)
@@ -125,32 +116,28 @@ export function dmmCidVariants(code: string): string[] {
   return [...new Set(out)]
 }
 
-/** Python `str.zfill(width)` for a numeric string (left-pad with zeros). */
+/** Left-pad a numeric string with zeros. */
 function zfill(s: string, width: number): string {
   return s.padStart(width, "0")
 }
 
 // ---------------------------------------------------------------- image dimensions
 
-/** Read a big-endian u16 from `bytes` at offset `offset`. */
 function be16(bytes: Uint8Array, offset: number): number {
   return (bytes[offset]! << 8) | bytes[offset + 1]!
 }
 
-/** Read a big-endian u32 from `bytes` at offset `offset`. */
 function be32(bytes: Uint8Array, offset: number): number {
   return ((bytes[offset]! << 24) | (bytes[offset + 1]! << 16) | (bytes[offset + 2]! << 8) | bytes[offset + 3]!) >>> 0
 }
 
-/** Read a little-endian u16 from `bytes` at offset `offset`. */
 function le16(bytes: Uint8Array, offset: number): number {
   return bytes[offset]! | (bytes[offset + 1]! << 8)
 }
 
 /**
- * Port of `img_dims(b)` — sniff (width, height) from the leading bytes of a
- * JPEG / PNG / WEBP image. Returns null when the format is unrecognized or the
- * buffer is too short. Exported for the parser test.
+ * Sniff (width, height) from the leading bytes of a JPEG / PNG / WEBP image.
+ * Returns null when the format is unrecognized or the buffer is too short.
  */
 export function imgDims(bytes: Uint8Array): [number, number] | null {
   if (!bytes || bytes.length < 24) return null
@@ -214,7 +201,7 @@ export function imgDims(bytes: Uint8Array): [number, number] | null {
   return null
 }
 
-/** Reject bodies smaller than this — the ps placeholder is ~3.4 KB. */
+/** Reject bodies smaller than this; the ps placeholder is ~3.4 KB. */
 const COVER_MIN_BYTES = 6000
 /** Dimensions of the FANZA "now printing" placeholder (~19 KB) to reject. */
 const PLACEHOLDER_W = 590
@@ -223,11 +210,9 @@ const PLACEHOLDER_H = 800
 const DEFAULT_COVER_AR = 0.72
 
 /**
- * Port of `_cover_meta(b)` — given fetched image bytes, decide whether this is a
- * real cover (rejecting FANZA "now printing" / ps placeholders) and compute its
- * aspect ratio (w/h). Returns null when it should be rejected.
- *
- * Split out from the fetch so it is unit-testable. The Python predicate:
+ * Given fetched image bytes, decide whether this is a real cover (rejecting
+ * FANZA "now printing" / ps placeholders) and compute its aspect ratio (w/h).
+ * Returns null when it should be rejected:
  *   - reject bodies < 6000 bytes (the ps placeholder is ~3.4 KB)
  *   - reject the 590×800 "now printing" placeholder (~19 KB)
  *   - otherwise ar = round(w/h, 3), defaulting to 0.72 when dims are unknown
@@ -242,11 +227,10 @@ export function coverMeta(bytes: Uint8Array): { ar: number } | null {
 
 /**
  * Fetch one pics.dmm.co.jp cover and return a displayable `blob:` URL plus its
- * true aspect ratio (measured from the bytes, so the card box matches the
- * jacket and nothing is cropped). Returns null on any failure or when the body
- * isn't a real cover — {@link coverMeta} rejects the tiny "ps" placeholder
- * (< 6000 bytes) and the 590×800 "now printing" graphic, so coverless titles
- * resolve to null here and get dropped by {@link fetchDmm} (no blank cards).
+ * true aspect ratio (measured from the bytes, so the card box matches the jacket
+ * and nothing is cropped). Returns null on any failure or when the body isn't a
+ * real cover; coverMeta rejects the tiny "ps" placeholder and the "now printing"
+ * graphic, so coverless titles get dropped by fetchDmm (no blank cards).
  */
 async function dmmBlobCover(
   url: string
@@ -262,14 +246,14 @@ async function dmmBlobCover(
   }
 }
 
-/** Python `round(x, 3)` (round-half-to-even is not required for these inputs). */
+/** Round to 3 decimals (round-half-to-even not required for these inputs). */
 function round3(x: number): number {
   return Math.round(x * 1000) / 1000
 }
 
 // ---------------------------------------------------------------- cover resolution
 
-/** studio video AND amateur floor (POW etc.). */
+/** studio video and amateur floor (POW etc.). */
 const DMM_FLOORS = ["digital/video", "digital/amateur"] as const
 /** front portrait, amateur jacket, wide jacket. */
 const DMM_SUFFIXES = ["ps", "jp", "pl"] as const
@@ -283,13 +267,11 @@ export interface DmmCover {
 }
 
 /**
- * Port of `dmm_cover(code)`. Derives the FANZA cid candidates from a printed
- * code, then probes every (cid × floor × suffix) combination on pics.dmm.co.jp,
- * returning the first that fetches a real (non-placeholder) image. Returns the
- * RAW pics URL (callers route it through {@link coverObjectUrl} for display, as
- * the sidecar did via /img).
- *
- * Returns `{ url: "", ar: 0 }` when nothing resolves.
+ * Derive the FANZA cid candidates from a printed code, then probe every
+ * (cid × floor × suffix) combination on pics.dmm.co.jp, returning the first that
+ * fetches a real (non-placeholder) image. Returns the raw pics URL (callers route
+ * it through {@link coverObjectUrl} for display). Returns `{ url: "", ar: 0 }` when
+ * nothing resolves.
  */
 export async function dmmCover(code: string): Promise<DmmCover> {
   for (const cid of dmmCidVariants(code)) {
@@ -326,12 +308,10 @@ export interface DmmListItem {
 const PRODUCT_RE = /\/detail\/=\/cid=([a-z0-9_]+)\/"[\s\S]{0,400}?(\/\/pics\.dmm\.co\.jp\/[^"' ]+?\.jpg)/g
 
 /**
- * Pure parser: extract product cells from a FANZA mono/dvd listing page.
- * Port of the parsing loop inside `fetch_dmm`.
- *
- * Dedups by derived code (FANZA lists the same title in several media editions
- * -> same code, different cid like n_707mbdd2190 / ...b / ...btk); skips cells
- * whose code won't parse. No network — feed it the HTML to test offline.
+ * Pure parser: extract product cells from a FANZA mono/dvd listing page. Dedups
+ * by derived code (FANZA lists the same title in several media editions -> same
+ * code, different cid like n_707mbdd2190 / ...b / ...btk); skips cells whose code
+ * won't parse.
  */
 export function parseDmmList(html: string): DmmListItem[] {
   const out: DmmListItem[] = []
@@ -385,7 +365,7 @@ const DMM_RANK_TERMS: Record<string, string> = {
   monthly: "monthly",
 }
 
-/** Build the listing URL for a (vr, list) combination. Exported for testing. */
+/** Build the listing URL for a (vr, list) combination. */
 export function dmmListUrl(vr: boolean, list: string): string {
   if (!vr && DMM_RANK_TERMS[list]) {
     return `https://www.dmm.co.jp/mono/dvd/-/ranking/=/term=${DMM_RANK_TERMS[list]}/`
@@ -401,14 +381,10 @@ export function dmmListUrl(vr: boolean, list: string): string {
 const MIN_LISTING_HTML_BYTES = 4000
 
 /**
- * Port of `fetch_dmm(vr, mode)` → DiscoverItem[].
- *
- * Scrapes the FANZA mono/dvd floor (VR keyword section when `vr`), parses the
- * server-rendered product cells, then resolves each cover through
- * {@link coverObjectUrl} (verbatim off the listing page — no per-code cover
- * derivation, matching the sidecar's "no resolve_covers pass" for DMM). Items
- * whose cover fails to load are dropped (the sidecar keeps only items with a
- * cover). Covers are resolved in parallel.
+ * Scrape the FANZA mono/dvd floor (VR keyword section when `vr`), parse the
+ * server-rendered product cells, then resolve each cover (verbatim off the
+ * listing page, no per-code derivation). Items whose cover fails to load are
+ * dropped. Covers are resolved in parallel.
  */
 export async function fetchDmm(vr: boolean, list: string): Promise<DiscoverItem[]> {
   const url = dmmListUrl(vr, list)
@@ -428,11 +404,10 @@ export async function fetchDmm(vr: boolean, list: string): Promise<DiscoverItem[
   const items = parsed.map((it, i) => ({ item: toDiscoverItem(it, vr, i), coverUrl: it.coverUrl }))
 
   // Resolve covers in parallel; drop any whose fetch fails (kept items must have
-  // a cover, mirroring the sidecar's `[x for x in data if x.get('cover')]`). The
-  // listing cells carry the narrow portrait `ps` thumbnail; prefer the wide `pl`
-  // jacket (front+back, ~1.49) so DMM matches the other adult sources, falling
-  // back to `ps` when a title has no `pl`. The true aspect ratio is measured
-  // from the fetched bytes so the card box matches the cover (no crop).
+  // a cover). The listing cells carry the narrow portrait `ps` thumbnail; prefer
+  // the wide `pl` jacket (front+back, ~1.49) so DMM matches the other adult
+  // sources, falling back to `ps` when a title has no `pl`. The true aspect ratio
+  // is measured from the fetched bytes so the card box matches the cover (no crop).
   const resolveCover = async (coverUrl: string): Promise<{ url: string; ar: number } | null> => {
     const plUrl = coverUrl.replace(/ps(\.jpe?g)(\?.*)?$/i, "pl$1$2")
     return (
@@ -466,13 +441,13 @@ export async function fetchDmm(vr: boolean, list: string): Promise<DiscoverItem[
  * Pure parser: pull a FANZA detail page's sample-image gallery, de-duped and
  * ordered by N, upgraded to the large variant.
  *
- * Samples live at `pics.dmm.co.jp/.../<sampleCid>/<sampleCid>-N.jpg` — note the
- * sample cid is NOT the listing cid for physical products (mono `k9snos258` →
- * samples under the digital cid `snos00258`). Related items on the page only
- * show a cover (no `-N` gallery), so we match the dir==filename-prefix gallery
- * pattern and keep the group for the listing `cid` if present, else the largest
- * gallery (the page's main product). Each thumbnail (`<cid>-N.jpg`, ~120×90) is
- * upgraded to the full sample (`<cid>jp-N.jpg`, ~600×800).
+ * Samples live at `pics.dmm.co.jp/.../<sampleCid>/<sampleCid>-N.jpg`; note the
+ * sample cid isn't the listing cid for physical products (mono `k9snos258` →
+ * samples under the digital cid `snos00258`). Related items on the page only show
+ * a cover (no `-N` gallery), so we match the dir==filename-prefix gallery pattern
+ * and keep the group for the listing `cid` if present, else the largest gallery
+ * (the page's main product). Each thumbnail (`<cid>-N.jpg`, ~120×90) is upgraded
+ * to the full sample (`<cid>jp-N.jpg`, ~600×800).
  */
 export function parseDmmPreviews(html: string, cid: string): string[] {
   if (!html) return []

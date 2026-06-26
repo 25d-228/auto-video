@@ -1,13 +1,11 @@
 /**
- * FANZA digital video via the public GraphQL API (api.video.dmm.co.jp). No auth /
- * cookies / referer needed (see docs/dmm-digital-api.md). It serves two Discover
- * feeds: the digital VR ranking (vrc) — the ONLY source of real streaming VR (the
- * scrapable mono/dvd VR floor carries only obscure physical discs like ovvr…) —
- * and the non-VR digital AV feed (ad, contentType TWO_DIMENSION).
+ * FANZA digital video via the public GraphQL API (api.video.dmm.co.jp). No auth,
+ * cookies, or referer needed (see docs/dmm-digital-api.md). Serves two Discover
+ * feeds: the digital VR ranking (vrc) and the non-VR digital AV feed (ad,
+ * contentType TWO_DIMENSION).
  *
- * Covers are raw awsimgsrc.dmm.co.jp URLs (hotlink-protected → a dmm Referer,
- * derived automatically by coverObjectUrl). discover() proxies them to blob:
- * URLs AFTER the listing cache, so SQLite keeps the raw URLs.
+ * Covers are raw awsimgsrc.dmm.co.jp URLs; that CDN isn't hotlink-protected
+ * (returns 200 with any/no Referer), so discover() renders them directly in <img>.
  */
 import type { Cat, DiscoverItem } from "@/api/types"
 import { httpJson } from "@/net/http"
@@ -58,9 +56,8 @@ async function gql<T>(query: string, variables?: Record<string, unknown>): Promi
 
 /**
  * Map digital content nodes to DiscoverItems for `cat` (vrc default, or ad for the
- * non-VR digital feed). Cover = the smaller `ps` jacket (the API hands back the
- * ~600 KB `pl`; `ps` is ~half that, fine for the grid). Pure (no network) so it
- * can be unit-tested.
+ * non-VR feed). Cover uses the smaller `ps` jacket (the API returns the ~600 KB
+ * `pl`; `ps` is about half that, fine for the grid).
  */
 export function mapDigitalContents(
   contents: readonly DigitalContent[],
@@ -106,8 +103,8 @@ const SEARCH_Q =
   ` result { contents { id title packageImage { largeUrl } } } } }`
 
 /**
- * Sample/preview images for a digital content id (raw awsimgsrc large URLs).
- * The mono/dvd detail-page scrape (dmmPreviews) can't resolve digital cids like
+ * Sample/preview images for a digital content id (raw awsimgsrc large URLs). The
+ * mono/dvd detail-page scrape (dmmPreviews) can't resolve digital cids like
  * vrkm01577, so the digital VR cards use this instead.
  */
 export async function dmmDigitalPreviews(cid: string): Promise<string[]> {
@@ -124,8 +121,7 @@ export async function dmmDigitalPreviews(cid: string): Promise<string[]> {
 /**
  * Digital feed for a Discover list id, for one contentType (VR or 2D) + category.
  * Search axis (legacySearchPPV):
- *   popular   -> RECOMMENDED   (exactly the website's /av/list/?sort=suggest — verified
- *                               against the SPA's own legacySearchPPV call)
+ *   popular   -> RECOMMENDED   (the website's /av/list/?sort=suggest default)
  *   newest    -> RELEASE_DATE  · top_rated -> REVIEW_RANK_SCORE
  * Ranking axis (ppvContentRanking):
  *   trending  -> SALES_BEST_SELLERS · monthly  -> SALES_MONTHLY
@@ -158,12 +154,12 @@ async function fetchDmmDigital(
   )
 }
 
-/** Digital VR feed (contentType VR) — the vrc FANZA source. */
+/** Digital VR feed (contentType VR), the vrc FANZA source. */
 export function fetchDmmDigitalVr(list: string): Promise<DiscoverItem[]> {
   return fetchDmmDigital("VR", list, "vrc")
 }
 
-/** Digital non-VR AV feed (contentType TWO_DIMENSION) — the ad FANZA source. */
+/** Digital non-VR AV feed (contentType TWO_DIMENSION), the ad FANZA source. */
 export function fetchDmmDigitalAv(list: string): Promise<DiscoverItem[]> {
   return fetchDmmDigital("TWO_DIMENSION", list, "ad")
 }

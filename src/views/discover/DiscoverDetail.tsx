@@ -1,7 +1,7 @@
 /**
- * Right-hand detail panel for a Discover item (old openDiscPreview /
- * discPanelHTML): poster, title (+ Japanese title for Adult/VR via /meta),
- * facts grid with a live seeder count, cast chips and a Download action.
+ * Right-hand detail panel for a Discover item: poster, title (+ Japanese title
+ * for Adult/VR via /meta), facts grid with a live seeder count, cast chips and
+ * a Download action.
  */
 import { useState } from "react"
 import { Badge } from "@/components/ui/badge"

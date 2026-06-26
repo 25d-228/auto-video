@@ -123,6 +123,9 @@ describe("refererForImage", () => {
     expect(refererForImage("https://tp.cmastd.com/d.jpg")).toBe(
       "https://javdb.com/"
     )
+    expect(refererForImage("https://tp.spfcas.com/d.jpg")).toBe(
+      "https://javdb.com/"
+    )
     expect(refererForImage("https://www.javdatabase.com/e.jpg")).toBe(
       "https://www.javdatabase.com/"
     )
@@ -274,7 +277,10 @@ describe("coverObjectUrl", () => {
 describe("cmastd cover decryption", () => {
   it("detects cmastd hosts", () => {
     expect(isCmastdCover("https://tp.cmastd.com/x/covers/aa/Ab.jpg")).toBe(true)
+    // The CDN rotates (cmastd -> spfcas -> ...); match the stable `tp.` host prefix.
+    expect(isCmastdCover("https://tp.spfcas.com/rhe951l4q/covers/2m/2mrnqX.jpg")).toBe(true)
     expect(isCmastdCover("https://pics.dmm.co.jp/x.jpg")).toBe(false)
+    expect(isCmastdCover("https://image.tmdb.org/t/p/w500/x.jpg")).toBe(false)
   })
 
   it("decrypts the single-byte XOR (first byte is the key)", () => {

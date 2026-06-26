@@ -5,16 +5,16 @@ use tauri::{Emitter, Manager};
 
 mod dl;
 
-/// One managed download: the librqbit handle + numeric torrent id plus the
-/// metadata every event carries. Both reach the torrent in the global session.
+/// One managed download: the librqbit handle, numeric torrent id, and the
+/// metadata every event carries.
 struct DlEntry {
     handle: dl::Handle,
     torrent_id: usize,
     title: String,
     dest: String,
 }
-/// our download id -> managed download. Removal from this map is what stops the
-/// polling loop (and signals a cancel to a still-running download).
+/// Our download id -> managed download. Removal from this map stops the polling
+/// loop (and signals a cancel to a still-running download).
 struct DlManager(Mutex<HashMap<String, DlEntry>>);
 
 /// Lock the download-management map. The guard borrows from `app` (not the
@@ -24,14 +24,14 @@ fn dl_map(app: &tauri::AppHandle) -> std::sync::MutexGuard<'_, HashMap<String, D
 }
 
 // ------------------------------------------------------------------ downloads
-/// The `state` value the frontend treats as "finished"; also the literal the
-/// polling loop watches for. Spelled once so it can't drift between producers.
+/// The `state` value the frontend treats as "finished", and the literal the
+/// polling loop watches for. Defined once so it can't drift between producers.
 const DL_STATE_DONE: &str = "done";
 
 /// Bytes per MiB. librqbit reports rates/sizes in bytes; the UI shows MB/s.
 const BYTES_PER_MIB: f64 = 1_048_576.0;
 
-/// How long the metadata-only shims (list_torrent_files / save_torrent) wait for
+/// How long the metadata-only calls (list_torrent_files / save_torrent) wait for
 /// a bare magnet's metadata to arrive from peers/DHT before giving up.
 const METADATA_FETCH_TIMEOUT_MS: u64 = 45_000;
 
@@ -195,8 +195,8 @@ async fn start_download(
     renames: Option<Vec<RenamePair>>,
 ) -> Result<(), String> {
     // Return immediately and do the heavy work in the background so the UI never
-    // blocks: add_torrent resolves the magnet's metadata (and lazily boots the
-    // session — DHT/UPnP — on the first download), which takes seconds and can
+    // blocks. add_torrent resolves the magnet's metadata (and lazily boots the
+    // session, DHT/UPnP, on the first download), which takes seconds and can
     // stall for a low-seeder magnet. The frontend already shows an optimistic
     // entry; any failure comes back as a "download-progress" event (state="error").
     tauri::async_runtime::spawn(async move {
@@ -287,10 +287,9 @@ async fn set_rate_limits(download_kib: i64, upload_kib: i64) -> Result<(), Strin
         .map_err(|e| e.to_string())
 }
 
-/// Resolve a torrent's file list WITHOUT downloading the data (metadata-only),
+/// Resolve a torrent's file list without downloading the data (metadata-only),
 /// so the UI can let the user choose which files to fetch. For a bare magnet the
-/// metadata must be fetched from peers/DHT, so
-/// the shim is bounded by a timeout; it BLOCKS, hence spawn_blocking.
+/// metadata must be fetched from peers/DHT, so this is bounded by a timeout.
 #[tauri::command]
 async fn list_torrent_files(magnet: String) -> Result<Vec<TorrentFile>, String> {
     let files = dl::list_files(&magnet, METADATA_FETCH_TIMEOUT_MS)
@@ -302,7 +301,7 @@ async fn list_torrent_files(magnet: String) -> Result<Vec<TorrentFile>, String> 
     Ok(files.into_iter().map(TorrentFile::from).collect())
 }
 
-/// Write the magnet's .torrent file to `out_path` (metadata only — no content is
+/// Write the magnet's .torrent file to `out_path` (metadata only, no content is
 /// downloaded). Awaits the metadata fetch from peers.
 #[tauri::command]
 async fn save_torrent(magnet: String, out_path: String) -> Result<(), String> {
@@ -379,7 +378,7 @@ fn walk_videos(dir: &Path, out: &mut Vec<ScanFile>) {
     }
 }
 
-/// Recursively list video files under `path` (native replacement for sidecar /scan).
+/// Recursively list video files under `path`.
 #[tauri::command]
 async fn scan_videos(path: String) -> Result<Vec<ScanFile>, String> {
     let root = PathBuf::from(&path);
@@ -471,10 +470,10 @@ async fn disk_stats(path: String) -> Result<DiskStats, String> {
 #[cfg(target_os = "macos")]
 fn align_traffic_lights(window: &tauri::WebviewWindow) {
     // Shift the buttons right (more left margin) and down (more top margin) from
-    // macOS's default. The move is RELATIVE to the buttons' own (valid) frame —
-    // unlike absolute window-height math, which read the wrong (titlebar-sized)
-    // superview height and silently did nothing. An idempotent guard (skip if x
-    // is already at our inset) stops the y offset from compounding on re-applies.
+    // macOS's default. The move is relative to the buttons' own (valid) frame.
+    // Absolute window-height math read the wrong (titlebar-sized) superview
+    // height and silently did nothing. An idempotent guard (skip if x is already
+    // at our inset) stops the y offset from compounding on re-applies.
     const INSET_X: f64 = 24.0;
     const DOWN_Y: f64 = 14.0;
     let win = window.clone();
@@ -490,13 +489,13 @@ fn align_traffic_lights(window: &tauri::WebviewWindow) {
         let close: *mut AnyObject = msg_send![ns_window, standardWindowButton: 0usize];
         let mini: *mut AnyObject = msg_send![ns_window, standardWindowButton: 1usize];
         let zoom: *mut AnyObject = msg_send![ns_window, standardWindowButton: 2usize];
-        // Buttons can be null before the window is shown — bail silently.
+        // Buttons can be null before the window is shown. Bail silently.
         if close.is_null() || mini.is_null() || zoom.is_null() {
             return;
         }
         let close_f: NSRect = msg_send![close, frame];
         // Idempotency: if x is already at our inset, macOS hasn't reset the
-        // buttons since our last apply — skip so the relative y move can't drift.
+        // buttons since our last apply. Skip so the relative y move can't drift.
         if (close_f.origin.x - INSET_X).abs() < 1.0 {
             return;
         }

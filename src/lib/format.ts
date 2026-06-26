@@ -1,8 +1,4 @@
-/**
- * Display formatters ported from the old vanilla engine (ui-src/engine.js,
- * now only in git history). Keep output byte-identical so the new UI reads
- * exactly like the old one.
- */
+/** Display formatters for seeder counts, byte sizes, and relative dates. */
 
 /** Seeder counts: 1234 -> "1.2k", 845 -> "845". */
 export function fseed(n: number): string {

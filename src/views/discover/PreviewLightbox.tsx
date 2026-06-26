@@ -1,8 +1,7 @@
 /**
- * Full-window preview viewer: one sample image at a time, paged with the
- * ‹ / › buttons (or ← / → keys), wrapping around. Opened by the "Preview"
- * action on a Discover card / detail panel. Images are fetched lazily via
- * usePreviews (javdb/dmm/mgstage) the moment it opens.
+ * Preview viewer: one sample image at a time, paged with the ‹ / › buttons or
+ * ← / → keys, wrapping around. Images are fetched lazily via usePreviews when
+ * it opens.
  */
 import { useEffect, useState } from "react"
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react"
@@ -31,11 +30,11 @@ export function PreviewLightbox({ item, onClose }: PreviewLightboxProps) {
   const itemId = item?.id
   useEffect(() => setIdx(0), [itemId])
 
-  // Wrap-around paging (loop), clamped to the current count.
+  // Wrap-around paging, clamped to the count.
   const go = (delta: number) =>
     setIdx((i) => (count > 0 ? (i + delta + count) % count : 0))
 
-  // ← / → page, Esc closes (only while open).
+  // ← / → to page, while open.
   useEffect(() => {
     if (item === null) return
     const onKey = (e: KeyboardEvent) => {

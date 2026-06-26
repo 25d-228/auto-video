@@ -1,9 +1,8 @@
 /**
- * Lazy cover + identification for one library file — the React port of the
- * old engine's lazyLibCovers(): ad/vr items resolve a cover by JAV code via
- * /cover, mov/tv items via the TMDB /movie|/tv lookup. Everything is cached
- * by the query layer (staleTime Infinity), so only mounted (= current page)
- * cards ever fetch.
+ * Lazy cover + identification for one library file: ad/vr items resolve a cover
+ * by JAV code via /cover, mov/tv items via the TMDB /movie|/tv lookup. Cached
+ * by the query layer (staleTime Infinity), so only mounted (current page) cards
+ * fetch.
  */
 import type { Cat, LibraryItem, TitleMeta } from "@/api/types"
 import { useCover, useTitleLookup } from "@/state/queries"
@@ -16,13 +15,13 @@ export function isJavCat(cat: Cat): boolean {
   return cat === "ad" || cat === "vrc"
 }
 
-/** Sort key for Rank=Release — the old libDate(): a year found in year||sub. */
+/** Sort key for Rank=Release: a year found in year||sub. */
 export function itemDate(item: LibraryItem): string {
   const yearMatch = /(19|20)\d{2}/.exec(String(item.year || item.sub || ""))
   return yearMatch ? yearMatch[0] : ""
 }
 
-/** "a, b / c" -> ["a","b","c"] for Chiplet sections — the old chips(). */
+/** "a, b / c" -> ["a","b","c"] for Chiplet sections. */
 export function splitChips(s: string | undefined): string[] {
   return (s || "")
     .split(/[,/]/)

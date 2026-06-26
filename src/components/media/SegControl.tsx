@@ -9,9 +9,8 @@ export interface SegControlProps<T extends string | number> {
 }
 
 /**
- * Segmented control per the prototype (.seg): muted track, the active
- * segment pops on a background card. Used for Trending/Newest, Asc/Desc,
- * Show 10/25/50/100, Light/Dark, …
+ * Segmented control: muted track, active segment pops on a background card.
+ * Used for Trending/Newest, Asc/Desc, Show 10/25/50/100, Light/Dark.
  */
 export function SegControl<T extends string | number>({
   options,

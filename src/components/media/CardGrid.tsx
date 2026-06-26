@@ -11,9 +11,8 @@ import { ChevronLeft, ChevronRight } from "lucide-react"
 import { cn } from "@/lib/utils"
 
 /**
- * Horizontal-wrap layout for natural-width MediaCards: cards flow left→right
- * and wrap to the next row. Tagged `data-cardgrid` so {@link useFitPageSize}
- * can measure how many fit in a fixed-height, non-scrolling area.
+ * Wrap layout for natural-width MediaCards. Tagged `data-cardgrid` so
+ * {@link useFitPageSize} can measure how many fit in a fixed-height area.
  */
 export function CardGrid({
   className,
@@ -33,12 +32,11 @@ export function CardGrid({
 }
 
 /**
- * Dynamic page size for a fixed-height, NON-scrolling card area: returns how
- * many cards fit in `boxRef` without overflowing, so the rest paginate. It
- * over-renders (the caller slices to a high probe count), measures how many
- * rows fit, then settles to that count. Re-probes on container resize and when
- * `resetKey` changes (e.g. category/source switch). Cards must be inside a
- * `[data-cardgrid]` element (see {@link CardGrid}).
+ * Page size for a fixed-height, non-scrolling card area: how many cards fit in
+ * `boxRef` without overflowing, so the rest paginate. Over-renders (caller
+ * slices to a high probe count), measures how many fit, then settles. Re-probes
+ * on resize and when `resetKey` changes. Cards must be inside a
+ * `[data-cardgrid]` element.
  */
 const FIT_PROBE = 60
 const FIT_TOLERANCE_PX = 1 // sub-pixel rounding slack
@@ -71,10 +69,10 @@ export function useFitPageSize(
     return () => ro.disconnect()
   }, [boxRef])
 
-  // Covers load lazily and snap to their intrinsic ratio (so card widths
-  // change after the first settle). Re-probe ONCE per reset cycle after a
-  // cover loads — only while already settled (perPage < FIT_PROBE), so the
-  // probe phase's own loads can't retrigger it and it can't oscillate.
+  // Covers load lazily and snap to their intrinsic ratio, so card widths change
+  // after the first settle. Re-probe once per reset cycle after a cover loads,
+  // and only while already settled (perPage < FIT_PROBE), so the probe phase's
+  // own loads can't retrigger it and it can't oscillate.
   useLayoutEffect(() => {
     const box = boxRef.current
     if (!box) return
@@ -122,12 +120,9 @@ export interface PagerState<T> {
 }
 
 /**
- * Fixed-page-size pagination over an in-memory pool (the old app's
- * DOM-measuring row packer is intentionally not ported — pick a clean
- * pageSize like 14/21/28 instead).
- *
- * Reset to page 1 yourself (`setPage(1)`) when the pool identity changes
- * (e.g. category/source switch); shrinking pools are auto-clamped.
+ * Fixed-page-size pagination over an in-memory pool. Reset to page 1 yourself
+ * (`setPage(1)`) when the pool identity changes; shrinking pools are
+ * auto-clamped.
  */
 export function usePager<T>(items: readonly T[], pageSize: number): PagerState<T> {
   const [rawPage, setPage] = useState(1)
@@ -166,9 +161,8 @@ export interface PagerProps {
 const PAGE_WINDOW = 2
 
 /**
- * Numbered jump-to-page pager like the old app's pgNav: prev/next arrows,
- * a window of ±2 numbers around the current page with first/last + ellipsis,
- * and an item count on the right. Renders nothing for a single page.
+ * Numbered pager: prev/next arrows, a window of ±2 pages around the current one
+ * with first/last + ellipsis, and an item count. Nothing for a single page.
  */
 export function Pager({
   page,

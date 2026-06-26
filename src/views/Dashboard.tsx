@@ -1,12 +1,8 @@
 /**
- * Dashboard — port of the old engine's renderDash() (git show
- * HEAD:ui-src/engine.js): stat tiles, per-category disk usage and the active
- * download list, styled after docs/design/prototype-shadcn-approved.html.
- *
- * Stats come from the sidecar via useStatsLive() (qk.stats() + a 30 s
- * refetch interval while the view is visible); downloads come from the
- * shared DownloadsProvider. With no sidecar (plain-browser dev) every disk
- * row degrades to "offline" and the tiles show an em dash — nothing crashes.
+ * Dashboard: stat tiles, per-category disk usage, active download list.
+ * Stats from useStatsLive() (refetches every 30s while visible); downloads
+ * from the shared DownloadsProvider. With no sidecar (plain-browser dev) disk
+ * rows show "offline" and the tiles show a dash.
  */
 import type { ReactNode } from "react"
 import { Card } from "@/components/ui/card"
@@ -15,7 +11,7 @@ import { useDownloads, type DownloadEntry } from "@/state/downloads"
 import type { Cat, DiskStats } from "@/api/types"
 import { useStatsLive } from "@/state/queries"
 
-/** Category order + fallback labels, as in the old renderDash(). */
+/** Category order + fallback labels. */
 const CATS: ReadonlyArray<{ cat: Cat; label: string }> = [
   { cat: "mov", label: "Movies" },
   { cat: "tv", label: "TV" },

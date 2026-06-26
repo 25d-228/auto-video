@@ -1,20 +1,20 @@
 /**
- * Shared API response shapes consumed by src/api/client.ts and the TS
- * aggregators (discover/seeders/meta/covers/library).
+ * Shared API response shapes used by client.ts and the aggregators
+ * (discover/seeders/meta/covers/library).
  */
 
-/** Library/category id used across the sidecar. */
+/** Library/category id. */
 export type Cat = "mov" | "tv" | "ad" | "vrc"
 
 export type DiscoverMode = "trending" | "newest"
 
-/** Every failing endpoint replies with this shape (HTTP status stays 200). */
+/** Failing endpoints reply with this shape (HTTP status stays 200). */
 export interface ApiError {
   ok: false
   err: string
 }
 
-/** One card in the Discover feed (after the sidecar's `_clean`). */
+/** One card in the Discover feed. */
 export interface DiscoverItem {
   id: string
   cat: Cat
@@ -32,11 +32,11 @@ export interface DiscoverItem {
   runtime: number
   rating: number
   code: string
-  /** Only set by javdb / TMDB / IMDb sources ("" on IMDb items). */
+  /** Set by javdb / TMDB / IMDb sources ("" on IMDb items). */
   date?: string
   /** Original feed position; only set by javdb / TMDB / IMDb / MGStage. */
   added?: number
-  /** Only present on sukebei items (`_clean` does not strip it). */
+  /** Only present on sukebei items. */
   magnet?: string
   /** URL of the item's original page on the source site (built during fetch). */
   link?: string
@@ -50,7 +50,7 @@ export interface DiscoverResponse {
   source: string
 }
 
-/** One real release row in the download dialog (/seeders). */
+/** One release row in the download dialog (/seeders). */
 export interface Release {
   name: string
   source: string
@@ -82,7 +82,7 @@ export interface LibraryItem {
   state: string
   cover: string
   ar: number
-  /** Parsed JAV code — ad/vrc items only. */
+  /** Parsed JAV code; ad/vrc items only. */
   code?: string
   title: string
   /** ad/vrc items only. */
@@ -133,13 +133,13 @@ export interface SaveKeyResponse {
 }
 
 export interface CoverResponse {
-  /** false simply means "no cover found" — not an error. */
+  /** false simply means "no cover found", not an error. */
   ok: boolean
   cover: string
   ar: number
 }
 
-/** TMDB metadata record built by tmdb_lookup() for /movie and /tv. */
+/** TMDB metadata record for /movie and /tv. */
 export interface TitleMeta {
   tmdb_id?: number
   cover?: string

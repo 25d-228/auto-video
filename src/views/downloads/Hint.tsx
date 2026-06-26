@@ -1,9 +1,8 @@
 import type { ReactNode } from "react"
 
 /**
- * Wraps a (possibly disabled) control. Disabled buttons swallow pointer
- * events, so the native-tooltip `title` goes on this wrapper span instead —
- * used for the plain-browser "needs the desktop app" hints.
+ * Wraps a possibly-disabled control. Disabled buttons swallow pointer events,
+ * so the tooltip `title` goes on this wrapper span instead.
  */
 export function Hint({
   show,

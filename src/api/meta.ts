@@ -1,30 +1,19 @@
 /**
- * Metadata resolvers — TypeScript port of the Python sidecar's /meta and
- * /movie//tv handlers and their helpers (from_r18, from_javdb, tmdb_lookup,
- * anilist_cover) in sidecar/av_proxy.py.
+ * Metadata resolvers, two surfaces:
  *
- * Two surfaces, mirroring the sidecar HTTP endpoints:
- *
- *   metaLookup({cid?, code?})  -> JavMeta            (the /meta endpoint)
+ *   metaLookup({cid?, code?}) -> JavMeta
  *     Japanese title + date + runtime + Japanese cast from r18.dev (by FANZA
- *     content id) with a javdatabase fallback (by printed code). Faithful to
- *     the Python `(from_r18(cid) if cid else None) or (from_javdb(code) if code
- *     else None) or {}` chain, keyed and cached by `cid || code`.
+ *     content id), with a javdatabase fallback (by printed code). Keyed and
+ *     cached by `cid || code`.
  *
- *   titleLookup(tv, title, year) -> TitleLookupResponse   (the /movie + /tv endpoints)
- *     Title-addressable lookup via TMDB (reuses src/api/sources/tmdb.tmdbLookup);
- *     for tv, falls back to an AniList cover when TMDB finds none, exactly like
- *     the sidecar's /tv handler.
+ *   titleLookup(tv, title, year) -> TitleLookupResponse
+ *     Title lookup via TMDB (tmdbLookup); for tv, falls back to an AniList cover
+ *     when TMDB finds none.
  *
- * Caching mirrors the sidecar: /meta lived in proxy_cache.json (the `cache`
- * dict, written permanently, never expiring) and /movie//tv lived in
- * discover_covers.json (cover_cached, also permanent). Both are ported onto the
- * SQLite meta_cache table with a very long TTL so a resolved record is treated
- * as permanent. Caching is best-effort and gated on isDbAvailable(), so on a
- * non-Tauri host (vitest / plain browser) the resolvers just hit the network.
- *
- * All network goes through src/net/http.ts. Every helper swallows fetch errors
- * to null/{} the same way the Python get_text / get_json / paced_get_json do.
+ * Both cache into the SQLite meta_cache table with a very long TTL (treated as
+ * permanent). Caching is best-effort and gated on isDbAvailable(), so on a
+ * non-Tauri host the resolvers just hit the network. Every helper swallows fetch
+ * errors to null/{}.
  */
 import { httpJson, httpText, DEFAULT_USER_AGENT } from "@/net/http"
 import { getCached, setCached, isDbAvailable } from "@/state/db"
@@ -34,9 +23,8 @@ import { normalizeCodeNum } from "@/lib/codes"
 import type { JavMeta, TitleLookupResponse, TitleMeta } from "@/api/types"
 
 /**
- * Treat a cached meta/title record as permanent (the Python caches never
- * expire). One year is effectively forever for this app's lifetime; the row is
- * overwritten on a forced refetch.
+ * Treat a cached meta/title record as permanent. One year is effectively forever
+ * for this app's lifetime; the row is overwritten on a forced refetch.
  */
 const META_TTL_SEC = 365 * 24 * 60 * 60
 
@@ -58,14 +46,9 @@ export interface R18Combined {
 }
 
 /**
- * Port of `from_r18(cid)`. Fetch the r18.dev combined detail JSON for a FANZA
- * content id and build a JavMeta: Japanese title, release date (YYYY-MM-DD),
- * runtime ("<n> min"), and the Japanese cast (kanji preferred, then kana, then
- * romaji). Returns null when the fetch fails or nothing useful is present.
- *
- * r18.dev is paced in the Python to respect its rate limit; the per-call pacing
- * lived in paced_get_json. We keep it a single request here (the aggregator can
- * pace a batch); a fetch failure just yields null like the Python.
+ * Build a JavMeta from an r18.dev combined detail: Japanese title, release date
+ * (YYYY-MM-DD), runtime ("<n> min"), Japanese cast (kanji, then kana, then
+ * romaji). Returns null when nothing useful is present.
  */
 export function parseR18(j: R18Combined | null): JavMeta | null {
   if (!j || typeof j !== "object") return null
@@ -100,18 +83,15 @@ export async function fromR18(cid: string): Promise<JavMeta | null> {
 // ------------------------------------------------------------------ javdatabase (/meta fallback)
 
 /**
- * Port of `from_javdb(code)`'s pure parsing. Given the javdatabase movie-page
- * HTML and the printed code, pull the romanized cast (from the <title>), the
- * first date (YYYY-MM-DD) on the page, and runtime ("<n> min"). Returns null
- * when the HTML is too small (< 2000 chars, the Python guard) or nothing is
- * found.
+ * From the javdatabase movie-page HTML and the printed code, pull the romanized
+ * cast (from the <title>), the first date (YYYY-MM-DD) on the page, and runtime
+ * ("<n> min"). Returns null when the HTML is too small (< 2000 chars) or nothing
+ * is found.
  *
- * NOTE on fidelity: the Python takes the FIRST `\d{4}-\d{2}-\d{2}` and the
- * FIRST `\d{2,3}\s*min` on the page verbatim — even though javdatabase's
- * current markup can surface a page-metadata date before the release date and
- * spells runtime as "... minutes" (so the `min` regex misses). This port
- * reproduces that behavior exactly rather than "fixing" it, so its output
- * matches the sidecar byte-for-byte.
+ * Gotcha: we take the first `\d{4}-\d{2}-\d{2}` and first `\d{2,3}\s*min`
+ * verbatim, even though javdatabase's current markup can surface a page-metadata
+ * date before the release date and spells runtime as "... minutes" (so the `min`
+ * regex misses). Kept as-is for stable output.
  */
 export function parseJavdb(html: string, code: string): JavMeta | null {
   if (!html || html.length < 2000) return null
@@ -181,26 +161,22 @@ export async function fromJavdb(code: string): Promise<JavMeta | null> {
 
 // ------------------------------------------------------------------ /meta
 
-/** Arguments mirroring the sidecar's /meta query string (cat is accepted but unused). */
+/** Arguments for /meta (cat is accepted but unused). */
 export interface MetaArgs {
   cid?: string
   code?: string
-  /** Accepted for API parity with the sidecar; the handler ignores it. */
+  /** Accepted for API parity; ignored. */
   cat?: string
 }
 
 /**
- * Port of the sidecar `/meta` handler.
- *
  * `key = cid || code`; with neither, returns `{}` (no lookup, not cached).
- * Otherwise returns the cached record if present, else resolves
- * `fromR18(cid) || fromJavdb(code) || {}`, caches it under `key`, and returns
- * it. r18.dev (by FANZA content id) is preferred; javdatabase (by printed code)
- * is the fallback. Always resolves to a JavMeta object (possibly empty) — never
- * throws — matching the Python which always 200s with a (cached) dict.
+ * Otherwise returns the cached record if present, else resolves r18.dev (by FANZA
+ * content id, preferred) then javdatabase (by printed code, fallback), caches
+ * under `key`, and returns it. Always resolves to a JavMeta (possibly empty),
+ * never throws.
  *
- * The empty `{}` result IS cached for a real key, exactly like the Python which
- * writes `cache[key] = rec` even when rec is `{}` (so a miss is not re-fetched).
+ * The empty `{}` result is cached for a real key, so a miss is not re-fetched.
  */
 export async function metaLookup(args: MetaArgs): Promise<JavMeta> {
   const cid = (args.cid ?? "").trim()
@@ -219,10 +195,10 @@ export async function metaLookup(args: MetaArgs): Promise<JavMeta> {
 
   // r18.dev (by FANZA cid) carries Japanese cast (cast_ja); javdatabase (by
   // code) only has romaji. Cover URLs are now blob: URLs, so a cid is rarely
-  // passed in — and we want 出演/cast in Japanese everywhere. So when we don't
-  // already have Japanese cast, fetch the javdatabase page (it also yields a
-  // FANZA cid via parseJavdb._cid) and use that cid to pull Japanese cast from
-  // r18. Merge order makes Japanese fields win, with romaji kept as a fallback.
+  // passed in, and we want cast in Japanese everywhere. So when we don't already
+  // have Japanese cast, fetch the javdatabase page (it also yields a FANZA cid
+  // via parseJavdb._cid) and use that cid to pull Japanese cast from r18. Merge
+  // order makes Japanese fields win, with romaji kept as a fallback.
   let rec: JavMeta = (cid ? await fromR18(cid) : null) ?? {}
   if (!rec.cast_ja && code) {
     const jdb = (await fromJavdb(code)) ?? {}
@@ -242,7 +218,7 @@ export async function metaLookup(args: MetaArgs): Promise<JavMeta> {
     try {
       await setCached("meta_cache", `meta:${key}`, rec)
     } catch {
-      // best-effort cache write (Python swallows the json.dump failure too)
+      // best-effort cache write
     }
   }
   return rec
@@ -260,9 +236,8 @@ interface AnilistResponse {
 }
 
 /**
- * Port of `anilist_cover(title)`. POST the AniList GraphQL API for an anime
- * matching `title` and return its cover image URL ("large", else "medium").
- * Returns "" on any failure — the Python swallows every exception to "".
+ * POST the AniList GraphQL API for an anime matching `title` and return its cover
+ * image URL ("large", else "medium"). Returns "" on any failure.
  */
 export async function anilistCover(title: string): Promise<string> {
   try {
@@ -290,21 +265,20 @@ export async function anilistCover(title: string): Promise<string> {
 // ------------------------------------------------------------------ /movie + /tv
 
 /**
- * Port of the sidecar `/movie` and `/tv` handlers (`tv` selects which).
+ * Movie/TV title lookup (`tv` selects which).
  *
- * Mirrors the response shape `{ ok, haskey, meta? }`:
- *   - no TMDB key            -> { ok:false, haskey:false }            (no meta)
- *   - key but empty title    -> { ok:false, haskey:true }             (no meta)
- *   - otherwise              -> { ok:<bool cover>, haskey:true, meta }
+ * Response shape `{ ok, haskey, meta? }`:
+ *   - no TMDB key         -> { ok:false, haskey:false }            (no meta)
+ *   - key but empty title -> { ok:false, haskey:true }             (no meta)
+ *   - otherwise           -> { ok:<bool cover>, haskey:true, meta }
  *
  * `meta` is `tmdbLookup(title, year, tv) or {}`. For tv, when TMDB yields no
- * cover, an AniList cover (ar 0.69) is tried as a fallback (no key needed),
- * exactly like the Python /tv handler. `ok` is true only when the final record
- * carries a cover.
+ * cover, an AniList cover (ar 0.69) is tried as a fallback (no key needed). `ok`
+ * is true only when the final record carries a cover.
  *
  * Results are cached (best-effort, permanent TTL) under
- * `("tmdbtv:" | "tmdb:") + title.toLowerCase() + "|" + year`, matching the
- * Python cover_cached key. `fresh` bypasses the cache and overwrites it.
+ * `("tmdbtv:" | "tmdb:") + title.toLowerCase() + "|" + year`. `fresh` bypasses
+ * the cache and overwrites it.
  */
 export async function titleLookup(
   tv: boolean,
@@ -332,7 +306,7 @@ export async function titleLookup(
     }
   }
 
-  // tmdb_lookup(...) or {}  — Python coerces a null lookup to an empty dict.
+  // tmdbLookup(...) or {}: coerce a null lookup to an empty record.
   let rec: TitleMeta = (await tmdbLookup(trimmedTitle, trimmedYear, tv)) ?? {}
 
   // anime fallback: AniList cover when TMDB found none (tv only, no key needed).

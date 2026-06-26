@@ -13,7 +13,7 @@ export interface ChipRowProps<T extends string | number> {
   className?: string
 }
 
-/** Category chip row per the prototype (.chips/.chip): pill buttons, active = primary. */
+/** Category chip row: pill buttons, active = primary. */
 export function ChipRow<T extends string | number>({
   options,
   value,
@@ -41,7 +41,7 @@ export function ChipRow<T extends string | number>({
   )
 }
 
-/** Small muted pill for cast/genre chips (prototype .cchip / old .mk-chiplet). */
+/** Small muted pill for cast/genre chips. */
 export function Chiplet({ className, ...props }: ComponentProps<"span">) {
   return (
     <span

@@ -1,7 +1,7 @@
 /**
- * One library grid card: MediaCard with a lazily resolved cover plus the
- * old engine's right-click menu (Play / Reveal in Finder / Delete to Trash).
- * OS actions are disabled in a plain browser (no window.__TAURI__).
+ * One library grid card: MediaCard with a lazily resolved cover plus a
+ * right-click menu (Play / Reveal in Finder / Delete to Trash). OS actions are
+ * disabled in a plain browser (no window.__TAURI__).
  */
 import { FolderOpen, Play, Trash2 } from "lucide-react"
 import type { LibraryItem } from "@/api/types"
@@ -19,7 +19,7 @@ const PLACEHOLDER_ASPECT = 0.7
 
 export interface LibraryCardProps {
   item: LibraryItem
-  /** False in plain-browser dev — Play/Reveal/Delete are disabled. */
+  /** False in plain-browser dev; Play/Reveal/Delete are disabled. */
   tauri: boolean
   onOpen: (item: LibraryItem) => void
   onPlay: (item: LibraryItem) => void
@@ -36,7 +36,7 @@ export function LibraryCard({
   onDelete,
 }: LibraryCardProps) {
   const art = useLibraryArt(item)
-  // mk-tag origin: TV on tv items, VR on vr files; movies stay untagged
+  // TV on tv items, VR on vr files; movies stay untagged
   const sourceBadge = item.cat === "tv" ? "TV" : item.vr ? "VR" : undefined
 
   return (

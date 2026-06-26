@@ -26,10 +26,9 @@ export type ViewId =
   | "settings"
 
 /**
- * macOS desktop runs with titleBarStyle "Overlay" + hiddenTitle (no native
- * title bar), so the traffic lights float over the top-left of the sidebar
- * and the brand row needs to clear them. Browser dev / Windows keep their
- * native chrome, so no headroom is reserved there.
+ * On macOS the window uses an overlay title bar (no native chrome), so the
+ * traffic lights float over the sidebar's top-left and the brand row needs
+ * headroom to clear them. Browser/Windows keep native chrome.
  */
 const MAC_OVERLAY_TITLEBAR =
   isTauri() && navigator.userAgent.includes("Macintosh")
@@ -145,10 +144,8 @@ function AppShell() {
         )}
       >
         {MAC_OVERLAY_TITLEBAR && (
-          // headroom for the floating traffic lights (which sit lowered to the
-          // content title row); doubles as the window-drag handle the hidden
-          // title bar used to provide. Tall enough to leave a clear gap between
-          // the lights and the brand below.
+          // headroom for the floating traffic lights; doubles as the
+          // window-drag handle.
           <div data-tauri-drag-region className="h-14 flex-none" />
         )}
         <div
@@ -191,7 +188,7 @@ function AppShell() {
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {view === "dashboard" && <Dashboard />}
         {/* Discover stays mounted (just hidden when inactive) so its category,
-            selectors and page are remembered across tab switches. */}
+            selectors and page survive tab switches. */}
         <div
           className={cn(
             "flex min-h-0 flex-1 flex-col",

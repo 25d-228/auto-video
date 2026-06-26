@@ -1,8 +1,4 @@
-/**
- * One in-flight download: title, destination path, progress bar with
- * percent + speed, a Pause/Resume toggle and the Cancel dropdown
- * (keep files directly; delete files via the parent's confirm dialog).
- */
+/** One in-flight download: progress, Pause/Resume, and the Cancel dropdown. */
 import { ChevronDown, FolderOpen, Pause, Play } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -29,11 +25,11 @@ export function ActiveDownloadRow({
   tauri: boolean
   onPause: (entry: DownloadEntry) => void
   onResume: (entry: DownloadEntry) => void
-  /** Cancel, keep files — non-destructive, runs directly. */
+  /** Cancel, keep files. Non-destructive, runs directly. */
   onCancelKeep: (entry: DownloadEntry) => void
-  /** Cancel and delete files — the parent confirms first. */
+  /** Cancel and delete files. Parent confirms first. */
   onCancelDelete: (entry: DownloadEntry) => void
-  /** Open the destination folder (so you can watch the file land while it downloads). */
+  /** Open the destination folder. */
   onOpenFolder: (entry: DownloadEntry) => void
 }) {
   const paused = entry.state === "paused"

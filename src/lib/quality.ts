@@ -1,5 +1,5 @@
 /**
- * Coarse quality label from a release name (Python _quality): the first of
+ * Coarse quality label from a release name: the first of
  * 2160p/4K/8K/1080p/720p/480p found, uppercased; "" when none present. Shared by
  * the javdb / sukebei / tpb / javbus scrapers so the resolution ladder lives in
  * one place.

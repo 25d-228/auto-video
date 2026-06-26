@@ -1,20 +1,18 @@
 /**
- * sukebei.nyaa.si scraper — ported from sidecar/av_proxy.py
- * (fetch_sukebei, seeders_sukebei, plus the _quality / human_size helpers it
- * leans on). sukebei is the adult/VR torrent index; it serves full HTML
- * listings under category c=2_2 ("Real Life - Videos"), so we parse the
- * <tbody> table exactly the way the Python regexes did.
+ * sukebei.nyaa.si scraper. sukebei is the adult/VR torrent index; it serves full
+ * HTML listings under category c=2_2 ("Real Life - Videos"), so we parse the
+ * <tbody> table directly.
  *
- * Two public entry points mirror the sidecar:
+ * Two public entry points:
  *   - fetchSukebei(list, query?, pages?) -> SukebeiItem[]  (the Discover feed;
  *     the aggregator later filters by `vr`, assigns `cat`, rewrites `sub`, and
- *     resolves a cover by `code` — so we leave cover empty and keep the code).
+ *     resolves a cover by `code`, so we leave cover empty and keep the code).
  *   - seedersSukebei(code) -> Release[]  (the per-item Download dialog rows).
  *
- * Network goes through src/net/http.ts (Tauri http plugin: bypasses CORS, sets
- * a Referer). Code / VR parsing reuses src/lib/codes.ts verbatim. Listings are
- * cached in the SQLite listing_cache (mirrors the sidecar's _listcache, same
- * 300s TTL) when the DB is available, degrading to a live fetch otherwise.
+ * Network goes through src/net/http.ts (Tauri http plugin: bypasses CORS, sets a
+ * Referer). Code / VR parsing reuses src/lib/codes.ts. Listings are cached in the
+ * SQLite listing_cache (300s TTL) when the DB is available, degrading to a live
+ * fetch otherwise.
  */
 import type { DiscoverItem, Release } from "@/api/types"
 import { isVr, parseCode } from "@/lib/codes"
@@ -29,7 +27,7 @@ export { quality }
 /** sukebei view-page / Referer host. */
 const SUKEBEI_BASE = "https://sukebei.nyaa.si"
 
-/** Seconds a listing stays fresh before a refetch (matches sidecar LIST_TTL). */
+/** Seconds a listing stays fresh before a refetch. */
 const LIST_TTL_SEC = 300
 
 /**
@@ -46,22 +44,21 @@ function nyaaSort(list: string): "seeders" | "id" | "downloads" {
 }
 
 /**
- * One sukebei feed row. Extends the shared {@link DiscoverItem} with the three
- * aggregator-internal fields the Python carried on the dict (and which the
- * wiring phase consumes before emitting the public shape):
- *   - `vr`        : true when isVr(title, code) — used to split ad vs vrc.
+ * One sukebei feed row. Extends the shared {@link DiscoverItem} with three
+ * aggregator-internal fields the wiring phase consumes before emitting the public
+ * shape:
+ *   - `vr`        : true when isVr(title, code); used to split ad vs vrc.
  *   - `_rawtitle` : the untruncated release title (sub fallback + seeder names).
  *   - `_downloads`: the completed count (used to sort the most_downloaded list).
  *
- * `cat` is a placeholder ("ad") at fetch time — the sidecar set it to None and
- * assigned the real category later; the aggregator overwrites it here too.
+ * `cat` is a placeholder ("ad") at fetch time; the aggregator overwrites it.
  */
 export interface SukebeiItem extends DiscoverItem {
   /** true for VR titles (isVr on the raw title + parsed code). */
   vr: boolean
-  /** Untruncated release title (sidecar dict key `_rawtitle`). */
+  /** Untruncated release title. */
   _rawtitle: string
-  /** Completed/download count (sidecar dict key `_downloads`). */
+  /** Completed/download count. */
   _downloads: number
 }
 
@@ -69,8 +66,7 @@ export interface SukebeiItem extends DiscoverItem {
 
 /**
  * Minimal HTML-entity unescape covering what nyaa emits in titles/magnets
- * (&amp; &lt; &gt; &quot; &#39; &nbsp; + numeric refs). Mirrors Python's
- * html.unescape for these cases; faithful enough for the magnet/title fields.
+ * (&amp; &lt; &gt; &quot; &#39; &nbsp; + numeric refs).
  */
 function unescapeHtml(s: string): string {
   if (!s) return ""
@@ -88,7 +84,7 @@ function unescapeHtml(s: string): string {
     .replace(/&amp;/g, "&")
 }
 
-/** Strip non-digits and parse to int; 0 on failure (Python _num). */
+/** Strip non-digits and parse to int; 0 on failure. */
 function numFromCell(x: string): number {
   const n = parseInt(x.replace(/[^\d]/g, ""), 10)
   return Number.isNaN(n) ? 0 : n
@@ -97,12 +93,11 @@ function numFromCell(x: string): number {
 // ----------------------------------------------------------------- parser
 
 /**
- * Parse a sukebei listing page's HTML into feed rows. Pure (no network) so the
- * unit test can run it against a saved fixture. `seen` dedups view-ids across
- * pages, exactly like the sidecar accumulator.
+ * Parse a sukebei listing page's HTML into feed rows. Pure (no network). `seen`
+ * dedups view-ids across pages.
  *
- * Returns the rows for this page (already deduped against `seen`), or [] when
- * the page has no <tbody>/<tr> (the sidecar's break condition).
+ * Returns the rows for this page (already deduped against `seen`), or [] when the
+ * page has no <tbody>/<tr>.
  */
 export function parseSukebeiList(
   html: string,
@@ -116,7 +111,7 @@ export function parseSukebeiList(
 
   for (const row of rows) {
     // The view link + title: prefer the `title="..."` attribute, fall back to
-    // the anchor text (matches the sidecar's two-pattern attempt).
+    // the anchor text.
     const viewMatch =
       /\/view\/(\d+)"\s+title="([^"]*)"/.exec(row) ??
       /\/view\/(\d+)"[^>]*>([^<]+)</.exec(row)
@@ -174,7 +169,7 @@ export function parseSukebeiList(
 /**
  * Sort a sukebei feed in place to match the requested nyaa sort:
  * seeders -> seeders desc; downloads -> completed desc; id (newest) -> leave the
- * page order (nyaa already returns newest-first). Mirrors the sidecar tail.
+ * page order (nyaa already returns newest-first).
  */
 export function sortSukebei(items: SukebeiItem[], list: string): SukebeiItem[] {
   const sort = nyaaSort(list)
@@ -195,16 +190,16 @@ function listUrl(query: string, sort: string, page: number): string {
 }
 
 /**
- * Fetch the sukebei feed for one Discover list. Ports fetch_sukebei:
+ * Fetch the sukebei feed for one Discover list.
  *   - `list` is the Discover list id (most_seeded|newest|most_downloaded),
  *     mapped to nyaa's s=seeders|id|downloads.
  *   - `query` filters by a search term (e.g. "VR" for the VR pool, or a code);
  *     "" pulls the whole category.
- *   - `pages` defaults to 1 when a query is set, else 3 (the sidecar default).
+ *   - `pages` defaults to 1 when a query is set, else 3.
  *
  * Cached per (sort, query, pages) in listing_cache (300s TTL) when the DB is
- * available. Pages are fetched sequentially and deduped by view-id; the loop
- * stops at the first page with no rows (the sidecar's break).
+ * available. Pages are fetched sequentially and deduped by view-id; the loop stops
+ * at the first page with no rows.
  */
 export async function fetchSukebei(
   list: string,
@@ -253,9 +248,9 @@ export async function fetchSukebei(
 }
 
 /**
- * Real sukebei releases for one JAV code, for the Download dialog. Ports
- * seeders_sukebei: a single-page code search ('trending' list = seeders sort,
- * pages=1) mapped to Release rows. Returns [] for an empty code.
+ * Real sukebei releases for one JAV code, for the Download dialog: a single-page
+ * code search ('trending' list = seeders sort, pages=1) mapped to Release rows.
+ * Returns [] for an empty code.
  */
 export async function seedersSukebei(code: string): Promise<Release[]> {
   if (!code) return []

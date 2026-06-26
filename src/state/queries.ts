@@ -2,7 +2,7 @@
  * TanStack Query hooks over the typed sidecar client (src/api/client.ts).
  *
  * Conventions:
- * - all keys are namespaced under ["sidecar", …] — see `qk` below; after a
+ * - all keys are namespaced under ["sidecar", …] (see `qk` below); after a
  *   savePath/saveKey/scan, invalidate qk.paths() / qk.keys() / qk.library().
  * - listings (discover/seeders/library) stay fresh for 5 minutes, matching
  *   the sidecar's own listing cache; covers/meta/lookups never go stale.
@@ -84,7 +84,7 @@ export interface SeederSubject {
   title?: string
   code?: string
   year?: string | number
-  /** Fallback year source — the old app's dlYear() scanned `year || sub`. */
+  /** Fallback year source: `year || sub`. */
   sub?: string
 }
 
@@ -93,7 +93,7 @@ function subjectYear(item: SeederSubject): string {
   return m ? m[0] : ""
 }
 
-/** Real releases + magnets for one item, merged across the seeder sites. */
+/** Releases + magnets for one item, merged across the seeder sites. */
 export function useSeeders(item: SeederSubject | null | undefined) {
   const cat = item?.cat ?? "mov"
   const title = item?.title ?? ""

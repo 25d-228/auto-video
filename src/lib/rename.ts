@@ -1,14 +1,13 @@
 /**
  * Post-download rename planner (pure). After a torrent finishes, its files
  * carry arbitrary, often spam-laden names (`489155.com@SNOS-239-C.mp4`) plus
- * bundled junk. Given the torrent's files, the canonical base name the app
- * already knows (JAV code for ad/vrc, `YEAR.Title` for mov, show name for tv)
- * and the category, this decides how to rename the KEPT video file(s) into the
- * library's naming convention — the same shape the scan/cover algorithm expects.
+ * bundled junk. Given the files, the canonical base name (JAV code for ad/vrc,
+ * `YEAR.Title` for mov, show name for tv) and the category, decide how to
+ * rename the kept video file(s) into the library's naming convention.
  *
- * Returns {from,to} relative paths within the destination folder. Non-video
- * files, named samples and tiny extras are dropped (no rename). The actual
- * filesystem moves are applied in Rust on the download's `done` transition.
+ * Returns {from,to} paths relative to the destination folder. Non-video files,
+ * named samples and tiny extras are dropped (no rename). The moves are applied
+ * in Rust on the download's `done` transition.
  */
 export type RenameCat = "mov" | "tv" | "ad" | "vrc"
 

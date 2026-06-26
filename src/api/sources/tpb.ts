@@ -1,7 +1,7 @@
 /**
- * The Pirate Bay (apibay.org) source — ported from sidecar/av_proxy.py.
+ * The Pirate Bay (apibay.org) source.
  *
- * Two responsibilities, mirroring the Python:
+ * Two responsibilities:
  *   1. fetchTv(mode) -> DiscoverItem[] for the TV Discover feed (cat="tv").
  *      - mode "newest"   : apibay q.php?q=category:205 (TV category, newest first)
  *      - mode "trending" : the precompiled data_top100_205.json, sorted by seeders
@@ -10,12 +10,11 @@
  *   2. seedersApibay(query) -> Release[] for the Download dialog / per-item seed
  *      badge: a free-text q.php search turned into magnet rows (with trackers).
  *
- * apibay's q.php returns every field as a STRING; the precompiled top100 file
- * returns id/size/seeders as NUMBERS. Both are coerced defensively here, exactly
- * like the Python (str(...) / int(...)).
+ * apibay's q.php returns every field as a string; the precompiled top100 file
+ * returns id/size/seeders as numbers. Both are coerced defensively here.
  *
  * Network goes through src/net/http.ts; TTL caching uses src/state/db.ts's
- * listing_cache (the Python kept fetch_tv behind its in-memory listing cache).
+ * listing_cache.
  */
 import { httpJson } from "@/net/http"
 import { getCached, setCached, isDbAvailable } from "@/state/db"
@@ -23,13 +22,13 @@ import type { DiscoverItem, DiscoverMode, Release } from "@/api/types"
 import { parseTvName } from "@/lib/codes"
 import { quality } from "@/api/sources/sukebei"
 
-/** apibay TV category id (the Python's `category:205`). */
+/** apibay TV category id (category:205). */
 const TV_CATEGORY = 205
 
 /** Base host for the apibay JSON API. */
 const APIBAY = "https://apibay.org"
 
-/** Seconds a listing is cached before re-fetch — matches the sidecar's LIST_TTL. */
+/** Seconds a listing is cached before re-fetch. */
 const LIST_TTL = 300
 
 /** Cap on the number of TV rows returned by parseTv. */
@@ -54,15 +53,15 @@ interface ApibayRow {
 
 // ----------------------------------------------------------------- coercion
 
-/** Python: int(x or 0) with a swallow-on-failure fallback. */
+/** parse to int, 0 on failure. */
 function toInt(v: unknown): number {
   const n = parseInt(String(v ?? ""), 10)
   return Number.isFinite(n) ? n : 0
 }
 
 /**
- * Python: human_size(b). Bytes use "%d B"; KB and up use one decimal place.
- * Mirrors the sidecar formatting exactly (646.0 MB, 1.9 GB, 512 B, 0 B).
+ * Bytes use "%d B"; KB and up use one decimal place (646.0 MB, 1.9 GB, 512 B,
+ * 0 B).
  */
 export function humanSize(bytes: number): string {
   let b = Number(bytes) || 0
@@ -77,9 +76,8 @@ export function humanSize(bytes: number): string {
 }
 
 /**
- * URL-encode like Python's urllib.parse.quote default (safe="/"): "/" is NOT
- * escaped. encodeURIComponent escapes "/", so we decode it back to match the
- * Python byte-for-byte (the magnet `dn` and q.php query depend on this).
+ * URL-encode but keep "/" raw (the magnet `dn` and q.php query depend on it).
+ * encodeURIComponent escapes "/", so we decode it back.
  */
 function pyQuote(s: string): string {
   return encodeURIComponent(s).replace(/%2F/g, "/")
@@ -87,7 +85,7 @@ function pyQuote(s: string): string {
 
 // ----------------------------------------------------------------- magnets
 
-/** Trackers appended to every built magnet (Python: TRACKERS). */
+/** Trackers appended to every built magnet. */
 const TRACKERS = [
   "udp://tracker.opentrackr.org:1337/announce",
   "udp://open.demonii.com:1337/announce",
@@ -97,7 +95,6 @@ const TRACKERS = [
   .map((t) => "&tr=" + pyQuote(t))
   .join("")
 
-/** Python: _magnet(ih, name). */
 function buildMagnet(infoHash: string, name: string): string {
   return `magnet:?xt=urn:btih:${infoHash}&dn=${pyQuote(name || "")}${TRACKERS}`
 }
@@ -110,13 +107,11 @@ function isZeroHash(ih: string): boolean {
 // ----------------------------------------------------------------- fetch_tv
 
 /**
- * Parse a raw apibay TV category response into DiscoverItem[] (cat="tv").
- *
- * Pure (no network): exported so the test can exercise it against a saved
- * fixture. Mirrors fetch_tv(): drops sentinel/empty rows, parses series + SxxEyy
- * via parseTvName, sorts by seeders for trending (q.php is already newest-first),
- * caps at 100, leaves cover "" (resolved later by tvmaze). The link points at the
- * TPB description page keyed by the apibay numeric id.
+ * Parse a raw apibay TV category response into DiscoverItem[] (cat="tv"). Pure
+ * (no network). Drops sentinel/empty rows, parses series + SxxEyy via parseTvName,
+ * sorts by seeders for trending (q.php is already newest-first), caps at 100,
+ * leaves cover "" (resolved later by tvmaze). The link points at the TPB
+ * description page keyed by the apibay numeric id.
  */
 export function parseTv(arr: unknown, mode: DiscoverMode): DiscoverItem[] {
   if (!Array.isArray(arr)) return []
@@ -143,7 +138,7 @@ export function parseTv(arr: unknown, mode: DiscoverMode): DiscoverItem[] {
     const size = humanSize(toInt(row.size))
     const tid = String(row.id ?? "").trim()
 
-    // sub = "<SxxEyy> · <imdb>" with empty parts trimmed (Python's .strip(' ·')).
+    // sub = "<SxxEyy> · <imdb>" with empty parts trimmed.
     const sub = ((seasonEpisode ? seasonEpisode + " · " : "") + (imdb || "")).replace(/^[\s·]+|[\s·]+$/g, "")
 
     const item: DiscoverItem = {
@@ -176,8 +171,8 @@ export function parseTv(arr: unknown, mode: DiscoverMode): DiscoverItem[] {
  *
  * mode "newest" hits q.php?q=category:205 (newest first); any other mode hits the
  * precompiled top100 file and sorts by seeders. Results are cached in
- * listing_cache for {@link LIST_TTL} seconds (matching the sidecar). On a network
- * failure this resolves to [] (the Python's get_json returns None -> []).
+ * listing_cache for {@link LIST_TTL} seconds. On a network failure this resolves
+ * to [].
  */
 export async function fetchTv(mode: DiscoverMode): Promise<DiscoverItem[]> {
   const url =
@@ -212,10 +207,8 @@ export async function fetchTv(mode: DiscoverMode): Promise<DiscoverItem[]> {
 // ----------------------------------------------------------------- seeders
 
 /**
- * Parse a raw apibay q.php search response into Release[].
- *
- * Pure (no network): exported for the fixture test. Mirrors seeders_apibay():
- * skips rows with no info_hash, an all-zero hash, or the "No results returned"
+ * Parse a raw apibay q.php search response into Release[]. Pure (no network).
+ * Skips rows with no info_hash, an all-zero hash, or the "No results returned"
  * sentinel; builds a magnet (with trackers) and a quality tag for each survivor.
  */
 export function parseSeeders(arr: unknown): Release[] {
@@ -238,9 +231,8 @@ export function parseSeeders(arr: unknown): Release[] {
 }
 
 /**
- * Free-text apibay search -> Release[] for the Download dialog / seed badge.
- * Mirrors seeders_apibay(query). On a network failure this resolves to [] (the
- * Python's get_json returns None -> the list stays empty).
+ * Free-text apibay search -> Release[] for the Download dialog / seed badge. On a
+ * network failure this resolves to [].
  */
 export async function seedersApibay(query: string): Promise<Release[]> {
   let raw: unknown

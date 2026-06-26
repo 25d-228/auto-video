@@ -1,7 +1,5 @@
 /**
- * Discover view domain helpers, ported from the old vanilla engine
- * (git show HEAD:ui-src/engine.js — DISC_SOURCES,
- * ownedKeys, cidOf). Pure functions only; React lives in the
+ * Discover view domain helpers. Pure functions only; React lives in the
  * sibling components.
  */
 import type { Cat, DiscoverItem, LibraryItem } from "@/api/types"
@@ -17,12 +15,11 @@ export const CAT_OPTIONS: readonly ChipOption<Cat>[] = [
 ]
 
 /**
- * The Discover catalog — the single source of truth for which providers and
- * lists each category offers, and in what order. The order here defines the
- * DEFAULTS (the first provider is the category default, and each provider's
- * first list id is its default) and the fallback resolution in
- * src/api/discover.ts — the dropdown menus themselves are rendered
- * alphabetically by label (see providersFor/listsFor).
+ * The Discover catalog defines which providers and lists each category offers,
+ * and in what order. The order sets the defaults (first provider is the
+ * category default; each provider's first list is its default) and the fallback
+ * resolution in src/api/discover.ts. Menus themselves render alphabetically by
+ * label (see providersFor/listsFor).
  */
 export type ProviderId =
   | "tmdb"
@@ -85,9 +82,9 @@ export interface CatalogProvider {
 }
 
 /**
- * Per-category provider catalog, in default-resolution order: the first
- * provider is the category default; each provider's first list is its
- * default list. Do not reorder — menus are sorted at render time instead.
+ * Per-category provider catalog, in default-resolution order: first provider is
+ * the category default, each provider's first list is its default. Do not
+ * reorder; menus are sorted at render time instead.
  */
 export const DISC_CATALOG: Record<Cat, readonly CatalogProvider[]> = {
   mov: [
@@ -128,8 +125,8 @@ export const DISC_CATALOG: Record<Cat, readonly CatalogProvider[]> = {
     // MGStage VR = the "VR popular" search (single list; the upstream VR view
     // ignores the ranking window/sort, so extra options would be a no-op).
     { provider: "mgstage", lists: ["popular"] },
-    // JavDB VR = the Categories→Censored browser with Genre=VR. It has no fixed
-    // "list" — the toolbar shows Year/Month/Sort selectors instead (see
+    // JavDB VR = the Categories→Censored browser with Genre=VR. No fixed
+    // "list"; the toolbar shows Year/Month/Sort selectors instead (see
     // JAVDB_VR_* below + Discover.tsx). The "newest" id here is a placeholder so
     // resolveList stays happy; the actual feed is driven by JavdbBrowseSel/opts.
     { provider: "javdb", lists: ["newest"] },
@@ -146,7 +143,7 @@ export interface ListOption {
   label: string
 }
 
-/** Sort dropdown options alphabetically by display label (menu order only —
+/** Sort dropdown options alphabetically by display label (menu order only;
  * DISC_CATALOG order still defines the per-category defaults). */
 function byLabel<T extends { label: string }>(a: T, b: T): number {
   return a.label.localeCompare(b.label)
@@ -225,13 +222,13 @@ const MONTH_NAMES = [
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ]
 
-/** Month options ("" = all months); value is the 1–12 month tag id. */
+/** Month options ("" = all months); value is the 1-12 month tag id. */
 export const JAVDB_MONTH_OPTIONS: readonly { value: string; label: string }[] = [
   { value: "", label: "All months" },
   ...MONTH_NAMES.map((name, i) => ({ value: String(i + 1), label: name })),
 ]
 
-/** One JavDB VR sort option (Image #5), mapped to the API sort_by/order_by. */
+/** One JavDB VR sort option, mapped to the API sort_by/order_by. */
 export interface JavdbSortOption {
   value: string
   label: string
@@ -239,7 +236,7 @@ export interface JavdbSortOption {
   orderBy: "desc" | "asc"
 }
 
-/** The seven verified VR sorts (sort_by tokens confirmed live). */
+/** The VR sort options (sort_by tokens). */
 export const JAVDB_SORT_OPTIONS: readonly JavdbSortOption[] = [
   { value: "release_desc", label: "Newest", sortBy: "release", orderBy: "desc" },
   { value: "release_asc", label: "Oldest", sortBy: "release", orderBy: "asc" },
@@ -250,7 +247,7 @@ export const JAVDB_SORT_OPTIONS: readonly JavdbSortOption[] = [
   { value: "watched_count", label: "Most watched", sortBy: "watched_count", orderBy: "desc" },
 ]
 
-/** JavDB browser toolbar selection (year/month/sort) — shared by VR + Category. */
+/** JavDB browser toolbar selection (year/month/sort), shared by VR + Category. */
 export interface JavdbBrowseSel {
   year: string
   month: string
@@ -272,7 +269,7 @@ export function javdbBrowseOpts(sel: JavdbBrowseSel): {
   return { year: sel.year, month: sel.month, sortBy: s.sortBy, orderBy: s.orderBy }
 }
 
-/** A list id implies a recency display (old Newest mode) for added-date pills. */
+/** Whether a list id implies a recency display, for added-date pills. */
 export function listIsRecency(list: string): boolean {
   return list === "newest" || list === "most_seeded"
 }
@@ -281,7 +278,7 @@ export function providerLabel(provider: string): string {
   return PROVIDER_LABELS[provider as ProviderId] ?? provider
 }
 
-/** Default poster aspect ratio per category (old defAr). */
+/** Default poster aspect ratio per category. */
 export function defAr(cat: Cat): number {
   return cat === "mov" ? 0.675 : cat === "tv" ? 0.7 : 0.72
 }
@@ -320,7 +317,7 @@ export interface CardState {
   progress?: number
 }
 
-/** Badge state: downloading (live queue) beats in-library beats NEW. */
+/** Badge state: downloading (live queue) beats in-library beats new. */
 export function itemState(
   it: DiscoverItem,
   owned: ReadonlySet<string>,

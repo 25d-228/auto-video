@@ -1,15 +1,11 @@
-//! Pure-Rust torrent backend (librqbit) — replaces the libtorrent C++ shim.
+//! Torrent backend (librqbit).
 //!
-//! librqbit was originally dropped because its default filesystem storage opens
-//! and creates EVERY file in the torrent up front (even deselected ones) as
-//! 0-byte stubs. This module plugs a custom [`LazyStorage`] into librqbit that:
-//!   - creates a file on disk only on the FIRST write to it, and
-//!   - SKIPS writes to deselected files entirely — including the boundary bytes
-//!     of a piece shared with a selected file.
-//! So deselected files are never created (no stubs) — the same clean on-disk
-//! result as libtorrent's sparse + priority-0, but in pure Rust (no C++, no
-//! Homebrew dylib). Torrent resume is still managed by the app, but DHT keeps
-//! its own lightweight routing-table cache so magnet starts are not always cold.
+//! librqbit's default storage creates every file in the torrent up front as
+//! 0-byte stubs, including deselected ones. [`LazyStorage`] avoids that: it
+//! creates a file only on the first write and skips writes to deselected files
+//! entirely, including the boundary bytes of a piece shared with a selected
+//! file. So deselected files are never created. DHT keeps its own routing-table
+//! cache so magnet starts aren't always cold.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -26,8 +22,8 @@ use librqbit::{
 };
 use tokio::sync::OnceCell;
 
-/// A managed-torrent handle. librqbit's `ManagedTorrentHandle` alias isn't
-/// re-exported at the crate root, but it is exactly `Arc<ManagedTorrent>`.
+/// Managed-torrent handle. librqbit's `ManagedTorrentHandle` alias isn't
+/// re-exported at the crate root; it's exactly `Arc<ManagedTorrent>`.
 pub type Handle = Arc<ManagedTorrent>;
 
 /// Bytes per MiB. librqbit reports live speed in MiB/s; the UI wants bytes/sec.
@@ -179,7 +175,7 @@ impl TorrentStorage for LazyStorage {
         let lf = self.files.get(file_id).context("no such file")?;
         let mut g = lf.handle.lock().unwrap();
         if g.is_none() {
-            // Open an EXISTING file only — a missing file surfaces as Err, which
+            // Open an existing file only. A missing file surfaces as Err, which
             // the integrity check treats as "piece not present" (no creation).
             *g = Some(
                 OpenOptions::new()
@@ -194,7 +190,7 @@ impl TorrentStorage for LazyStorage {
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
-        // Skip deselected / padding files entirely so they are never created —
+        // Skip deselected / padding files entirely so they're never created,
         // including the boundary bytes of a piece shared with a selected file.
         if !self.wanted(file_id) {
             return Ok(());
@@ -245,8 +241,8 @@ impl TorrentStorage for LazyStorage {
     }
 
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
-        // Move the open handles into a fresh storage, neutering this one (called
-        // on pause/delete), mirroring FilesystemStorage::take.
+        // Move the open handles into a fresh storage, neutering this one. Called
+        // on pause/delete.
         let files = self
             .files
             .iter()
@@ -268,8 +264,8 @@ impl TorrentStorage for LazyStorage {
         _shared: &ManagedTorrentShared,
         _meta: &TorrentMetadata,
     ) -> anyhow::Result<()> {
-        // Crucially a NO-OP: create nothing here. (The stock storage opens every
-        // file here — that is what produced the 0-byte stubs.)
+        // A no-op: create nothing here. The stock storage opens every file here,
+        // which is what produced the 0-byte stubs.
         Ok(())
     }
 }
@@ -319,9 +315,9 @@ fn selected_set(only_files: &[usize]) -> Option<Arc<HashSet<usize>>> {
     }
 }
 
-/// Add a magnet for download into `dest`, fetching ONLY `only_files` (empty =
-/// all). Returns (torrent_id, handle). Bounded by a metadata-fetch timeout (a
-/// bare magnet otherwise awaits peers forever).
+/// Add a magnet for download into `dest`, fetching only `only_files` (empty =
+/// all). Returns (torrent_id, handle). Bounded by a metadata-fetch timeout; a
+/// bare magnet otherwise awaits peers forever.
 pub async fn add(magnet: &str, dest: &str, only_files: &[usize]) -> anyhow::Result<(usize, Handle)> {
     let s = session().await?;
     let factory = LazyStorageFactory {
@@ -351,9 +347,9 @@ pub async fn add(magnet: &str, dest: &str, only_files: &[usize]) -> anyhow::Resu
     }
 }
 
-/// A polled status snapshot (shape kept close to the old shim's LtStatus).
+/// A polled status snapshot.
 pub struct Status {
-    pub progress: f64,      // 0..1 over the SELECTED files
+    pub progress: f64,      // 0..1 over the selected files
     pub state: String,      // "downloading" | "paused" | "done" | "error"
     pub download_rate: u64, // bytes/sec
     pub finished: bool,
@@ -423,7 +419,7 @@ pub struct FileEntry {
     pub size: u64,
 }
 
-/// Resolve a magnet's file list WITHOUT downloading (list-only), bounded by a
+/// Resolve a magnet's file list without downloading (list-only), bounded by a
 /// timeout. The `index` matches the `only_files` / storage file id.
 pub async fn list_files(magnet: &str, timeout_ms: u64) -> anyhow::Result<Vec<FileEntry>> {
     let lo = list_only(magnet, timeout_ms).await?;

@@ -1,9 +1,7 @@
 /**
- * Discover view — live trending feeds per category, ported from the old
- * renderDisc/discPaint (git show HEAD:ui-src/engine.js) onto the shared
- * media components. Toolbar (category chips, per-category provider + list,
- * show-count, refresh) -> source-ordered grid with lazy live seeder badges ->
- * detail panel -> download dialog.
+ * Discover: live trending feeds per category. Toolbar (category chips,
+ * per-category provider + list, show-count, refresh) -> source-ordered grid
+ * with lazy seeder badges -> detail panel -> download dialog.
  */
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Loader2, RefreshCw } from "lucide-react"
@@ -64,7 +62,7 @@ interface Selection {
   list: ListId
 }
 
-/** Default {source, list} for every category — initial per-category state. */
+/** Default {source, list} for every category. */
 function initialSelByCat(): Record<Cat, Selection> {
   return {
     mov: defaultSelection("mov"),
@@ -88,7 +86,7 @@ export default function Discover({ active = true }: { active?: boolean }) {
   const [selected, setSelected] = useState<DiscoverItem | null>(null)
   const [dlItem, setDlItem] = useState<DiscoverItem | null>(null)
   const [previewItem, setPreviewItem] = useState<DiscoverItem | null>(null)
-  // The JavDB Year/Month/Sort browser — shared by VR and Adult→Category.
+  // The JavDB Year/Month/Sort browser, shared by VR and Adult→Category.
   const [javdbBrowse, setJavdbBrowse] =
     useState<JavdbBrowseSel>(DEFAULT_JAVDB_BROWSE)
   // Adult→JavDB toggles between the ranking windows and the category browser.
@@ -149,7 +147,7 @@ export default function Discover({ active = true }: { active?: boolean }) {
   ])
 
   // Discover stays mounted across tab switches so the category/selectors/page
-  // are remembered, but its dialogs render in a body portal — close them while
+  // are remembered, but its dialogs render in a body portal. Close them while
   // the view is hidden so they can't linger over another tab.
   useEffect(() => {
     if (active) return
@@ -402,7 +400,7 @@ export default function Discover({ active = true }: { active?: boolean }) {
         onPreview={(it) => setPreviewItem(it)}
       />
       {/* These render in a body portal, so the hidden wrapper can't hide them
-          while Discover stays mounted on another tab — gate on `active` so they
+          while Discover stays mounted on another tab. Gate on `active` so they
           unmount immediately instead of animating out over the new tab. */}
       {active && (
         <>

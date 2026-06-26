@@ -1,11 +1,10 @@
 /**
- * Settings — library folders, provider keys, appearance and about.
+ * Settings: library folders, provider keys, appearance and about.
  *
  * Folder paths and provider keys persist in the local SQLite database
- * (src/state/db.ts, paths/provider_keys tables — formerly the Python
- * sidecar's av_paths.json / av_keys.json); the native folder picker
- * (dialog plugin) is desktop-only and disabled in a plain browser, while
- * typing a path manually still works.
+ * (src/state/db.ts, paths/provider_keys tables). The native folder picker
+ * (dialog plugin) is desktop-only and disabled in a plain browser; typing a
+ * path manually still works.
  */
 import { useEffect, useRef, useState } from "react"
 import { useQueryClient } from "@tanstack/react-query"
@@ -38,7 +37,7 @@ const FOLDER_CATS: { cat: Cat; label: string }[] = [
   { cat: "vrc", label: "VR" },
 ]
 
-/** Provider ids as the old app stored them (av_keys.json / localStorage). */
+/** Provider ids. */
 const KEY_FIELDS: { provider: string; label: string; placeholder: string }[] = [
   { provider: "tmdb", label: "TMDB API key", placeholder: "Not configured" },
   { provider: "dmmApi", label: "DMM API ID", placeholder: "Not configured" },

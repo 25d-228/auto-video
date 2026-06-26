@@ -1,13 +1,9 @@
 /**
  * SQLite store layer over @tauri-apps/plugin-sql.
  *
- * Replaces the Python sidecar's JSON side-files (sidecar/av_proxy.py) —
- * av_keys.json, av_paths.json, proxy_cache.json (listings),
- * discover_covers.json (covers), and the scanned library.
- *
  * Schema (all `CREATE TABLE IF NOT EXISTS`):
- *   provider_keys(provider PK, value)            -- keys_store: tmdb/javbus/...
- *   library_paths(cat PK, path)                  -- paths_store: cat -> folder
+ *   provider_keys(provider PK, value)            -- tmdb/javbus/... keys
+ *   library_paths(cat PK, path)                  -- cat -> folder
  *   listing_cache(key PK, json, fetched_at)      -- TTL cache of a feed page
  *   cover_cache(code PK, url, ar, fetched_at)    -- TTL cache of a resolved cover
  *   meta_cache(key PK, json, fetched_at)         -- TTL cache of a /meta record
@@ -16,7 +12,7 @@
  *
  * Tauri guard: Database.load() throws outside a Tauri webview (plain browser /
  * vitest / SSR). initDb() swallows that and leaves the module unavailable;
- * isDbAvailable() lets callers degrade gracefully (fall back to the sidecar).
+ * isDbAvailable() lets callers degrade gracefully.
  */
 import Database from "@tauri-apps/plugin-sql"
 import type { Cat } from "@/api/types"
@@ -27,12 +23,12 @@ export const DB_URL = "sqlite:autovideo.db"
 type SqlBool = 0 | 1
 
 /**
- * One row of the scanned library. Mirrors the sidecar's scan_library() output
- * (av_proxy.py) and the LibraryItem API shape, but flattened for one SQL row:
- * `vr` is 0/1 here (not boolean) and every column is always present.
+ * One row of the scanned library. Matches the LibraryItem API shape but
+ * flattened for one SQL row: `vr` is 0/1 here (not boolean) and every column
+ * is always present.
  */
 export interface LibraryRow {
-  /** Absolute file path — primary key. */
+  /** Absolute file path (primary key). */
   path: string
   cat: Cat
   fname: string
@@ -110,8 +106,8 @@ const MIGRATIONS: readonly string[] = [
    )`,
 ]
 
-/** Idempotent column adds for tables that predate a field (SQLite lacks IF NOT
- *  EXISTS on ADD COLUMN, so we run these tolerantly — a duplicate just errors). */
+/** Idempotent column adds for tables that predate a field. SQLite lacks IF NOT
+ *  EXISTS on ADD COLUMN, so we run these tolerantly; a duplicate just errors. */
 const COLUMN_ADDITIONS: readonly string[] = [
   "ALTER TABLE downloads ADD COLUMN only_files TEXT",
   "ALTER TABLE downloads ADD COLUMN renames TEXT",
@@ -124,10 +120,10 @@ let available = false
 
 /**
  * Load the DB (once) and run the CREATE-TABLE migrations. Safe to call many
- * times — the load + migration only happen on the first call; later calls
+ * times: the load + migration only happen on the first call, later calls
  * return the same connection. On any failure (e.g. running outside Tauri, where
  * Database.load throws) it resolves to null and isDbAvailable() stays false so
- * callers can degrade to the sidecar.
+ * callers can degrade gracefully.
  */
 export async function initDb(): Promise<Database | null> {
   if (dbPromise) {
@@ -197,7 +193,7 @@ export async function getKey(provider: string): Promise<string | null> {
   return rows.length > 0 ? rows[0].value : null
 }
 
-/** Persist a provider key; an empty value DELETES the entry (matches the sidecar). */
+/** Persist a provider key; an empty value deletes the entry. */
 export async function setKey(provider: string, value: string): Promise<void> {
   const db = await requireDb()
   if (value === "") {
@@ -211,7 +207,7 @@ export async function setKey(provider: string, value: string): Promise<void> {
   )
 }
 
-/** All provider keys as a plain record (mirrors keys_store / KeysRecord). */
+/** All provider keys as a plain record. */
 export async function allKeys(): Promise<Record<string, string>> {
   const db = await requireDb()
   const rows = await db.select<{ provider: string; value: string }[]>(
@@ -234,7 +230,7 @@ export async function getPath(cat: Cat): Promise<string | null> {
   return rows.length > 0 ? rows[0].path : null
 }
 
-/** Persist a category's folder; an empty path DELETES the entry. */
+/** Persist a category's folder; an empty path deletes the entry. */
 export async function setPath(cat: Cat, path: string): Promise<void> {
   const db = await requireDb()
   if (path === "") {
@@ -248,7 +244,7 @@ export async function setPath(cat: Cat, path: string): Promise<void> {
   )
 }
 
-/** All configured paths as a partial record (mirrors paths_store / PathsRecord). */
+/** All configured paths as a partial record. */
 export async function allPaths(): Promise<Partial<Record<Cat, string>>> {
   const db = await requireDb()
   const rows = await db.select<{ cat: Cat; path: string }[]>(
@@ -261,7 +257,7 @@ export async function allPaths(): Promise<Partial<Record<Cat, string>>> {
 
 // ------------------------------------------------------------------ TTL caches
 
-/** Current Unix time in whole seconds — kept local so the TTL math reads clearly. */
+/** Current Unix time in whole seconds. */
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
 }
@@ -271,7 +267,7 @@ function nowSeconds(): number {
  * value (typed as T) on a fresh hit, or null on a miss / stale / parse error.
  * The stale row is left in place; setCached overwrites it on the next refetch.
  *
- * `ttlSeconds <= 0` is treated as "never fresh" — always a miss (forced refetch).
+ * `ttlSeconds <= 0` is treated as "never fresh", always a miss (forced refetch).
  */
 export async function getCached<T>(
   table: JsonCacheTable,
@@ -398,7 +394,7 @@ export async function removeDownload(id: string): Promise<void> {
   await db.execute("DELETE FROM downloads WHERE id = $1", [id])
 }
 
-/** Every persisted download, oldest first — the queue to resume on launch. */
+/** Every persisted download, oldest first: the queue to resume on launch. */
 export async function allDownloads(): Promise<DownloadRow[]> {
   const db = await requireDb()
   const rows = await db.select<

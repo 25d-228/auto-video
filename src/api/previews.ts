@@ -1,12 +1,12 @@
 /**
- * Preview (sample) images for a Discover item — the strip of screenshots the
- * source sites show on a product page. Lazily fetched when the detail panel
- * opens (NOT for Library items). Supported sources:
+ * Preview (sample) images for a Discover item, the strip of screenshots the
+ * source sites show on a product page. Lazily fetched when the detail panel opens
+ * (not for Library items). Supported sources:
  *   - javdb:   the detail payload's preview_images (tp.cmastd.com)
  *   - dmm:     FANZA digital sample images via the GraphQL API (awsimgsrc.dmm.co.jp)
  *   - mgstage: the product detail page (image.mgstage.com/.../cap_e_N_<code>.jpg)
- * Every image is hotlink-protected (and cmastd is XOR-encrypted), so each raw
- * URL is routed through {@link coverObjectUrl} (referer + cmastd decode) into a
+ * Every image is hotlink-protected (and cmastd is XOR-encrypted), so each raw URL
+ * is routed through {@link coverObjectUrl} (referer + cmastd decode) into a
  * displayable blob: URL.
  */
 import { coverObjectUrl } from "@/net/http"
@@ -44,7 +44,7 @@ async function rawPreviews(item: DiscoverItem): Promise<string[]> {
     case "mgstage":
       return mgstagePreviews(item.code || item.title)
     case "sukebei":
-      // No native previews — borrow JavDB's by the parsed code.
+      // No native previews; borrow JavDB's by the parsed code.
       return item.code ? previewsByCode(item.code) : []
     default:
       return []

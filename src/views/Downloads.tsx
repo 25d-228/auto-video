@@ -1,8 +1,8 @@
 /**
- * Downloads management view — active transfers (pause/resume/cancel over the
- * Rust librqbit commands) on top, settled ones (open/reveal/remove) below.
- * In a plain browser the rows still render but every OS-touching control is
- * disabled with a tooltip; cancel-and-delete goes through a confirm dialog.
+ * Downloads view: active transfers (pause/resume/cancel over the Rust librqbit
+ * commands) on top, settled ones (open/reveal/remove) below. In a plain browser
+ * the rows still render but OS-touching controls are disabled with a tooltip;
+ * cancel-and-delete goes through a confirm dialog.
  */
 import { useState, type ReactNode } from "react"
 import { Compass } from "lucide-react"

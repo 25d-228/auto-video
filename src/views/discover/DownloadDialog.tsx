@@ -1,8 +1,8 @@
 /**
- * Download modal (old openDl): live releases from /seeders as radio rows
- * sorted by seeders, a file line for the picked release, and a summary with
- * the destination folder from /paths. Start hands the magnet to the Rust
- * downloader; outside Tauri the button is disabled (browser preview).
+ * Download modal: live releases from /seeders as radio rows sorted by seeders,
+ * a file picker for the chosen release, and a summary with the destination
+ * folder from /paths. Start hands the magnet to the Rust downloader; outside
+ * Tauri the button is disabled.
  */
 import { useEffect, useMemo, useState } from "react"
 import { Check, Loader2 } from "lucide-react"
@@ -65,9 +65,9 @@ function renameBase(cat: RenameCat, item: DiscoverItem): string {
 }
 
 /**
- * Build the download plan for the picked files: which file indices to fetch
- * (a real subset only — all/unknown means the whole torrent) and the canonical
- * renames to apply once it finishes.
+ * Build the download plan: which file indices to fetch (a real subset only;
+ * all/unknown means the whole torrent) and the renames to apply once it
+ * finishes.
  */
 function buildPlan(
   item: DiscoverItem,
@@ -113,8 +113,8 @@ export function DownloadDialog({ item, onClose }: DownloadDialogProps) {
     const rels = [...(seedQ.data?.releases ?? [])].sort(
       (a, b) => b.seeders - a.seeders
     )
-    // sukebei items already carry their own magnet — use it when /seeders
-    // comes back empty so the download still works
+    // sukebei items carry their own magnet; use it when /seeders comes back
+    // empty so the download still works
     if (rels.length === 0 && item.magnet) {
       rels.push({
         name: item.title,
@@ -191,7 +191,7 @@ export function DownloadDialog({ item, onClose }: DownloadDialogProps) {
     }
   }
 
-  // Save just the .torrent file (metadata only — no content), to load into
+  // Save just the .torrent file (metadata only, no content), to load into
   // another client or archive. Independent of the file picker.
   const onSaveTorrent = async () => {
     if (!item || !sel?.magnet || savingTorrent || starting) return

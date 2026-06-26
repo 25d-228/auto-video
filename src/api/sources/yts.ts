@@ -1,15 +1,14 @@
 /**
- * YTS movie source — TypeScript port of the Python sidecar's `fetch_movies`
- * and `seeders_yts` (see sidecar/av_proxy.py).
+ * YTS movie source.
  *
  * YTS exposes a stable JSON API (`/api/v2/list_movies.json`) mirrored across a
  * handful of hosts. `fetchMovies(sort)` returns a Discover feed of cat="mov"
  * cards (trending / newest / top_rated / most_seeded), and `seedersYts` returns
- * the real torrent releases for a single title (used by the download dialog /
- * per-item seed aggregation).
+ * the torrent releases for a single title (used by the download dialog / per-item
+ * seed aggregation).
  *
- * Network goes through src/net/http.ts (Rust-backed fetch, bypasses CORS).
- * The parsers are pure so they can be unit-tested against a recorded fixture.
+ * Network goes through src/net/http.ts (Rust-backed fetch, bypasses CORS). The
+ * parsers are pure so they can be unit-tested against a recorded fixture.
  */
 import { httpJson } from "@/net/http"
 import { getCached, setCached, isDbAvailable } from "@/state/db"
@@ -37,7 +36,7 @@ export interface YtsMovie {
   rating?: number
   imdb_code?: string
   large_cover_image?: string
-  /** YTS movie page URL — present in list_movies, captured into item.link. */
+  /** YTS movie page URL; present in list_movies, captured into item.link. */
   url?: string
   torrents?: YtsTorrent[]
 }
@@ -53,9 +52,8 @@ export interface YtsListResponse {
 // --------------------------------------------------------------- constants
 
 /**
- * YTS API mirrors, tried in order until one returns a valid payload. Mirrors
- * the Python `YTS_BASES` tuple verbatim. yts.mx is frequently geo/ISP-blocked,
- * so it is last.
+ * YTS API mirrors, tried in order until one returns a valid payload. yts.mx is
+ * frequently geo/ISP-blocked, so it is last.
  */
 export const YTS_BASES = [
   "https://yts.bz/api/v2/",
@@ -65,9 +63,9 @@ export const YTS_BASES = [
 ] as const
 
 /**
- * The exported `fetchMovies` sort id -> YTS `sort_by` query value. Mirrors the
- * Python `YTS_SORTS` map. The legacy mode strings "trending"/"newest" are also
- * accepted for backward compatibility (see {@link resolveSort}).
+ * The `fetchMovies` sort id -> YTS `sort_by` query value. The legacy mode strings
+ * "trending"/"newest" are also accepted for backward compatibility (see
+ * {@link resolveSort}).
  */
 const YTS_SORTS: Record<string, string> = {
   most_seeded: "seeds",
@@ -88,11 +86,10 @@ export type YtsSort =
   | "rating"
 
 /**
- * BitTorrent trackers appended to every synthesised magnet, mirroring the
- * Python `TRACKERS` constant (YTS torrents carry only an info-hash).
+ * BitTorrent trackers appended to every synthesised magnet (YTS torrents carry
+ * only an info-hash).
  */
-// Python encodes each tracker with `urllib.parse.quote` (default safe='/'), so
-// the `/` stays raw — quotePlusName reproduces that exactly.
+// quotePlusName keeps the `/` in each tracker raw.
 const TRACKERS = [
   "udp://tracker.opentrackr.org:1337/announce",
   "udp://open.demonii.com:1337/announce",
@@ -102,7 +99,7 @@ const TRACKERS = [
   .map((t) => "&tr=" + quotePlusName(t))
   .join("")
 
-/** TTL for a cached movie listing (matches the sidecar's LIST_TTL = 300s). */
+/** TTL for a cached movie listing (300s). */
 const LIST_TTL_SEC = 300
 
 /** YTS poster aspect ratio (width/height) used for every Discover card. */
@@ -111,9 +108,9 @@ const YTS_POSTER_AR = 0.675
 // --------------------------------------------------------------- helpers
 
 /**
- * Port of the Python `YTS_SORTS.get(mode) or (...)` fallback: map a public sort
- * id to a YTS `sort_by` value, accepting the legacy "trending"/"newest" strings
- * and defaulting unknown values to "download_count" (newest -> "date_added").
+ * Map a public sort id to a YTS `sort_by` value, accepting the legacy
+ * "trending"/"newest" strings and defaulting unknown values to "download_count"
+ * (newest -> "date_added").
  */
 export function resolveSort(sort: string): string {
   return (
@@ -122,10 +119,9 @@ export function resolveSort(sort: string): string {
 }
 
 /**
- * Port of `_magnet(ih, name)`: build a magnet URI from an info-hash and a
- * display name, with the shared tracker list appended. `name` is URL-encoded
- * exactly like Python's `urllib.parse.quote(name, '')` default
- * (encodes everything except A–Z a–z 0–9 _.-~ and `/`).
+ * Build a magnet URI from an info-hash and a display name, with the shared
+ * tracker list appended. `name` is URL-encoded keeping everything except
+ * A-Z a-z 0-9 _.-~ and `/` raw.
  */
 export function ytsMagnet(infoHash: string, name: string): string {
   return (
@@ -138,13 +134,12 @@ export function ytsMagnet(infoHash: string, name: string): string {
 }
 
 /**
- * Mirror Python `urllib.parse.quote(s)` (default `safe='/'`) byte-for-byte:
- * the always-safe set is letters, digits and `_.-~`, plus `/` from `safe`.
+ * URL-encode keeping the always-safe set (letters, digits, `_.-~`) plus `/` raw.
  *
- * `encodeURIComponent` differs in two ways we must reconcile:
- *   - it encodes `/` (Python keeps it)         -> decode `%2F` back to `/`
- *   - it leaves `! * ' ( )` raw (Python encodes them) -> re-encode them
- * (`~` is left raw by both, so it needs no fix-up.)
+ * `encodeURIComponent` needs two fix-ups to get there:
+ *   - it encodes `/`            -> decode `%2F` back to `/`
+ *   - it leaves `! * ' ( )` raw -> re-encode them
+ * (`~` is left raw already, so it needs no fix-up.)
  */
 function quotePlusName(s: string): string {
   return encodeURIComponent(s ?? "")
@@ -159,10 +154,10 @@ function quotePlusName(s: string): string {
 // --------------------------------------------------------------- parsers (pure)
 
 /**
- * Port of the item-building loop in Python `fetch_movies`. Given the raw movie
- * objects (already merged across pages), produce the Discover cards.
+ * Given the raw movie objects (already merged across pages), produce the Discover
+ * cards.
  *
- * Field conventions match the sidecar exactly:
+ * Field conventions:
  *   id        = "mov_<id>"
  *   seeders   = max seeds across torrents (0 if none)
  *   size      = first torrent's size string ("" if none)
@@ -211,17 +206,16 @@ export function parseMovies(movies: YtsMovie[]): DiscoverItem[] {
   return out
 }
 
-/** Zero-pad to two digits, matching Python `'%02d'`. */
+/** Zero-pad to two digits. */
 function pad2(n: number): string {
   return String(n).padStart(2, "0")
 }
 
 /**
- * Port of the release-building loop in Python `seeders_yts`. Given the raw
- * movies returned for a `query_term` search and the optional `year` filter,
- * produce the real torrent releases.
+ * Given the raw movies returned for a `query_term` search and the optional `year`
+ * filter, produce the torrent releases.
  *
- * Field conventions match the sidecar exactly:
+ * Field conventions:
  *   name    = "<title_long|title> [<quality> <type>]" (trimmed)
  *   source  = "YTS"
  *   seeders = torrent.seeds
@@ -263,7 +257,7 @@ export function parseSeeders(
 /**
  * Fetch one page of `list_movies.json` across the mirror list, returning the
  * first valid (`status == "ok"` with movies) payload's movie array, or null if
- * every mirror failed. Mirrors the per-page inner loop of Python `fetch_movies`.
+ * every mirror failed.
  */
 async function fetchMoviesPage(
   sortBy: string,
@@ -277,20 +271,19 @@ async function fetchMoviesPage(
       if (j?.status === "ok" && movies && movies.length > 0) return movies
     } catch {
       // A dead mirror / non-2xx / JSON parse error -> try the next mirror.
-      // (The Python helper likewise swallows all fetch errors.)
     }
   }
   return null
 }
 
 /**
- * Port of Python `fetch_movies(mode)`: pull up to two pages (YTS caps `limit`
- * at 50, so 2 pages -> up to 100 movies) across the mirror list, then build the
- * Discover cards. Returns [] when no mirror served any movies.
+ * Pull up to two pages (YTS caps `limit` at 50, so 2 pages -> up to 100 movies)
+ * across the mirror list, then build the Discover cards. Returns [] when no mirror
+ * served any movies.
  *
- * Results are cached in `listing_cache` (TTL = {@link LIST_TTL_SEC}) keyed by
- * the resolved sort, mirroring the sidecar's `listing_cached` behavior. Caching
- * is skipped (still works, just always live) when the DB is unavailable.
+ * Results are cached in `listing_cache` (TTL = {@link LIST_TTL_SEC}) keyed by the
+ * resolved sort. Caching is skipped (still works, just always live) when the DB is
+ * unavailable.
  *
  * @param sort  one of trending | newest | top_rated | most_seeded (or a raw
  *              YTS sort_by value / legacy mode); see {@link resolveSort}.
@@ -332,9 +325,9 @@ export async function fetchMovies(
 }
 
 /**
- * Port of Python `seeders_yts(title, year)`: query the YTS API for the title
- * and return the matching torrent releases. Unlike {@link fetchMovies} this
- * hits yts.mx directly (the Python uses a single host here) and is not cached.
+ * Query the YTS API for the title and return the matching torrent releases.
+ * Unlike {@link fetchMovies} this hits yts.mx directly (a single host) and is not
+ * cached.
  *
  * Returns [] on any fetch/parse failure (the per-item seeder aggregation must
  * never throw).

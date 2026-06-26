@@ -1,22 +1,9 @@
 /**
- * Discover aggregator — TypeScript port of the sidecar's build_discover()
- * (sidecar/av_proxy.py). Routes a (cat, source, list) selection from the
- * two-dropdown catalog (src/views/discover/model.ts DISC_CATALOG) to the right
- * source module, resolves covers where the source can't, drops coverless items,
- * caches the listing for 300s, and returns DiscoverItem[].
- *
- * The list id carries the trending/newest meaning (the legacy `mode` is gone);
- * an unknown/empty list falls back to the provider's first (default) list, and
- * an unknown provider falls back to the category's default provider — exactly
- * like the Python _resolve_list().
- *
- * Cover policy (mirrors the Python):
- *   - mov: TMDB / IMDb / YTS all ship a poster; just drop the rare coverless row.
- *   - tv (tmdb/imdb): ship a poster. tv (tpb): no cover -> resolveCovers('tv').
- *   - dmmdv (FANZA): raw awsimgsrc covers proxied to blob: AFTER the cache.
- *   - javdb: the source ships cmastd cover URLs; cmastd serves them as
- *     octet-stream so they're proxied to blob: URLs post-cache (coverObjectUrl).
- *   - mgstage/sukebei: resolve a portrait cover by code, then drop coverless.
+ * Discover aggregator. Routes a (cat, source, list) selection (from
+ * src/views/discover/model.ts DISC_CATALOG) to a source module, resolves covers
+ * where the source can't, drops coverless items, caches the listing for 300s,
+ * returns DiscoverItem[]. An unknown/empty list falls back to the provider's
+ * default list; an unknown provider to the category's default provider.
  */
 import { fetchDmmDigitalAv, fetchDmmDigitalVr } from "@/api/sources/dmm-digital"
 import { fetchImdbChart, type ImdbSort } from "@/api/sources/imdb"
@@ -41,13 +28,13 @@ import { coverObjectUrl } from "@/net/http"
 import { DISC_CATALOG } from "@/views/discover/model"
 import { getCached, getKey, isDbAvailable, setCached } from "@/state/db"
 
-/** Seconds a discover listing is cached before re-fetching (sidecar LIST_TTL). */
+/** Seconds a discover listing is cached before re-fetching. */
 export const LIST_TTL_SEC = 300
 
 /**
- * Resolve the effective (source, list) for a (cat, source, list) request.
- * Port of _resolve_list(): an unknown source falls back to the category's first
- * provider; an unknown/empty list falls back to that provider's first list.
+ * Resolve the effective (source, list) for a request. An unknown source falls
+ * back to the category's first provider; an unknown/empty list to that
+ * provider's first list.
  */
 export function resolveList(
   cat: Cat,
@@ -69,8 +56,7 @@ export function resolveList(
 
 /**
  * Read the javbus cookie (provider key) for the gated cover probe. Returns ""
- * when unset or the DB is unavailable, so the javbus step is skipped (matches
- * the sidecar reading keys_store['javbus']).
+ * when unset or the DB is unavailable, so the javbus step is skipped.
  */
 async function javbusCookie(): Promise<string> {
   if (!isDbAvailable()) return ""
@@ -83,10 +69,10 @@ async function javbusCookie(): Promise<string> {
 
 
 /**
- * Turn each item's cmastd cover URL into a displayable `blob:` URL in place,
- * decrypting the single-byte-XOR payload (handled inside coverObjectUrl). Runs
- * AFTER the listing cache so SQLite stores the raw cmastd URLs. A failed fetch
- * leaves the raw URL (CoverImage falls back to its placeholder). Parallel.
+ * Turn each item's cmastd cover URL into a displayable blob: URL in place,
+ * decrypting the single-byte XOR payload (inside coverObjectUrl). Runs after the
+ * listing cache so SQLite stores the raw cmastd URLs. A failed fetch leaves the
+ * raw URL (CoverImage shows its placeholder). Parallel.
  */
 async function proxyCovers(items: DiscoverItem[]): Promise<void> {
   await Promise.all(
@@ -101,7 +87,7 @@ async function proxyCovers(items: DiscoverItem[]): Promise<void> {
   )
 }
 
-/** Keep only items that carry a cover, then cut to `n` (port of the Python list-comp). */
+/** Keep only items that carry a cover, then cut to `n`. */
 function keepCovered(items: DiscoverItem[], n: number): DiscoverItem[] {
   const out: DiscoverItem[] = []
   for (const item of items) {
@@ -117,19 +103,19 @@ type CachedListing = { sid: string; data: DiscoverItem[] }
 
 /**
  * Per-process tag stamped into every cached listing. dmm/mgstage covers are
- * `blob:` object URLs local to the webview document, so they die when the app
- * restarts; a listing cached by a PRIOR process must be re-fetched rather than
- * served with dead blobs (which render as blank cards). Entries that carry only
- * raw http(s) covers (tmdb/javdb/sukebei) stay valid across a restart.
+ * blob: object URLs local to the webview document, so they die when the app
+ * restarts; a listing cached by a prior process must be re-fetched rather than
+ * served with dead blobs (which render as blank cards). Entries with only raw
+ * http(s) covers (tmdb/javdb/sukebei) stay valid across a restart.
  */
 const SESSION_TAG = `${Date.now()}.${Math.random().toString(36).slice(2)}`
 
 /**
- * Run `fn` behind the 300s listing cache (port of listing_cached). The cache key
- * is "<cat>|<src>|<lst>". `fresh` bypasses the cache. Caching is best-effort and
- * only active inside Tauri (isDbAvailable()); elsewhere it's a live fetch. A
- * prior-session hit that still carries session-local blob: covers is treated as
- * a miss and re-fetched, so dmm/mgstage covers can't go blank after a restart.
+ * Run `fn` behind the 300s listing cache. Key is "<cat>|<src>|<lst>". `fresh`
+ * bypasses it. Caching is best-effort and only active inside Tauri; elsewhere
+ * it's a live fetch. A prior-session hit that still carries session-local blob:
+ * covers is treated as a miss and re-fetched, so dmm/mgstage covers can't go
+ * blank after a restart.
  */
 async function cachedListing(
   key: string,
@@ -147,8 +133,8 @@ async function cachedListing(
       const sid = Array.isArray(hit) ? "" : hit.sid
       const items = Array.isArray(hit) ? hit : hit.data
       // A prior-session hit is stale if it carries dead blob: covers (session-
-      // local object URLs) OR is empty — an empty result from another process
-      // may be a transient/now-fixed failure, so re-verify it this session.
+      // local object URLs) or is empty: an empty result from another process may
+      // be a transient/now-fixed failure, so re-verify it this session.
       const stale =
         sid !== SESSION_TAG &&
         (items.length === 0 || items.some((item) => item.cover.startsWith("blob:")))
@@ -220,8 +206,8 @@ export async function discover(
       return keepCovered(data, n)
     }
     // tpb: trending=top100 precompiled, newest=q.php category:205. No cover on
-    // the rows -> resolve via tvmaze AFTER the listing cache (the Python caches
-    // the raw scan, and resolveTvCover has its own persistent cover_cache).
+    // the rows -> resolve via tvmaze after the listing cache (we cache the raw
+    // scan, and resolveTvCover has its own persistent cover_cache).
     const scan = await cachedListing(key, fresh, () =>
       fetchTv(lst === "newest" ? "newest" : "trending")
     )
@@ -236,26 +222,26 @@ export async function discover(
   if (src === "dmmdv") {
     // FANZA: the digital streaming catalog via the GraphQL API (legacySearchPPV /
     // ppvContentRanking). vrc -> VR titles, ad -> 2D titles; "popular" is the
-    // website's /av/list/?sort=suggest (sort RECOMMENDED). Covers are raw awsimgsrc
-    // URLs → proxied to blob: AFTER the cache so SQLite keeps raw URLs.
+    // website's /av/list/?sort=suggest (sort RECOMMENDED). awsimgsrc covers aren't
+    // hotlink-protected (200 with any/no Referer), so use the raw URLs in <img>
+    // directly, no blob proxy, and the raw URLs stay valid across a restart in
+    // the listing cache.
     const data = await cachedListing(key, fresh, () =>
       wantVr ? fetchDmmDigitalVr(lst) : fetchDmmDigitalAv(lst)
     )
-    await proxyCovers(data)
     return keepCovered(data, n)
   }
 
   if (src === "javdb") {
     // javdb source ships cmastd covers. ad -> the Censored ranking for the list
     // window (daily/weekly/monthly); vrc -> the Categories→Censored VR browser
-    // (tag 212) filtered by the chosen year/month and ordered by the chosen
-    // sort. The cmastd CDN "encrypts" the jacket with a trivial single-byte XOR;
-    // coverObjectUrl decodes it, so we use the REAL javdb jacket directly. Proxy
-    // AFTER the cache so SQLite keeps the raw cmastd URLs, not blob: URLs.
-    // The vrc selection lives in opts (not the list id), so it's part of the key.
-    // Both the VR browser (vrc) and the Adult→Category browser (mode ===
-    // "category") are driven by the year/month/sort opts rather than the list
-    // id, so fold those (and the mode) into the cache key.
+    // (tag 212) filtered by the chosen year/month and ordered by the chosen sort.
+    // The cmastd CDN "encrypts" the jacket with a trivial single-byte XOR;
+    // coverObjectUrl decodes it, so we use the real javdb jacket directly. Proxy
+    // after the cache so SQLite keeps the raw cmastd URLs, not blob: URLs.
+    // The VR browser (vrc) and the Adult→Category browser (mode === "category")
+    // are driven by the year/month/sort opts rather than the list id, so fold
+    // those (and the mode) into the cache key.
     const javdbCacheKey =
       cat === "vrc" || opts.mode === "category"
         ? `${key}|${opts.mode ?? ""}|${opts.year ?? ""}|${opts.month ?? ""}|${opts.sortBy ?? ""}|${opts.orderBy ?? ""}`
@@ -269,19 +255,19 @@ export async function discover(
     // MGStage ranking windows (daily/weekly/monthly/popular). Every listed
     // product ships its own wide-jacket cover, so keep it directly. The old
     // "clear the jacket, resolve a portrait by code" pass dropped most
-    // MG-exclusive labels (SIRO/LUXU/GANA/300MIUM have no portrait on
-    // dmm/javbus, and a stale 'no cover' cache entry made it stick) — leaving
-    // ~5 items where the page actually has 50. It was also slow (per-code
-    // cascade). The intrinsic-ratio cover card renders the wide jacket fine.
+    // MG-exclusive labels (SIRO/LUXU/GANA/300MIUM have no portrait on dmm/javbus,
+    // and a stale 'no cover' cache entry made it stick), leaving ~5 items where
+    // the page has 50. It was also slow (per-code cascade). The intrinsic-ratio
+    // cover card renders the wide jacket fine.
     const data = await cachedListing(key, fresh, () => fetchMgstage(wantVr, lst))
     return keepCovered(data, n)
   }
 
   // sukebei: lst is most_seeded|newest|most_downloaded -> nyaa s=seeders|id|downloads.
-  // The RAW pool is cached (like the Python listing_cached around fetch_sukebei);
-  // the vr split / cover resolve / sub rewrite run per call, so a different `n`
-  // within the TTL still re-derives from the full pool. resolveJavCover keeps its
-  // own persistent cover_cache, so re-resolution on a cache hit stays cheap.
+  // The raw pool is cached; the vr split / cover resolve / sub rewrite run per
+  // call, so a different `n` within the TTL still re-derives from the full pool.
+  // resolveJavCover keeps its own persistent cover_cache, so re-resolution on a
+  // cache hit stays cheap.
   const pool = (await cachedListing(key, fresh, () =>
     wantVr ? fetchSukebei(lst, "VR", 4) : fetchSukebei(lst, "", 8)
   )) as SukebeiItem[]
@@ -293,8 +279,8 @@ export async function discover(
     if (!x.cover) continue
     const code = x.code || ""
     const sub = ((wantVr ? "VR · " : "") + code).replace(/^[\s·]+|[\s·]+$/g, "")
-    // Strip the aggregator-internal fields like the Python _clean (which drops
-    // every "_"-prefixed key and "vr"; `magnet` is intentionally kept).
+    // Strip the aggregator-internal fields: every "_"-prefixed key and "vr"
+    // (`magnet` is intentionally kept).
     const { vr: _omitVr, _rawtitle, _downloads: _omitDl, ...item } = x
     item.cat = cat
     item.sub = sub || (_rawtitle || "").slice(0, 30)

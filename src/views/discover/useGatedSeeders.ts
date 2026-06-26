@@ -1,9 +1,8 @@
 /**
- * Lazy seeder-badge upgrades with a concurrency cap: every visible card
- * wants its real aggregated topSeed from /seeders, but only a few requests
- * may be in flight at once. Cards queue for a slot, fetch, then release the
- * slot when the query settles (success or error). Cached results resolve
- * instantly, so revisiting a page drains the queue immediately.
+ * Lazy seeder-badge upgrades with a concurrency cap: every visible card wants
+ * its topSeed from /seeders, but only a few requests run at once. Cards queue
+ * for a slot, fetch, then release it when the query settles. Cached results
+ * resolve instantly, so revisiting a page drains the queue immediately.
  */
 import { useEffect, useRef, useState } from "react"
 import { useSeeders, type SeederSubject } from "@/state/queries"
@@ -87,8 +86,8 @@ export function useGatedSeeders(item: SeederSubject & { id: string }) {
 
   const query = useSeeders(granted ? item : null)
 
-  // free the slot once the request settles — or immediately for items the
-  // hook can never fetch (no title and no code)
+  // free the slot once the request settles, or immediately for items the hook
+  // can never fetch (no title and no code)
   const fetchable = Boolean(item.title || item.code)
   const settled = query.isSuccess || query.isError
   useEffect(() => {

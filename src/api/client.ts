@@ -1,17 +1,8 @@
 /**
- * Pure-TypeScript API facade — the in-process replacement for the old Python
- * sidecar client. Same exported names, parameter objects, and response shapes
- * as the HTTP client had (src/api/types.ts), but every call now runs the TS
- * aggregators directly (no localhost HTTP):
- *
- *   - discover/seeders   -> src/api/discover.ts / src/api/seeders.ts
- *   - meta/cover/lookups -> src/api/meta.ts / src/api/covers.ts
- *   - paths/keys         -> the SQLite store (src/state/db.ts)
- *   - library/stats      -> src/api/library.ts (re-exported)
- *
- * Failures throw — ClientError for the feed aggregators (mirroring the old
- * `{ok:false, err}` replies) and the store's own DbUnavailableError on a
- * non-Tauri host — so TanStack Query still sees them as query errors.
+ * In-process API facade. Same exported names, parameter objects, and response
+ * shapes as src/api/types.ts; each call runs the TS aggregators directly (no
+ * HTTP). Failures throw (ClientError for the feed aggregators, the store's
+ * DbUnavailableError on a non-Tauri host) so TanStack Query sees query errors.
  */
 import { resolveJavCover } from "@/api/covers"
 import { normalizeCodeNum } from "@/lib/codes"
@@ -44,7 +35,7 @@ import type {
   TitleLookupResponse,
 } from "./types"
 
-/** Thrown when a feed aggregator fails (the old `{ok:false, err}` reply). */
+/** Thrown when a feed aggregator fails. */
 export class ClientError extends Error {
   constructor(message: string) {
     super(message)

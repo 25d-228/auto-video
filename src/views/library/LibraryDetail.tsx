@@ -1,7 +1,7 @@
 /**
- * The Library detail panel — the React port of the old openLib(): cover,
- * title, identified facts (date / runtime via r18 meta or the TMDB lookup),
- * genre/cast chip sections, the on-disk location and Play / Reveal / Delete.
+ * Library detail panel: cover, title, identified facts (date / runtime via r18
+ * meta or the TMDB lookup), genre/cast chip sections, the on-disk location and
+ * Play / Reveal / Delete.
  */
 import type { LibraryItem } from "@/api/types"
 import {
@@ -46,7 +46,7 @@ export interface LibraryDetailProps {
   item: LibraryItem | null
   open: boolean
   onClose: () => void
-  /** False in plain-browser dev — the OS action buttons are disabled. */
+  /** False in plain-browser dev; the OS action buttons are disabled. */
   tauri: boolean
   onPlay: (item: LibraryItem) => void
   onReveal: (item: LibraryItem) => void
@@ -64,7 +64,7 @@ export function LibraryDetail({
 }: LibraryDetailProps) {
   const art = useLibraryArt(item)
   const jav = item != null && isJavCat(item.cat)
-  // r18 content id parsed from the resolved cover (the old cidOf(it.u))
+  // r18 content id parsed from the resolved cover
   const cid = jav && art.cover ? cidOf(art.cover) : ""
   const metaQ = useMeta(
     jav

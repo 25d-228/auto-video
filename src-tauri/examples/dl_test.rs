@@ -1,6 +1,6 @@
-// Smoke test: prove librqbit can take a magnet, connect to peers, and resolve the
-// torrent metadata (= the download path works). Stops as soon as metadata arrives —
-// it does NOT download the content. Run: cargo run --example dl_test -- "<magnet>"
+// Smoke test: prove librqbit can take a magnet, connect to peers, and resolve
+// the torrent metadata. Stops as soon as metadata arrives; it does not download
+// the content. Run: cargo run --example dl_test -- "<magnet>"
 #[tokio::main]
 async fn main() {
     let magnet = std::env::args().nth(1).expect("pass a magnet as the first argument");

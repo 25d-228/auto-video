@@ -1,21 +1,18 @@
 /**
- * MGStage source — TypeScript port of the Python sidecar's mgstage code
- * (sidecar/av_proxy.py: fetch_mgstage / _mg_get, plus mgstage_cover / mgstage_ids).
+ * MGStage source.
  *
  * MGStage (www.mgstage.com) is an adult-video storefront whose ranking pages
  * (week / day) and VR search list MGStage-exclusive labels (SIRO / LUXU / GANA /
  * PRVRSS / DSVR …). Every request needs the age cookie `adc=1` and an mgstage
  * Referer; the package images on image.mgstage.com are hotlink-protected, so a
- * cover URL is fetched through {@link coverObjectUrl} (the TS replacement for the
- * sidecar's `/img` proxy) which sends the mgstage Referer and hands back a
- * `blob:` URL an <img> can render directly.
+ * cover URL is fetched through {@link coverObjectUrl}, which sends the mgstage
+ * Referer and returns a `blob:` URL an <img> can render directly.
  *
  *   fetchMgstage(vr, mode) -> DiscoverItem[]   // ranking (ad) or VR search (vrc)
  *   mgstageCover(code)     -> { url, ar }      // resolve a package cover by code
  *
- * Cover resolution (jav_cover / resolve_covers) is the AGGREGATOR's job; this
- * module only provides the listing parse + the per-code cover probe, matching the
- * Python field conventions exactly.
+ * Cover resolution is the aggregator's job; this module only provides the listing
+ * parse + the per-code cover probe.
  */
 import type { DiscoverItem } from "@/api/types"
 import { coverObjectUrl, httpText, HttpError } from "@/net/http"
@@ -32,7 +29,6 @@ const MGSTAGE_FLAT_AR = 0.7
 /**
  * One product parsed out of a ranking/search page: the product id (as it appears
  * in the URL, e.g. "PRVRSS-007") and the wide-jacket package image URL.
- * Exported so the parser can be unit-tested against a saved fixture (no network).
  */
 export interface MgstageListItem {
   /** Product id straight from the URL (case as found, e.g. "300MIUM-1380"). */
@@ -42,8 +38,7 @@ export interface MgstageListItem {
 }
 
 // Each product block is a /product/product_detail/<pid>/ link followed (within
-// ~400 chars) by its image.mgstage.com .jpg cover. Mirrors the Python
-// re.finditer pattern in fetch_mgstage verbatim. The `[\s\S]{0,400}?` lazily
+// ~400 chars) by its image.mgstage.com .jpg cover. The `[\s\S]{0,400}?` lazily
 // spans the markup between the link and the image. `g` so we can iterate matches.
 const PRODUCT_RE =
   /\/product\/product_detail\/([0-9A-Za-z_-]+)\/"[\s\S]{0,400}?(https?:\/\/image\.mgstage\.com\/images\/[^"']+?\.jpg)/g
@@ -51,9 +46,7 @@ const PRODUCT_RE =
 /**
  * Pure parser: extract the de-duplicated product list (pid + cover) from a
  * ranking or search HTML page. Dedup is by uppercased pid, preserving first-seen
- * order — exactly like the Python `seen` set keyed on `code = pid.upper()`.
- *
- * Exported and side-effect-free so the unit test can run it on a saved fixture.
+ * order.
  */
 export function parseMgstageList(html: string): MgstageListItem[] {
   const out: MgstageListItem[] = []
@@ -73,12 +66,10 @@ export function parseMgstageList(html: string): MgstageListItem[] {
 }
 
 /**
- * Build the DiscoverItem for one parsed product. Mirrors the dict the Python
- * fetch_mgstage emits item-for-item: code is the uppercased pid, ar 0.72 for VR
- * else 0.7, sub "VR" for VR else "", `added` is the feed position, and `link`
- * is the product page. `cover` is the proxied wide-jacket blob URL (the Python's
- * `_img(cov)`); the aggregator may later overwrite it with a portrait resolved
- * by {@link mgstageCover}.
+ * Build the DiscoverItem for one parsed product: code is the uppercased pid,
+ * ar 0.72 for VR else 0.7, sub "VR" for VR else "", `added` is the feed position,
+ * and `link` is the product page. `cover` is the proxied wide-jacket blob URL; the
+ * aggregator may later overwrite it with a portrait resolved by {@link mgstageCover}.
  */
 function toDiscoverItem(
   item: MgstageListItem,
@@ -122,7 +113,7 @@ const MG_RANKING_ID: Record<string, string> = {
   newest: "day",
 }
 
-/** GET an mgstage page with the age cookie + Referer; "" on any failure (Python _mg_get). */
+/** GET an mgstage page with the age cookie + Referer; "" on any failure. */
 async function mgGet(url: string): Promise<string> {
   try {
     return await httpText(url, {
@@ -135,14 +126,12 @@ async function mgGet(url: string): Promise<string> {
 }
 
 /**
- * Port of `fetch_mgstage(vr, mode)`.
- *
  * VR (vr=true) -> the VR popular search (cat "vrc"); otherwise the ranking page
  * for the window named by `mode` (see {@link MG_RANKING_ID}: daily/weekly/
  * monthly/popular), defaulting to the weekly ranking. Returns DiscoverItem[] in
  * feed order with the wide-jacket cover routed through {@link coverObjectUrl}
- * (mgstage Referer) — every listed product ships its own jacket, so the
- * aggregator keeps it directly instead of resolving a portrait by code.
+ * (mgstage Referer). Every listed product ships its own jacket, so the aggregator
+ * keeps it directly instead of resolving a portrait by code.
  */
 export async function fetchMgstage(
   vr: boolean,
@@ -177,12 +166,9 @@ export interface MgstageCover {
   ar: number
 }
 
-// `mgstage_cover` couldn't measure dimensions here (coverObjectUrl returns a
-// blob, not bytes), so VR-vs-flat aspect can't be probed; the package jackets
-// are landscape wide jackets, matching the Python's flat default. The Python
-// `_cover_meta` returned ~0.72 for portrait probes that succeeded; for the
-// by-code package image we use the same conservative default the sidecar fell
-// back to so the card layout stays stable.
+// We can't measure dimensions here (coverObjectUrl returns a blob, not bytes),
+// so VR-vs-flat aspect can't be probed; the package jackets are landscape wide
+// jackets. Use a conservative default so the card layout stays stable.
 const MGSTAGE_DEFAULT_AR = 0.72
 
 const MGSTAGE_ID_RE = /^([0-9A-Za-z]+)-?(\d+)$/
@@ -191,12 +177,9 @@ const MGSTAGE_ID_RE = /^([0-9A-Za-z]+)-?(\d+)$/
 const MGSTAGE_ID_PAD_WIDTH = 3
 
 /**
- * Port of `mgstage_ids(code)`. MGStage product ids drop leading zeros
- * (PRVRSS-00007 -> PRVRSS-007), so probe the common paddings:
- *   [original code, "LAB-%03d", "LAB-%d", "LAB-<rawnum>"] — de-duplicated,
- *   first-seen order. Falls back to [code] when the code doesn't split.
- *
- * Exported for unit testing.
+ * MGStage product ids drop leading zeros (PRVRSS-00007 -> PRVRSS-007), so probe
+ * the common paddings: [original code, "LAB-%03d", "LAB-%d", "LAB-<rawnum>"],
+ * de-duplicated, first-seen order. Falls back to [code] when the code doesn't split.
  */
 export function mgstageIds(code: string): string[] {
   const rawCode = code || ""
@@ -211,11 +194,11 @@ export function mgstageIds(code: string): string[] {
     `${lab}-${numericValue}`,
     `${lab}-${rawDigits}`,
   ]
-  // dict.fromkeys order-preserving dedup
+  // order-preserving dedup
   return Array.from(new Set(candidates))
 }
 
-/** Big-image markers, tried in priority order (Python: pb_e, then pf_o1, then any). */
+/** Big-image markers, tried in priority order (pb_e, then pf_o1, then any). */
 function pickBigCovers(cands: string[]): string[] {
   const pbE = cands.filter((x) => x.includes("pb_e"))
   if (pbE.length) return pbE
@@ -228,8 +211,7 @@ const IMG_RE = /https?:\/\/image\.mgstage\.com\/images\/[^"'\s]+?\.jpg/g
 
 /**
  * Pure parser for the product-detail page: pull the package image candidates and
- * pick the best (pb_e > pf_o1 > any), returning up to the first 3. Exported for
- * unit testing without network.
+ * pick the best (pb_e > pf_o1 > any), returning up to the first 3.
  */
 export function parseMgstageCovers(html: string): string[] {
   const cands = html.match(IMG_RE) ?? []
@@ -237,17 +219,14 @@ export function parseMgstageCovers(html: string): string[] {
 }
 
 /**
- * Port of `mgstage_cover(code)`.
- *
  * For each padded product id (see {@link mgstageIds}) fetch the product-detail
- * page with the age cookie + Referer. A missing product REDIRECTS to a different
- * path (not a 404); we detect that the way the Python did — by checking the final
- * URL still contains the requested product path — and skip it. From the first
- * surviving page, pick the best package image (pb_e > pf_o1 > any) and route it
- * through {@link coverObjectUrl} with the mgstage Referer (hotlink-protected).
+ * page with the age cookie + Referer. A missing product redirects to a different
+ * path (not a 404); we detect that by checking the final URL still contains the
+ * requested product path, and skip it. From the first surviving page, pick the
+ * best package image (pb_e > pf_o1 > any) and route it through
+ * {@link coverObjectUrl} with the mgstage Referer (hotlink-protected).
  *
- * Returns { url: "", ar: 0 } when nothing resolves — the "no cover" sentinel the
- * Python returned as `('', 0)`.
+ * Returns { url: "", ar: 0 } when nothing resolves.
  */
 export async function mgstageCover(code: string): Promise<MgstageCover> {
   for (const mid of mgstageIds(code)) {
@@ -257,10 +236,10 @@ export async function mgstageCover(code: string): Promise<MgstageCover> {
     for (const cov of parseMgstageCovers(html)) {
       try {
         // Validate that the image actually loads (hotlink-protected), but
-        // return the RAW image.mgstage.com URL — NOT the blob: URL. The
-        // aggregator persists this in cover_cache; a blob: URL would be a
-        // dead session-scoped reference in the next app run. It is re-proxied
-        // for display each session (the bytes are warm in coverCache here).
+        // return the raw image.mgstage.com URL, not the blob: URL. The aggregator
+        // persists this in cover_cache; a blob: URL would be a dead session-scoped
+        // reference in the next app run. It is re-proxied for display each session
+        // (the bytes are warm in coverCache here).
         await coverObjectUrl(cov, { referer: MGSTAGE_REFERER })
         return { url: cov, ar: MGSTAGE_DEFAULT_AR }
       } catch {
@@ -285,15 +264,14 @@ async function fetchProductDetail(path: string): Promise<string | null> {
       referer: MGSTAGE_REFERER,
     })
   } catch (err) {
-    // A hard non-2xx (rare here) is a miss, like the Python's bare except.
+    // A hard non-2xx (rare here) is a miss.
     if (err instanceof HttpError) return null
     return null
   }
   // Redirect-to-home detection: the genuine product page references its own
   // product path (canonical link / og:url / the detail link); the home page it
-  // redirects to does not. This is the behavioural equivalent of the Python
-  // `if path not in r.geturl(): continue` guard, since httpText does not expose
-  // the final URL.
+  // redirects to does not. We check the body since httpText does not expose the
+  // final URL.
   if (!html.includes(path)) return null
   return html
 }

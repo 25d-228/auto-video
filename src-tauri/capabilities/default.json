@@ -19,6 +19,8 @@
       "allow": [
         { "url": "https://apidd.spthgb.com/*" },
         { "url": "https://tp.cmastd.com/*" },
+        { "url": "https://tp.spfcas.com/*" },
+        { "url": "https://tp.*.com/*" },
         { "url": "https://*.dmm.co.jp/*" },
         { "url": "https://pics.dmm.co.jp/*" },
         { "url": "https://api.video.dmm.co.jp/*" },

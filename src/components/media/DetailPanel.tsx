@@ -42,10 +42,9 @@ export interface DetailPanelProps {
 }
 
 /**
- * Slide-in right detail panel per the prototype (.detail): header with state
- * pill + close ✕, scrollable body (poster, title, sub, facts grid, chip
- * sections, free-form children) and a sticky action footer. Stays mounted
- * while closed so the slide transition can play.
+ * Slide-in right detail panel: header with state pill + close, scrollable body
+ * (poster, title, sub, facts grid, chip sections, children), sticky action
+ * footer. Stays mounted while closed so the slide transition can play.
  */
 export function DetailPanel({
   open,
@@ -62,9 +61,9 @@ export function DetailPanel({
   className,
 }: DetailPanelProps) {
   const panelRef = useRef<HTMLElement>(null)
-  // The preview keeps the cover's TRUE aspect ratio: start from the passed
-  // placeholder (coverAspect) and snap to the image's intrinsic ratio once it
-  // loads, so a wide DVD jacket isn't cropped/squished into a portrait box.
+  // Keep the cover's true aspect ratio: start from the passed placeholder
+  // (coverAspect) and snap to the image's intrinsic ratio once it loads, so a
+  // wide DVD jacket isn't cropped into a portrait box.
   const [measuredAr, setMeasuredAr] = useState<number | null>(null)
   const [coverKey, setCoverKey] = useState(cover)
   if (coverKey !== cover) {
