@@ -59,9 +59,9 @@ describe("dmmCidToCode", () => {
     ["n_1428ss154", "SS-154"],
     ["n_709maraa244tk", "MARAA-244"],
     ["ovvr616", "OVVR-616"],
-    ["13dsvr01911", "DSVR-1911"],
+    ["13dsvr01911", "3DSVR-1911"], // FANZA "13dsvr" = 3DSVR (maker code), not DSVR
     ["ebod123", "EBOD-123"],
-    ["3dsvr0911", "DSVR-911"],
+    ["3dsvr0911", "3DSVR-911"],
   ]
   for (const [cid, code] of cases) {
     it(`maps ${cid} -> ${code}`, () => {

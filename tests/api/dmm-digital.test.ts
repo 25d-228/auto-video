@@ -36,8 +36,8 @@ describe("mapDigitalContents", () => {
     )
   })
 
-  it("strips the FANZA VR digit prefix via dmmCidToCode (13dsvr01947 -> DSVR-1947)", () => {
-    expect(mapDigitalContents([node("13dsvr01947")])[0]!.code).toBe("DSVR-1947")
+  it("maps FANZA 13dsvr to 3DSVR (maker code), not DSVR (13dsvr01947 -> 3DSVR-1947)", () => {
+    expect(mapDigitalContents([node("13dsvr01947")])[0]!.code).toBe("3DSVR-1947")
   })
 
   it("dedupes repeated cids and tolerates a missing cover", () => {

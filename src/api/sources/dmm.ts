@@ -57,7 +57,12 @@ export function dmmCidToCode(cid: string): string {
   let normalized = (cid || "").toLowerCase()
   normalized = normalized.replace(/^n_\d+/, "") // n_NNNN maker prefix
   normalized = normalized.replace(/(btk|tk)$/, "") // trailing media tag
-  const m = /([a-z]+)(\d+)$/.exec(normalized) // last alpha-run + trailing number
+  // FANZA digitizes the 3DSVR label as "13dsvr…" (digital "1" prefix + the "3dsvr"
+  // label). The generic alpha-run below would drop the "3" and mislabel it DSVR —
+  // but the maker code (品番) is 3DSVR (verified via the API's makerContentId), and
+  // 3DSVR/DSVR are distinct lists, so match "3dsvr" first to keep the 3.
+  const m =
+    /(3dsvr)(\d+)$/.exec(normalized) ?? /([a-z]+)(\d+)$/.exec(normalized) // last alpha-run + trailing number
   if (!m) return ""
   let label = m[1]!
   let number = m[2]!
