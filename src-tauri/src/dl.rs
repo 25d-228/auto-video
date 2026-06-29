@@ -370,9 +370,22 @@ pub fn status(handle: &Handle) -> Status {
         .as_ref()
         .map(|l| (l.download_speed.mbps * BYTES_PER_MIB) as u64)
         .unwrap_or(0);
+    // librqbit can leave `finished` false at "100%" when a DESELECTED file (an ad
+    // or BEP47 padding file) is part of the torrent: those bytes are never fetched,
+    // so `progress` — measured over the WHOLE torrent — asymptotes just under 1.0
+    // and the completion path (rename + UI "done") stalls forever. Treat a torrent
+    // that has STALLED (no download activity) at >= 99.9% of the whole torrent as
+    // done: the only thing left is the tiny deselected file, which never arrives.
+    // The `active && rate == 0` guard means an in-progress download is never
+    // finalized early (it always has a non-zero rate or isn't yet at 99.9%).
+    let active = !matches!(
+        s.state,
+        TorrentStatsState::Initializing | TorrentStatsState::Paused | TorrentStatsState::Error
+    );
+    let finished = s.finished || (active && download_rate == 0 && progress >= 0.999);
     let (state, error) = if matches!(s.state, TorrentStatsState::Error) {
         ("error".to_string(), s.error.clone().unwrap_or_default())
-    } else if s.finished {
+    } else if finished {
         ("done".to_string(), String::new())
     } else if matches!(s.state, TorrentStatsState::Paused) {
         ("paused".to_string(), String::new())
@@ -383,7 +396,7 @@ pub fn status(handle: &Handle) -> Status {
         progress,
         state,
         download_rate,
-        finished: s.finished,
+        finished,
         error,
     }
 }
