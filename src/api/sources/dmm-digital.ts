@@ -16,8 +16,11 @@ const DMM_GQL = "https://api.video.dmm.co.jp/graphql"
 /** Digital floor content filter: VR titles vs 2D (non-VR) titles. */
 type DigitalContentType = "VR" | "TWO_DIMENSION"
 
-/** Wide digital jacket (~1600x1000); CoverImage measures the real ratio. */
-const DIGITAL_WIDE_JACKET_AR = 1.6
+/** The displayed cover is the PORTRAIT `ps` jacket (~1429x1944, ar ~0.74), not the
+ * wide `pl`. Use a portrait placeholder (matches every other JAV/VR card) so the
+ * grid's page-fit sizes cards right before the image loads; CoverImage then snaps
+ * to the exact ratio. (A wide 1.6 here laid the grid out sparse.) */
+const DIGITAL_COVER_AR = 0.72
 
 /** One content node from the digital API (`content.id` is the cid). */
 export interface DigitalContent {
@@ -77,7 +80,7 @@ export function mapDigitalContents(
       title: code || cid,
       sub: cat === "vrc" ? "VR" : "",
       cover,
-      ar: DIGITAL_WIDE_JACKET_AR, // CoverImage measures the real ratio
+      ar: DIGITAL_COVER_AR, // portrait placeholder; CoverImage snaps to the real ratio
       seeders: 0,
       size: "",
       src: "DMM",
