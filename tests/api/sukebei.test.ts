@@ -47,8 +47,8 @@ describe("parseSukebeiList (listing fixture)", () => {
     expect(first.code).toBe("ABF-358")
     expect(first.title).toBe("ABF-358")
     expect(first._rawtitle).toBe("+++ [FHD] ABF-358 究極のぬるぬるオーガズム 涼森れむ")
-    // link is the nyaa view page.
-    expect(first.link).toBe("https://sukebei.nyaa.si/view/4621826")
+    // link is the nyaa view page (SUKEBEI_BASE host).
+    expect(first.link).toBe("https://sukebei.nyaa.mom/view/4621826")
   })
 
   it("unescapes the magnet (&amp; -> &) and keeps the info hash", () => {

@@ -24,8 +24,9 @@ import { getCached, isDbAvailable, setCached } from "@/state/db"
 // (tpb.ts, the seeders helpers, the sukebei unit test).
 export { quality }
 
-/** sukebei view-page / Referer host. */
-const SUKEBEI_BASE = "https://sukebei.nyaa.si"
+/** sukebei view-page / Referer host. The domain rotates (nyaa.si -> nyaa.mom -> …);
+ * keep capabilities/default.json's http allowlist in sync. */
+const SUKEBEI_BASE = "https://sukebei.nyaa.mom"
 
 /** Seconds a listing stays fresh before a refetch. */
 const LIST_TTL_SEC = 300
