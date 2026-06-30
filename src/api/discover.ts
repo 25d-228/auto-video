@@ -18,6 +18,7 @@ import {
 import {
   fetchTmdbList,
   fetchTmdbTrending,
+  searchTmdb,
   tmdbPath,
 } from "@/api/sources/tmdb"
 import { fetchTv } from "@/api/sources/tpb"
@@ -160,6 +161,8 @@ export interface DiscoverOpts {
   orderBy?: "desc" | "asc"
   /** JavDB Adult browser flag: "category" = all-titles-by-window minus VR. */
   mode?: string
+  /** Free-text title search (mov/tv only); overrides the browse list when set. */
+  query?: string
 }
 
 /**
@@ -184,8 +187,20 @@ export async function discover(
   const lst = resolved.list
   const key = `${cat}|${src || "def"}|${lst || "def"}`
 
+  // A non-empty search query overrides the browse list (mov/tv only): hit TMDB
+  // search/{movie,tv} regardless of the selected provider. Cache per query so a
+  // re-typed term is instant; TMDB posters are raw URLs, so cross-session hits
+  // stay valid.
+  const query = (opts.query ?? "").trim()
+
   // -------------------------------------------------------------- movies
   if (cat === "mov") {
+    if (query) {
+      const data = await cachedListing(`${cat}|search|${query}`, fresh, () =>
+        searchTmdb("mov", query)
+      )
+      return keepCovered(data, n)
+    }
     const data = await cachedListing(key, fresh, () => {
       if (src === "imdb") return fetchImdbChart("mov", lst as ImdbSort, { fresh })
       if (src === "yts") return fetchMovies(lst, fresh)
@@ -197,6 +212,12 @@ export async function discover(
 
   // -------------------------------------------------------------- TV
   if (cat === "tv") {
+    if (query) {
+      const data = await cachedListing(`${cat}|search|${query}`, fresh, () =>
+        searchTmdb("tv", query)
+      )
+      return keepCovered(data, n)
+    }
     if (src === "tmdb" || src === "imdb") {
       const data = await cachedListing(key, fresh, () => {
         if (src === "imdb") return fetchImdbChart("tv", lst as ImdbSort, { fresh })

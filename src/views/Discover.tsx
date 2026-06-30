@@ -4,7 +4,7 @@
  * with lazy seeder badges -> detail panel -> download dialog.
  */
 import { useEffect, useMemo, useRef, useState } from "react"
-import { Loader2, RefreshCw } from "lucide-react"
+import { Loader2, RefreshCw, Search, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
   Select,
@@ -91,6 +91,14 @@ export default function Discover({ active = true }: { active?: boolean }) {
     useState<JavdbBrowseSel>(DEFAULT_JAVDB_BROWSE)
   // Adult→JavDB toggles between the ranking windows and the category browser.
   const [javdbAdMode, setJavdbAdMode] = useState<JavdbAdMode>("ranking")
+  // Free-text title search (mov/tv only). The debounced value drives the feed so
+  // typing doesn't fire a TMDB request per keystroke.
+  const [search, setSearch] = useState("")
+  const [debouncedSearch, setDebouncedSearch] = useState("")
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search.trim()), 300)
+    return () => clearTimeout(t)
+  }, [search])
 
   const { source, list } = selByCat[cat]
   const isJavdbVr = cat === "vrc" && source === "javdb"
@@ -104,13 +112,21 @@ export default function Discover({ active = true }: { active?: boolean }) {
         ...(isJavdbCategory ? { mode: "category" } : {}),
       }
     : undefined
+  // A non-empty search box (mov/tv) overrides the browse list and hits TMDB
+  // search; otherwise the feed is the selected provider/list (or, for the JavDB
+  // browser, year/month/sort + mode).
+  const canSearch = cat === "mov" || cat === "tv"
+  const searching = canSearch && debouncedSearch !== ""
+  const effectiveOpts = searching ? { query: debouncedSearch } : browseOpts
   // For the browser the feed identity is year/month/sort (+ mode), not the list.
-  const feedKey = isBrowser
-    ? `${cat}|${source}|${isJavdbCategory ? "category" : "vr"}|${javdbBrowse.year}|${javdbBrowse.month}|${javdbBrowse.sort}`
-    : `${cat}|${source}|${list}`
+  const feedKey = searching
+    ? `${cat}|search|${debouncedSearch}`
+    : isBrowser
+      ? `${cat}|${source}|${isJavdbCategory ? "category" : "vr"}|${javdbBrowse.year}|${javdbBrowse.month}|${javdbBrowse.sort}`
+      : `${cat}|${source}|${list}`
   const isFresh = freshKeys.has(feedKey)
 
-  const query = useDiscover(cat, source, list, FEED_FETCH_LIMIT, isFresh, browseOpts)
+  const query = useDiscover(cat, source, list, FEED_FETCH_LIMIT, isFresh, effectiveOpts)
   const libraryQ = useLibrary()
   const { downloads } = useDownloads()
 
@@ -139,6 +155,7 @@ export default function Discover({ active = true }: { active?: boolean }) {
     source,
     list,
     limit,
+    debouncedSearch,
     javdbAdMode,
     javdbBrowse.year,
     javdbBrowse.month,
@@ -169,6 +186,8 @@ export default function Discover({ active = true }: { active?: boolean }) {
   const switchCat = (next: Cat) => {
     setCat(next)
     setSelByCat((prev) => ({ ...prev, [next]: defaultSelection(next) }))
+    setSearch("")
+    setDebouncedSearch("")
     closePanels()
   }
 
@@ -212,7 +231,7 @@ export default function Discover({ active = true }: { active?: boolean }) {
     }
   }
 
-  const showAdded = listIsRecency(list)
+  const showAdded = !searching && listIsRecency(list)
 
   return (
     <section className="flex h-full min-h-0 flex-col p-5">
@@ -322,6 +341,30 @@ export default function Discover({ active = true }: { active?: boolean }) {
           </Select>
         )}
 
+        {canSearch && (
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={`Search ${cat === "mov" ? "movies" : "TV"}…`}
+              aria-label="Search title"
+              className="h-8 w-44 rounded-md border border-input bg-transparent pl-7 pr-7 text-xs shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+            />
+            {search && (
+              <button
+                type="button"
+                aria-label="Clear search"
+                onClick={() => setSearch("")}
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                <X className="size-3.5" />
+              </button>
+            )}
+          </div>
+        )}
+
         <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
           Show
           <SegControl
@@ -356,11 +399,15 @@ export default function Discover({ active = true }: { active?: boolean }) {
           {query.isPending ? (
             <div className="flex items-center gap-2.5 py-12 text-sm text-muted-foreground">
               <Loader2 className="size-4 animate-spin" />
-              Fetching live results from {providerLabel(source)}…
+              {searching
+                ? `Searching for “${debouncedSearch}”…`
+                : `Fetching live results from ${providerLabel(source)}…`}
             </div>
           ) : pool.length === 0 ? (
             <div className="py-12 text-sm text-muted-foreground">
-              No live results right now — try Refresh.
+              {searching
+                ? `No matches for “${debouncedSearch}”.`
+                : "No live results right now — try Refresh."}
             </div>
           ) : (
             <CardGrid>

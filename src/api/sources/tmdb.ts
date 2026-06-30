@@ -193,16 +193,18 @@ export function parseFeedPages(
 /**
  * Walk up to 5 pages of a paged TMDB endpoint, collecting raw pages (stop on an
  * empty page or once the last page is reached), then hand them to
- * {@link parseFeedPages}.
+ * {@link parseFeedPages}. `extra` adds fixed query params on every page (e.g. the
+ * search `query`).
  */
 async function collectPaged(
   path: string,
   cat: Cat,
-  idPrefix: string
+  idPrefix: string,
+  extra: Record<string, string | number> = {}
 ): Promise<DiscoverItem[]> {
   const pages: TmdbListResponse[] = []
   for (let page = 1; page <= MAX_FEED_PAGES; page++) {
-    const pageResponse = (await tmdbGet<TmdbListResponse>(path, { page })) ?? {}
+    const pageResponse = (await tmdbGet<TmdbListResponse>(path, { ...extra, page })) ?? {}
     const results = pageResponse.results ?? []
     if (results.length === 0) break
     pages.push(pageResponse)
@@ -230,6 +232,19 @@ export async function fetchTmdbTrending(kind: TmdbKind): Promise<DiscoverItem[]>
 export async function fetchTmdbList(cat: Cat, path: string): Promise<DiscoverItem[]> {
   if (!(await tmdbKey())) return []
   return collectPaged(path, cat, "tmdbp_")
+}
+
+/**
+ * Free-text title search for movies (cat "mov") or TV (cat "tv") via TMDB
+ * search/{movie,tv}, ordered by TMDB relevance. Cards use id prefix "tmdbs_".
+ * Returns [] for a blank query or when no key is configured.
+ */
+export async function searchTmdb(cat: Cat, query: string): Promise<DiscoverItem[]> {
+  const q = query.trim()
+  if (!q) return []
+  if (!(await tmdbKey())) return []
+  const kind = cat === "mov" ? "movie" : "tv"
+  return collectPaged(`search/${kind}`, cat, "tmdbs_", { query: q })
 }
 
 /**

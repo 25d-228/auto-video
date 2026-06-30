@@ -69,7 +69,7 @@ export function useDiscover(
   fresh = false,
   opts: DiscoverOpts = {}
 ) {
-  const optsKey = `${opts.year ?? ""}|${opts.month ?? ""}|${opts.sortBy ?? ""}|${opts.orderBy ?? ""}|${opts.mode ?? ""}`
+  const optsKey = `${opts.year ?? ""}|${opts.month ?? ""}|${opts.sortBy ?? ""}|${opts.orderBy ?? ""}|${opts.mode ?? ""}|${opts.query ?? ""}`
   return useQuery({
     queryKey: qk.discover(cat, source, list, n, fresh, optsKey),
     queryFn: () =>
