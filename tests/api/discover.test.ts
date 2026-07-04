@@ -46,7 +46,7 @@ vi.mock("@/net/http", () => ({
 }))
 
 import { resolveCovers } from "@/api/covers"
-import { discover, resolveList } from "@/api/discover"
+import { discover, proxyCovers, resolveList } from "@/api/discover"
 import { coverObjectUrl } from "@/net/http"
 import { fetchDmmDigitalAv, fetchDmmDigitalVr } from "@/api/sources/dmm-digital"
 import { fetchImdbChart } from "@/api/sources/imdb"
@@ -463,6 +463,71 @@ describe("listing cache (listing_cached port)", () => {
     await discover("mov", "tmdb", "trending")
     expect(getCached).not.toHaveBeenCalled()
     expect(setCached).not.toHaveBeenCalled()
+  })
+})
+
+describe("proxyCovers", () => {
+  it("caps concurrent cover fetches at the pool size (10)", async () => {
+    let inflight = 0
+    let peak = 0
+    vi.mocked(coverObjectUrl).mockImplementation(async (url) => {
+      inflight++
+      peak = Math.max(peak, inflight)
+      await new Promise((r) => setTimeout(r, 1))
+      inflight--
+      return "blob:" + url
+    })
+    const items = Array.from({ length: 40 }, (_, i) =>
+      di({ id: `c${i}`, cover: `https://tp.spfcas.com/covers/${i}.jpg` })
+    )
+    await proxyCovers(items)
+    // All 10 workers start synchronously before any 1ms timer fires, so the
+    // peak is exactly the pool size — deterministic, no flake risk.
+    expect(peak).toBe(10)
+    expect(items.every((x) => x.cover.startsWith("blob:"))).toBe(true)
+  })
+
+  it("breaks off when the host is dead (5 failures, zero successes)", async () => {
+    vi.mocked(coverObjectUrl).mockRejectedValue(new Error("connect timeout"))
+    const items = Array.from({ length: 40 }, (_, i) =>
+      di({ id: `d${i}`, cover: `https://tp.dead.com/covers/${i}.jpg` })
+    )
+    await proxyCovers(items)
+    // First wave of 10 fetches settles, breaker trips, the rest are skipped.
+    expect(vi.mocked(coverObjectUrl).mock.calls.length).toBeLessThanOrEqual(15)
+    expect(items.every((x) => x.cover.startsWith("https://"))).toBe(true)
+  })
+
+  it("does not break off on scattered failures once anything has succeeded", async () => {
+    let calls = 0
+    vi.mocked(coverObjectUrl).mockImplementation(async (url) => {
+      calls++
+      if (calls % 3 === 0) throw new Error("dropped") // 1-in-3 failure rate
+      return "blob:" + url
+    })
+    const items = Array.from({ length: 30 }, (_, i) =>
+      di({ id: `s${i}`, cover: `https://tp.spfcas.com/covers/${i}.jpg` })
+    )
+    await proxyCovers(items)
+    expect(calls).toBe(30) // every cover was attempted; no early break
+    expect(items.filter((x) => x.cover.startsWith("blob:")).length).toBe(20)
+  })
+
+  it("keeps the raw URL when a cover fetch fails and skips existing blobs", async () => {
+    vi.mocked(coverObjectUrl).mockImplementation(async (url) => {
+      if (url.includes("bad")) throw new Error("dropped")
+      return "blob:" + url
+    })
+    const items = [
+      di({ id: "ok", cover: "https://tp.spfcas.com/ok.jpg" }),
+      di({ id: "bad", cover: "https://tp.spfcas.com/bad.jpg" }),
+      di({ id: "done", cover: "blob:already" }),
+    ]
+    await proxyCovers(items)
+    expect(items[0]!.cover).toBe("blob:https://tp.spfcas.com/ok.jpg")
+    expect(items[1]!.cover).toBe("https://tp.spfcas.com/bad.jpg")
+    expect(items[2]!.cover).toBe("blob:already")
+    expect(coverObjectUrl).toHaveBeenCalledTimes(2)
   })
 })
 

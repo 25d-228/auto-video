@@ -194,6 +194,50 @@ export function decryptCmastd(data: Uint8Array): Uint8Array {
 }
 
 /**
+ * Magic-byte sniff for the common raster formats (JPEG/PNG/GIF/WebP). Guards
+ * the cmastd decode: a CDN challenge/error page served with HTTP 200 would
+ * otherwise XOR into garbage, get typed image/jpeg, and poison the session
+ * cover cache. Exported for testing.
+ */
+export function looksLikeImage(bytes: Uint8Array): boolean {
+  if (bytes.length < 12) return false
+  const [b0, b1, b2, b3] = [bytes[0], bytes[1], bytes[2], bytes[3]]
+  if (b0 === 0xff && b1 === 0xd8 && b2 === 0xff) return true // JPEG
+  if (b0 === 0x89 && b1 === 0x50 && b2 === 0x4e && b3 === 0x47) return true // PNG
+  if (b0 === 0x47 && b1 === 0x49 && b2 === 0x46 && b3 === 0x38) return true // GIF
+  return (
+    b0 === 0x52 && b1 === 0x49 && b2 === 0x46 && b3 === 0x46 && // RIFF…
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50 // …WEBP
+  )
+}
+
+// Cover fetches retry transient failures: loading a full Discover feed fires
+// many requests at one CDN host and a few connections get dropped/reset, which
+// used to leave permanent placeholder cards. Genuine 4xx (403/404, and the
+// synthetic 415 for a non-image payload) fail fast.
+const COVER_FETCH_ATTEMPTS = 3
+const COVER_RETRY_DELAY_MS = 400
+// Covers either connect fast or the host is gone (the tp.* CDN rotates); a
+// short connect timeout keeps a dead host from gating the whole feed.
+const COVER_TIMEOUT_MS = 5_000
+
+/**
+ * Worth retrying: no response / rate-limited / server error — or a non-HTTP
+ * failure such as the connection dropping mid-body read (the plugin resolves
+ * fetch at the headers, so a later stream reset rejects as a plain Error).
+ */
+function isTransientCoverError(e: unknown): boolean {
+  if (e instanceof HttpError) {
+    return e.status === 0 || e.status === 429 || e.status >= 500
+  }
+  return true
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
  * Fetch image bytes (with a hotlink-bypassing Referer) and return a `blob:`
  * object URL that an `<img>` can render directly. Results are cached by source
  * URL; call {@link revokeCover} (or {@link revokeAllCovers}) to release the
@@ -210,22 +254,38 @@ export async function coverObjectUrl(
   if (cached) return cached
 
   const referer = opts.referer ?? refererForImage(url)
-  const res = await request(url, { ...opts, referer })
 
-  const raw = new Uint8Array(await res.arrayBuffer())
-  const bytes = isCmastdCover(url) ? decryptCmastd(raw) : raw
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await request(url, { timeoutMs: COVER_TIMEOUT_MS, ...opts, referer })
 
-  // Some CDNs mislabel images as octet-stream; coerce to a sane image type.
-  const contentType = res.headers.get("Content-Type") ?? ""
-  const type =
-    !isCmastdCover(url) && contentType.startsWith("image/")
-      ? contentType
-      : "image/jpeg"
+      const raw = new Uint8Array(await res.arrayBuffer())
+      const bytes = isCmastdCover(url) ? decryptCmastd(raw) : raw
 
-  const blob = new Blob([bytes as BlobPart], { type })
-  const objectUrl = URL.createObjectURL(blob)
-  coverCache.set(url, objectUrl)
-  return objectUrl
+      // A 200 from the tp.* CDN can still be a challenge/error page; caching
+      // its XOR "decode" would break the cover for the whole session. The
+      // synthetic 415 fails fast — a challenge won't clear within our backoff,
+      // and nothing is cached, so the next feed refetch retries naturally.
+      if (isCmastdCover(url) && !looksLikeImage(bytes)) {
+        throw new HttpError(`non-image cover payload for ${url}`, 415, url)
+      }
+
+      // Some CDNs mislabel images as octet-stream; coerce to a sane image type.
+      const contentType = res.headers.get("Content-Type") ?? ""
+      const type =
+        !isCmastdCover(url) && contentType.startsWith("image/")
+          ? contentType
+          : "image/jpeg"
+
+      const blob = new Blob([bytes as BlobPart], { type })
+      const objectUrl = URL.createObjectURL(blob)
+      coverCache.set(url, objectUrl)
+      return objectUrl
+    } catch (e) {
+      if (attempt >= COVER_FETCH_ATTEMPTS || !isTransientCoverError(e)) throw e
+      await delay(COVER_RETRY_DELAY_MS * attempt)
+    }
+  }
 }
 
 /** Revoke the cached blob URL for one source URL (no-op if not cached). */

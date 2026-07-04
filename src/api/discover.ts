@@ -69,22 +69,42 @@ async function javbusCookie(): Promise<string> {
 }
 
 
+// Concurrent cover fetches per feed. A full-feed burst (100 at once against the
+// single tp.* CDN host) got a few connections dropped, leaving permanent
+// placeholder cards; a small pool avoids that, and coverObjectUrl's retry
+// catches the stragglers.
+const COVER_POOL_SIZE = 10
+// If this many covers fail before ANY succeeds, the CDN host is unreachable
+// (rotated away): stop fetching so the feed isn't gated on serial timeouts.
+const COVER_BREAKER_FAILURES = 5
+
 /**
  * Turn each item's cmastd cover URL into a displayable blob: URL in place,
  * decrypting the single-byte XOR payload (inside coverObjectUrl). Runs after the
  * listing cache so SQLite stores the raw cmastd URLs. A failed fetch leaves the
- * raw URL (CoverImage shows its placeholder). Parallel.
+ * raw URL (CoverImage shows its placeholder). At most COVER_POOL_SIZE fetches
+ * run concurrently. Exported for testing.
  */
-async function proxyCovers(items: DiscoverItem[]): Promise<void> {
-  await Promise.all(
-    items.map(async (item) => {
-      if (!item.cover || item.cover.startsWith("blob:")) return
+export async function proxyCovers(items: DiscoverItem[]): Promise<void> {
+  let next = 0
+  let failures = 0
+  let successes = 0
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const item = items[next++]!
+      if (!item.cover || item.cover.startsWith("blob:")) continue
+      if (failures >= COVER_BREAKER_FAILURES && successes === 0) continue
       try {
         item.cover = await coverObjectUrl(item.cover)
+        successes++
       } catch {
+        failures++
         // keep raw URL; CoverImage shows the placeholder
       }
-    })
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(COVER_POOL_SIZE, items.length) }, worker)
   )
 }
 
