@@ -24,6 +24,12 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
 const openFolderMock = vi.mocked(open);
 
+type ResizeObserverRecord = {
+  callback: ResizeObserverCallback;
+  observer: ResizeObserver;
+  targets: Set<Element>;
+};
+
 let systemPrefersDark = false;
 let mediaQueryListeners = new Set<(event: MediaQueryListEvent) => void>();
 let invokeMock: Mock<
@@ -42,6 +48,62 @@ let saveTmdbTokenMock: Mock<
 let clearTmdbTokenMock: Mock<() => Promise<void>>;
 let fetchMock: Mock<typeof fetch>;
 let clipboardWriteMock: Mock<(text: string) => Promise<void>>;
+let resizeObserverRecords: ResizeObserverRecord[] = [];
+
+function createResizeEntry(
+  target: Element,
+  width: number,
+  height: number,
+): ResizeObserverEntry {
+  const contentRect = {
+    bottom: height,
+    height,
+    left: 0,
+    right: width,
+    top: 0,
+    width,
+    x: 0,
+    y: 0,
+    toJSON: () => ({}),
+  } as DOMRectReadOnly;
+
+  return {
+    borderBoxSize: [],
+    contentBoxSize: [],
+    contentRect,
+    devicePixelContentBoxSize: [],
+    target,
+  };
+}
+
+class TestResizeObserver implements ResizeObserver {
+  private readonly record: ResizeObserverRecord;
+
+  constructor(callback: ResizeObserverCallback) {
+    this.record = {
+      callback,
+      observer: this,
+      targets: new Set(),
+    };
+    resizeObserverRecords.push(this.record);
+  }
+
+  observe(target: Element) {
+    this.record.targets.add(target);
+    this.record.callback(
+      [createResizeEntry(target, 2000, 3000)],
+      this,
+    );
+  }
+
+  unobserve(target: Element) {
+    this.record.targets.delete(target);
+  }
+
+  disconnect() {
+    this.record.targets.clear();
+  }
+}
 
 function createMediaQueryList(query: string): MediaQueryList {
   return {
@@ -113,9 +175,40 @@ function setSystemPreference(prefersDark: boolean) {
   });
 }
 
+function resizeGallery(
+  variant: "discover" | "library",
+  width: number,
+  height: number,
+) {
+  const viewport = document.querySelector(
+    `[data-gallery="${variant}"] .media-gallery__viewport`,
+  );
+  if (viewport === null) {
+    throw new Error(`The ${variant} gallery viewport was not rendered.`);
+  }
+
+  act(() => {
+    for (const record of resizeObserverRecords) {
+      if (record.targets.has(viewport)) {
+        record.callback(
+          [createResizeEntry(viewport, width, height)],
+          record.observer,
+        );
+      }
+    }
+  });
+}
+
+function visibleCardCount(listName: string) {
+  return within(screen.getByRole("list", { name: listName })).getAllByRole(
+    "article",
+  ).length;
+}
+
 beforeEach(() => {
   systemPrefersDark = false;
   mediaQueryListeners = new Set();
+  resizeObserverRecords = [];
   scanMoviesMock = vi.fn().mockResolvedValue([]);
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
@@ -144,6 +237,7 @@ beforeEach(() => {
   vi.stubGlobal("matchMedia", vi.fn(createMediaQueryList));
   vi.stubGlobal("__TAURI__", { core: { invoke: invokeMock } });
   vi.stubGlobal("fetch", fetchMock);
+  vi.stubGlobal("ResizeObserver", TestResizeObserver);
   Object.defineProperty(navigator, "clipboard", {
     configurable: true,
     value: { writeText: clipboardWriteMock },
@@ -917,5 +1011,146 @@ describe("local Movies library", () => {
       "The Movies folder picker could not be opened.",
     );
     expect(window.localStorage.getItem("auto-video-movies-folder")).toBeNull();
+  });
+});
+
+describe("resize-aware media galleries", () => {
+  it("updates Discover through the 25 to 7 to 10 regression without refetching and clamps its page", async () => {
+    const results = Array.from({ length: 25 }, (_, index) => ({
+      id: index + 1,
+      title: `Discover ${String(index + 1).padStart(2, "0")}`,
+    }));
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockResolvedValue(jsonResponse({ results }));
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByText("Discover 01");
+
+    resizeGallery("discover", 1088, 2408);
+    expect(visibleCardCount("Weekly trending Movies")).toBe(25);
+    expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+
+    const firstCopyButton = screen.getByRole("button", {
+      name: "Copy title: Discover 01",
+    });
+    fireEvent.click(firstCopyButton);
+    expect(
+      await screen.findByRole("button", {
+        name: "Copied title: Discover 01",
+      }),
+    ).toBeTruthy();
+
+    resizeGallery("discover", 1528, 472);
+    expect(visibleCardCount("Weekly trending Movies")).toBe(7);
+    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Copied title: Discover 01" }),
+    ).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const nextPage = screen.getByRole("button", {
+      name: "Next Weekly trending Movies page",
+    });
+    nextPage.focus();
+    expect(document.activeElement).toBe(nextPage);
+
+    resizeGallery("discover", 1088, 956);
+    expect(visibleCardCount("Weekly trending Movies")).toBe(10);
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Copied title: Discover 01" }),
+    ).toBeTruthy();
+
+    resizeGallery("discover", 1528, 472);
+    for (let page = 1; page < 4; page += 1) {
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "Next Weekly trending Movies page",
+        }),
+      );
+    }
+    expect(screen.getByText("Page 4 of 4")).toBeTruthy();
+    expect(visibleCardCount("Weekly trending Movies")).toBe(4);
+    expect(screen.getByText("Discover 22")).toBeTruthy();
+
+    resizeGallery("discover", 1088, 956);
+    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    expect(visibleCardCount("Weekly trending Movies")).toBe(5);
+    expect(screen.getByText("Discover 21")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Discover",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("updates Library through the 25 to 7 to 10 regression without rescanning and clamps its page", async () => {
+    const paths = Array.from(
+      { length: 25 },
+      (_, index) =>
+        `/Movies/Library ${String(index + 1).padStart(2, "0")}.mp4`,
+    );
+    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    scanMoviesMock.mockResolvedValue(paths);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByText("Library 01");
+
+    resizeGallery("library", 1088, 728);
+    expect(visibleCardCount("Movies")).toBe(25);
+    expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Copy title: Library 01" }),
+    );
+    expect(
+      await screen.findByRole("button", {
+        name: "Copied title: Library 01",
+      }),
+    ).toBeTruthy();
+
+    resizeGallery("library", 1528, 136);
+    expect(visibleCardCount("Movies")).toBe(7);
+    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Copied title: Library 01" }),
+    ).toBeTruthy();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+
+    const nextPage = screen.getByRole("button", {
+      name: "Next Movies page",
+    });
+    nextPage.focus();
+    expect(document.activeElement).toBe(nextPage);
+
+    resizeGallery("library", 1088, 284);
+    expect(visibleCardCount("Movies")).toBe(10);
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Copied title: Library 01" }),
+    ).toBeTruthy();
+
+    resizeGallery("library", 1528, 136);
+    for (let page = 1; page < 4; page += 1) {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Next Movies page" }),
+      );
+    }
+    expect(screen.getByText("Page 4 of 4")).toBeTruthy();
+    expect(visibleCardCount("Movies")).toBe(4);
+    expect(screen.getByText("Library 22")).toBeTruthy();
+
+    resizeGallery("library", 1088, 284);
+    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    expect(visibleCardCount("Movies")).toBe(5);
+    expect(screen.getByText("Library 21")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Library",
+    );
+    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
+      "/Movies",
+    );
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
   });
 });
