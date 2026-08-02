@@ -865,7 +865,15 @@ button {
 }
 
 .movie-card .media-title-row {
+  grid-template-columns: minmax(0, 1fr) 5.625rem;
   margin-top: 0.625rem;
+}
+
+.movie-card__title-actions {
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 0.125rem;
 }
 
 .movie-card h3 {
@@ -915,6 +923,70 @@ button {
   p
   + p {
   margin-top: 0.0625rem;
+}
+
+.trash-dialog__backdrop {
+  position: fixed;
+  z-index: 50;
+  inset: 0;
+  background: color-mix(in oklch, var(--foreground) 45%, transparent);
+}
+
+.trash-dialog__viewport {
+  position: fixed;
+  z-index: 51;
+  inset: 0;
+  display: grid;
+  padding: 1rem;
+  pointer-events: none;
+  place-items: center;
+}
+
+.trash-dialog__popup {
+  width: min(26rem, 100%);
+  max-height: 100%;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: 0 1rem 3rem color-mix(in oklch, var(--foreground) 20%, transparent);
+  padding: 1rem;
+  pointer-events: auto;
+}
+
+.trash-dialog__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.trash-dialog__heading h2 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-size: 1rem;
+  line-height: 1.35;
+}
+
+.trash-dialog__popup > p {
+  margin: 0.75rem 0 0;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.trash-dialog__popup .trash-dialog__error {
+  color: var(--destructive);
+}
+
+.trash-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
 }
 
 @media (hover: none) {

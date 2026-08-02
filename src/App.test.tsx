@@ -5,6 +5,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import {
@@ -45,6 +46,9 @@ let openMovieMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
 let revealMovieMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let trashMovieMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
 let loadTmdbTokenMock: Mock<() => Promise<string | null>>;
@@ -218,6 +222,7 @@ beforeEach(() => {
   scanMoviesMock = vi.fn().mockResolvedValue([]);
   openMovieMock = vi.fn().mockResolvedValue(undefined);
   revealMovieMock = vi.fn().mockResolvedValue(undefined);
+  trashMovieMock = vi.fn().mockResolvedValue(undefined);
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
@@ -230,6 +235,8 @@ beforeEach(() => {
           return openMovieMock(parameters);
         case "reveal_movie":
           return revealMovieMock(parameters);
+        case "trash_movie":
+          return trashMovieMock(parameters);
         case "load_tmdb_token":
           return loadTmdbTokenMock();
         case "save_tmdb_token":
@@ -596,6 +603,7 @@ describe("TMDB Discover", () => {
     expect(copyButton.getAttribute("aria-label")).toBe(
       `Copied title: ${title}`,
     );
+    expect(trashMovieMock).not.toHaveBeenCalled();
     expect(within(card).getByRole("status").textContent).toBe(
       `Copied title: ${title}`,
     );
@@ -904,6 +912,461 @@ describe("local Movies library", () => {
     expect(clipboardWriteMock).not.toHaveBeenCalled();
   });
 
+  it("requires explicit confirmation and makes every dialog dismissal non-mutating", async () => {
+    const path = "/Movies/映画  —  Confirm me.MKV";
+    const parentActivation = vi.fn();
+    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    scanMoviesMock.mockResolvedValue([path]);
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectLibrary();
+
+    const trashButton = await screen.findByRole("button", {
+      name: "Move movie to Trash or Recycle Bin: 映画 — Confirm me",
+    });
+    parentActivation.mockClear();
+    trashButton.focus();
+    fireEvent.keyDown(trashButton, { key: "Enter" });
+    fireEvent.click(trashButton);
+
+    let dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain("Move “映画  —  Confirm me” to Trash?");
+    expect(dialog.textContent).toContain(
+      "macOS Trash or the Windows Recycle Bin",
+    );
+    expect(dialog.textContent).not.toContain(path);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("button", { name: "Cancel" }),
+      );
+    });
+    expect(trashMovieMock).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    dialog = await screen.findByRole("alertdialog");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Close confirmation" }),
+    );
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    await screen.findByRole("alertdialog");
+    const backdrop = document.querySelector(".trash-dialog__backdrop");
+    if (backdrop === null) {
+      throw new Error("The Trash confirmation backdrop was not rendered.");
+    }
+    fireEvent.pointerDown(backdrop);
+    fireEvent.click(backdrop);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+    expect(trashMovieMock).not.toHaveBeenCalled();
+    expect(openMovieMock).not.toHaveBeenCalled();
+    expect(revealMovieMock).not.toHaveBeenCalled();
+    expect(clipboardWriteMock).not.toHaveBeenCalled();
+    expect(parentActivation).not.toHaveBeenCalled();
+  });
+
+  it("trashes the exact confirmed path once and clamps the final page after acceptance", async () => {
+    const pendingTrash = createDeferred<void>();
+    const folder = "C:\\Movies";
+    const exactPath =
+      "C:\\Movies\\映画  —  Final.CUT & punctuation! [1080p].MKV";
+    const title = "映画  —  Final.CUT & punctuation! [1080p]";
+    const paths = Array.from({ length: 15 }, (_, index) =>
+      index === 14
+        ? exactPath
+        : `C:\\Movies\\Library ${String(index + 1).padStart(2, "0")}.mp4`,
+    );
+    const parentActivation = vi.fn();
+    window.localStorage.setItem("auto-video-movies-folder", folder);
+    scanMoviesMock.mockResolvedValue(paths);
+    trashMovieMock.mockReturnValue(pendingTrash.promise);
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectLibrary();
+    await screen.findByText("Library 01");
+    resizeGallery("library", 1528, 136);
+    fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
+    fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
+    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+
+    const card = screen
+      .getByRole("heading", {
+        level: 3,
+        name: "映画 — Final.CUT & punctuation! [1080p]",
+      })
+      .closest("article") as HTMLElement;
+    fireEvent.click(
+      within(card).getByRole("button", { name: /Copy title:/ }),
+    );
+    expect(
+      await within(card).findByRole("button", { name: /Copied title:/ }),
+    ).toBeTruthy();
+    clipboardWriteMock.mockClear();
+    parentActivation.mockClear();
+
+    const trashButton = within(card).getByRole("button", {
+      name: /Move movie to Trash or Recycle Bin:/,
+    });
+    fireEvent.pointerDown(trashButton);
+    fireEvent.click(trashButton);
+    const dialog = await screen.findByRole("alertdialog");
+    expect(trashMovieMock).not.toHaveBeenCalled();
+
+    const confirmButton = within(dialog).getByRole("button", {
+      name: /Confirm moving movie to Trash or Recycle Bin:/,
+    });
+    expect(confirmButton.getAttribute("aria-label")).toBe(
+      `Confirm moving movie to Trash or Recycle Bin: ${title}`,
+    );
+    confirmButton.focus();
+    fireEvent.keyDown(confirmButton, { key: "Enter" });
+    fireEvent.click(confirmButton);
+    confirmButton.click();
+
+    expect(trashMovieMock).toHaveBeenCalledTimes(1);
+    expect(trashMovieMock).toHaveBeenCalledWith({
+      folder,
+      libraryPaths: paths,
+      path: exactPath,
+    });
+    expect(confirmButton).toHaveProperty("disabled", true);
+    expect(dialog.getAttribute("aria-busy")).toBe("true");
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(
+      within(dialog).getByRole("button", { name: "Cancel" }),
+    ).toHaveProperty("disabled", true);
+    expect(
+      within(dialog).getByRole("button", { name: "Close confirmation" }),
+    ).toHaveProperty("disabled", true);
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    const pendingBackdrop = document.querySelector(".trash-dialog__backdrop");
+    if (pendingBackdrop === null) {
+      throw new Error("The pending Trash backdrop was not rendered.");
+    }
+    fireEvent.click(pendingBackdrop);
+    expect(screen.getByRole("alertdialog")).toBe(dialog);
+    expect(trashMovieMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    expect(screen.queryByText(`${title} was moved to Trash or the Recycle Bin.`))
+      .toBeNull();
+    expect(openMovieMock).not.toHaveBeenCalled();
+    expect(revealMovieMock).not.toHaveBeenCalled();
+    expect(clipboardWriteMock).not.toHaveBeenCalled();
+    expect(parentActivation).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingTrash.resolve(undefined);
+      await pendingTrash.promise;
+    });
+
+    expect(await screen.findByText("Page 2 of 2")).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", {
+        level: 3,
+        name: "映画 — Final.CUT & punctuation! [1080p]",
+      }),
+    ).toBeNull();
+    expect(screen.getByRole("status").textContent).toBe(
+      `${title} was moved to Trash or the Recycle Bin.`,
+    );
+    expect(visibleCardCount("Movies")).toBe(7);
+    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
+      folder,
+    );
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Library",
+    );
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("removes only the confirmed movie and preserves unrelated card feedback", async () => {
+    const firstPath = "/Movies/Remove only me.mp4";
+    const secondPath = "/Movies/Keep my feedback.mkv";
+    const parentActivation = vi.fn();
+    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    scanMoviesMock.mockResolvedValue([firstPath, secondPath]);
+    openMovieMock.mockRejectedValueOnce("movie_open_failed");
+    revealMovieMock.mockRejectedValueOnce("movie_reveal_failed");
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectLibrary();
+
+    const secondCard = (
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "Keep my feedback",
+      })
+    ).closest("article") as HTMLElement;
+    fireEvent.click(
+      within(secondCard).getByRole("button", { name: /Open movie:/ }),
+    );
+    fireEvent.click(
+      within(secondCard).getByRole("button", { name: /Reveal movie:/ }),
+    );
+    fireEvent.click(
+      within(secondCard).getByRole("button", { name: /Copy title:/ }),
+    );
+    expect(await within(secondCard).findAllByRole("alert")).toHaveLength(2);
+    expect(
+      await within(secondCard).findByRole("button", { name: /Copied title:/ }),
+    ).toBeTruthy();
+    expect(trashMovieMock).not.toHaveBeenCalled();
+
+    openMovieMock.mockClear();
+    revealMovieMock.mockClear();
+    clipboardWriteMock.mockClear();
+    parentActivation.mockClear();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move movie to Trash or Recycle Bin: Remove only me",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving movie to Trash or Recycle Bin: Remove only me",
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "Keep my feedback",
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("heading", { level: 3, name: "Remove only me" }),
+    ).toBeNull();
+    const fileActionErrors = within(secondCard).getAllByRole("alert");
+    expect(fileActionErrors.map((alert) => alert.textContent)).toEqual([
+      "The operating system could not open this movie.",
+      "The operating system could not reveal this movie.",
+    ]);
+    expect(
+      within(secondCard).getByRole("button", { name: /Copied title:/ }),
+    ).toBeTruthy();
+    expect(trashMovieMock).toHaveBeenCalledWith({
+      folder: "/Movies",
+      libraryPaths: [firstPath, secondPath],
+      path: firstPath,
+    });
+    expect(openMovieMock).not.toHaveBeenCalled();
+    expect(revealMovieMock).not.toHaveBeenCalled();
+    expect(clipboardWriteMock).not.toHaveBeenCalled();
+    expect(parentActivation).not.toHaveBeenCalled();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["movie_trash_not_found", "This movie is no longer available."],
+    ["movie_trash_unavailable", "Auto-Video could not access this movie."],
+    ["movie_trash_not_file", "This item is not an eligible video file."],
+    [
+      "movie_trash_unsupported",
+      "This item is not a supported .mp4 or .mkv file.",
+    ],
+    [
+      "movie_trash_folder_unavailable",
+      "The configured Movies folder is no longer available.",
+    ],
+    [
+      "movie_trash_outside_folder",
+      "This movie is outside the configured Movies folder.",
+    ],
+    [
+      "movie_trash_stale",
+      "This movie is no longer part of the current Library.",
+    ],
+    [
+      "movie_trash_failed",
+      "The operating system could not move this movie to Trash or the Recycle Bin.",
+    ],
+  ])(
+    "reports %s in the confirmation and keeps the movie",
+    async (errorCode, expectedMessage) => {
+      const path = "/Movies/First — exact.mp4";
+      window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+      scanMoviesMock.mockResolvedValue([
+        path,
+        "/Movies/Second remains available.mkv",
+      ]);
+      trashMovieMock.mockRejectedValueOnce(errorCode);
+
+      render(<App />);
+      selectLibrary();
+
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Move movie to Trash or Recycle Bin: First — exact",
+        }),
+      );
+      const dialog = await screen.findByRole("alertdialog");
+      fireEvent.click(
+        within(dialog).getByRole("button", {
+          name: "Confirm moving movie to Trash or Recycle Bin: First — exact",
+        }),
+      );
+
+      expect(await within(dialog).findByRole("alert")).toHaveProperty(
+        "textContent",
+        expectedMessage,
+      );
+      expect(dialog.textContent).not.toContain(path);
+      expect(screen.getByText("First — exact", { selector: "h3" })).toBeTruthy();
+      expect(
+        within(dialog).getByRole("button", {
+          name: "Confirm moving movie to Trash or Recycle Bin: First — exact",
+        }),
+      ).toHaveProperty("disabled", false);
+      expect(trashMovieMock).toHaveBeenCalledWith({
+        folder: "/Movies",
+        libraryPaths: [path, "/Movies/Second remains available.mkv"],
+        path,
+      });
+      expect(openMovieMock).not.toHaveBeenCalled();
+      expect(revealMovieMock).not.toHaveBeenCalled();
+      expect(clipboardWriteMock).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("invalidates a stale refresh result after a pending Trash request succeeds", async () => {
+    const pendingTrash = createDeferred<void>();
+    const staleRefresh = createDeferred<string[]>();
+    const trashedPath = "/Movies/Trash during refresh.mp4";
+    const remainingPath = "/Movies/Remaining.mkv";
+    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    scanMoviesMock
+      .mockResolvedValueOnce([trashedPath, remainingPath])
+      .mockReturnValueOnce(staleRefresh.promise)
+      .mockResolvedValueOnce([remainingPath]);
+    trashMovieMock.mockReturnValue(pendingTrash.promise);
+
+    render(<App />);
+    selectLibrary();
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Move movie to Trash or Recycle Bin: Trash during refresh",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving movie to Trash or Recycle Bin: Trash during refresh",
+      }),
+    );
+    expect(trashMovieMock).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByText("Refresh", { selector: "button" }));
+    expect(await screen.findByText("Scanning Movies folder")).toBeTruthy();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      pendingTrash.resolve(undefined);
+      await pendingTrash.promise;
+    });
+
+    expect(await screen.findByText("Remaining")).toBeTruthy();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(3);
+    expect(
+      screen.queryByRole("heading", {
+        level: 3,
+        name: "Trash during refresh",
+      }),
+    ).toBeNull();
+
+    await act(async () => {
+      staleRefresh.resolve([trashedPath, remainingPath]);
+      await staleRefresh.promise;
+    });
+    expect(screen.getByText("Remaining")).toBeTruthy();
+    expect(screen.queryByText("Trash during refresh")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not let a late Trash response alter a replacement folder", async () => {
+    const pendingTrash = createDeferred<void>();
+    const oldFolder = "/Movies/Old";
+    const newFolder = "/Movies/New";
+    const oldPath = `${oldFolder}/Old movie.mp4`;
+    const newPath = `${newFolder}/New movie.mkv`;
+    window.localStorage.setItem("auto-video-movies-folder", oldFolder);
+    scanMoviesMock
+      .mockResolvedValueOnce([oldPath])
+      .mockResolvedValueOnce([newPath]);
+    trashMovieMock.mockReturnValue(pendingTrash.promise);
+    openFolderMock.mockResolvedValue(newFolder);
+
+    render(<App />);
+    selectLibrary();
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Move movie to Trash or Recycle Bin: Old movie",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving movie to Trash or Recycle Bin: Old movie",
+      }),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { hidden: true, name: "Settings" }),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Change folder" }));
+      await Promise.resolve();
+    });
+    selectLibrary();
+    expect(await screen.findByText("New movie")).toBeTruthy();
+
+    await act(async () => {
+      pendingTrash.resolve(undefined);
+      await pendingTrash.promise;
+    });
+
+    expect(screen.getByText("New movie")).toBeTruthy();
+    expect(
+      screen.queryByText("Old movie was moved to Trash or the Recycle Bin."),
+    ).toBeNull();
+    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
+      newFolder,
+    );
+    expect(scanMoviesMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("opens the exact scanned path once while preserving copy and pagination state", async () => {
     const pendingOpen = createDeferred<void>();
     const exactPath =
@@ -959,6 +1422,7 @@ describe("local Movies library", () => {
     expect(openMovieMock).toHaveBeenCalledTimes(1);
     expect(openMovieMock).toHaveBeenCalledWith({ path: exactPath });
     expect(revealMovieMock).not.toHaveBeenCalled();
+    expect(trashMovieMock).not.toHaveBeenCalled();
     expect(openButton).toHaveProperty("disabled", true);
     expect(openButton.getAttribute("aria-label")).toBe(
       `Opening movie: ${title}`,
@@ -1043,6 +1507,7 @@ describe("local Movies library", () => {
       expect(firstOpenButton).toHaveProperty("disabled", false);
       expect(openMovieMock).toHaveBeenCalledWith({ path: firstPath });
       expect(revealMovieMock).not.toHaveBeenCalled();
+      expect(trashMovieMock).not.toHaveBeenCalled();
       expect(clipboardWriteMock).not.toHaveBeenCalled();
       expect(scanMoviesMock).toHaveBeenCalledTimes(1);
     },
@@ -1112,6 +1577,7 @@ describe("local Movies library", () => {
 
     expect(revealMovieMock).toHaveBeenCalledTimes(1);
     expect(revealMovieMock).toHaveBeenCalledWith({ path: exactPath });
+    expect(trashMovieMock).not.toHaveBeenCalled();
     expect(revealButton).toHaveProperty("disabled", true);
     expect(revealButton.getAttribute("aria-label")).toBe(
       `Revealing movie: ${title}`,
@@ -1221,6 +1687,7 @@ describe("local Movies library", () => {
       expect(firstRevealButton).toHaveProperty("disabled", false);
       expect(revealMovieMock).toHaveBeenCalledWith({ path: firstPath });
       expect(openMovieMock).not.toHaveBeenCalled();
+      expect(trashMovieMock).not.toHaveBeenCalled();
       expect(clipboardWriteMock).not.toHaveBeenCalled();
       expect(scanMoviesMock).toHaveBeenCalledTimes(1);
     },

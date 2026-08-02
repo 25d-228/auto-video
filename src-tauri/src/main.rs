@@ -6,6 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::process::{Command, Stdio};
+
 use tauri::Manager;
 
 const MOVIES_FOLDER_UNAVAILABLE: &str = "movies_folder_unavailable";
@@ -20,6 +23,14 @@ const MOVIE_REVEAL_NOT_FILE: &str = "movie_reveal_not_file";
 const MOVIE_REVEAL_NOT_FOUND: &str = "movie_reveal_not_found";
 const MOVIE_REVEAL_UNAVAILABLE: &str = "movie_reveal_unavailable";
 const MOVIE_REVEAL_UNSUPPORTED: &str = "movie_reveal_unsupported";
+const MOVIE_TRASH_FAILED: &str = "movie_trash_failed";
+const MOVIE_TRASH_FOLDER_UNAVAILABLE: &str = "movie_trash_folder_unavailable";
+const MOVIE_TRASH_NOT_FILE: &str = "movie_trash_not_file";
+const MOVIE_TRASH_NOT_FOUND: &str = "movie_trash_not_found";
+const MOVIE_TRASH_OUTSIDE_FOLDER: &str = "movie_trash_outside_folder";
+const MOVIE_TRASH_STALE: &str = "movie_trash_stale";
+const MOVIE_TRASH_UNAVAILABLE: &str = "movie_trash_unavailable";
+const MOVIE_TRASH_UNSUPPORTED: &str = "movie_trash_unsupported";
 const TMDB_TOKEN_FILE_NAME: &str = ".tmdb-api-read-access-token";
 const TMDB_TOKEN_INVALID: &str = "tmdb_token_invalid";
 const TMDB_TOKEN_STORAGE_FAILED: &str = "tmdb_token_storage_failed";
@@ -96,6 +107,15 @@ impl MoviePathValidationError {
             Self::Unsupported => MOVIE_REVEAL_UNSUPPORTED,
         }
     }
+
+    fn trash_error_code(self) -> &'static str {
+        match self {
+            Self::NotFound => MOVIE_TRASH_NOT_FOUND,
+            Self::Unavailable => MOVIE_TRASH_UNAVAILABLE,
+            Self::NotFile => MOVIE_TRASH_NOT_FILE,
+            Self::Unsupported => MOVIE_TRASH_UNSUPPORTED,
+        }
+    }
 }
 
 fn movie_metadata_error(error: &io::Error) -> MoviePathValidationError {
@@ -134,6 +154,100 @@ fn reveal_movie_path_with(
     validate_movie_path(path).map_err(MoviePathValidationError::reveal_error_code)?;
 
     dispatch(path).map_err(|_| MOVIE_REVEAL_FAILED)
+}
+
+fn trash_movie_path_with(
+    path: &Path,
+    folder: &Path,
+    confirmed_movie_paths: &[String],
+    current_movie_paths: &[String],
+    dispatch: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    let folder_metadata = fs::metadata(folder).map_err(|_| MOVIE_TRASH_FOLDER_UNAVAILABLE)?;
+    if !folder_metadata.is_dir() {
+        return Err(MOVIE_TRASH_FOLDER_UNAVAILABLE);
+    }
+
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| movie_metadata_error(&error).trash_error_code())?;
+    if !path_metadata.is_file() {
+        return Err(MOVIE_TRASH_NOT_FILE);
+    }
+    if !is_supported_movie(path) {
+        return Err(MOVIE_TRASH_UNSUPPORTED);
+    }
+
+    let canonical_folder = fs::canonicalize(folder).map_err(|_| MOVIE_TRASH_FOLDER_UNAVAILABLE)?;
+    let canonical_path =
+        fs::canonicalize(path).map_err(|error| movie_metadata_error(&error).trash_error_code())?;
+    if !canonical_path.starts_with(canonical_folder) {
+        return Err(MOVIE_TRASH_OUTSIDE_FOLDER);
+    }
+
+    let requested_path = path.to_str().ok_or(MOVIE_TRASH_UNAVAILABLE)?;
+    if !confirmed_movie_paths
+        .iter()
+        .any(|confirmed_path| confirmed_path == requested_path)
+        || !current_movie_paths
+            .iter()
+            .any(|current_path| current_path == requested_path)
+    {
+        return Err(MOVIE_TRASH_STALE);
+    }
+
+    dispatch(path).map_err(|_| MOVIE_TRASH_FAILED)
+}
+
+#[cfg(target_os = "macos")]
+fn move_to_os_trash(path: &Path) -> Result<(), ()> {
+    const MACOS_TRASH_SCRIPT: &str = r#"on run argv
+tell application "Finder"
+  delete (POSIX file (item 1 of argv))
+end tell
+end run"#;
+
+    Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(MACOS_TRASH_SCRIPT)
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| ())?
+        .success()
+        .then_some(())
+        .ok_or(())
+}
+
+#[cfg(target_os = "windows")]
+fn move_to_os_trash(path: &Path) -> Result<(), ()> {
+    const WINDOWS_TRASH_PATH_ENV: &str = "AUTO_VIDEO_TRASH_PATH";
+    // Microsoft.VisualBasic sends the file to the Recycle Bin without a permanent-delete fallback.
+    const WINDOWS_RECYCLE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName Microsoft.VisualBasic
+[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+  $env:AUTO_VIDEO_TRASH_PATH,
+  [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+  [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,
+  [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException
+)"#;
+
+    Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(WINDOWS_RECYCLE_SCRIPT)
+        .env(WINDOWS_TRASH_PATH_ENV, path.as_os_str())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| ())?
+        .success()
+        .then_some(())
+        .ok_or(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn move_to_os_trash(_path: &Path) -> Result<(), ()> {
+    Err(())
 }
 
 fn is_valid_tmdb_token(token: &str) -> bool {
@@ -236,6 +350,33 @@ async fn reveal_movie(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn trash_movie(
+    path: String,
+    folder: String,
+    library_paths: Vec<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let current_movie_paths = scan_movie_paths(Path::new(&folder)).map_err(|error| {
+            if error == MOVIES_FOLDER_UNAVAILABLE {
+                MOVIE_TRASH_FOLDER_UNAVAILABLE
+            } else {
+                MOVIE_TRASH_UNAVAILABLE
+            }
+        })?;
+        trash_movie_path_with(
+            Path::new(&path),
+            Path::new(&folder),
+            &library_paths,
+            &current_movie_paths,
+            move_to_os_trash,
+        )
+    })
+    .await
+    .map_err(|_| MOVIE_TRASH_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn load_tmdb_token(app: tauri::AppHandle) -> Result<Option<String>, String> {
     load_tmdb_token_file(&tmdb_token_path(&app)?).map_err(str::to_owned)
 }
@@ -257,6 +398,7 @@ fn main() {
             scan_movies,
             open_movie,
             reveal_movie,
+            trash_movie,
             load_tmdb_token,
             save_tmdb_token,
             clear_tmdb_token
@@ -276,11 +418,14 @@ mod tests {
 
     use super::{
         clear_tmdb_token_file, load_tmdb_token_file, movie_metadata_error, open_movie_path_with,
-        reveal_movie_path_with, save_tmdb_token_file, scan_movie_paths, MoviePathValidationError,
-        MOVIES_FOLDER_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND,
-        MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE,
-        MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED,
-        TMDB_TOKEN_INVALID,
+        reveal_movie_path_with, save_tmdb_token_file, scan_movie_paths, trash_movie_path_with,
+        MoviePathValidationError, MOVIES_FOLDER_UNAVAILABLE, MOVIE_OPEN_FAILED,
+        MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED,
+        MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
+        MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED,
+        MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND,
+        MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE, MOVIE_TRASH_UNAVAILABLE,
+        MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID,
     };
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -388,6 +533,28 @@ mod tests {
     }
 
     #[test]
+    fn trashes_the_exact_current_movie_path_after_root_validation() {
+        let fixture = FilesystemFixture::new();
+        let movie_path = fixture.create_file("nested/映画  —  Final.CUT!.MKV");
+        let current_movie_paths = vec![path_string(movie_path.clone())];
+        let dispatched_path = RefCell::new(None);
+
+        let result = trash_movie_path_with(
+            &movie_path,
+            &fixture.path,
+            &current_movie_paths,
+            &current_movie_paths,
+            |path| {
+                dispatched_path.replace(Some(path.to_path_buf()));
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(dispatched_path.into_inner(), Some(movie_path));
+    }
+
+    #[test]
     fn open_rejects_missing_directories_and_unsupported_files_before_dispatch() {
         let fixture = FilesystemFixture::new();
         let missing_path = fixture.path.join("missing.mp4");
@@ -436,6 +603,129 @@ mod tests {
     }
 
     #[test]
+    fn trash_rejects_invalid_or_unassociated_targets_before_dispatch() {
+        let fixture = FilesystemFixture::new();
+        let outside_fixture = FilesystemFixture::new();
+        let missing_path = fixture.path.join("missing.mp4");
+        let directory_path = fixture.path.join("directory.mkv");
+        let unsupported_path = fixture.create_file("notes.txt");
+        let unconfirmed_path = fixture.create_file("unconfirmed.mp4");
+        let stale_path = fixture.create_file("stale.mp4");
+        let outside_path = outside_fixture.create_file("outside.mkv");
+        fs::create_dir(&directory_path).expect("failed to create fixture directory");
+
+        for (path, folder, confirmed_movie_paths, current_movie_paths, expected_error) in [
+            (
+                &missing_path,
+                &fixture.path,
+                Vec::new(),
+                Vec::new(),
+                MOVIE_TRASH_NOT_FOUND,
+            ),
+            (
+                &directory_path,
+                &fixture.path,
+                Vec::new(),
+                Vec::new(),
+                MOVIE_TRASH_NOT_FILE,
+            ),
+            (
+                &unsupported_path,
+                &fixture.path,
+                Vec::new(),
+                Vec::new(),
+                MOVIE_TRASH_UNSUPPORTED,
+            ),
+            (
+                &outside_path,
+                &fixture.path,
+                vec![path_string(outside_path.clone())],
+                vec![path_string(outside_path.clone())],
+                MOVIE_TRASH_OUTSIDE_FOLDER,
+            ),
+            (
+                &unconfirmed_path,
+                &fixture.path,
+                Vec::new(),
+                vec![path_string(unconfirmed_path.clone())],
+                MOVIE_TRASH_STALE,
+            ),
+            (
+                &stale_path,
+                &fixture.path,
+                vec![path_string(stale_path.clone())],
+                Vec::new(),
+                MOVIE_TRASH_STALE,
+            ),
+        ] {
+            let dispatched = RefCell::new(false);
+            let result = trash_movie_path_with(
+                path,
+                folder,
+                &confirmed_movie_paths,
+                &current_movie_paths,
+                |_| {
+                    dispatched.replace(true);
+                    Ok(())
+                },
+            );
+
+            assert_eq!(result, Err(expected_error));
+            assert!(!dispatched.into_inner());
+        }
+    }
+
+    #[test]
+    fn trash_rejects_an_unavailable_movies_folder_before_dispatch() {
+        let fixture = FilesystemFixture::new();
+        let movie_path = fixture.create_file("Movie.mp4");
+        let missing_folder = fixture.path.join("missing-folder");
+        let current_movie_paths = vec![path_string(movie_path.clone())];
+        let dispatched = RefCell::new(false);
+
+        let result = trash_movie_path_with(
+            &movie_path,
+            &missing_folder,
+            &current_movie_paths,
+            &current_movie_paths,
+            |_| {
+                dispatched.replace(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(MOVIE_TRASH_FOLDER_UNAVAILABLE));
+        assert!(!dispatched.into_inner());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trash_rejects_a_symlink_instead_of_treating_it_as_a_regular_file() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = FilesystemFixture::new();
+        let movie_path = fixture.create_file("Movie.mp4");
+        let symlink_path = fixture.path.join("Movie link.mp4");
+        symlink(movie_path, &symlink_path).expect("failed to create fixture symlink");
+        let current_movie_paths = vec![path_string(symlink_path.clone())];
+        let dispatched = RefCell::new(false);
+
+        let result = trash_movie_path_with(
+            &symlink_path,
+            &fixture.path,
+            &current_movie_paths,
+            &current_movie_paths,
+            |_| {
+                dispatched.replace(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(MOVIE_TRASH_NOT_FILE));
+        assert!(!dispatched.into_inner());
+    }
+
+    #[test]
     fn reports_inaccessible_metadata_and_operating_system_action_failures() {
         let inaccessible = io::Error::new(io::ErrorKind::PermissionDenied, "fixture denial");
         assert_eq!(
@@ -450,6 +740,10 @@ mod tests {
             MoviePathValidationError::Unavailable.reveal_error_code(),
             MOVIE_REVEAL_UNAVAILABLE
         );
+        assert_eq!(
+            MoviePathValidationError::Unavailable.trash_error_code(),
+            MOVIE_TRASH_UNAVAILABLE
+        );
 
         let fixture = FilesystemFixture::new();
         let movie_path = fixture.create_file("Valid.mp4");
@@ -460,6 +754,16 @@ mod tests {
         assert_eq!(
             reveal_movie_path_with(&movie_path, |_| Err(())),
             Err(MOVIE_REVEAL_FAILED)
+        );
+        assert_eq!(
+            trash_movie_path_with(
+                &movie_path,
+                &fixture.path,
+                &[path_string(movie_path.clone())],
+                &[path_string(movie_path.clone())],
+                |_| Err(())
+            ),
+            Err(MOVIE_TRASH_FAILED)
         );
     }
 
