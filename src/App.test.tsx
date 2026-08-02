@@ -97,6 +97,21 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("Mira visual preset", () => {
+  it("renders existing accessible controls with Base UI and Phosphor icons", () => {
+    render(<App />);
+
+    const dashboard = screen.getByRole("button", { name: "Dashboard" });
+    expect(dashboard.getAttribute("data-slot")).toBe("button");
+
+    const icons = Array.from(document.querySelectorAll("svg.app-icon"));
+    expect(icons.length).toBeGreaterThan(0);
+    expect(
+      icons.every((icon) => icon.getAttribute("viewBox") === "0 0 256 256"),
+    ).toBe(true);
+  });
+});
+
 describe("Auto-Video application shell", () => {
   it("navigates to every destination and exposes the active page", () => {
     render(<App />);

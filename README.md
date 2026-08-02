@@ -4,7 +4,24 @@ Auto-Video is being rebuilt as a Tauri 2 desktop application with a React and Ty
 
 ## Toolchain
 
-Tauri 2 provides the maintained macOS and Windows native shell. React 19, TypeScript 6, and Vite 8 provide a standard DOM and CSS interface that is compatible with shadcn/ui without adding the component system before the application-shell work.
+Tauri 2 provides the maintained macOS and Windows native shell. React 19, TypeScript 6, and Vite 8 provide the interface foundation. The interface uses the shadcn/ui Base UI Mira preset and its semantic tokens.
+
+## Visual preset
+
+The approved shadcn/ui preset is `b3wnVLs40m`. Base UI is the single component base.
+
+| Setting | Value |
+|---|---|
+| Style | Mira |
+| Base color | Neutral |
+| Theme | Red |
+| Chart color | Rose |
+| Heading | Geist Mono |
+| Font | Inter |
+| Icon library | Phosphor Icons |
+| Radius | None |
+| Menu | Default (solid) |
+| Menu accent | Subtle |
 
 ## Requirements
 
