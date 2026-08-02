@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+*.log
+
+.env
+.env.*
+*.local
+
+src-tauri/target/
+src-tauri/gen/
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
