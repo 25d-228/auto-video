@@ -5,6 +5,7 @@ import {
   fireEvent,
   render,
   screen,
+  within,
 } from "@testing-library/react";
 import {
   afterEach,
@@ -40,6 +41,7 @@ let saveTmdbTokenMock: Mock<
 >;
 let clearTmdbTokenMock: Mock<() => Promise<void>>;
 let fetchMock: Mock<typeof fetch>;
+let clipboardWriteMock: Mock<(text: string) => Promise<void>>;
 
 function createMediaQueryList(query: string): MediaQueryList {
   return {
@@ -135,12 +137,17 @@ beforeEach(() => {
     },
   );
   fetchMock = vi.fn();
+  clipboardWriteMock = vi.fn().mockResolvedValue(undefined);
   openFolderMock.mockReset();
   openFolderMock.mockResolvedValue(null);
   window.localStorage.clear();
   vi.stubGlobal("matchMedia", vi.fn(createMediaQueryList));
   vi.stubGlobal("__TAURI__", { core: { invoke: invokeMock } });
   vi.stubGlobal("fetch", fetchMock);
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: clipboardWriteMock },
+  });
 });
 
 afterEach(() => {
@@ -148,6 +155,8 @@ afterEach(() => {
   window.localStorage.clear();
   delete document.documentElement.dataset.appearance;
   delete document.documentElement.dataset.theme;
+  Reflect.deleteProperty(navigator, "clipboard");
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -438,6 +447,80 @@ describe("TMDB Discover", () => {
     expect(screen.getAllByText("Poster unavailable")).toHaveLength(2);
   });
 
+  it("copies the exact Discover title with isolated keyboard-accessible feedback", async () => {
+    const title = "映画  —  A Very Long Director's “CUT”!";
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockResolvedValue(
+      jsonResponse({ results: [{ id: 91, title, poster_path: null }] }),
+    );
+    const parentActivation = vi.fn();
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectDiscover();
+
+    const heading = await screen.findByRole("heading", {
+      level: 3,
+      name: "映画 — A Very Long Director's “CUT”!",
+    });
+    const card = heading.closest("article") as HTMLElement;
+    const copyButton = within(card).getByRole("button", {
+      name: /Copy title:/,
+    });
+    expect(copyButton.getAttribute("aria-label")).toBe(`Copy title: ${title}`);
+    expect(copyButton.getAttribute("data-copy-state")).toBe("idle");
+    copyButton.focus();
+    expect(document.activeElement).toBe(copyButton);
+    parentActivation.mockClear();
+
+    vi.useFakeTimers();
+    fireEvent.pointerDown(copyButton);
+    await act(async () => {
+      fireEvent.click(copyButton);
+      await Promise.resolve();
+    });
+
+    expect(clipboardWriteMock).toHaveBeenCalledWith(title);
+    expect(parentActivation).not.toHaveBeenCalled();
+    expect(copyButton.getAttribute("aria-label")).toBe(
+      `Copied title: ${title}`,
+    );
+    expect(within(card).getByRole("status").textContent).toBe(
+      `Copied title: ${title}`,
+    );
+
+    act(() => vi.advanceTimersByTime(2000));
+    expect(copyButton.getAttribute("aria-label")).toBe(`Copy title: ${title}`);
+  });
+
+  it("reports a rejected Discover clipboard write on its card", async () => {
+    clipboardWriteMock.mockRejectedValue(new Error("permission denied"));
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockResolvedValue(
+      jsonResponse({ results: [{ id: 92, title: "Rejected title" }] }),
+    );
+
+    render(<App />);
+    selectDiscover();
+
+    const copyButton = await screen.findByRole("button", {
+      name: "Copy title: Rejected title",
+    });
+    fireEvent.click(copyButton);
+
+    expect(
+      await screen.findByRole("button", {
+        name: "Copy failed for title: Rejected title",
+      }),
+    ).toHaveProperty("textContent", "Failed");
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Copy failed for title: Rejected title",
+    );
+  });
+
   it.each([
     {
       caseName: "empty feed",
@@ -652,6 +735,65 @@ describe("local Movies library", () => {
         name: "CAPS & punctuation!",
       }),
     ).toBeTruthy();
+  });
+
+  it("copies the exact filename-derived Library title without parent activation", async () => {
+    const title = "映画  —  Final.CUT & punctuation!";
+    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    scanMoviesMock.mockResolvedValue([`/Movies/${title}.MKV`]);
+    const parentActivation = vi.fn();
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectLibrary();
+
+    const heading = await screen.findByRole("heading", {
+      level: 3,
+      name: "映画 — Final.CUT & punctuation!",
+    });
+    const card = heading.closest("article") as HTMLElement;
+    const copyButton = within(card).getByRole("button", {
+      name: /Copy title:/,
+    });
+    parentActivation.mockClear();
+    fireEvent.pointerDown(copyButton);
+    await act(async () => {
+      fireEvent.click(copyButton);
+      await Promise.resolve();
+    });
+
+    expect(clipboardWriteMock).toHaveBeenCalledWith(title);
+    expect(parentActivation).not.toHaveBeenCalled();
+    expect(copyButton.getAttribute("aria-label")).toBe(
+      `Copied title: ${title}`,
+    );
+  });
+
+  it("reports an unavailable clipboard on the affected Library card", async () => {
+    Reflect.deleteProperty(navigator, "clipboard");
+    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    scanMoviesMock.mockResolvedValue(["/Movies/Unavailable clipboard.mp4"]);
+
+    render(<App />);
+    selectLibrary();
+
+    const copyButton = await screen.findByRole("button", {
+      name: "Copy title: Unavailable clipboard",
+    });
+    fireEvent.click(copyButton);
+
+    expect(
+      await screen.findByRole("button", {
+        name: "Copy failed for title: Unavailable clipboard",
+      }),
+    ).toHaveProperty("textContent", "Failed");
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Copy failed for title: Unavailable clipboard",
+    );
+    expect(clipboardWriteMock).not.toHaveBeenCalled();
   });
 
   it("refresh replaces files added or removed since the previous scan", async () => {

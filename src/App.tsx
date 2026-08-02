@@ -1,6 +1,8 @@
 import {
   ArrowClockwiseIcon,
+  CheckIcon,
   CompassIcon,
+  CopySimpleIcon,
   DownloadSimpleIcon,
   FilmSlateIcon,
   FilmStripIcon,
@@ -14,11 +16,13 @@ import {
   PlayIcon,
   SquaresFourIcon,
   SunIcon,
+  WarningCircleIcon,
 } from "@phosphor-icons/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
   useEffect,
   useRef,
   useState,
@@ -100,6 +104,9 @@ const appIcons = {
   refresh: ArrowClockwiseIcon,
   movie: FilmStripIcon,
   poster: ImageSquareIcon,
+  copy: CopySimpleIcon,
+  copied: CheckIcon,
+  "copy-error": WarningCircleIcon,
 } satisfies Record<string, Icon>;
 
 type AppearanceMode = (typeof appearanceModes)[number]["id"];
@@ -123,11 +130,14 @@ type CredentialMessage = {
   role: "alert" | "status";
   text: string;
 };
+type CopyTitleState = "idle" | "success" | "error";
 
 const appearanceStorageKey = "auto-video-appearance";
 const moviesFolderStorageKey = "auto-video-movies-folder";
 const moviesFolderUnavailable = "movies_folder_unavailable";
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
+// Two seconds confirms a successful copy without leaving stale feedback on the card.
+const copySuccessDuration = 2000;
 
 const movieScanMessages = {
   unconfigured: {
@@ -221,6 +231,97 @@ function AppIcon({ name }: { name: IconName }) {
   );
 }
 
+function CopyTitleAction({ title }: { title: string }) {
+  const [copyState, setCopyState] = useState<CopyTitleState>("idle");
+  const resetFeedbackTimeout = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (resetFeedbackTimeout.current !== null) {
+        window.clearTimeout(resetFeedbackTimeout.current);
+      }
+    },
+    [],
+  );
+
+  const copyTitle = async (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+
+    if (resetFeedbackTimeout.current !== null) {
+      window.clearTimeout(resetFeedbackTimeout.current);
+      resetFeedbackTimeout.current = null;
+    }
+    setCopyState("idle");
+
+    try {
+      const clipboard = navigator.clipboard;
+      if (
+        clipboard === undefined ||
+        typeof clipboard.writeText !== "function"
+      ) {
+        setCopyState("error");
+        return;
+      }
+
+      await clipboard.writeText(title);
+      setCopyState("success");
+      resetFeedbackTimeout.current = window.setTimeout(() => {
+        setCopyState("idle");
+        resetFeedbackTimeout.current = null;
+      }, copySuccessDuration);
+    } catch {
+      setCopyState("error");
+    }
+  };
+
+  const accessibleLabel =
+    copyState === "success"
+      ? `Copied title: ${title}`
+      : copyState === "error"
+        ? `Copy failed for title: ${title}`
+        : `Copy title: ${title}`;
+  const visibleLabel =
+    copyState === "success"
+      ? "Copied"
+      : copyState === "error"
+        ? "Failed"
+        : "Copy";
+  const iconName =
+    copyState === "success"
+      ? "copied"
+      : copyState === "error"
+        ? "copy-error"
+        : "copy";
+
+  return (
+    <>
+      <Button
+        aria-label={accessibleLabel}
+        className="title-copy-button"
+        data-copy-state={copyState}
+        onClick={copyTitle}
+        onKeyDown={(event) => event.stopPropagation()}
+        onPointerDown={(event) => event.stopPropagation()}
+        size="xs"
+        type="button"
+        variant="ghost"
+      >
+        <AppIcon name={iconName} />
+        {visibleLabel}
+      </Button>
+      {copyState !== "idle" ? (
+        <span
+          aria-atomic="true"
+          className="sr-only"
+          role={copyState === "error" ? "alert" : "status"}
+        >
+          {accessibleLabel}
+        </span>
+      ) : null}
+    </>
+  );
+}
+
 function DiscoverMovieCard({
   movie,
   resultIndex,
@@ -248,7 +349,10 @@ function DiscoverMovieCard({
         )}
       </div>
       <div className="discover-card__body">
-        <h3 id={titleId}>{movie.title}</h3>
+        <div className="media-title-row">
+          <h3 id={titleId}>{movie.title}</h3>
+          <CopyTitleAction title={movie.title} />
+        </div>
         <dl>
           <div>
             <dt>Release</dt>
@@ -808,7 +912,10 @@ export default function App() {
                         <span className="movie-card__icon">
                           <AppIcon name="movie" />
                         </span>
-                        <h3>{movie.title}</h3>
+                        <div className="media-title-row">
+                          <h3>{movie.title}</h3>
+                          <CopyTitleAction title={movie.title} />
+                        </div>
                       </article>
                     </li>
                   ))}

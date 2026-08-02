@@ -55,4 +55,20 @@ describe("Mira preset contract", () => {
     );
     expect(new Set(surfaceRadii)).toEqual(new Set(["var(--radius)"]));
   });
+
+  it("reserves a stable title action column and reveals it for hover and focus", () => {
+    expect(applicationStyles).toContain(
+      "grid-template-columns: minmax(0, 1fr) 4.25rem;",
+    );
+    expect(applicationStyles).toContain(
+      ".media-title-row:hover .title-copy-button,",
+    );
+    expect(applicationStyles).toContain(
+      ".media-title-row:focus-within .title-copy-button,",
+    );
+    expect(applicationStyles).toContain(
+      '.title-copy-button[data-copy-state="success"],',
+    );
+    expect(applicationStyles).toContain("@media (hover: none)");
+  });
 });
