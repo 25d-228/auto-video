@@ -20,10 +20,13 @@ import {
 } from "@phosphor-icons/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  type CSSProperties,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -131,6 +134,12 @@ type CredentialMessage = {
   text: string;
 };
 type CopyTitleState = "idle" | "success" | "error";
+type GalleryVariant = "discover" | "library";
+type GalleryLayout = {
+  capacity: number;
+  columns: number;
+  rowHeight: number;
+};
 
 const appearanceStorageKey = "auto-video-appearance";
 const moviesFolderStorageKey = "auto-video-movies-folder";
@@ -138,6 +147,12 @@ const moviesFolderUnavailable = "movies_folder_unavailable";
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
 // Two seconds confirms a successful copy without leaving stale feedback on the card.
 const copySuccessDuration = 2000;
+// These pixel values mirror the current 0.75rem gap and 13rem minimum card width.
+const galleryGap = 12;
+const minimumGalleryCardWidth = 208;
+// Fixed title limits keep every calculated row within its observed viewport.
+const discoverCardBodyHeight = 160;
+const libraryCardHeight = 136;
 
 const movieScanMessages = {
   unconfigured: {
@@ -319,6 +334,161 @@ function CopyTitleAction({ title }: { title: string }) {
         </span>
       ) : null}
     </>
+  );
+}
+
+function calculateGalleryLayout(
+  variant: GalleryVariant,
+  width: number,
+  height: number,
+): GalleryLayout {
+  const columns = Math.max(
+    1,
+    Math.floor(
+      (width + galleryGap) / (minimumGalleryCardWidth + galleryGap),
+    ),
+  );
+  const cardWidth = Math.max(
+    0,
+    (width - galleryGap * (columns - 1)) / columns,
+  );
+  const rowHeight =
+    variant === "discover"
+      ? cardWidth * 1.5 + discoverCardBodyHeight
+      : libraryCardHeight;
+  const rows = Math.max(
+    1,
+    Math.floor((height + galleryGap) / (rowHeight + galleryGap)),
+  );
+
+  return { capacity: columns * rows, columns, rowHeight };
+}
+
+function ResizeAwareGallery<Item>({
+  ariaLabel,
+  getItemKey,
+  items,
+  renderItem,
+  variant,
+}: {
+  ariaLabel: string;
+  getItemKey: (item: Item, index: number) => string;
+  items: Item[];
+  renderItem: (item: Item, index: number) => ReactNode;
+  variant: GalleryVariant;
+}) {
+  const viewport = useRef<HTMLDivElement | null>(null);
+  const [layout, setLayout] = useState<GalleryLayout>(() =>
+    calculateGalleryLayout(variant, minimumGalleryCardWidth, 1),
+  );
+  const [selectedPage, setSelectedPage] = useState(1);
+
+  useLayoutEffect(() => {
+    const galleryViewport = viewport.current;
+    if (galleryViewport === null) {
+      return;
+    }
+
+    const updateLayout = (width: number, height: number) => {
+      if (width <= 0 || height <= 0) {
+        return;
+      }
+
+      const nextLayout = calculateGalleryLayout(variant, width, height);
+      setLayout((currentLayout) =>
+        currentLayout.capacity === nextLayout.capacity &&
+        currentLayout.columns === nextLayout.columns &&
+        currentLayout.rowHeight === nextLayout.rowHeight
+          ? currentLayout
+          : nextLayout,
+      );
+    };
+    const resizeObserver = new ResizeObserver((entries) => {
+      const entry = entries.find(
+        ({ target }) => target === galleryViewport,
+      );
+      if (entry !== undefined) {
+        updateLayout(entry.contentRect.width, entry.contentRect.height);
+      }
+    });
+    const initialBounds = galleryViewport.getBoundingClientRect();
+
+    updateLayout(initialBounds.width, initialBounds.height);
+    resizeObserver.observe(galleryViewport);
+    return () => resizeObserver.disconnect();
+  }, [variant]);
+
+  const pageCount = Math.max(1, Math.ceil(items.length / layout.capacity));
+  const currentPage = Math.min(selectedPage, pageCount);
+  const firstVisibleIndex = (currentPage - 1) * layout.capacity;
+  const visibleItems = items.slice(
+    firstVisibleIndex,
+    firstVisibleIndex + layout.capacity,
+  );
+  const gridStyle = {
+    "--gallery-columns": layout.columns,
+    "--gallery-row-height": `${layout.rowHeight}px`,
+  } as CSSProperties;
+
+  useLayoutEffect(() => {
+    if (selectedPage !== currentPage) {
+      setSelectedPage(currentPage);
+    }
+  }, [currentPage, selectedPage]);
+
+  return (
+    <div
+      className={`media-gallery media-gallery--${variant}`}
+      data-current-page={currentPage}
+      data-gallery={variant}
+      data-page-capacity={layout.capacity}
+      data-page-count={pageCount}
+    >
+      <div className="media-gallery__viewport" ref={viewport}>
+        <ul
+          aria-label={ariaLabel}
+          className={`media-grid ${variant === "discover" ? "discover-grid" : "movie-grid"}`}
+          style={gridStyle}
+        >
+          {visibleItems.map((item, visibleIndex) => {
+            const itemIndex = firstVisibleIndex + visibleIndex;
+            return (
+              <li key={getItemKey(item, itemIndex)}>
+                {renderItem(item, itemIndex)}
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+      <nav
+        aria-label={`${ariaLabel} pagination`}
+        className="media-pagination"
+      >
+        <Button
+          aria-label={`Previous ${ariaLabel} page`}
+          disabled={currentPage === 1}
+          onClick={() => setSelectedPage(currentPage - 1)}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          Previous
+        </Button>
+        <p aria-atomic="true" aria-live="polite">
+          Page {currentPage} of {pageCount}
+        </p>
+        <Button
+          aria-label={`Next ${ariaLabel} page`}
+          disabled={currentPage === pageCount}
+          onClick={() => setSelectedPage(currentPage + 1)}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          Next
+        </Button>
+      </nav>
+    </div>
   );
 }
 
@@ -828,18 +998,21 @@ export default function App() {
               </div>
 
               {discoverState.status === "ready" ? (
-                <ul aria-label="Weekly trending Movies" className="discover-grid">
-                  {discoverState.movies.map((movie, resultIndex) => (
-                    <li
-                      key={`${movie.id}-${resultIndex}-${movie.posterPath ?? "posterless"}`}
-                    >
-                      <DiscoverMovieCard
-                        movie={movie}
-                        resultIndex={resultIndex}
-                      />
-                    </li>
-                  ))}
-                </ul>
+                <ResizeAwareGallery
+                  ariaLabel="Weekly trending Movies"
+                  getItemKey={(movie, resultIndex) =>
+                    `${movie.id}-${resultIndex}-${movie.posterPath ?? "posterless"}`
+                  }
+                  items={discoverState.movies}
+                  key="discover-gallery"
+                  renderItem={(movie, resultIndex) => (
+                    <DiscoverMovieCard
+                      movie={movie}
+                      resultIndex={resultIndex}
+                    />
+                  )}
+                  variant="discover"
+                />
               ) : (
                 <div
                   className="empty-state discover-state"
@@ -905,21 +1078,24 @@ export default function App() {
               </div>
 
               {movieScanState.status === "ready" ? (
-                <ul aria-label="Movies" className="movie-grid">
-                  {movieScanState.movies.map((movie) => (
-                    <li key={movie.path}>
-                      <article className="movie-card">
-                        <span className="movie-card__icon">
-                          <AppIcon name="movie" />
-                        </span>
-                        <div className="media-title-row">
-                          <h3>{movie.title}</h3>
-                          <CopyTitleAction title={movie.title} />
-                        </div>
-                      </article>
-                    </li>
-                  ))}
-                </ul>
+                <ResizeAwareGallery
+                  ariaLabel="Movies"
+                  getItemKey={(movie) => movie.path}
+                  items={movieScanState.movies}
+                  key="library-gallery"
+                  renderItem={(movie) => (
+                    <article className="movie-card">
+                      <span className="movie-card__icon">
+                        <AppIcon name="movie" />
+                      </span>
+                      <div className="media-title-row">
+                        <h3>{movie.title}</h3>
+                        <CopyTitleAction title={movie.title} />
+                      </div>
+                    </article>
+                  )}
+                  variant="library"
+                />
               ) : (
                 <div
                   className="empty-state library-state"
