@@ -1,3 +1,18 @@
+import {
+  ArrowClockwiseIcon,
+  CompassIcon,
+  DownloadSimpleIcon,
+  FilmSlateIcon,
+  FilmStripIcon,
+  FolderSimpleIcon,
+  GearSixIcon,
+  type Icon,
+  MonitorIcon,
+  MoonIcon,
+  PlayIcon,
+  SquaresFourIcon,
+  SunIcon,
+} from "@phosphor-icons/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
@@ -5,6 +20,8 @@ import {
   useRef,
   useState,
 } from "react";
+
+import { Button } from "@/components/ui/button";
 
 import "./index.css";
 
@@ -57,48 +74,23 @@ const appearanceModes = [
   { id: "system", label: "System" },
 ] as const;
 
-const iconPaths = {
-  brand: ["m8 5 11 7-11 7V5Z"],
-  dashboard: [
-    "M3 3h7v7H3V3Z",
-    "M14 3h7v7h-7V3Z",
-    "M3 14h7v7H3v-7Z",
-    "M14 14h7v7h-7v-7Z",
-  ],
-  discover: [
-    "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z",
-    "m15.5 8.5-2 5-5 2 2-5 5-2Z",
-  ],
-  library: [
-    "M4 19.5V5a2 2 0 0 1 2-2h11v16H6a2 2 0 0 0-2 2Z",
-    "M8 7h5",
-    "M8 11h5",
-  ],
-  downloads: ["M12 3v12", "m7 10 5 5 5-5", "M5 21h14"],
-  settings: [
-    "M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z",
-    "M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.12 2.12-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1 1.56V20h-3v-.08a1.7 1.7 0 0 0-1-1.56 1.7 1.7 0 0 0-1.88.34l-.06.06-2.12-2.12.06-.06A1.7 1.7 0 0 0 6.08 15 1.7 1.7 0 0 0 4.52 14H4v-3h.52a1.7 1.7 0 0 0 1.56-1 1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.12-2.12.06.06a1.7 1.7 0 0 0 1.88.34 1.7 1.7 0 0 0 1-1.56V4h3v.78a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06 2.12 2.12-.06.06A1.7 1.7 0 0 0 19.4 10 1.7 1.7 0 0 0 20.96 11H21v3h-.04a1.7 1.7 0 0 0-1.56 1Z",
-  ],
-  light: [
-    "M12 2v2",
-    "M12 20v2",
-    "m4.93-14.93 1.41-1.41",
-    "m5.66 18.34 1.41-1.41",
-    "M20 12h2",
-    "M2 12h2",
-    "m16.93 4.93 1.41 1.41",
-    "m5.66 5.66 1.41 1.41",
-    "M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z",
-  ],
-  dark: ["M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"],
-  system: ["M4 4h16v12H4V4Z", "M8 20h8", "M12 16v4"],
-  folder: ["M3 6h6l2 2h10v11H3V6Z"],
-  refresh: ["M20 6v5h-5", "M4 18v-5h5", "M18.5 9A7 7 0 0 0 6 6.5L4 11", "M5.5 15A7 7 0 0 0 18 17.5l2-4.5"],
-  movie: ["M5 3h14v18H5V3Z", "m10 12-5 3V9l5 3Z"],
-} as const;
+const appIcons = {
+  brand: PlayIcon,
+  dashboard: SquaresFourIcon,
+  discover: CompassIcon,
+  library: FilmSlateIcon,
+  downloads: DownloadSimpleIcon,
+  settings: GearSixIcon,
+  light: SunIcon,
+  dark: MoonIcon,
+  system: MonitorIcon,
+  folder: FolderSimpleIcon,
+  refresh: ArrowClockwiseIcon,
+  movie: FilmStripIcon,
+} satisfies Record<string, Icon>;
 
 type AppearanceMode = (typeof appearanceModes)[number]["id"];
-type IconName = keyof typeof iconPaths;
+type IconName = keyof typeof appIcons;
 type ResolvedTheme = Exclude<AppearanceMode, "system">;
 type Movie = { path: string; title: string };
 type MovieScanState =
@@ -146,18 +138,15 @@ const movieScanMessages = {
 } as const;
 
 function AppIcon({ name }: { name: IconName }) {
+  const IconComponent = appIcons[name];
+
   return (
-    <svg
+    <IconComponent
       aria-hidden="true"
       className="app-icon"
-      fill="none"
       focusable="false"
-      viewBox="0 0 24 24"
-    >
-      {iconPaths[name].map((path) => (
-        <path d={path} key={path} />
-      ))}
-    </svg>
+      weight="regular"
+    />
   );
 }
 
@@ -379,7 +368,7 @@ export default function App() {
 
               return (
                 <li key={destination.id}>
-                  <button
+                  <Button
                     aria-current={isActive ? "page" : undefined}
                     className="navigation-item"
                     onClick={() => setActiveDestination(destination)}
@@ -388,10 +377,11 @@ export default function App() {
                       navigationItems.current[index] = element;
                     }}
                     type="button"
+                    variant="ghost"
                   >
                     <AppIcon name={destination.id} />
                     <span>{destination.label}</span>
-                  </button>
+                  </Button>
                 </li>
               );
             })}
@@ -429,15 +419,15 @@ export default function App() {
                   </div>
                 </div>
                 {moviesFolder !== null ? (
-                  <button
-                    className="button button--secondary"
+                  <Button
                     disabled={movieScanState.status === "scanning"}
                     onClick={refreshMovies}
                     type="button"
+                    variant="outline"
                   >
                     <AppIcon name="refresh" />
                     Refresh
-                  </button>
+                  </Button>
                 ) : null}
               </div>
 
@@ -498,8 +488,7 @@ export default function App() {
                     </div>
                   )}
                   <div className="folder-setting__actions">
-                    <button
-                      className="button button--primary"
+                    <Button
                       disabled={isChoosingFolder}
                       onClick={() => void chooseMoviesFolder()}
                       type="button"
@@ -510,15 +499,15 @@ export default function App() {
                         : moviesFolder === null
                           ? "Choose folder"
                           : "Change folder"}
-                    </button>
+                    </Button>
                     {moviesFolder !== null ? (
-                      <button
-                        className="button button--secondary"
+                      <Button
                         onClick={clearMoviesFolder}
                         type="button"
+                        variant="outline"
                       >
                         Clear folder
-                      </button>
+                      </Button>
                     ) : null}
                   </div>
                   {folderSelectionError === null ? null : (
