@@ -709,16 +709,18 @@ mod tests {
     #[test]
     fn trashes_the_exact_current_movie_path_after_root_validation() {
         let fixture = FilesystemFixture::new();
-        let movie_path = fixture.create_file("nested/映画  —  Final.CUT!.MKV");
+        fixture.create_file("nested/映画  —  Final.CUT!.MKV");
+        let movie_paths = scan_movie_paths(&fixture.path).expect("failed to scan fixture");
+        let movie_path = PathBuf::from(&movie_paths[0]);
         let mut library = MoviesLibraryContext {
             folder: Some(fixture.path.clone()),
-            movie_paths: scan_movie_paths(&fixture.path).expect("failed to scan fixture"),
+            movie_paths: movie_paths.clone(),
         };
         let dispatched_path = RefCell::new(None);
 
         let result = trash_movie_request_with(
             TrashMovieRequest {
-                path: path_string(movie_path.clone()),
+                path: movie_paths[0].clone(),
                 folder: None,
                 library_paths: None,
             },
