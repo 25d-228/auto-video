@@ -1,0 +1,46 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  application:
+    name: Test and web build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm install --global npm@11.13.0
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  native:
+    name: Native build (${{ matrix.os }})
+    strategy:
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm install --global npm@11.13.0
+      - run: npm ci
+      - run: rustup toolchain install 1.96.0 --profile minimal --component clippy --component rustfmt
+      - run: npm run lint
+      - run: npm run test:native
+      - run: npm run build:native

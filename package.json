@@ -1,0 +1,38 @@
+{
+  "name": "auto-video",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "npm@11.13.0",
+  "engines": {
+    "node": "24.17.x",
+    "npm": "11.13.x"
+  },
+  "scripts": {
+    "dev": "tauri dev",
+    "dev:ui": "vite",
+    "lint": "oxlint . && cargo fmt --manifest-path src-tauri/Cargo.toml --check && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+    "test": "vitest run",
+    "test:native": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "build": "tsc -b && vite build",
+    "build:native": "tauri build --no-bundle"
+  },
+  "dependencies": {
+    "@tauri-apps/plugin-dialog": "2.7.2",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.0.5",
+    "jsdom": "30.0.1",
+    "oxlint": "1.76.0",
+    "typescript": "6.0.2",
+    "vite": "8.2.0",
+    "vitest": "4.1.10"
+  }
+}
