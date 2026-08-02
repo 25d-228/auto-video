@@ -37,10 +37,16 @@ Run the TypeScript, React, formatting, and Rust lints:
 npm run lint
 ```
 
-Run the application entry-surface test:
+Run the interface tests:
 
 ```sh
 npm test
+```
+
+Run the native scanner tests:
+
+```sh
+npm run test:native
 ```
 
 Create the production web assets:

@@ -42,4 +42,5 @@ jobs:
       - run: npm ci
       - run: rustup toolchain install 1.96.0 --profile minimal --component clippy --component rustfmt
       - run: npm run lint
+      - run: npm run test:native
       - run: npm run build:native

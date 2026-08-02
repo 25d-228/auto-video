@@ -1,3 +1,4 @@
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   useEffect,
@@ -27,10 +28,10 @@ const destinations = [
   {
     id: "library",
     label: "Library",
-    description: "Manage local media after library support is available.",
-    emptyHeading: "No library folder is configured",
+    description: "Browse supported video files from your local Movies folder.",
+    emptyHeading: "Choose a Movies folder to begin",
     emptyMessage:
-      "Folder selection and media scanning are not available in this presentation-only shell.",
+      "Configure one local Movies folder in Settings before scanning your library.",
   },
   {
     id: "downloads",
@@ -43,7 +44,7 @@ const destinations = [
   {
     id: "settings",
     label: "Settings",
-    description: "Adjust the application options that are available today.",
+    description: "Configure your local Movies folder and application appearance.",
     emptyHeading: "Other settings are not configured",
     emptyMessage:
       "Provider credentials and additional preferences will appear only with the features they control.",
@@ -91,14 +92,58 @@ const iconPaths = {
   ],
   dark: ["M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"],
   system: ["M4 4h16v12H4V4Z", "M8 20h8", "M12 16v4"],
+  folder: ["M3 6h6l2 2h10v11H3V6Z"],
+  refresh: ["M20 6v5h-5", "M4 18v-5h5", "M18.5 9A7 7 0 0 0 6 6.5L4 11", "M5.5 15A7 7 0 0 0 18 17.5l2-4.5"],
+  movie: ["M5 3h14v18H5V3Z", "m10 12-5 3V9l5 3Z"],
 } as const;
 
 type AppearanceMode = (typeof appearanceModes)[number]["id"];
 type IconName = keyof typeof iconPaths;
 type ResolvedTheme = Exclude<AppearanceMode, "system">;
+type Movie = { path: string; title: string };
+type MovieScanState =
+  | { status: "unconfigured" }
+  | { status: "scanning" }
+  | { status: "empty" }
+  | { status: "unavailable" }
+  | { status: "error" }
+  | { status: "ready"; movies: Movie[] };
 
 const appearanceStorageKey = "auto-video-appearance";
+const moviesFolderStorageKey = "auto-video-movies-folder";
+const moviesFolderUnavailable = "movies_folder_unavailable";
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
+
+const movieScanMessages = {
+  unconfigured: {
+    heading: "Choose a Movies folder to begin",
+    message:
+      "Configure one local Movies folder in Settings before scanning your library.",
+    role: undefined,
+  },
+  scanning: {
+    heading: "Scanning Movies folder",
+    message: "Looking recursively for .mp4 and .mkv files.",
+    role: "status",
+  },
+  empty: {
+    heading: "No supported videos found",
+    message: "This folder does not contain any .mp4 or .mkv files.",
+    role: undefined,
+  },
+  unavailable: {
+    heading: "Movies folder is unavailable",
+    message:
+      "The configured folder may have moved or become inaccessible. Check it in Settings or try Refresh.",
+    role: "alert",
+  },
+  error: {
+    heading: "Movies folder could not be scanned",
+    message:
+      "Auto-Video could not read every item in this folder. Check its access and try Refresh.",
+    role: "alert",
+  },
+} as const;
 
 function AppIcon({ name }: { name: IconName }) {
   return (
@@ -120,6 +165,12 @@ function isAppearanceMode(value: string | null): value is AppearanceMode {
   return appearanceModes.some((mode) => mode.id === value);
 }
 
+function movieTitleFromPath(path: string) {
+  const filename = path.split(/[/\\]/).at(-1) ?? path;
+  const extensionStart = filename.lastIndexOf(".");
+  return extensionStart > 0 ? filename.slice(0, extensionStart) : filename;
+}
+
 export default function App() {
   const [activeDestination, setActiveDestination] = useState<
     (typeof destinations)[number]
@@ -131,7 +182,20 @@ export default function App() {
   const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(() =>
     window.matchMedia(systemDarkModeQuery).matches ? "dark" : "light",
   );
+  const [moviesFolder, setMoviesFolder] = useState<string | null>(() => {
+    const storedFolder = window.localStorage.getItem(moviesFolderStorageKey);
+    return storedFolder === "" ? null : storedFolder;
+  });
+  const [movieScanState, setMovieScanState] = useState<MovieScanState>(
+    moviesFolder === null ? { status: "unconfigured" } : { status: "scanning" },
+  );
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [isChoosingFolder, setIsChoosingFolder] = useState(false);
+  const [folderSelectionError, setFolderSelectionError] = useState<
+    string | null
+  >(null);
   const navigationItems = useRef<Array<HTMLButtonElement | null>>([]);
+  const scanRequestId = useRef(0);
 
   useEffect(() => {
     const systemPreference = window.matchMedia(systemDarkModeQuery);
@@ -153,6 +217,64 @@ export default function App() {
     document.documentElement.dataset.theme = resolvedTheme;
     window.localStorage.setItem(appearanceStorageKey, appearance);
   }, [appearance, resolvedTheme]);
+
+  useEffect(() => {
+    if (moviesFolder === null) {
+      window.localStorage.removeItem(moviesFolderStorageKey);
+    } else {
+      window.localStorage.setItem(moviesFolderStorageKey, moviesFolder);
+    }
+  }, [moviesFolder]);
+
+  useEffect(() => {
+    const requestId = ++scanRequestId.current;
+
+    if (moviesFolder === null) {
+      setMovieScanState({ status: "unconfigured" });
+      return;
+    }
+
+    setMovieScanState({ status: "scanning" });
+    void window.__TAURI__.core
+      .invoke<string[]>("scan_movies", { folder: moviesFolder })
+      .then((paths) => {
+        if (requestId !== scanRequestId.current) {
+          return;
+        }
+        if (!Array.isArray(paths) || paths.some((path) => typeof path !== "string")) {
+          throw new Error("The native scanner returned invalid movie paths.");
+        }
+
+        const movies = paths.map((path) => ({
+          path,
+          title: movieTitleFromPath(path),
+        }));
+        setMovieScanState(
+          movies.length === 0
+            ? { status: "empty" }
+            : { status: "ready", movies },
+        );
+      })
+      .catch((error: unknown) => {
+        if (requestId !== scanRequestId.current) {
+          return;
+        }
+
+        const errorCode =
+          typeof error === "string"
+            ? error
+            : error instanceof Error
+              ? error.message
+              : "";
+        setMovieScanState({
+          status: errorCode === moviesFolderUnavailable ? "unavailable" : "error",
+        });
+      });
+
+    return () => {
+      scanRequestId.current += 1;
+    };
+  }, [moviesFolder, refreshVersion]);
 
   const moveNavigationFocus = (
     event: ReactKeyboardEvent<HTMLButtonElement>,
@@ -181,6 +303,60 @@ export default function App() {
     event.preventDefault();
     navigationItems.current[nextIndex]?.focus();
   };
+
+  const chooseMoviesFolder = async () => {
+    setFolderSelectionError(null);
+    setIsChoosingFolder(true);
+
+    try {
+      const selectedFolder = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose Movies folder",
+      });
+
+      if (selectedFolder === null) {
+        return;
+      }
+      if (typeof selectedFolder !== "string") {
+        throw new Error("The native folder picker returned an invalid path.");
+      }
+
+      scanRequestId.current += 1;
+      setMovieScanState({ status: "scanning" });
+      if (selectedFolder === moviesFolder) {
+        setRefreshVersion((version) => version + 1);
+      } else {
+        setMoviesFolder(selectedFolder);
+      }
+    } catch {
+      setFolderSelectionError("The Movies folder picker could not be opened.");
+    } finally {
+      setIsChoosingFolder(false);
+    }
+  };
+
+  const clearMoviesFolder = () => {
+    scanRequestId.current += 1;
+    setFolderSelectionError(null);
+    setMovieScanState({ status: "unconfigured" });
+    setMoviesFolder(null);
+  };
+
+  const refreshMovies = () => {
+    if (moviesFolder === null) {
+      return;
+    }
+
+    scanRequestId.current += 1;
+    setMovieScanState({ status: "scanning" });
+    setRefreshVersion((version) => version + 1);
+  };
+
+  const currentMovieScanMessage =
+    movieScanState.status === "ready"
+      ? null
+      : movieScanMessages[movieScanState.status];
 
   return (
     <div className="app-shell">
@@ -222,7 +398,7 @@ export default function App() {
           </ul>
         </nav>
 
-        <p className="sidebar__status">Presentation shell</p>
+        <p className="sidebar__status">Local desktop library</p>
       </aside>
 
       <main className="workspace">
@@ -233,8 +409,126 @@ export default function App() {
             <p>{activeDestination.description}</p>
           </header>
 
-          {activeDestination.id === "settings" ? (
+          {activeDestination.id === "library" ? (
+            <section
+              aria-busy={movieScanState.status === "scanning"}
+              aria-labelledby="movies-heading"
+              className="library-content"
+            >
+              <div className="library-toolbar">
+                <div className="library-toolbar__heading">
+                  <span className="empty-state__icon">
+                    <AppIcon name="library" />
+                  </span>
+                  <div>
+                    <p className="card-eyebrow">Local library</p>
+                    <h2 id="movies-heading">Movies</h2>
+                    <p className="library-folder">
+                      {moviesFolder ?? "No Movies folder configured"}
+                    </p>
+                  </div>
+                </div>
+                {moviesFolder !== null ? (
+                  <button
+                    className="button button--secondary"
+                    disabled={movieScanState.status === "scanning"}
+                    onClick={refreshMovies}
+                    type="button"
+                  >
+                    <AppIcon name="refresh" />
+                    Refresh
+                  </button>
+                ) : null}
+              </div>
+
+              {movieScanState.status === "ready" ? (
+                <ul aria-label="Movies" className="movie-grid">
+                  {movieScanState.movies.map((movie) => (
+                    <li key={movie.path}>
+                      <article className="movie-card">
+                        <span className="movie-card__icon">
+                          <AppIcon name="movie" />
+                        </span>
+                        <h3>{movie.title}</h3>
+                      </article>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div
+                  className="empty-state library-state"
+                  role={currentMovieScanMessage?.role}
+                >
+                  <span className="empty-state__icon">
+                    <AppIcon name="library" />
+                  </span>
+                  <h2>{currentMovieScanMessage?.heading}</h2>
+                  <p>{currentMovieScanMessage?.message}</p>
+                </div>
+              )}
+            </section>
+          ) : activeDestination.id === "settings" ? (
             <div className="settings-content">
+              <section
+                aria-labelledby="movies-folder-heading"
+                className="settings-card"
+              >
+                <div className="settings-card__heading">
+                  <span className="empty-state__icon">
+                    <AppIcon name="folder" />
+                  </span>
+                  <div>
+                    <h2 id="movies-folder-heading">Movies folder</h2>
+                    <p>
+                      Choose one local folder. Its path stays on this device and
+                      is used only to scan for supported videos.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="folder-setting">
+                  {moviesFolder === null ? (
+                    <p className="folder-setting__empty">
+                      No Movies folder configured.
+                    </p>
+                  ) : (
+                    <div>
+                      <p className="field-label">Configured folder</p>
+                      <p className="folder-path">{moviesFolder}</p>
+                    </div>
+                  )}
+                  <div className="folder-setting__actions">
+                    <button
+                      className="button button--primary"
+                      disabled={isChoosingFolder}
+                      onClick={() => void chooseMoviesFolder()}
+                      type="button"
+                    >
+                      <AppIcon name="folder" />
+                      {isChoosingFolder
+                        ? "Choosing…"
+                        : moviesFolder === null
+                          ? "Choose folder"
+                          : "Change folder"}
+                    </button>
+                    {moviesFolder !== null ? (
+                      <button
+                        className="button button--secondary"
+                        onClick={clearMoviesFolder}
+                        type="button"
+                      >
+                        Clear folder
+                      </button>
+                    ) : null}
+                  </div>
+                  {folderSelectionError === null ? null : (
+                    <p className="field-error" role="alert">
+                      {folderSelectionError}
+                    </p>
+                  )}
+                </div>
+              </section>
+
               <section
                 aria-labelledby="appearance-heading"
                 className="settings-card"
