@@ -50,7 +50,7 @@ const destinations = [
   {
     id: "dashboard",
     label: "Dashboard",
-    description: "A home for verified activity and storage information.",
+    description: "Current status for your local Movies Library.",
     emptyHeading: "Dashboard data is not available yet",
     emptyMessage:
       "Metrics and storage details will appear here only after their data sources are implemented.",
@@ -88,6 +88,7 @@ const destinations = [
       "Provider credentials and additional preferences will appear only with the features they control.",
   },
 ] as const;
+const libraryDestination = destinations[2];
 const settingsDestination = destinations[4];
 
 const appearanceModes = [
@@ -409,20 +410,23 @@ function ResizeAwareGallery<Item>({
   ariaLabel,
   getItemKey,
   items,
+  onSelectedPageChange,
   renderItem,
+  selectedPage,
   variant,
 }: {
   ariaLabel: string;
   getItemKey: (item: Item, index: number) => string;
   items: Item[];
+  onSelectedPageChange: (page: number) => void;
   renderItem: (item: Item, index: number) => ReactNode;
+  selectedPage: number;
   variant: GalleryVariant;
 }) {
   const viewport = useRef<HTMLDivElement | null>(null);
   const [layout, setLayout] = useState<GalleryLayout>(() =>
     calculateGalleryLayout(variant, minimumGalleryCardWidth, 1),
   );
-  const [selectedPage, setSelectedPage] = useState(1);
 
   useLayoutEffect(() => {
     const galleryViewport = viewport.current;
@@ -473,9 +477,9 @@ function ResizeAwareGallery<Item>({
 
   useLayoutEffect(() => {
     if (selectedPage !== currentPage) {
-      setSelectedPage(currentPage);
+      onSelectedPageChange(currentPage);
     }
-  }, [currentPage, selectedPage]);
+  }, [currentPage, onSelectedPageChange, selectedPage]);
 
   return (
     <div
@@ -508,7 +512,7 @@ function ResizeAwareGallery<Item>({
         <Button
           aria-label={`Previous ${ariaLabel} page`}
           disabled={currentPage === 1}
-          onClick={() => setSelectedPage(currentPage - 1)}
+          onClick={() => onSelectedPageChange(currentPage - 1)}
           size="sm"
           type="button"
           variant="outline"
@@ -521,7 +525,7 @@ function ResizeAwareGallery<Item>({
         <Button
           aria-label={`Next ${ariaLabel} page`}
           disabled={currentPage === pageCount}
-          onClick={() => setSelectedPage(currentPage + 1)}
+          onClick={() => onSelectedPageChange(currentPage + 1)}
           size="sm"
           type="button"
           variant="outline"
@@ -898,6 +902,7 @@ export default function App() {
     status: "unconfigured",
   });
   const [movieRefreshVersion, setMovieRefreshVersion] = useState(0);
+  const [librarySelectedPage, setLibrarySelectedPage] = useState(1);
   const [movieTrashAnnouncement, setMovieTrashAnnouncement] = useState<
     string | null
   >(null);
@@ -917,6 +922,7 @@ export default function App() {
     status: "loading-credential",
   });
   const [discoverRefreshVersion, setDiscoverRefreshVersion] = useState(0);
+  const [discoverSelectedPage, setDiscoverSelectedPage] = useState(1);
   const navigationItems = useRef<Array<HTMLButtonElement | null>>([]);
   const workspace = useRef<HTMLElement | null>(null);
   const scanRequestId = useRef(0);
@@ -1323,6 +1329,57 @@ export default function App() {
     discoverState.status === "ready"
       ? null
       : discoverMessages[discoverState.status];
+  let dashboardMoviesHeading = "Loading Movies Library";
+  let dashboardMoviesMessage = "Loading the configured Movies folder.";
+  let dashboardMoviesRole: "alert" | "status" | undefined = "status";
+  let dashboardMoviesDestination: (typeof destinations)[number] | null = null;
+
+  if (isMoviesFolderLoaded) {
+    if (moviesFolder === null && folderSelectionError !== null) {
+      dashboardMoviesHeading = "Movies Library needs attention";
+      dashboardMoviesMessage = folderSelectionError;
+      dashboardMoviesRole = "alert";
+      dashboardMoviesDestination = settingsDestination;
+    } else if (moviesFolder === null) {
+      dashboardMoviesHeading = "Movies Library is not configured";
+      dashboardMoviesMessage = "Choose one local Movies folder in Settings.";
+      dashboardMoviesRole = undefined;
+      dashboardMoviesDestination = settingsDestination;
+    } else if (
+      movieScanState.status === "scanning" ||
+      movieScanState.status === "unconfigured"
+    ) {
+      dashboardMoviesHeading = "Scanning Movies Library";
+      dashboardMoviesMessage =
+        "Looking recursively for supported .mp4 and .mkv files.";
+      dashboardMoviesDestination = libraryDestination;
+    } else if (movieScanState.status === "empty") {
+      dashboardMoviesHeading = "0 supported Movies";
+      dashboardMoviesMessage =
+        "The configured folder is available but contains no supported .mp4 or .mkv files.";
+      dashboardMoviesRole = undefined;
+      dashboardMoviesDestination = libraryDestination;
+    } else if (movieScanState.status === "ready") {
+      const movieCount = movieScanState.movies.length;
+      dashboardMoviesHeading = `${movieCount} supported ${movieCount === 1 ? "Movie" : "Movies"}`;
+      dashboardMoviesMessage =
+        "This total comes from the complete current folder scan.";
+      dashboardMoviesRole = undefined;
+      dashboardMoviesDestination = libraryDestination;
+    } else if (movieScanState.status === "unavailable") {
+      dashboardMoviesHeading = "Movies folder is unavailable";
+      dashboardMoviesMessage =
+        "The configured folder may have moved or become inaccessible.";
+      dashboardMoviesRole = "alert";
+      dashboardMoviesDestination = settingsDestination;
+    } else {
+      dashboardMoviesHeading = "Movies Library scan failed";
+      dashboardMoviesMessage =
+        "Auto-Video could not read every item in the configured folder.";
+      dashboardMoviesRole = "alert";
+      dashboardMoviesDestination = libraryDestination;
+    }
+  }
 
   return (
     <div className="app-shell">
@@ -1382,7 +1439,53 @@ export default function App() {
             </p>
           )}
 
-          {activeDestination.id === "discover" ? (
+          {activeDestination.id === "dashboard" ? (
+            <section
+              aria-busy={
+                !isMoviesFolderLoaded ||
+                movieScanState.status === "scanning" ||
+                (moviesFolder !== null &&
+                  movieScanState.status === "unconfigured")
+              }
+              aria-labelledby="dashboard-movies-heading"
+              className="dashboard-library-summary"
+            >
+              <div className="dashboard-library-summary__heading">
+                <span className="empty-state__icon">
+                  <AppIcon name="library" />
+                </span>
+                <div>
+                  <p className="card-eyebrow">Local library</p>
+                  <h2 id="dashboard-movies-heading">Movies Library</h2>
+                  <p className="dashboard-library-summary__folder">
+                    {!isMoviesFolderLoaded
+                      ? "Loading configured Movies folder…"
+                      : moviesFolder ?? "No Movies folder configured"}
+                  </p>
+                </div>
+              </div>
+
+              <div
+                className="dashboard-library-summary__status"
+                role={dashboardMoviesRole}
+              >
+                <p className="card-eyebrow">Current status</p>
+                <h3>{dashboardMoviesHeading}</h3>
+                <p>{dashboardMoviesMessage}</p>
+              </div>
+
+              {dashboardMoviesDestination === null ? null : (
+                <Button
+                  className="dashboard-library-summary__action"
+                  onClick={() => navigateTo(dashboardMoviesDestination)}
+                  type="button"
+                >
+                  <AppIcon name={dashboardMoviesDestination.id} />
+                  Open {dashboardMoviesDestination.label}
+                </Button>
+              )}
+            </section>
+          ) : activeDestination.id === "discover" ? (
             <section
               aria-busy={discoverState.status === "loading"}
               aria-labelledby="discover-movies-heading"
@@ -1421,12 +1524,14 @@ export default function App() {
                   }
                   items={discoverState.movies}
                   key="discover-gallery"
+                  onSelectedPageChange={setDiscoverSelectedPage}
                   renderItem={(movie, resultIndex) => (
                     <DiscoverMovieCard
                       movie={movie}
                       resultIndex={resultIndex}
                     />
                   )}
+                  selectedPage={discoverSelectedPage}
                   variant="discover"
                 />
               ) : (
@@ -1499,6 +1604,7 @@ export default function App() {
                   getItemKey={(movie) => movie.path}
                   items={movieScanState.movies}
                   key="library-gallery"
+                  onSelectedPageChange={setLibrarySelectedPage}
                   renderItem={(movie) => (
                     <LibraryMovieCard
                       folder={moviesFolder}
@@ -1506,6 +1612,7 @@ export default function App() {
                       onMovieTrashed={recordTrashedMovie}
                     />
                   )}
+                  selectedPage={librarySelectedPage}
                   variant="library"
                 />
               ) : (

@@ -341,6 +341,7 @@ button {
 }
 
 .empty-state,
+.dashboard-library-summary,
 .settings-card,
 .library-toolbar,
 .movie-card,
@@ -351,6 +352,58 @@ button {
   background: var(--card);
   color: var(--card-foreground);
   box-shadow: none;
+}
+
+.dashboard-library-summary {
+  display: grid;
+  min-width: 0;
+  gap: 1rem;
+  margin-top: 1.25rem;
+  padding: 1rem;
+}
+
+.dashboard-library-summary__heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.dashboard-library-summary__heading > div {
+  min-width: 0;
+}
+
+.dashboard-library-summary__heading .empty-state__icon {
+  width: 2.25rem;
+  height: 2.25rem;
+  margin: 0;
+}
+
+.dashboard-library-summary h2,
+.dashboard-library-summary h3 {
+  margin: 0.25rem 0 0;
+  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-size: 0.875rem;
+  letter-spacing: -0.01em;
+}
+
+.dashboard-library-summary__folder,
+.dashboard-library-summary__status > p:last-child {
+  margin: 0.375rem 0 0;
+  overflow-wrap: anywhere;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.dashboard-library-summary__status {
+  min-width: 0;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.dashboard-library-summary__action {
+  justify-self: start;
 }
 
 .empty-state {
