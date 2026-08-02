@@ -121,9 +121,10 @@ mod tests {
     fn recursively_finds_supported_files_in_deterministic_order() {
         let fixture = MoviesFixture::new();
         let first_movie = fixture.create_file("Alpha.mp4");
-        let second_movie = fixture.create_file("nested/Beta.MKV");
-        let third_movie = fixture.create_file("nested/deeper/映画 — Final.mP4");
-        fixture.create_file("nested/notes.txt");
+        let second_movie = fixture.create_file(Path::new("nested").join("Beta.MKV"));
+        let third_movie =
+            fixture.create_file(Path::new("nested").join("deeper").join("映画 — Final.mP4"));
+        fixture.create_file(Path::new("nested").join("notes.txt"));
         fixture.create_file("clip.mov");
         fs::create_dir(fixture.path.join("directory.mkv"))
             .expect("failed to create fixture directory");
