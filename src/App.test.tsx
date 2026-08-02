@@ -44,6 +44,9 @@ let scanMoviesMock: Mock<
 let openMovieMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
+let revealMovieMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
 let loadTmdbTokenMock: Mock<() => Promise<string | null>>;
 let saveTmdbTokenMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
@@ -214,6 +217,7 @@ beforeEach(() => {
   resizeObserverRecords = [];
   scanMoviesMock = vi.fn().mockResolvedValue([]);
   openMovieMock = vi.fn().mockResolvedValue(undefined);
+  revealMovieMock = vi.fn().mockResolvedValue(undefined);
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
@@ -224,6 +228,8 @@ beforeEach(() => {
           return scanMoviesMock(parameters);
         case "open_movie":
           return openMovieMock(parameters);
+        case "reveal_movie":
+          return revealMovieMock(parameters);
         case "load_tmdb_token":
           return loadTmdbTokenMock();
         case "save_tmdb_token":
@@ -584,6 +590,8 @@ describe("TMDB Discover", () => {
     });
 
     expect(clipboardWriteMock).toHaveBeenCalledWith(title);
+    expect(openMovieMock).not.toHaveBeenCalled();
+    expect(revealMovieMock).not.toHaveBeenCalled();
     expect(parentActivation).not.toHaveBeenCalled();
     expect(copyButton.getAttribute("aria-label")).toBe(
       `Copied title: ${title}`,
@@ -950,6 +958,7 @@ describe("local Movies library", () => {
 
     expect(openMovieMock).toHaveBeenCalledTimes(1);
     expect(openMovieMock).toHaveBeenCalledWith({ path: exactPath });
+    expect(revealMovieMock).not.toHaveBeenCalled();
     expect(openButton).toHaveProperty("disabled", true);
     expect(openButton.getAttribute("aria-label")).toBe(
       `Opening movie: ${title}`,
@@ -1033,6 +1042,185 @@ describe("local Movies library", () => {
       expect(firstCard.textContent).not.toContain(firstPath);
       expect(firstOpenButton).toHaveProperty("disabled", false);
       expect(openMovieMock).toHaveBeenCalledWith({ path: firstPath });
+      expect(revealMovieMock).not.toHaveBeenCalled();
+      expect(clipboardWriteMock).not.toHaveBeenCalled();
+      expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("reveals the exact scanned path once while preserving Open, copy, and pagination state", async () => {
+    const pendingReveal = createDeferred<void>();
+    const exactPath =
+      "C:\\Movies\\映画  —  Final.CUT & punctuation! [1080p].MKV";
+    const paths = Array.from({ length: 25 }, (_, index) =>
+      index === 10
+        ? exactPath
+        : `/Movies/Library ${String(index + 1).padStart(2, "0")}.mp4`,
+    );
+    const title = "映画  —  Final.CUT & punctuation! [1080p]";
+    const parentActivation = vi.fn();
+    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    scanMoviesMock.mockResolvedValue(paths);
+    openMovieMock.mockRejectedValueOnce("movie_open_failed");
+    revealMovieMock
+      .mockReturnValueOnce(pendingReveal.promise)
+      .mockRejectedValueOnce("movie_reveal_failed");
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectLibrary();
+    await screen.findByText("Library 01");
+    resizeGallery("library", 1528, 136);
+    fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
+
+    const heading = screen.getByRole("heading", {
+      level: 3,
+      name: "映画 — Final.CUT & punctuation! [1080p]",
+    });
+    const card = heading.closest("article") as HTMLElement;
+    fireEvent.click(
+      within(card).getByRole("button", { name: /Open movie:/ }),
+    );
+    expect(await within(card).findByRole("alert")).toHaveProperty(
+      "textContent",
+      "The operating system could not open this movie.",
+    );
+    fireEvent.click(
+      within(card).getByRole("button", { name: /Copy title:/ }),
+    );
+    const copiedButton = await within(card).findByRole("button", {
+      name: /Copied title:/,
+    });
+    expect(copiedButton.getAttribute("aria-label")).toBe(
+      `Copied title: ${title}`,
+    );
+
+    openMovieMock.mockClear();
+    clipboardWriteMock.mockClear();
+    parentActivation.mockClear();
+    const revealButton = within(card).getByRole("button", {
+      name: /Reveal movie:/,
+    });
+    revealButton.focus();
+    expect(document.activeElement).toBe(revealButton);
+    fireEvent.pointerDown(revealButton);
+    fireEvent.click(revealButton);
+    revealButton.click();
+
+    expect(revealMovieMock).toHaveBeenCalledTimes(1);
+    expect(revealMovieMock).toHaveBeenCalledWith({ path: exactPath });
+    expect(revealButton).toHaveProperty("disabled", true);
+    expect(revealButton.getAttribute("aria-label")).toBe(
+      `Revealing movie: ${title}`,
+    );
+    expect(within(card).queryByText("Revealed")).toBeNull();
+    expect(within(card).getByRole("alert")).toHaveProperty(
+      "textContent",
+      "The operating system could not open this movie.",
+    );
+    expect(
+      within(card).getByRole("button", { name: /Copied title:/ }),
+    ).toBeTruthy();
+    expect(
+      within(card).getByRole("button", { name: /Open movie:/ }),
+    ).toHaveProperty("disabled", false);
+    expect(openMovieMock).not.toHaveBeenCalled();
+    expect(clipboardWriteMock).not.toHaveBeenCalled();
+    expect(parentActivation).not.toHaveBeenCalled();
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pendingReveal.resolve(undefined);
+      await pendingReveal.promise;
+    });
+    expect(
+      within(card).getByRole("button", { name: /Reveal movie:/ }),
+    ).toHaveProperty("disabled", false);
+
+    fireEvent.click(
+      within(card).getByRole("button", { name: /Reveal movie:/ }),
+    );
+    expect(
+      await within(card).findByText(
+        "The operating system could not reveal this movie.",
+      ),
+    ).toBeTruthy();
+    const fileActionErrors = within(card).getAllByRole("alert");
+    expect(fileActionErrors.map((alert) => alert.textContent)).toEqual([
+      "The operating system could not open this movie.",
+      "The operating system could not reveal this movie.",
+    ]);
+    expect(
+      within(card).getByRole("button", { name: /Copied title:/ }),
+    ).toBeTruthy();
+    expect(revealMovieMock).toHaveBeenCalledTimes(2);
+    expect(revealMovieMock).toHaveBeenNthCalledWith(2, { path: exactPath });
+
+    resizeGallery("library", 1088, 284);
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Copied title:/ })).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Library",
+    );
+    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
+      "/Movies",
+    );
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["movie_reveal_not_found", "This movie is no longer available."],
+    ["movie_reveal_unavailable", "Auto-Video could not access this movie."],
+    ["movie_reveal_not_file", "This item is not an eligible video file."],
+    [
+      "movie_reveal_unsupported",
+      "This item is not a supported .mp4 or .mkv file.",
+    ],
+    [
+      "movie_reveal_failed",
+      "The operating system could not reveal this movie.",
+    ],
+  ])(
+    "reports %s on only the affected card",
+    async (errorCode, expectedMessage) => {
+      const firstPath = "/Movies/First — exact.mp4";
+      window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+      scanMoviesMock.mockResolvedValue([
+        firstPath,
+        "/Movies/Second remains available.mkv",
+      ]);
+      revealMovieMock.mockRejectedValueOnce(errorCode);
+
+      render(<App />);
+      selectLibrary();
+
+      const firstRevealButton = await screen.findByRole("button", {
+        name: "Reveal movie: First — exact",
+      });
+      const firstCard = firstRevealButton.closest("article") as HTMLElement;
+      const secondCard = screen
+        .getByRole("button", {
+          name: "Reveal movie: Second remains available",
+        })
+        .closest("article") as HTMLElement;
+      firstRevealButton.focus();
+      fireEvent.keyDown(firstRevealButton, { key: "Enter" });
+      fireEvent.click(firstRevealButton);
+
+      expect(await within(firstCard).findByRole("alert")).toHaveProperty(
+        "textContent",
+        expectedMessage,
+      );
+      expect(within(secondCard).queryByRole("alert")).toBeNull();
+      expect(firstCard.textContent).not.toContain(firstPath);
+      expect(firstRevealButton).toHaveProperty("disabled", false);
+      expect(revealMovieMock).toHaveBeenCalledWith({ path: firstPath });
+      expect(openMovieMock).not.toHaveBeenCalled();
       expect(clipboardWriteMock).not.toHaveBeenCalled();
       expect(scanMoviesMock).toHaveBeenCalledTimes(1);
     },

@@ -6,6 +6,7 @@ import {
   DownloadSimpleIcon,
   FilmSlateIcon,
   FilmStripIcon,
+  FolderOpenIcon,
   FolderSimpleIcon,
   GearSixIcon,
   ImageSquareIcon,
@@ -107,6 +108,7 @@ const appIcons = {
   refresh: ArrowClockwiseIcon,
   movie: FilmStripIcon,
   open: PlayIcon,
+  reveal: FolderOpenIcon,
   poster: ImageSquareIcon,
   copy: CopySimpleIcon,
   copied: CheckIcon,
@@ -194,6 +196,15 @@ const movieOpenErrorMessages: Record<string, string> = {
   movie_open_failed: "The operating system could not open this movie.",
 };
 const movieOpenFallbackMessage = "Auto-Video could not open this movie.";
+
+const movieRevealErrorMessages: Record<string, string> = {
+  movie_reveal_not_found: "This movie is no longer available.",
+  movie_reveal_unavailable: "Auto-Video could not access this movie.",
+  movie_reveal_not_file: "This item is not an eligible video file.",
+  movie_reveal_unsupported: "This item is not a supported .mp4 or .mkv file.",
+  movie_reveal_failed: "The operating system could not reveal this movie.",
+};
+const movieRevealFallbackMessage = "Auto-Video could not reveal this movie.";
 
 const discoverMessages = {
   "loading-credential": {
@@ -550,8 +561,11 @@ function DiscoverMovieCard({
 
 function LibraryMovieCard({ movie }: { movie: Movie }) {
   const [isOpening, setIsOpening] = useState(false);
+  const [isRevealing, setIsRevealing] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
+  const [revealError, setRevealError] = useState<string | null>(null);
   const openRequestPending = useRef(false);
+  const revealRequestPending = useRef(false);
 
   const openMovie = async (event: ReactMouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -581,40 +595,97 @@ function LibraryMovieCard({ movie }: { movie: Movie }) {
     }
   };
 
+  const revealMovie = async (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (revealRequestPending.current) {
+      return;
+    }
+
+    revealRequestPending.current = true;
+    setIsRevealing(true);
+    setRevealError(null);
+
+    try {
+      await window.__TAURI__.core.invoke("reveal_movie", { path: movie.path });
+    } catch (error: unknown) {
+      const errorCode =
+        typeof error === "string"
+          ? error
+          : error instanceof Error
+            ? error.message
+            : "";
+      setRevealError(
+        movieRevealErrorMessages[errorCode] ?? movieRevealFallbackMessage,
+      );
+    } finally {
+      revealRequestPending.current = false;
+      setIsRevealing(false);
+    }
+  };
+
+  const fileActionErrorCount =
+    Number(openError !== null) + Number(revealError !== null);
+
   return (
     <article
       className="movie-card"
+      data-file-action-errors={fileActionErrorCount}
       data-open-state={
         openError === null ? (isOpening ? "pending" : "idle") : "error"
+      }
+      data-reveal-state={
+        revealError === null ? (isRevealing ? "pending" : "idle") : "error"
       }
     >
       <div className="movie-card__header">
         <span className="movie-card__icon">
           <AppIcon name="movie" />
         </span>
-        <Button
-          aria-label={`${isOpening ? "Opening" : "Open"} movie: ${movie.title}`}
-          disabled={isOpening}
-          onClick={openMovie}
-          onKeyDown={(event) => event.stopPropagation()}
-          onPointerDown={(event) => event.stopPropagation()}
-          size="sm"
-          type="button"
-          variant="outline"
-        >
-          <AppIcon name="open" />
-          {isOpening ? "Opening" : "Open"}
-        </Button>
+        <div className="movie-card__actions">
+          <Button
+            aria-label={`${isOpening ? "Opening" : "Open"} movie: ${movie.title}`}
+            disabled={isOpening}
+            onClick={openMovie}
+            onKeyDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+            size="xs"
+            type="button"
+            variant="outline"
+          >
+            <AppIcon name="open" />
+            {isOpening ? "Opening" : "Open"}
+          </Button>
+          <Button
+            aria-label={`${isRevealing ? "Revealing" : "Reveal"} movie: ${movie.title}`}
+            disabled={isRevealing}
+            onClick={revealMovie}
+            onKeyDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+            size="xs"
+            type="button"
+            variant="outline"
+          >
+            <AppIcon name="reveal" />
+            {isRevealing ? "Revealing" : "Reveal"}
+          </Button>
+        </div>
       </div>
       <div className="media-title-row">
         <h3>{movie.title}</h3>
         <CopyTitleAction title={movie.title} />
       </div>
-      {openError === null ? null : (
-        <p aria-atomic="true" className="movie-card__open-error" role="alert">
-          {openError}
-        </p>
-      )}
+      <div className="movie-card__file-action-errors">
+        {openError === null ? null : (
+          <p aria-atomic="true" role="alert">
+            {openError}
+          </p>
+        )}
+        {revealError === null ? null : (
+          <p aria-atomic="true" role="alert">
+            {revealError}
+          </p>
+        )}
+      </div>
     </article>
   );
 }

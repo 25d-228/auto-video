@@ -15,6 +15,11 @@ const MOVIE_OPEN_NOT_FILE: &str = "movie_open_not_file";
 const MOVIE_OPEN_NOT_FOUND: &str = "movie_open_not_found";
 const MOVIE_OPEN_UNAVAILABLE: &str = "movie_open_unavailable";
 const MOVIE_OPEN_UNSUPPORTED: &str = "movie_open_unsupported";
+const MOVIE_REVEAL_FAILED: &str = "movie_reveal_failed";
+const MOVIE_REVEAL_NOT_FILE: &str = "movie_reveal_not_file";
+const MOVIE_REVEAL_NOT_FOUND: &str = "movie_reveal_not_found";
+const MOVIE_REVEAL_UNAVAILABLE: &str = "movie_reveal_unavailable";
+const MOVIE_REVEAL_UNSUPPORTED: &str = "movie_reveal_unsupported";
 const TMDB_TOKEN_FILE_NAME: &str = ".tmdb-api-read-access-token";
 const TMDB_TOKEN_INVALID: &str = "tmdb_token_invalid";
 const TMDB_TOKEN_STORAGE_FAILED: &str = "tmdb_token_storage_failed";
@@ -65,27 +70,70 @@ fn scan_movie_paths(folder: &Path) -> Result<Vec<String>, &'static str> {
         .collect()
 }
 
-fn movie_metadata_error(error: &io::Error) -> &'static str {
-    if error.kind() == io::ErrorKind::NotFound {
-        MOVIE_OPEN_NOT_FOUND
-    } else {
-        MOVIE_OPEN_UNAVAILABLE
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MoviePathValidationError {
+    NotFound,
+    Unavailable,
+    NotFile,
+    Unsupported,
+}
+
+impl MoviePathValidationError {
+    fn open_error_code(self) -> &'static str {
+        match self {
+            Self::NotFound => MOVIE_OPEN_NOT_FOUND,
+            Self::Unavailable => MOVIE_OPEN_UNAVAILABLE,
+            Self::NotFile => MOVIE_OPEN_NOT_FILE,
+            Self::Unsupported => MOVIE_OPEN_UNSUPPORTED,
+        }
     }
+
+    fn reveal_error_code(self) -> &'static str {
+        match self {
+            Self::NotFound => MOVIE_REVEAL_NOT_FOUND,
+            Self::Unavailable => MOVIE_REVEAL_UNAVAILABLE,
+            Self::NotFile => MOVIE_REVEAL_NOT_FILE,
+            Self::Unsupported => MOVIE_REVEAL_UNSUPPORTED,
+        }
+    }
+}
+
+fn movie_metadata_error(error: &io::Error) -> MoviePathValidationError {
+    if error.kind() == io::ErrorKind::NotFound {
+        MoviePathValidationError::NotFound
+    } else {
+        MoviePathValidationError::Unavailable
+    }
+}
+
+fn validate_movie_path(path: &Path) -> Result<(), MoviePathValidationError> {
+    let metadata = fs::metadata(path).map_err(|error| movie_metadata_error(&error))?;
+    if !metadata.is_file() {
+        return Err(MoviePathValidationError::NotFile);
+    }
+    if !is_supported_movie(path) {
+        return Err(MoviePathValidationError::Unsupported);
+    }
+
+    Ok(())
 }
 
 fn open_movie_path_with(
     path: &Path,
     dispatch: impl FnOnce(&Path) -> Result<(), ()>,
 ) -> Result<(), &'static str> {
-    let metadata = fs::metadata(path).map_err(|error| movie_metadata_error(&error))?;
-    if !metadata.is_file() {
-        return Err(MOVIE_OPEN_NOT_FILE);
-    }
-    if !is_supported_movie(path) {
-        return Err(MOVIE_OPEN_UNSUPPORTED);
-    }
+    validate_movie_path(path).map_err(MoviePathValidationError::open_error_code)?;
 
     dispatch(path).map_err(|_| MOVIE_OPEN_FAILED)
+}
+
+fn reveal_movie_path_with(
+    path: &Path,
+    dispatch: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    validate_movie_path(path).map_err(MoviePathValidationError::reveal_error_code)?;
+
+    dispatch(path).map_err(|_| MOVIE_REVEAL_FAILED)
 }
 
 fn is_valid_tmdb_token(token: &str) -> bool {
@@ -176,6 +224,18 @@ async fn open_movie(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn reveal_movie(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        reveal_movie_path_with(Path::new(&path), |movie_path| {
+            tauri_plugin_opener::reveal_item_in_dir(movie_path).map_err(|_| ())
+        })
+    })
+    .await
+    .map_err(|_| MOVIE_REVEAL_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn load_tmdb_token(app: tauri::AppHandle) -> Result<Option<String>, String> {
     load_tmdb_token_file(&tmdb_token_path(&app)?).map_err(str::to_owned)
 }
@@ -196,6 +256,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             scan_movies,
             open_movie,
+            reveal_movie,
             load_tmdb_token,
             save_tmdb_token,
             clear_tmdb_token
@@ -215,8 +276,10 @@ mod tests {
 
     use super::{
         clear_tmdb_token_file, load_tmdb_token_file, movie_metadata_error, open_movie_path_with,
-        save_tmdb_token_file, scan_movie_paths, MOVIES_FOLDER_UNAVAILABLE, MOVIE_OPEN_FAILED,
-        MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED,
+        reveal_movie_path_with, save_tmdb_token_file, scan_movie_paths, MoviePathValidationError,
+        MOVIES_FOLDER_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND,
+        MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE,
+        MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED,
         TMDB_TOKEN_INVALID,
     };
 
@@ -310,7 +373,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_directories_and_unsupported_files_before_dispatch() {
+    fn reveals_the_exact_supported_movie_path_after_validation() {
+        let fixture = FilesystemFixture::new();
+        let movie_path = fixture.create_file("映画  —  Final.CUT!.MKV");
+        let dispatched_path = RefCell::new(None);
+
+        let result = reveal_movie_path_with(&movie_path, |path| {
+            dispatched_path.replace(Some(path.to_path_buf()));
+            Ok(())
+        });
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(dispatched_path.into_inner(), Some(movie_path));
+    }
+
+    #[test]
+    fn open_rejects_missing_directories_and_unsupported_files_before_dispatch() {
         let fixture = FilesystemFixture::new();
         let missing_path = fixture.path.join("missing.mp4");
         let directory_path = fixture.path.join("directory.mkv");
@@ -334,15 +412,54 @@ mod tests {
     }
 
     #[test]
-    fn reports_inaccessible_metadata_and_operating_system_failures() {
+    fn reveal_rejects_missing_directories_and_unsupported_files_before_dispatch() {
+        let fixture = FilesystemFixture::new();
+        let missing_path = fixture.path.join("missing.mp4");
+        let directory_path = fixture.path.join("directory.mkv");
+        let unsupported_path = fixture.create_file("notes.txt");
+        fs::create_dir(&directory_path).expect("failed to create fixture directory");
+
+        for (path, expected_error) in [
+            (&missing_path, MOVIE_REVEAL_NOT_FOUND),
+            (&directory_path, MOVIE_REVEAL_NOT_FILE),
+            (&unsupported_path, MOVIE_REVEAL_UNSUPPORTED),
+        ] {
+            let dispatched = RefCell::new(false);
+            let result = reveal_movie_path_with(path, |_| {
+                dispatched.replace(true);
+                Ok(())
+            });
+
+            assert_eq!(result, Err(expected_error));
+            assert!(!dispatched.into_inner());
+        }
+    }
+
+    #[test]
+    fn reports_inaccessible_metadata_and_operating_system_action_failures() {
         let inaccessible = io::Error::new(io::ErrorKind::PermissionDenied, "fixture denial");
-        assert_eq!(movie_metadata_error(&inaccessible), MOVIE_OPEN_UNAVAILABLE);
+        assert_eq!(
+            movie_metadata_error(&inaccessible),
+            MoviePathValidationError::Unavailable
+        );
+        assert_eq!(
+            MoviePathValidationError::Unavailable.open_error_code(),
+            MOVIE_OPEN_UNAVAILABLE
+        );
+        assert_eq!(
+            MoviePathValidationError::Unavailable.reveal_error_code(),
+            MOVIE_REVEAL_UNAVAILABLE
+        );
 
         let fixture = FilesystemFixture::new();
         let movie_path = fixture.create_file("Valid.mp4");
         assert_eq!(
             open_movie_path_with(&movie_path, |_| Err(())),
             Err(MOVIE_OPEN_FAILED)
+        );
+        assert_eq!(
+            reveal_movie_path_with(&movie_path, |_| Err(())),
+            Err(MOVIE_REVEAL_FAILED)
         );
     }
 
