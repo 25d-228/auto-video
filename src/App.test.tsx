@@ -41,6 +41,9 @@ let invokeMock: Mock<
 let scanMoviesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
+let openMovieMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
 let loadTmdbTokenMock: Mock<() => Promise<string | null>>;
 let saveTmdbTokenMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
@@ -210,6 +213,7 @@ beforeEach(() => {
   mediaQueryListeners = new Set();
   resizeObserverRecords = [];
   scanMoviesMock = vi.fn().mockResolvedValue([]);
+  openMovieMock = vi.fn().mockResolvedValue(undefined);
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
@@ -218,6 +222,8 @@ beforeEach(() => {
       switch (command) {
         case "scan_movies":
           return scanMoviesMock(parameters);
+        case "open_movie":
+          return openMovieMock(parameters);
         case "load_tmdb_token":
           return loadTmdbTokenMock();
         case "save_tmdb_token":
@@ -889,6 +895,148 @@ describe("local Movies library", () => {
     );
     expect(clipboardWriteMock).not.toHaveBeenCalled();
   });
+
+  it("opens the exact scanned path once while preserving copy and pagination state", async () => {
+    const pendingOpen = createDeferred<void>();
+    const exactPath =
+      "C:\\Movies\\映画  —  Final.CUT & punctuation! [1080p].MKV";
+    const paths = Array.from({ length: 25 }, (_, index) =>
+      index === 10
+        ? exactPath
+        : `/Movies/Library ${String(index + 1).padStart(2, "0")}.mp4`,
+    );
+    const title = "映画  —  Final.CUT & punctuation! [1080p]";
+    const parentActivation = vi.fn();
+    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    scanMoviesMock.mockResolvedValue(paths);
+    openMovieMock.mockReturnValue(pendingOpen.promise);
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectLibrary();
+    await screen.findByText("Library 01");
+    resizeGallery("library", 1528, 136);
+    fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
+
+    const heading = screen.getByRole("heading", {
+      level: 3,
+      name: "映画 — Final.CUT & punctuation! [1080p]",
+    });
+    const card = heading.closest("article") as HTMLElement;
+    const copyButton = within(card).getByRole("button", {
+      name: /Copy title:/,
+    });
+    fireEvent.click(copyButton);
+    const copiedButton = await within(card).findByRole("button", {
+      name: /Copied title:/,
+    });
+    expect(copiedButton.getAttribute("aria-label")).toBe(
+      `Copied title: ${title}`,
+    );
+
+    clipboardWriteMock.mockClear();
+    parentActivation.mockClear();
+    const openButton = within(card).getByRole("button", {
+      name: /Open movie:/,
+    });
+    openButton.focus();
+    expect(document.activeElement).toBe(openButton);
+    fireEvent.pointerDown(openButton);
+    fireEvent.click(openButton);
+    openButton.click();
+
+    expect(openMovieMock).toHaveBeenCalledTimes(1);
+    expect(openMovieMock).toHaveBeenCalledWith({ path: exactPath });
+    expect(openButton).toHaveProperty("disabled", true);
+    expect(openButton.getAttribute("aria-label")).toBe(
+      `Opening movie: ${title}`,
+    );
+    expect(within(card).queryByText("Opened")).toBeNull();
+    expect(
+      within(card).getByRole("button", { name: /Copied title:/ }),
+    ).toBeTruthy();
+    expect(clipboardWriteMock).not.toHaveBeenCalled();
+    expect(parentActivation).not.toHaveBeenCalled();
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pendingOpen.resolve(undefined);
+      await pendingOpen.promise;
+    });
+    expect(
+      within(card).getByRole("button", { name: /Open movie:/ }),
+    ).toHaveProperty("disabled", false);
+
+    resizeGallery("library", 1088, 284);
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: /Copied title:/ }),
+    ).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
+      "Library",
+    );
+    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
+      "/Movies",
+    );
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["movie_open_not_found", "This movie is no longer available."],
+    ["movie_open_unavailable", "Auto-Video could not access this movie."],
+    ["movie_open_not_file", "This item is not an eligible video file."],
+    [
+      "movie_open_unsupported",
+      "This item is not a supported .mp4 or .mkv file.",
+    ],
+    [
+      "movie_open_failed",
+      "The operating system could not open this movie.",
+    ],
+  ])(
+    "reports %s on only the affected card",
+    async (errorCode, expectedMessage) => {
+      const firstPath = "/Movies/First — exact.mp4";
+      window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+      scanMoviesMock.mockResolvedValue([
+        firstPath,
+        "/Movies/Second remains available.mkv",
+      ]);
+      openMovieMock.mockRejectedValueOnce(errorCode);
+
+      render(<App />);
+      selectLibrary();
+
+      const firstOpenButton = await screen.findByRole("button", {
+        name: "Open movie: First — exact",
+      });
+      const firstCard = firstOpenButton.closest("article") as HTMLElement;
+      const secondCard = screen
+        .getByRole("button", {
+          name: "Open movie: Second remains available",
+        })
+        .closest("article") as HTMLElement;
+      firstOpenButton.focus();
+      fireEvent.keyDown(firstOpenButton, { key: "Enter" });
+      fireEvent.click(firstOpenButton);
+
+      expect(await within(firstCard).findByRole("alert")).toHaveProperty(
+        "textContent",
+        expectedMessage,
+      );
+      expect(within(secondCard).queryByRole("alert")).toBeNull();
+      expect(firstCard.textContent).not.toContain(firstPath);
+      expect(firstOpenButton).toHaveProperty("disabled", false);
+      expect(openMovieMock).toHaveBeenCalledWith({ path: firstPath });
+      expect(clipboardWriteMock).not.toHaveBeenCalled();
+      expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("refresh replaces files added or removed since the previous scan", async () => {
     window.localStorage.setItem("auto-video-movies-folder", "/Movies");
