@@ -106,6 +106,7 @@ const appIcons = {
   credential: KeyIcon,
   refresh: ArrowClockwiseIcon,
   movie: FilmStripIcon,
+  open: PlayIcon,
   poster: ImageSquareIcon,
   copy: CopySimpleIcon,
   copied: CheckIcon,
@@ -184,6 +185,15 @@ const movieScanMessages = {
     role: "alert",
   },
 } as const;
+
+const movieOpenErrorMessages: Record<string, string> = {
+  movie_open_not_found: "This movie is no longer available.",
+  movie_open_unavailable: "Auto-Video could not access this movie.",
+  movie_open_not_file: "This item is not an eligible video file.",
+  movie_open_unsupported: "This item is not a supported .mp4 or .mkv file.",
+  movie_open_failed: "The operating system could not open this movie.",
+};
+const movieOpenFallbackMessage = "Auto-Video could not open this movie.";
 
 const discoverMessages = {
   "loading-credential": {
@@ -534,6 +544,77 @@ function DiscoverMovieCard({
           </div>
         </dl>
       </div>
+    </article>
+  );
+}
+
+function LibraryMovieCard({ movie }: { movie: Movie }) {
+  const [isOpening, setIsOpening] = useState(false);
+  const [openError, setOpenError] = useState<string | null>(null);
+  const openRequestPending = useRef(false);
+
+  const openMovie = async (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (openRequestPending.current) {
+      return;
+    }
+
+    openRequestPending.current = true;
+    setIsOpening(true);
+    setOpenError(null);
+
+    try {
+      await window.__TAURI__.core.invoke("open_movie", { path: movie.path });
+    } catch (error: unknown) {
+      const errorCode =
+        typeof error === "string"
+          ? error
+          : error instanceof Error
+            ? error.message
+            : "";
+      setOpenError(
+        movieOpenErrorMessages[errorCode] ?? movieOpenFallbackMessage,
+      );
+    } finally {
+      openRequestPending.current = false;
+      setIsOpening(false);
+    }
+  };
+
+  return (
+    <article
+      className="movie-card"
+      data-open-state={
+        openError === null ? (isOpening ? "pending" : "idle") : "error"
+      }
+    >
+      <div className="movie-card__header">
+        <span className="movie-card__icon">
+          <AppIcon name="movie" />
+        </span>
+        <Button
+          aria-label={`${isOpening ? "Opening" : "Open"} movie: ${movie.title}`}
+          disabled={isOpening}
+          onClick={openMovie}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          <AppIcon name="open" />
+          {isOpening ? "Opening" : "Open"}
+        </Button>
+      </div>
+      <div className="media-title-row">
+        <h3>{movie.title}</h3>
+        <CopyTitleAction title={movie.title} />
+      </div>
+      {openError === null ? null : (
+        <p aria-atomic="true" className="movie-card__open-error" role="alert">
+          {openError}
+        </p>
+      )}
     </article>
   );
 }
@@ -1083,17 +1164,7 @@ export default function App() {
                   getItemKey={(movie) => movie.path}
                   items={movieScanState.movies}
                   key="library-gallery"
-                  renderItem={(movie) => (
-                    <article className="movie-card">
-                      <span className="movie-card__icon">
-                        <AppIcon name="movie" />
-                      </span>
-                      <div className="media-title-row">
-                        <h3>{movie.title}</h3>
-                        <CopyTitleAction title={movie.title} />
-                      </div>
-                    </article>
-                  )}
+                  renderItem={(movie) => <LibraryMovieCard movie={movie} />}
                   variant="library"
                 />
               ) : (
