@@ -22,7 +22,6 @@ import {
   WarningCircleIcon,
   XIcon,
 } from "@phosphor-icons/react";
-import { open } from "@tauri-apps/plugin-dialog";
 import {
   type CSSProperties,
   type FormEvent,
@@ -151,7 +150,6 @@ type GalleryLayout = {
 };
 
 const appearanceStorageKey = "auto-video-appearance";
-const moviesFolderStorageKey = "auto-video-movies-folder";
 const moviesFolderUnavailable = "movies_folder_unavailable";
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
 // Two seconds confirms a successful copy without leaving stale feedback on the card.
@@ -583,12 +581,10 @@ function DiscoverMovieCard({
 
 function LibraryMovieCard({
   folder,
-  libraryPaths,
   movie,
   onMovieTrashed,
 }: {
   folder: string;
-  libraryPaths: string[];
   movie: Movie;
   onMovieTrashed: (movie: Movie, folder: string) => void;
 }) {
@@ -686,8 +682,6 @@ function LibraryMovieCard({
 
     try {
       await window.__TAURI__.core.invoke("trash_movie", {
-        folder,
-        libraryPaths,
         path: movie.path,
       });
       onMovieTrashed(movie, folder);
@@ -898,13 +892,11 @@ export default function App() {
   const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(() =>
     window.matchMedia(systemDarkModeQuery).matches ? "dark" : "light",
   );
-  const [moviesFolder, setMoviesFolder] = useState<string | null>(() => {
-    const storedFolder = window.localStorage.getItem(moviesFolderStorageKey);
-    return storedFolder === "" ? null : storedFolder;
+  const [moviesFolder, setMoviesFolder] = useState<string | null>(null);
+  const [isMoviesFolderLoaded, setIsMoviesFolderLoaded] = useState(false);
+  const [movieScanState, setMovieScanState] = useState<MovieScanState>({
+    status: "unconfigured",
   });
-  const [movieScanState, setMovieScanState] = useState<MovieScanState>(
-    moviesFolder === null ? { status: "unconfigured" } : { status: "scanning" },
-  );
   const [movieRefreshVersion, setMovieRefreshVersion] = useState(0);
   const [movieTrashAnnouncement, setMovieTrashAnnouncement] = useState<
     string | null
@@ -957,12 +949,41 @@ export default function App() {
   }, [appearance, resolvedTheme]);
 
   useEffect(() => {
-    if (moviesFolder === null) {
-      window.localStorage.removeItem(moviesFolderStorageKey);
-    } else {
-      window.localStorage.setItem(moviesFolderStorageKey, moviesFolder);
-    }
-  }, [moviesFolder]);
+    let isCurrent = true;
+
+    void window.__TAURI__.core
+      .invoke<string | null>("load_movies_folder")
+      .then((savedFolder) => {
+        if (!isCurrent) {
+          return;
+        }
+        if (
+          savedFolder !== null &&
+          (typeof savedFolder !== "string" || savedFolder === "")
+        ) {
+          throw new Error("The native Movies folder store returned invalid data.");
+        }
+
+        setMoviesFolder(savedFolder);
+      })
+      .catch(() => {
+        if (isCurrent) {
+          setMoviesFolder(null);
+          setFolderSelectionError(
+            "The Movies folder configuration could not be loaded.",
+          );
+        }
+      })
+      .finally(() => {
+        if (isCurrent) {
+          setIsMoviesFolderLoaded(true);
+        }
+      });
+
+    return () => {
+      isCurrent = false;
+    };
+  }, []);
 
   useEffect(() => {
     let isCurrent = true;
@@ -1003,6 +1024,9 @@ export default function App() {
   useEffect(() => {
     const requestId = ++scanRequestId.current;
 
+    if (!isMoviesFolderLoaded) {
+      return;
+    }
     if (moviesFolder === null) {
       setMovieScanState({ status: "unconfigured" });
       return;
@@ -1010,7 +1034,7 @@ export default function App() {
 
     setMovieScanState({ status: "scanning" });
     void window.__TAURI__.core
-      .invoke<string[]>("scan_movies", { folder: moviesFolder })
+      .invoke<string[]>("scan_movies")
       .then((paths) => {
         if (requestId !== scanRequestId.current) {
           return;
@@ -1048,7 +1072,7 @@ export default function App() {
     return () => {
       scanRequestId.current += 1;
     };
-  }, [moviesFolder, movieRefreshVersion]);
+  }, [isMoviesFolderLoaded, moviesFolder, movieRefreshVersion]);
 
   useEffect(() => {
     const requestId = ++discoverRequestId.current;
@@ -1131,11 +1155,9 @@ export default function App() {
     setIsChoosingFolder(true);
 
     try {
-      const selectedFolder = await open({
-        directory: true,
-        multiple: false,
-        title: "Choose Movies folder",
-      });
+      const selectedFolder = await window.__TAURI__.core.invoke<string | null>(
+        "choose_movies_folder",
+      );
 
       if (selectedFolder === null) {
         return;
@@ -1158,11 +1180,19 @@ export default function App() {
     }
   };
 
-  const clearMoviesFolder = () => {
+  const clearMoviesFolder = async () => {
     scanRequestId.current += 1;
     setFolderSelectionError(null);
     setMovieScanState({ status: "unconfigured" });
-    setMoviesFolder(null);
+    try {
+      await window.__TAURI__.core.invoke("clear_movies_folder");
+      setMoviesFolder(null);
+    } catch {
+      setFolderSelectionError(
+        "The Movies folder configuration could not be cleared.",
+      );
+      setMovieRefreshVersion((version) => version + 1);
+    }
   };
 
   const refreshMovies = () => {
@@ -1289,10 +1319,6 @@ export default function App() {
     movieScanState.status === "ready"
       ? null
       : movieScanMessages[movieScanState.status];
-  const currentLibraryPaths =
-    movieScanState.status === "ready"
-      ? movieScanState.movies.map((movie) => movie.path)
-      : [];
   const currentDiscoverMessage =
     discoverState.status === "ready"
       ? null
@@ -1476,7 +1502,6 @@ export default function App() {
                   renderItem={(movie) => (
                     <LibraryMovieCard
                       folder={moviesFolder}
-                      libraryPaths={currentLibraryPaths}
                       movie={movie}
                       onMovieTrashed={recordTrashedMovie}
                     />

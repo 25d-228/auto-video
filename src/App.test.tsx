@@ -1,4 +1,3 @@
-import { open } from "@tauri-apps/plugin-dialog";
 import {
   act,
   cleanup,
@@ -20,10 +19,7 @@ import {
 
 import App from "./App";
 
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
-
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
-const openFolderMock = vi.mocked(open);
 
 type ResizeObserverRecord = {
   callback: ResizeObserverCallback;
@@ -51,6 +47,8 @@ let revealMovieMock: Mock<
 let trashMovieMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
+let openFolderMock: Mock<() => Promise<string | null>>;
+let clearMoviesFolderMock: Mock<() => Promise<void>>;
 let loadTmdbTokenMock: Mock<() => Promise<string | null>>;
 let saveTmdbTokenMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
@@ -59,6 +57,7 @@ let clearTmdbTokenMock: Mock<() => Promise<void>>;
 let fetchMock: Mock<typeof fetch>;
 let clipboardWriteMock: Mock<(text: string) => Promise<void>>;
 let resizeObserverRecords: ResizeObserverRecord[] = [];
+let savedMoviesFolder: string | null;
 
 function createResizeEntry(
   target: Element,
@@ -219,16 +218,32 @@ beforeEach(() => {
   systemPrefersDark = false;
   mediaQueryListeners = new Set();
   resizeObserverRecords = [];
+  savedMoviesFolder = null;
   scanMoviesMock = vi.fn().mockResolvedValue([]);
   openMovieMock = vi.fn().mockResolvedValue(undefined);
   revealMovieMock = vi.fn().mockResolvedValue(undefined);
   trashMovieMock = vi.fn().mockResolvedValue(undefined);
+  openFolderMock = vi.fn().mockResolvedValue(null);
+  clearMoviesFolderMock = vi.fn().mockResolvedValue(undefined);
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   invokeMock = vi.fn(
     (command: string, parameters?: Record<string, unknown>) => {
       switch (command) {
+        case "load_movies_folder":
+          return Promise.resolve(savedMoviesFolder);
+        case "choose_movies_folder":
+          return openFolderMock().then((selectedFolder) => {
+            if (selectedFolder !== null) {
+              savedMoviesFolder = selectedFolder;
+            }
+            return selectedFolder;
+          });
+        case "clear_movies_folder":
+          return clearMoviesFolderMock().then(() => {
+            savedMoviesFolder = null;
+          });
         case "scan_movies":
           return scanMoviesMock(parameters);
         case "open_movie":
@@ -250,8 +265,6 @@ beforeEach(() => {
   );
   fetchMock = vi.fn();
   clipboardWriteMock = vi.fn().mockResolvedValue(undefined);
-  openFolderMock.mockReset();
-  openFolderMock.mockResolvedValue(null);
   window.localStorage.clear();
   vi.stubGlobal("matchMedia", vi.fn(createMediaQueryList));
   vi.stubGlobal("__TAURI__", { core: { invoke: invokeMock } });
@@ -797,23 +810,19 @@ describe("local Movies library", () => {
     fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
 
     expect(await screen.findByText("/Local/Movies — 家族")).toBeTruthy();
-    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
-      "/Local/Movies — 家族",
-    );
-    expect(openFolderMock).toHaveBeenCalledWith({
-      directory: true,
-      multiple: false,
-      title: "Choose Movies folder",
-    });
+    expect(savedMoviesFolder).toBe("/Local/Movies — 家族");
+    expect(openFolderMock).toHaveBeenCalledOnce();
 
     cleanup();
     render(<App />);
     selectSettings();
-    expect(screen.getByText("/Local/Movies — 家族")).toBeTruthy();
+    expect(await screen.findByText("/Local/Movies — 家族")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Clear folder" }));
-    expect(screen.getByText("No Movies folder configured.")).toBeTruthy();
-    expect(window.localStorage.getItem("auto-video-movies-folder")).toBeNull();
+    expect(
+      await screen.findByText("No Movies folder configured."),
+    ).toBeTruthy();
+    await waitFor(() => expect(savedMoviesFolder).toBeNull());
 
     selectLibrary();
     expect(
@@ -831,7 +840,7 @@ describe("local Movies library", () => {
   });
 
   it("renders exact Unicode titles and removes only the final extension", async () => {
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock.mockResolvedValue([
       "/Movies/映画  —  Final.Cut.MKV",
       "C:\\Movies\\CAPS & punctuation!.MP4",
@@ -855,7 +864,7 @@ describe("local Movies library", () => {
 
   it("copies the exact filename-derived Library title without parent activation", async () => {
     const title = "映画  —  Final.CUT & punctuation!";
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock.mockResolvedValue([`/Movies/${title}.MKV`]);
     const parentActivation = vi.fn();
 
@@ -890,7 +899,7 @@ describe("local Movies library", () => {
 
   it("reports an unavailable clipboard on the affected Library card", async () => {
     Reflect.deleteProperty(navigator, "clipboard");
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock.mockResolvedValue(["/Movies/Unavailable clipboard.mp4"]);
 
     render(<App />);
@@ -915,7 +924,7 @@ describe("local Movies library", () => {
   it("requires explicit confirmation and makes every dialog dismissal non-mutating", async () => {
     const path = "/Movies/映画  —  Confirm me.MKV";
     const parentActivation = vi.fn();
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock.mockResolvedValue([path]);
 
     render(
@@ -993,7 +1002,7 @@ describe("local Movies library", () => {
         : `C:\\Movies\\Library ${String(index + 1).padStart(2, "0")}.mp4`,
     );
     const parentActivation = vi.fn();
-    window.localStorage.setItem("auto-video-movies-folder", folder);
+    savedMoviesFolder = folder;
     scanMoviesMock.mockResolvedValue(paths);
     trashMovieMock.mockReturnValue(pendingTrash.promise);
 
@@ -1045,8 +1054,6 @@ describe("local Movies library", () => {
 
     expect(trashMovieMock).toHaveBeenCalledTimes(1);
     expect(trashMovieMock).toHaveBeenCalledWith({
-      folder,
-      libraryPaths: paths,
       path: exactPath,
     });
     expect(confirmButton).toHaveProperty("disabled", true);
@@ -1092,9 +1099,7 @@ describe("local Movies library", () => {
       `${title} was moved to Trash or the Recycle Bin.`,
     );
     expect(visibleCardCount("Movies")).toBe(7);
-    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
-      folder,
-    );
+    expect(savedMoviesFolder).toBe(folder);
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
       "Library",
     );
@@ -1105,7 +1110,7 @@ describe("local Movies library", () => {
     const firstPath = "/Movies/Remove only me.mp4";
     const secondPath = "/Movies/Keep my feedback.mkv";
     const parentActivation = vi.fn();
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock.mockResolvedValue([firstPath, secondPath]);
     openMovieMock.mockRejectedValueOnce("movie_open_failed");
     revealMovieMock.mockRejectedValueOnce("movie_reveal_failed");
@@ -1172,8 +1177,6 @@ describe("local Movies library", () => {
       within(secondCard).getByRole("button", { name: /Copied title:/ }),
     ).toBeTruthy();
     expect(trashMovieMock).toHaveBeenCalledWith({
-      folder: "/Movies",
-      libraryPaths: [firstPath, secondPath],
       path: firstPath,
     });
     expect(openMovieMock).not.toHaveBeenCalled();
@@ -1212,7 +1215,7 @@ describe("local Movies library", () => {
     "reports %s in the confirmation and keeps the movie",
     async (errorCode, expectedMessage) => {
       const path = "/Movies/First — exact.mp4";
-      window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+      savedMoviesFolder = "/Movies";
       scanMoviesMock.mockResolvedValue([
         path,
         "/Movies/Second remains available.mkv",
@@ -1246,8 +1249,6 @@ describe("local Movies library", () => {
         }),
       ).toHaveProperty("disabled", false);
       expect(trashMovieMock).toHaveBeenCalledWith({
-        folder: "/Movies",
-        libraryPaths: [path, "/Movies/Second remains available.mkv"],
         path,
       });
       expect(openMovieMock).not.toHaveBeenCalled();
@@ -1263,7 +1264,7 @@ describe("local Movies library", () => {
     const staleRefresh = createDeferred<string[]>();
     const trashedPath = "/Movies/Trash during refresh.mp4";
     const remainingPath = "/Movies/Remaining.mkv";
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock
       .mockResolvedValueOnce([trashedPath, remainingPath])
       .mockReturnValueOnce(staleRefresh.promise)
@@ -1319,7 +1320,7 @@ describe("local Movies library", () => {
     const newFolder = "/Movies/New";
     const oldPath = `${oldFolder}/Old movie.mp4`;
     const newPath = `${newFolder}/New movie.mkv`;
-    window.localStorage.setItem("auto-video-movies-folder", oldFolder);
+    savedMoviesFolder = oldFolder;
     scanMoviesMock
       .mockResolvedValueOnce([oldPath])
       .mockResolvedValueOnce([newPath]);
@@ -1360,9 +1361,7 @@ describe("local Movies library", () => {
     expect(
       screen.queryByText("Old movie was moved to Trash or the Recycle Bin."),
     ).toBeNull();
-    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
-      newFolder,
-    );
+    expect(savedMoviesFolder).toBe(newFolder);
     expect(scanMoviesMock).toHaveBeenCalledTimes(2);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -1378,7 +1377,7 @@ describe("local Movies library", () => {
     );
     const title = "映画  —  Final.CUT & punctuation! [1080p]";
     const parentActivation = vi.fn();
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock.mockResolvedValue(paths);
     openMovieMock.mockReturnValue(pendingOpen.promise);
 
@@ -1453,9 +1452,7 @@ describe("local Movies library", () => {
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
       "Library",
     );
-    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
-      "/Movies",
-    );
+    expect(savedMoviesFolder).toBe("/Movies");
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
   });
 
@@ -1475,7 +1472,7 @@ describe("local Movies library", () => {
     "reports %s on only the affected card",
     async (errorCode, expectedMessage) => {
       const firstPath = "/Movies/First — exact.mp4";
-      window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+      savedMoviesFolder = "/Movies";
       scanMoviesMock.mockResolvedValue([
         firstPath,
         "/Movies/Second remains available.mkv",
@@ -1524,7 +1521,7 @@ describe("local Movies library", () => {
     );
     const title = "映画  —  Final.CUT & punctuation! [1080p]";
     const parentActivation = vi.fn();
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock.mockResolvedValue(paths);
     openMovieMock.mockRejectedValueOnce("movie_open_failed");
     revealMovieMock
@@ -1633,9 +1630,7 @@ describe("local Movies library", () => {
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
       "Library",
     );
-    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
-      "/Movies",
-    );
+    expect(savedMoviesFolder).toBe("/Movies");
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
   });
 
@@ -1655,7 +1650,7 @@ describe("local Movies library", () => {
     "reports %s on only the affected card",
     async (errorCode, expectedMessage) => {
       const firstPath = "/Movies/First — exact.mp4";
-      window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+      savedMoviesFolder = "/Movies";
       scanMoviesMock.mockResolvedValue([
         firstPath,
         "/Movies/Second remains available.mkv",
@@ -1694,7 +1689,7 @@ describe("local Movies library", () => {
   );
 
   it("refresh replaces files added or removed since the previous scan", async () => {
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock
       .mockResolvedValueOnce(["/Movies/First.mp4"])
       .mockResolvedValueOnce(["/Movies/Second.mkv"]);
@@ -1708,21 +1703,19 @@ describe("local Movies library", () => {
     expect(await screen.findByText("Second")).toBeTruthy();
     expect(screen.queryByText("First")).toBeNull();
     expect(scanMoviesMock).toHaveBeenCalledTimes(2);
-    expect(scanMoviesMock).toHaveBeenNthCalledWith(2, {
-      folder: "/Movies",
-    });
+    expect(scanMoviesMock).toHaveBeenNthCalledWith(2, undefined);
   });
 
   it("shows distinct scanning and empty-folder states", async () => {
     const pendingScan = createDeferred<string[]>();
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock.mockReturnValue(pendingScan.promise);
 
     render(<App />);
     selectLibrary();
 
     expect(
-      screen.getByRole("status").querySelector("h2")?.textContent,
+      (await screen.findByRole("status")).querySelector("h2")?.textContent,
     ).toBe("Scanning Movies folder");
 
     await act(async () => {
@@ -1738,7 +1731,7 @@ describe("local Movies library", () => {
   });
 
   it("distinguishes an unavailable folder from a recursive scan failure", async () => {
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock.mockRejectedValueOnce("movies_folder_unavailable");
 
     render(<App />);
@@ -1764,19 +1757,18 @@ describe("local Movies library", () => {
 
   it("removes prior results and prevents an earlier scan from replacing a new folder", async () => {
     const earlierScan = createDeferred<string[]>();
-    let oldFolderScans = 0;
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies/Old");
-    scanMoviesMock.mockImplementation(
-      (argumentsValue?: Record<string, unknown>) => {
-        if (argumentsValue?.folder === "/Movies/Old") {
-          oldFolderScans += 1;
-          return oldFolderScans === 1
-            ? Promise.resolve(["/Movies/Old/Old title.mp4"])
-            : earlierScan.promise;
-        }
-        return Promise.resolve(["/Movies/New/New title.mkv"]);
-      },
-    );
+    let scanCount = 0;
+    savedMoviesFolder = "/Movies/Old";
+    scanMoviesMock.mockImplementation(() => {
+      scanCount += 1;
+      if (scanCount === 1) {
+        return Promise.resolve(["/Movies/Old/Old title.mp4"]);
+      }
+      if (scanCount === 2) {
+        return earlierScan.promise;
+      }
+      return Promise.resolve(["/Movies/New/New title.mkv"]);
+    });
     openFolderMock.mockResolvedValue("/Movies/New");
 
     render(<App />);
@@ -1813,7 +1805,7 @@ describe("local Movies library", () => {
       "textContent",
       "The Movies folder picker could not be opened.",
     );
-    expect(window.localStorage.getItem("auto-video-movies-folder")).toBeNull();
+    expect(savedMoviesFolder).toBeNull();
   });
 });
 
@@ -1893,7 +1885,7 @@ describe("resize-aware media galleries", () => {
       (_, index) =>
         `/Movies/Library ${String(index + 1).padStart(2, "0")}.mp4`,
     );
-    window.localStorage.setItem("auto-video-movies-folder", "/Movies");
+    savedMoviesFolder = "/Movies";
     scanMoviesMock.mockResolvedValue(paths);
 
     render(<App />);
@@ -1951,9 +1943,7 @@ describe("resize-aware media galleries", () => {
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
       "Library",
     );
-    expect(window.localStorage.getItem("auto-video-movies-folder")).toBe(
-      "/Movies",
-    );
+    expect(savedMoviesFolder).toBe("/Movies");
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
   });
 });

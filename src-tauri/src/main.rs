@@ -4,14 +4,18 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::{Command, Stdio};
 
 use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
 
+const MOVIES_FOLDER_FILE_NAME: &str = ".movies-folder";
 const MOVIES_FOLDER_UNAVAILABLE: &str = "movies_folder_unavailable";
+const MOVIES_FOLDER_STORAGE_FAILED: &str = "movies_folder_storage_failed";
 const MOVIES_SCAN_FAILED: &str = "movies_scan_failed";
 const MOVIE_OPEN_FAILED: &str = "movie_open_failed";
 const MOVIE_OPEN_NOT_FILE: &str = "movie_open_not_file";
@@ -36,6 +40,21 @@ const TMDB_TOKEN_INVALID: &str = "tmdb_token_invalid";
 const TMDB_TOKEN_STORAGE_FAILED: &str = "tmdb_token_storage_failed";
 // API Read Access Tokens are much shorter; this rejects arbitrary oversized IPC or file input.
 const TMDB_TOKEN_MAX_LENGTH: usize = 4096;
+
+#[derive(Default)]
+struct MoviesLibraryContext {
+    folder: Option<PathBuf>,
+    movie_paths: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct MoviesLibraryState(Arc<Mutex<MoviesLibraryContext>>);
+
+struct TrashMovieRequest {
+    path: String,
+    folder: Option<String>,
+    library_paths: Option<Vec<String>>,
+}
 
 fn collect_movie_paths(directory: &Path, movie_paths: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(directory)? {
@@ -79,6 +98,37 @@ fn scan_movie_paths(folder: &Path) -> Result<Vec<String>, &'static str> {
                 .map_err(|_| MOVIES_SCAN_FAILED)
         })
         .collect()
+}
+
+fn load_movies_folder_file(path: &Path) -> Result<Option<PathBuf>, &'static str> {
+    match fs::read_to_string(path) {
+        Ok(folder) if !folder.is_empty() => Ok(Some(PathBuf::from(folder))),
+        Ok(_) => Err(MOVIES_FOLDER_STORAGE_FAILED),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(MOVIES_FOLDER_STORAGE_FAILED),
+    }
+}
+
+fn save_movies_folder_file(path: &Path, folder: &Path) -> Result<(), &'static str> {
+    let folder = folder.to_str().ok_or(MOVIES_FOLDER_STORAGE_FAILED)?;
+    let parent = path.parent().ok_or(MOVIES_FOLDER_STORAGE_FAILED)?;
+    fs::create_dir_all(parent).map_err(|_| MOVIES_FOLDER_STORAGE_FAILED)?;
+    fs::write(path, folder).map_err(|_| MOVIES_FOLDER_STORAGE_FAILED)
+}
+
+fn clear_movies_folder_file(path: &Path) -> Result<(), &'static str> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(MOVIES_FOLDER_STORAGE_FAILED),
+    }
+}
+
+fn scan_movies_library(library: &mut MoviesLibraryContext) -> Result<Vec<String>, &'static str> {
+    let folder = library.folder.as_deref().ok_or(MOVIES_FOLDER_UNAVAILABLE)?;
+    let movie_paths = scan_movie_paths(folder)?;
+    library.movie_paths.clone_from(&movie_paths);
+    Ok(movie_paths)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -196,6 +246,38 @@ fn trash_movie_path_with(
     }
 
     dispatch(path).map_err(|_| MOVIE_TRASH_FAILED)
+}
+
+fn trash_movie_request_with(
+    request: TrashMovieRequest,
+    library: &mut MoviesLibraryContext,
+    dispatch: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    // Caller context is accepted for compatibility but never participates in authorization.
+    let _ignored_caller_context = (request.folder, request.library_paths);
+    let folder = library
+        .folder
+        .as_deref()
+        .ok_or(MOVIE_TRASH_FOLDER_UNAVAILABLE)?;
+    let current_movie_paths = scan_movie_paths(folder).map_err(|error| {
+        if error == MOVIES_FOLDER_UNAVAILABLE {
+            MOVIE_TRASH_FOLDER_UNAVAILABLE
+        } else {
+            MOVIE_TRASH_UNAVAILABLE
+        }
+    })?;
+
+    trash_movie_path_with(
+        Path::new(&request.path),
+        folder,
+        &library.movie_paths,
+        &current_movie_paths,
+        dispatch,
+    )?;
+    library
+        .movie_paths
+        .retain(|movie_path| movie_path != &request.path);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -317,12 +399,101 @@ fn tmdb_token_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|_| TMDB_TOKEN_STORAGE_FAILED.to_owned())
 }
 
+fn movies_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(MOVIES_FOLDER_FILE_NAME))
+        .map_err(|_| MOVIES_FOLDER_STORAGE_FAILED.to_owned())
+}
+
 #[tauri::command]
-async fn scan_movies(folder: String) -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || scan_movie_paths(Path::new(&folder)))
-        .await
-        .map_err(|_| MOVIES_SCAN_FAILED.to_owned())?
-        .map_err(str::to_owned)
+fn load_movies_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<Option<String>, String> {
+    let folder = load_movies_folder_file(&movies_folder_path(&app)?)?;
+    let response = folder
+        .as_ref()
+        .map(|folder| {
+            folder
+                .to_str()
+                .map(str::to_owned)
+                .ok_or(MOVIES_FOLDER_STORAGE_FAILED)
+        })
+        .transpose()?;
+    let mut library = state
+        .0
+        .lock()
+        .map_err(|_| MOVIES_FOLDER_STORAGE_FAILED.to_owned())?;
+    library.folder = folder;
+    library.movie_paths.clear();
+    Ok(response)
+}
+
+#[tauri::command]
+async fn choose_movies_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<Option<String>, String> {
+    let dialog_app = app.clone();
+    let selected_folder = tauri::async_runtime::spawn_blocking(move || {
+        dialog_app
+            .dialog()
+            .file()
+            .set_title("Choose Movies folder")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|_| MOVIES_FOLDER_UNAVAILABLE.to_owned())?;
+    let Some(selected_folder) = selected_folder else {
+        return Ok(None);
+    };
+    let folder = selected_folder
+        .into_path()
+        .map_err(|_| MOVIES_FOLDER_UNAVAILABLE.to_owned())?;
+    let metadata = fs::metadata(&folder).map_err(|_| MOVIES_FOLDER_UNAVAILABLE.to_owned())?;
+    if !metadata.is_dir() {
+        return Err(MOVIES_FOLDER_UNAVAILABLE.to_owned());
+    }
+    let response = folder
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| MOVIES_FOLDER_UNAVAILABLE.to_owned())?;
+
+    save_movies_folder_file(&movies_folder_path(&app)?, &folder)?;
+    let mut library = state
+        .0
+        .lock()
+        .map_err(|_| MOVIES_FOLDER_STORAGE_FAILED.to_owned())?;
+    library.folder = Some(folder);
+    library.movie_paths.clear();
+    Ok(Some(response))
+}
+
+#[tauri::command]
+fn clear_movies_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<(), String> {
+    clear_movies_folder_file(&movies_folder_path(&app)?)?;
+    let mut library = state
+        .0
+        .lock()
+        .map_err(|_| MOVIES_FOLDER_STORAGE_FAILED.to_owned())?;
+    library.folder = None;
+    library.movie_paths.clear();
+    Ok(())
+}
+
+#[tauri::command]
+async fn scan_movies(state: tauri::State<'_, MoviesLibraryState>) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut library = state.0.lock().map_err(|_| MOVIES_SCAN_FAILED.to_owned())?;
+        scan_movies_library(&mut library).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| MOVIES_SCAN_FAILED.to_owned())?
 }
 
 #[tauri::command]
@@ -352,22 +523,20 @@ async fn reveal_movie(path: String) -> Result<(), String> {
 #[tauri::command]
 async fn trash_movie(
     path: String,
-    folder: String,
-    library_paths: Vec<String>,
+    folder: Option<String>,
+    library_paths: Option<Vec<String>>,
+    state: tauri::State<'_, MoviesLibraryState>,
 ) -> Result<(), String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let current_movie_paths = scan_movie_paths(Path::new(&folder)).map_err(|error| {
-            if error == MOVIES_FOLDER_UNAVAILABLE {
-                MOVIE_TRASH_FOLDER_UNAVAILABLE
-            } else {
-                MOVIE_TRASH_UNAVAILABLE
-            }
-        })?;
-        trash_movie_path_with(
-            Path::new(&path),
-            Path::new(&folder),
-            &library_paths,
-            &current_movie_paths,
+        let mut library = state.0.lock().map_err(|_| MOVIE_TRASH_UNAVAILABLE)?;
+        trash_movie_request_with(
+            TrashMovieRequest {
+                path,
+                folder,
+                library_paths,
+            },
+            &mut library,
             move_to_os_trash,
         )
     })
@@ -394,7 +563,11 @@ fn clear_tmdb_token(app: tauri::AppHandle) -> Result<(), String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(MoviesLibraryState::default())
         .invoke_handler(tauri::generate_handler![
+            load_movies_folder,
+            choose_movies_folder,
+            clear_movies_folder,
             scan_movies,
             open_movie,
             reveal_movie,
@@ -417,15 +590,16 @@ mod tests {
     };
 
     use super::{
-        clear_tmdb_token_file, load_tmdb_token_file, movie_metadata_error, open_movie_path_with,
-        reveal_movie_path_with, save_tmdb_token_file, scan_movie_paths, trash_movie_path_with,
-        MoviePathValidationError, MOVIES_FOLDER_UNAVAILABLE, MOVIE_OPEN_FAILED,
-        MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED,
-        MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
-        MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED,
-        MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND,
-        MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE, MOVIE_TRASH_UNAVAILABLE,
-        MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID,
+        clear_movies_folder_file, clear_tmdb_token_file, load_movies_folder_file,
+        load_tmdb_token_file, movie_metadata_error, open_movie_path_with, reveal_movie_path_with,
+        save_movies_folder_file, save_tmdb_token_file, scan_movie_paths, trash_movie_path_with,
+        trash_movie_request_with, MoviePathValidationError, MoviesLibraryContext,
+        TrashMovieRequest, MOVIES_FOLDER_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE,
+        MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED,
+        MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE,
+        MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED, MOVIE_TRASH_FOLDER_UNAVAILABLE,
+        MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND, MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE,
+        MOVIE_TRASH_UNAVAILABLE, MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID,
     };
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -536,14 +710,19 @@ mod tests {
     fn trashes_the_exact_current_movie_path_after_root_validation() {
         let fixture = FilesystemFixture::new();
         let movie_path = fixture.create_file("nested/映画  —  Final.CUT!.MKV");
-        let current_movie_paths = vec![path_string(movie_path.clone())];
+        let mut library = MoviesLibraryContext {
+            folder: Some(fixture.path.clone()),
+            movie_paths: vec![path_string(movie_path.clone())],
+        };
         let dispatched_path = RefCell::new(None);
 
-        let result = trash_movie_path_with(
-            &movie_path,
-            &fixture.path,
-            &current_movie_paths,
-            &current_movie_paths,
+        let result = trash_movie_request_with(
+            TrashMovieRequest {
+                path: path_string(movie_path.clone()),
+                folder: None,
+                library_paths: None,
+            },
+            &mut library,
             |path| {
                 dispatched_path.replace(Some(path.to_path_buf()));
                 Ok(())
@@ -552,6 +731,37 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(dispatched_path.into_inner(), Some(movie_path));
+        assert!(library.movie_paths.is_empty());
+    }
+
+    #[test]
+    fn trash_rejects_fabricated_context_for_a_movie_outside_the_trusted_library() {
+        let trusted_fixture = FilesystemFixture::new();
+        let trusted_movie = trusted_fixture.create_file("Trusted.mp4");
+        let unrelated_fixture = FilesystemFixture::new();
+        let unrelated_movie = unrelated_fixture.create_file("Unrelated.mkv");
+        let unrelated_movie_path = path_string(unrelated_movie.clone());
+        let mut trusted_library = MoviesLibraryContext {
+            folder: Some(trusted_fixture.path.clone()),
+            movie_paths: vec![path_string(trusted_movie)],
+        };
+        let dispatched = RefCell::new(false);
+
+        let result = trash_movie_request_with(
+            TrashMovieRequest {
+                path: unrelated_movie_path.clone(),
+                folder: Some(path_string(unrelated_fixture.path.clone())),
+                library_paths: Some(vec![unrelated_movie_path]),
+            },
+            &mut trusted_library,
+            |_| {
+                dispatched.replace(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(MOVIE_TRASH_OUTSIDE_FOLDER));
+        assert!(!dispatched.into_inner());
     }
 
     #[test]
@@ -765,6 +975,23 @@ mod tests {
             ),
             Err(MOVIE_TRASH_FAILED)
         );
+    }
+
+    #[test]
+    fn persists_loads_and_clears_the_configured_movies_folder() {
+        let fixture = FilesystemFixture::new();
+        let config_path = fixture.path.join("movies-folder");
+        let movies_folder = fixture.path.join("Movies — 家族");
+
+        assert_eq!(load_movies_folder_file(&config_path), Ok(None));
+        save_movies_folder_file(&config_path, &movies_folder)
+            .expect("failed to save Movies folder");
+        assert_eq!(
+            load_movies_folder_file(&config_path),
+            Ok(Some(movies_folder))
+        );
+        clear_movies_folder_file(&config_path).expect("failed to clear Movies folder");
+        assert_eq!(load_movies_folder_file(&config_path), Ok(None));
     }
 
     #[test]
