@@ -1,3 +1,4 @@
+import { AlertDialog } from "@base-ui/react/alert-dialog";
 import {
   ArrowClockwiseIcon,
   CheckIcon,
@@ -17,9 +18,10 @@ import {
   PlayIcon,
   SquaresFourIcon,
   SunIcon,
+  TrashIcon,
   WarningCircleIcon,
+  XIcon,
 } from "@phosphor-icons/react";
-import { open } from "@tauri-apps/plugin-dialog";
 import {
   type CSSProperties,
   type FormEvent,
@@ -27,6 +29,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
   useEffect,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
@@ -109,6 +112,8 @@ const appIcons = {
   movie: FilmStripIcon,
   open: PlayIcon,
   reveal: FolderOpenIcon,
+  trash: TrashIcon,
+  close: XIcon,
   poster: ImageSquareIcon,
   copy: CopySimpleIcon,
   copied: CheckIcon,
@@ -145,7 +150,6 @@ type GalleryLayout = {
 };
 
 const appearanceStorageKey = "auto-video-appearance";
-const moviesFolderStorageKey = "auto-video-movies-folder";
 const moviesFolderUnavailable = "movies_folder_unavailable";
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
 // Two seconds confirms a successful copy without leaving stale feedback on the card.
@@ -205,6 +209,22 @@ const movieRevealErrorMessages: Record<string, string> = {
   movie_reveal_failed: "The operating system could not reveal this movie.",
 };
 const movieRevealFallbackMessage = "Auto-Video could not reveal this movie.";
+
+const movieTrashErrorMessages: Record<string, string> = {
+  movie_trash_not_found: "This movie is no longer available.",
+  movie_trash_unavailable: "Auto-Video could not access this movie.",
+  movie_trash_not_file: "This item is not an eligible video file.",
+  movie_trash_unsupported: "This item is not a supported .mp4 or .mkv file.",
+  movie_trash_folder_unavailable:
+    "The configured Movies folder is no longer available.",
+  movie_trash_outside_folder:
+    "This movie is outside the configured Movies folder.",
+  movie_trash_stale: "This movie is no longer part of the current Library.",
+  movie_trash_failed:
+    "The operating system could not move this movie to Trash or the Recycle Bin.",
+};
+const movieTrashFallbackMessage =
+  "Auto-Video could not move this movie to Trash or the Recycle Bin.";
 
 const discoverMessages = {
   "loading-credential": {
@@ -559,13 +579,28 @@ function DiscoverMovieCard({
   );
 }
 
-function LibraryMovieCard({ movie }: { movie: Movie }) {
+function LibraryMovieCard({
+  folder,
+  movie,
+  onMovieTrashed,
+}: {
+  folder: string;
+  movie: Movie;
+  onMovieTrashed: (movie: Movie, folder: string) => void;
+}) {
   const [isOpening, setIsOpening] = useState(false);
   const [isRevealing, setIsRevealing] = useState(false);
+  const [isTrashing, setIsTrashing] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
   const [revealError, setRevealError] = useState<string | null>(null);
+  const [trashError, setTrashError] = useState<string | null>(null);
+  const [trashDialogOpen, setTrashDialogOpen] = useState(false);
   const openRequestPending = useRef(false);
   const revealRequestPending = useRef(false);
+  const trashRequestPending = useRef(false);
+  const trashCancelButton = useRef<HTMLButtonElement | null>(null);
+  const trashDialogPopup = useRef<HTMLDivElement | null>(null);
+  const trashTriggerId = useId();
 
   const openMovie = async (event: ReactMouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -623,6 +658,49 @@ function LibraryMovieCard({ movie }: { movie: Movie }) {
     }
   };
 
+  const updateTrashDialog = (open: boolean) => {
+    if (!open && trashRequestPending.current) {
+      return;
+    }
+
+    setTrashDialogOpen(open);
+    if (open) {
+      setTrashError(null);
+    }
+  };
+
+  const trashMovie = async (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (trashRequestPending.current) {
+      return;
+    }
+
+    trashRequestPending.current = true;
+    setIsTrashing(true);
+    setTrashError(null);
+    trashDialogPopup.current?.focus();
+
+    try {
+      await window.__TAURI__.core.invoke("trash_movie", {
+        path: movie.path,
+      });
+      onMovieTrashed(movie, folder);
+    } catch (error: unknown) {
+      const errorCode =
+        typeof error === "string"
+          ? error
+          : error instanceof Error
+            ? error.message
+            : "";
+      setTrashError(
+        movieTrashErrorMessages[errorCode] ?? movieTrashFallbackMessage,
+      );
+    } finally {
+      trashRequestPending.current = false;
+      setIsTrashing(false);
+    }
+  };
+
   const fileActionErrorCount =
     Number(openError !== null) + Number(revealError !== null);
 
@@ -672,7 +750,110 @@ function LibraryMovieCard({ movie }: { movie: Movie }) {
       </div>
       <div className="media-title-row">
         <h3>{movie.title}</h3>
-        <CopyTitleAction title={movie.title} />
+        <div className="movie-card__title-actions">
+          <AlertDialog.Root
+            onOpenChange={updateTrashDialog}
+            open={trashDialogOpen}
+            triggerId={trashDialogOpen ? trashTriggerId : null}
+          >
+            <AlertDialog.Trigger
+              id={trashTriggerId}
+              render={
+                <Button
+                  aria-label={`Move movie to Trash or Recycle Bin: ${movie.title}`}
+                  disabled={isTrashing}
+                  onClick={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  size="icon-xs"
+                  title="Move to Trash or Recycle Bin"
+                  type="button"
+                  variant="destructive"
+                >
+                  <AppIcon name="trash" />
+                </Button>
+              }
+            />
+            <AlertDialog.Portal>
+              <AlertDialog.Backdrop
+                className="trash-dialog__backdrop"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  updateTrashDialog(false);
+                }}
+                onPointerDown={(event) => event.stopPropagation()}
+              />
+              <AlertDialog.Viewport className="trash-dialog__viewport">
+                <AlertDialog.Popup
+                  aria-busy={isTrashing}
+                  className="trash-dialog__popup"
+                  initialFocus={() => trashCancelButton.current}
+                  onClick={(event) => event.stopPropagation()}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  ref={trashDialogPopup}
+                >
+                  <div className="trash-dialog__heading">
+                    <AlertDialog.Title>
+                      Move “{movie.title}” to Trash?
+                    </AlertDialog.Title>
+                    <AlertDialog.Close
+                      render={
+                        <Button
+                          aria-label="Close confirmation"
+                          disabled={isTrashing}
+                          size="icon-xs"
+                          type="button"
+                          variant="ghost"
+                        >
+                          <AppIcon name="close" />
+                        </Button>
+                      }
+                    />
+                  </div>
+                  <AlertDialog.Description>
+                    This moves the selected video to macOS Trash or the Windows
+                    Recycle Bin. It may be recoverable there.
+                  </AlertDialog.Description>
+                  {trashError === null ? null : (
+                    <p
+                      aria-atomic="true"
+                      className="trash-dialog__error"
+                      role="alert"
+                    >
+                      {trashError}
+                    </p>
+                  )}
+                  <div className="trash-dialog__actions">
+                    <AlertDialog.Close
+                      render={
+                        <Button
+                          disabled={isTrashing}
+                          ref={trashCancelButton}
+                          type="button"
+                          variant="outline"
+                        >
+                          Cancel
+                        </Button>
+                      }
+                    />
+                    <Button
+                      aria-label={`${isTrashing ? "Moving" : "Confirm moving"} movie to Trash or Recycle Bin: ${movie.title}`}
+                      disabled={isTrashing}
+                      onClick={trashMovie}
+                      onKeyDown={(event) => event.stopPropagation()}
+                      type="button"
+                      variant="destructive"
+                    >
+                      <AppIcon name="trash" />
+                      {isTrashing ? "Moving…" : "Move file"}
+                    </Button>
+                  </div>
+                </AlertDialog.Popup>
+              </AlertDialog.Viewport>
+            </AlertDialog.Portal>
+          </AlertDialog.Root>
+          <CopyTitleAction title={movie.title} />
+        </div>
       </div>
       <div className="movie-card__file-action-errors">
         {openError === null ? null : (
@@ -711,14 +892,15 @@ export default function App() {
   const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(() =>
     window.matchMedia(systemDarkModeQuery).matches ? "dark" : "light",
   );
-  const [moviesFolder, setMoviesFolder] = useState<string | null>(() => {
-    const storedFolder = window.localStorage.getItem(moviesFolderStorageKey);
-    return storedFolder === "" ? null : storedFolder;
+  const [moviesFolder, setMoviesFolder] = useState<string | null>(null);
+  const [isMoviesFolderLoaded, setIsMoviesFolderLoaded] = useState(false);
+  const [movieScanState, setMovieScanState] = useState<MovieScanState>({
+    status: "unconfigured",
   });
-  const [movieScanState, setMovieScanState] = useState<MovieScanState>(
-    moviesFolder === null ? { status: "unconfigured" } : { status: "scanning" },
-  );
   const [movieRefreshVersion, setMovieRefreshVersion] = useState(0);
+  const [movieTrashAnnouncement, setMovieTrashAnnouncement] = useState<
+    string | null
+  >(null);
   const [isChoosingFolder, setIsChoosingFolder] = useState(false);
   const [folderSelectionError, setFolderSelectionError] = useState<
     string | null
@@ -739,6 +921,11 @@ export default function App() {
   const workspace = useRef<HTMLElement | null>(null);
   const scanRequestId = useRef(0);
   const discoverRequestId = useRef(0);
+  const currentMoviesFolder = useRef(moviesFolder);
+  const currentMovieScanState = useRef(movieScanState);
+  // Late Trash responses read current state so an old card cannot modify replacement results.
+  currentMoviesFolder.current = moviesFolder;
+  currentMovieScanState.current = movieScanState;
 
   useEffect(() => {
     const systemPreference = window.matchMedia(systemDarkModeQuery);
@@ -762,12 +949,41 @@ export default function App() {
   }, [appearance, resolvedTheme]);
 
   useEffect(() => {
-    if (moviesFolder === null) {
-      window.localStorage.removeItem(moviesFolderStorageKey);
-    } else {
-      window.localStorage.setItem(moviesFolderStorageKey, moviesFolder);
-    }
-  }, [moviesFolder]);
+    let isCurrent = true;
+
+    void window.__TAURI__.core
+      .invoke<string | null>("load_movies_folder")
+      .then((savedFolder) => {
+        if (!isCurrent) {
+          return;
+        }
+        if (
+          savedFolder !== null &&
+          (typeof savedFolder !== "string" || savedFolder === "")
+        ) {
+          throw new Error("The native Movies folder store returned invalid data.");
+        }
+
+        setMoviesFolder(savedFolder);
+      })
+      .catch(() => {
+        if (isCurrent) {
+          setMoviesFolder(null);
+          setFolderSelectionError(
+            "The Movies folder configuration could not be loaded.",
+          );
+        }
+      })
+      .finally(() => {
+        if (isCurrent) {
+          setIsMoviesFolderLoaded(true);
+        }
+      });
+
+    return () => {
+      isCurrent = false;
+    };
+  }, []);
 
   useEffect(() => {
     let isCurrent = true;
@@ -808,6 +1024,9 @@ export default function App() {
   useEffect(() => {
     const requestId = ++scanRequestId.current;
 
+    if (!isMoviesFolderLoaded) {
+      return;
+    }
     if (moviesFolder === null) {
       setMovieScanState({ status: "unconfigured" });
       return;
@@ -815,7 +1034,7 @@ export default function App() {
 
     setMovieScanState({ status: "scanning" });
     void window.__TAURI__.core
-      .invoke<string[]>("scan_movies", { folder: moviesFolder })
+      .invoke<string[]>("scan_movies")
       .then((paths) => {
         if (requestId !== scanRequestId.current) {
           return;
@@ -853,7 +1072,7 @@ export default function App() {
     return () => {
       scanRequestId.current += 1;
     };
-  }, [moviesFolder, movieRefreshVersion]);
+  }, [isMoviesFolderLoaded, moviesFolder, movieRefreshVersion]);
 
   useEffect(() => {
     const requestId = ++discoverRequestId.current;
@@ -936,11 +1155,9 @@ export default function App() {
     setIsChoosingFolder(true);
 
     try {
-      const selectedFolder = await open({
-        directory: true,
-        multiple: false,
-        title: "Choose Movies folder",
-      });
+      const selectedFolder = await window.__TAURI__.core.invoke<string | null>(
+        "choose_movies_folder",
+      );
 
       if (selectedFolder === null) {
         return;
@@ -963,11 +1180,19 @@ export default function App() {
     }
   };
 
-  const clearMoviesFolder = () => {
+  const clearMoviesFolder = async () => {
     scanRequestId.current += 1;
     setFolderSelectionError(null);
     setMovieScanState({ status: "unconfigured" });
-    setMoviesFolder(null);
+    try {
+      await window.__TAURI__.core.invoke("clear_movies_folder");
+      setMoviesFolder(null);
+    } catch {
+      setFolderSelectionError(
+        "The Movies folder configuration could not be cleared.",
+      );
+      setMovieRefreshVersion((version) => version + 1);
+    }
   };
 
   const refreshMovies = () => {
@@ -978,6 +1203,39 @@ export default function App() {
     scanRequestId.current += 1;
     setMovieScanState({ status: "scanning" });
     setMovieRefreshVersion((version) => version + 1);
+  };
+
+  const recordTrashedMovie = (movie: Movie, confirmedFolder: string) => {
+    if (currentMoviesFolder.current !== confirmedFolder) {
+      return;
+    }
+
+    setMovieTrashAnnouncement(
+      `${movie.title} was moved to Trash or the Recycle Bin.`,
+    );
+
+    if (currentMovieScanState.current.status === "scanning") {
+      scanRequestId.current += 1;
+      setMovieRefreshVersion((version) => version + 1);
+      return;
+    }
+
+    setMovieScanState((currentState) => {
+      if (currentState.status !== "ready") {
+        return currentState;
+      }
+
+      const remainingMovies = currentState.movies.filter(
+        (currentMovie) => currentMovie.path !== movie.path,
+      );
+      if (remainingMovies.length === currentState.movies.length) {
+        return currentState;
+      }
+
+      return remainingMovies.length === 0
+        ? { status: "empty" }
+        : { status: "ready", movies: remainingMovies };
+    });
   };
 
   const saveTmdbToken = async (event: FormEvent<HTMLFormElement>) => {
@@ -1118,6 +1376,12 @@ export default function App() {
             <p>{activeDestination.description}</p>
           </header>
 
+          {movieTrashAnnouncement === null ? null : (
+            <p aria-atomic="true" className="sr-only" role="status">
+              {movieTrashAnnouncement}
+            </p>
+          )}
+
           {activeDestination.id === "discover" ? (
             <section
               aria-busy={discoverState.status === "loading"}
@@ -1229,13 +1493,19 @@ export default function App() {
                 ) : null}
               </div>
 
-              {movieScanState.status === "ready" ? (
+              {movieScanState.status === "ready" && moviesFolder !== null ? (
                 <ResizeAwareGallery
                   ariaLabel="Movies"
                   getItemKey={(movie) => movie.path}
                   items={movieScanState.movies}
                   key="library-gallery"
-                  renderItem={(movie) => <LibraryMovieCard movie={movie} />}
+                  renderItem={(movie) => (
+                    <LibraryMovieCard
+                      folder={moviesFolder}
+                      movie={movie}
+                      onMovieTrashed={recordTrashedMovie}
+                    />
+                  )}
                   variant="library"
                 />
               ) : (
