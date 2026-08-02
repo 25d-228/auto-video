@@ -712,7 +712,7 @@ mod tests {
         let movie_path = fixture.create_file("nested/映画  —  Final.CUT!.MKV");
         let mut library = MoviesLibraryContext {
             folder: Some(fixture.path.clone()),
-            movie_paths: vec![path_string(movie_path.clone())],
+            movie_paths: scan_movie_paths(&fixture.path).expect("failed to scan fixture"),
         };
         let dispatched_path = RefCell::new(None);
 
