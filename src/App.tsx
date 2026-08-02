@@ -6,7 +6,9 @@ import {
   FilmStripIcon,
   FolderSimpleIcon,
   GearSixIcon,
+  ImageSquareIcon,
   type Icon,
+  KeyIcon,
   MonitorIcon,
   MoonIcon,
   PlayIcon,
@@ -15,13 +17,21 @@ import {
 } from "@phosphor-icons/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   useEffect,
   useRef,
   useState,
 } from "react";
 
+import tmdbLogo from "@/assets/tmdb-logo.svg";
 import { Button } from "@/components/ui/button";
+import {
+  fetchWeeklyTrendingMovies,
+  type TmdbMovie,
+  type TmdbTrendingResult,
+  tmdbPosterUrl,
+} from "@/tmdb";
 
 import "./index.css";
 
@@ -37,10 +47,10 @@ const destinations = [
   {
     id: "discover",
     label: "Discover",
-    description: "Find media after discovery providers are introduced.",
+    description: "Browse TMDB's weekly trending Movies feed.",
     emptyHeading: "Discovery is not configured",
     emptyMessage:
-      "Provider feeds, search, and media results will be added in a later product slice.",
+      "Add a TMDB API Read Access Token in Settings to load weekly trending Movies.",
   },
   {
     id: "library",
@@ -61,12 +71,13 @@ const destinations = [
   {
     id: "settings",
     label: "Settings",
-    description: "Configure your local Movies folder and application appearance.",
+    description: "Configure TMDB, your local Movies folder, and appearance.",
     emptyHeading: "Other settings are not configured",
     emptyMessage:
       "Provider credentials and additional preferences will appear only with the features they control.",
   },
 ] as const;
+const settingsDestination = destinations[4];
 
 const appearanceModes = [
   { id: "light", label: "Light" },
@@ -85,8 +96,10 @@ const appIcons = {
   dark: MoonIcon,
   system: MonitorIcon,
   folder: FolderSimpleIcon,
+  credential: KeyIcon,
   refresh: ArrowClockwiseIcon,
   movie: FilmStripIcon,
+  poster: ImageSquareIcon,
 } satisfies Record<string, Icon>;
 
 type AppearanceMode = (typeof appearanceModes)[number]["id"];
@@ -100,6 +113,16 @@ type MovieScanState =
   | { status: "unavailable" }
   | { status: "error" }
   | { status: "ready"; movies: Movie[] };
+type DiscoverState =
+  | { status: "loading-credential" }
+  | { status: "credential-error" }
+  | { status: "unconfigured" }
+  | { status: "loading" }
+  | TmdbTrendingResult;
+type CredentialMessage = {
+  role: "alert" | "status";
+  text: string;
+};
 
 const appearanceStorageKey = "auto-video-appearance";
 const moviesFolderStorageKey = "auto-video-movies-folder";
@@ -137,6 +160,54 @@ const movieScanMessages = {
   },
 } as const;
 
+const discoverMessages = {
+  "loading-credential": {
+    heading: "Loading TMDB configuration",
+    message: "Checking for a locally saved TMDB token.",
+    role: "status",
+  },
+  "credential-error": {
+    heading: "TMDB configuration could not be loaded",
+    message: "Open Settings to save the TMDB token again.",
+    role: "alert",
+  },
+  unconfigured: {
+    heading: "Configure TMDB to discover movies",
+    message: "Add a TMDB API Read Access Token in Settings before loading the feed.",
+    role: undefined,
+  },
+  loading: {
+    heading: "Loading weekly trending Movies",
+    message: "Requesting this week's Movies feed from TMDB.",
+    role: "status",
+  },
+  empty: {
+    heading: "No trending movies returned",
+    message: "TMDB returned an empty weekly Movies feed. Try Refresh later.",
+    role: undefined,
+  },
+  unauthorized: {
+    heading: "TMDB token was not accepted",
+    message: "Replace the API Read Access Token in Settings and try again.",
+    role: "alert",
+  },
+  "rate-limited": {
+    heading: "TMDB rate limit reached",
+    message: "TMDB is temporarily limiting requests. Wait before trying Refresh.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "TMDB could not be reached",
+    message: "Check the network connection and try Refresh.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "TMDB could not load trending Movies",
+    message: "TMDB returned an unexpected response. Try Refresh later.",
+    role: "alert",
+  },
+} as const;
+
 function AppIcon({ name }: { name: IconName }) {
   const IconComponent = appIcons[name];
 
@@ -147,6 +218,49 @@ function AppIcon({ name }: { name: IconName }) {
       focusable="false"
       weight="regular"
     />
+  );
+}
+
+function DiscoverMovieCard({
+  movie,
+  resultIndex,
+}: {
+  movie: TmdbMovie;
+  resultIndex: number;
+}) {
+  const [posterFailed, setPosterFailed] = useState(false);
+  const titleId = `tmdb-movie-${movie.id}-${resultIndex}`;
+
+  return (
+    <article aria-labelledby={titleId} className="discover-card">
+      <div className="discover-card__poster">
+        {movie.posterPath !== null && !posterFailed ? (
+          <img
+            alt=""
+            onError={() => setPosterFailed(true)}
+            src={tmdbPosterUrl(movie.posterPath)}
+          />
+        ) : (
+          <div className="discover-card__poster-fallback">
+            <AppIcon name="poster" />
+            <span>Poster unavailable</span>
+          </div>
+        )}
+      </div>
+      <div className="discover-card__body">
+        <h3 id={titleId}>{movie.title}</h3>
+        <dl>
+          <div>
+            <dt>Release</dt>
+            <dd>{movie.releaseDate ?? "Unavailable"}</dd>
+          </div>
+          <div>
+            <dt>Source</dt>
+            <dd>TMDB</dd>
+          </div>
+        </dl>
+      </div>
+    </article>
   );
 }
 
@@ -178,13 +292,27 @@ export default function App() {
   const [movieScanState, setMovieScanState] = useState<MovieScanState>(
     moviesFolder === null ? { status: "unconfigured" } : { status: "scanning" },
   );
-  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [movieRefreshVersion, setMovieRefreshVersion] = useState(0);
   const [isChoosingFolder, setIsChoosingFolder] = useState(false);
   const [folderSelectionError, setFolderSelectionError] = useState<
     string | null
   >(null);
+  const [tmdbToken, setTmdbToken] = useState<string | null>(null);
+  const [isTmdbTokenLoaded, setIsTmdbTokenLoaded] = useState(false);
+  const [tmdbCredentialLoadFailed, setTmdbCredentialLoadFailed] =
+    useState(false);
+  const [tmdbTokenInput, setTmdbTokenInput] = useState("");
+  const [isSavingTmdbToken, setIsSavingTmdbToken] = useState(false);
+  const [tmdbCredentialMessage, setTmdbCredentialMessage] =
+    useState<CredentialMessage | null>(null);
+  const [discoverState, setDiscoverState] = useState<DiscoverState>({
+    status: "loading-credential",
+  });
+  const [discoverRefreshVersion, setDiscoverRefreshVersion] = useState(0);
   const navigationItems = useRef<Array<HTMLButtonElement | null>>([]);
+  const workspace = useRef<HTMLElement | null>(null);
   const scanRequestId = useRef(0);
+  const discoverRequestId = useRef(0);
 
   useEffect(() => {
     const systemPreference = window.matchMedia(systemDarkModeQuery);
@@ -214,6 +342,42 @@ export default function App() {
       window.localStorage.setItem(moviesFolderStorageKey, moviesFolder);
     }
   }, [moviesFolder]);
+
+  useEffect(() => {
+    let isCurrent = true;
+
+    void window.__TAURI__.core
+      .invoke<string | null>("load_tmdb_token")
+      .then((savedToken) => {
+        if (!isCurrent) {
+          return;
+        }
+        if (
+          savedToken !== null &&
+          (typeof savedToken !== "string" || savedToken === "")
+        ) {
+          throw new Error("The native credential store returned invalid data.");
+        }
+
+        setTmdbToken(savedToken);
+        setTmdbCredentialLoadFailed(false);
+      })
+      .catch(() => {
+        if (isCurrent) {
+          setTmdbToken(null);
+          setTmdbCredentialLoadFailed(true);
+        }
+      })
+      .finally(() => {
+        if (isCurrent) {
+          setIsTmdbTokenLoaded(true);
+        }
+      });
+
+    return () => {
+      isCurrent = false;
+    };
+  }, []);
 
   useEffect(() => {
     const requestId = ++scanRequestId.current;
@@ -263,7 +427,48 @@ export default function App() {
     return () => {
       scanRequestId.current += 1;
     };
-  }, [moviesFolder, refreshVersion]);
+  }, [moviesFolder, movieRefreshVersion]);
+
+  useEffect(() => {
+    const requestId = ++discoverRequestId.current;
+
+    if (activeDestination.id !== "discover") {
+      return;
+    }
+    if (!isTmdbTokenLoaded) {
+      setDiscoverState({ status: "loading-credential" });
+      return;
+    }
+    if (tmdbCredentialLoadFailed) {
+      setDiscoverState({ status: "credential-error" });
+      return;
+    }
+    if (tmdbToken === null) {
+      setDiscoverState({ status: "unconfigured" });
+      return;
+    }
+
+    const abortController = new AbortController();
+    setDiscoverState({ status: "loading" });
+    void fetchWeeklyTrendingMovies(tmdbToken, abortController.signal).then(
+      (result) => {
+        if (requestId === discoverRequestId.current) {
+          setDiscoverState(result);
+        }
+      },
+    );
+
+    return () => {
+      discoverRequestId.current += 1;
+      abortController.abort();
+    };
+  }, [
+    activeDestination.id,
+    discoverRefreshVersion,
+    isTmdbTokenLoaded,
+    tmdbCredentialLoadFailed,
+    tmdbToken,
+  ]);
 
   const moveNavigationFocus = (
     event: ReactKeyboardEvent<HTMLButtonElement>,
@@ -293,6 +498,13 @@ export default function App() {
     navigationItems.current[nextIndex]?.focus();
   };
 
+  const navigateTo = (destination: (typeof destinations)[number]) => {
+    setActiveDestination(destination);
+    if (workspace.current !== null) {
+      workspace.current.scrollTop = 0;
+    }
+  };
+
   const chooseMoviesFolder = async () => {
     setFolderSelectionError(null);
     setIsChoosingFolder(true);
@@ -314,7 +526,7 @@ export default function App() {
       scanRequestId.current += 1;
       setMovieScanState({ status: "scanning" });
       if (selectedFolder === moviesFolder) {
-        setRefreshVersion((version) => version + 1);
+        setMovieRefreshVersion((version) => version + 1);
       } else {
         setMoviesFolder(selectedFolder);
       }
@@ -339,13 +551,94 @@ export default function App() {
 
     scanRequestId.current += 1;
     setMovieScanState({ status: "scanning" });
-    setRefreshVersion((version) => version + 1);
+    setMovieRefreshVersion((version) => version + 1);
+  };
+
+  const saveTmdbToken = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const token = tmdbTokenInput.trim();
+    if (token === "") {
+      return;
+    }
+
+    const previousToken = tmdbToken;
+    discoverRequestId.current += 1;
+    setDiscoverState({ status: "loading" });
+    setTmdbToken(null);
+    setIsSavingTmdbToken(true);
+    setTmdbCredentialMessage(null);
+
+    try {
+      await window.__TAURI__.core.invoke("save_tmdb_token", { token });
+      setTmdbToken(token);
+      setIsTmdbTokenLoaded(true);
+      setTmdbCredentialLoadFailed(false);
+      setTmdbTokenInput("");
+      setTmdbCredentialMessage({
+        role: "status",
+        text:
+          previousToken === null ? "TMDB token saved." : "TMDB token replaced.",
+      });
+    } catch {
+      setTmdbToken(previousToken);
+      setDiscoverRefreshVersion((version) => version + 1);
+      setTmdbCredentialMessage({
+        role: "alert",
+        text: "The TMDB token could not be saved on this device.",
+      });
+    } finally {
+      setIsSavingTmdbToken(false);
+    }
+  };
+
+  const clearTmdbToken = async () => {
+    const tokenToRestore = tmdbToken;
+    discoverRequestId.current += 1;
+    setDiscoverState({ status: "unconfigured" });
+    setTmdbToken(null);
+    setIsSavingTmdbToken(true);
+    setTmdbCredentialMessage(null);
+
+    try {
+      await window.__TAURI__.core.invoke("clear_tmdb_token");
+      setTmdbToken(null);
+      setIsTmdbTokenLoaded(true);
+      setTmdbCredentialLoadFailed(false);
+      setTmdbTokenInput("");
+      setTmdbCredentialMessage({
+        role: "status",
+        text: "TMDB token cleared.",
+      });
+    } catch {
+      setTmdbToken(tokenToRestore);
+      setDiscoverRefreshVersion((version) => version + 1);
+      setTmdbCredentialMessage({
+        role: "alert",
+        text: "The TMDB token could not be cleared from this device.",
+      });
+    } finally {
+      setIsSavingTmdbToken(false);
+    }
+  };
+
+  const refreshDiscover = () => {
+    if (tmdbToken === null) {
+      return;
+    }
+
+    discoverRequestId.current += 1;
+    setDiscoverState({ status: "loading" });
+    setDiscoverRefreshVersion((version) => version + 1);
   };
 
   const currentMovieScanMessage =
     movieScanState.status === "ready"
       ? null
       : movieScanMessages[movieScanState.status];
+  const currentDiscoverMessage =
+    discoverState.status === "ready"
+      ? null
+      : discoverMessages[discoverState.status];
 
   return (
     <div className="app-shell">
@@ -371,7 +664,7 @@ export default function App() {
                   <Button
                     aria-current={isActive ? "page" : undefined}
                     className="navigation-item"
-                    onClick={() => setActiveDestination(destination)}
+                    onClick={() => navigateTo(destination)}
                     onKeyDown={(event) => moveNavigationFocus(event, index)}
                     ref={(element) => {
                       navigationItems.current[index] = element;
@@ -391,7 +684,7 @@ export default function App() {
         <p className="sidebar__status">Local desktop library</p>
       </aside>
 
-      <main className="workspace">
+      <main className="workspace" ref={workspace}>
         <div className="workspace__content">
           <header className="page-header">
             <p className="page-eyebrow">Auto-Video workspace</p>
@@ -399,7 +692,83 @@ export default function App() {
             <p>{activeDestination.description}</p>
           </header>
 
-          {activeDestination.id === "library" ? (
+          {activeDestination.id === "discover" ? (
+            <section
+              aria-busy={discoverState.status === "loading"}
+              aria-labelledby="discover-movies-heading"
+              className="discover-content"
+            >
+              <div className="library-toolbar">
+                <div className="library-toolbar__heading">
+                  <span className="empty-state__icon">
+                    <AppIcon name="discover" />
+                  </span>
+                  <div>
+                    <p className="card-eyebrow">TMDB Discover</p>
+                    <h2 id="discover-movies-heading">Weekly trending Movies</h2>
+                    <p className="library-folder">Weekly Movies feed</p>
+                  </div>
+                </div>
+                {isTmdbTokenLoaded &&
+                !tmdbCredentialLoadFailed &&
+                tmdbToken !== null ? (
+                  <Button
+                    onClick={refreshDiscover}
+                    type="button"
+                    variant="outline"
+                  >
+                    <AppIcon name="refresh" />
+                    Refresh
+                  </Button>
+                ) : null}
+              </div>
+
+              {discoverState.status === "ready" ? (
+                <ul aria-label="Weekly trending Movies" className="discover-grid">
+                  {discoverState.movies.map((movie, resultIndex) => (
+                    <li
+                      key={`${movie.id}-${resultIndex}-${movie.posterPath ?? "posterless"}`}
+                    >
+                      <DiscoverMovieCard
+                        movie={movie}
+                        resultIndex={resultIndex}
+                      />
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div
+                  className="empty-state discover-state"
+                  role={currentDiscoverMessage?.role}
+                >
+                  <span className="empty-state__icon">
+                    <AppIcon name="discover" />
+                  </span>
+                  <h2>{currentDiscoverMessage?.heading}</h2>
+                  <p>{currentDiscoverMessage?.message}</p>
+                  {discoverState.status === "unconfigured" ||
+                  discoverState.status === "credential-error" ||
+                  discoverState.status === "unauthorized" ? (
+                    <Button
+                      className="empty-state__action"
+                      onClick={() => navigateTo(settingsDestination)}
+                      type="button"
+                    >
+                      Open Settings
+                    </Button>
+                  ) : null}
+                </div>
+              )}
+
+              <footer aria-label="TMDB credits" className="tmdb-attribution">
+                <img alt="TMDB" src={tmdbLogo} />
+                <p>
+                  This product uses the TMDB API but is not endorsed or certified
+                  by TMDB.
+                </p>
+              </footer>
+            </section>
+          ) : activeDestination.id === "library" ? (
             <section
               aria-busy={movieScanState.status === "scanning"}
               aria-labelledby="movies-heading"
@@ -459,6 +828,97 @@ export default function App() {
             </section>
           ) : activeDestination.id === "settings" ? (
             <div className="settings-content">
+              <section
+                aria-labelledby="tmdb-token-heading"
+                className="settings-card"
+              >
+                <div className="settings-card__heading">
+                  <span className="empty-state__icon">
+                    <AppIcon name="credential" />
+                  </span>
+                  <div>
+                    <h2 id="tmdb-token-heading">TMDB API Read Access Token</h2>
+                    <p>
+                      Save one token locally for the weekly Movies feed. The
+                      saved value is never shown.
+                    </p>
+                  </div>
+                </div>
+
+                <form className="credential-setting" onSubmit={saveTmdbToken}>
+                  <p
+                    className={
+                      tmdbCredentialLoadFailed
+                        ? "field-error credential-setting__status"
+                        : "credential-setting__status"
+                    }
+                    id="tmdb-token-status"
+                    role={tmdbCredentialLoadFailed ? "alert" : undefined}
+                  >
+                    {!isTmdbTokenLoaded
+                      ? "Loading saved token…"
+                      : tmdbCredentialLoadFailed
+                        ? "The saved TMDB token could not be read. Save it again."
+                        : tmdbToken === null
+                          ? "No TMDB token configured."
+                          : "TMDB token configured on this device."}
+                  </p>
+                  <label className="field-label" htmlFor="tmdb-token">
+                    {tmdbToken === null ? "Token" : "New token"}
+                  </label>
+                  <input
+                    aria-describedby="tmdb-token-help tmdb-token-status"
+                    autoComplete="off"
+                    className="credential-input"
+                    id="tmdb-token"
+                    onChange={(event) => setTmdbTokenInput(event.target.value)}
+                    spellCheck={false}
+                    type="password"
+                    value={tmdbTokenInput}
+                  />
+                  <p className="field-help" id="tmdb-token-help">
+                    Use the API Read Access Token from TMDB account settings.
+                  </p>
+                  <div className="folder-setting__actions">
+                    <Button
+                      disabled={
+                        isSavingTmdbToken || tmdbTokenInput.trim() === ""
+                      }
+                      type="submit"
+                    >
+                      <AppIcon name="credential" />
+                      {isSavingTmdbToken
+                        ? "Saving…"
+                        : tmdbToken === null
+                          ? "Save token"
+                          : "Replace token"}
+                    </Button>
+                    {tmdbToken !== null ? (
+                      <Button
+                        disabled={isSavingTmdbToken}
+                        onClick={() => void clearTmdbToken()}
+                        type="button"
+                        variant="outline"
+                      >
+                        Clear token
+                      </Button>
+                    ) : null}
+                  </div>
+                  {tmdbCredentialMessage === null ? null : (
+                    <p
+                      className={
+                        tmdbCredentialMessage.role === "alert"
+                          ? "field-error"
+                          : "field-success"
+                      }
+                      role={tmdbCredentialMessage.role}
+                    >
+                      {tmdbCredentialMessage.text}
+                    </p>
+                  )}
+                </form>
+              </section>
+
               <section
                 aria-labelledby="movies-folder-heading"
                 className="settings-card"

@@ -292,6 +292,7 @@ button {
 
 .navigation-item:focus-visible,
 [data-slot="button"]:focus-visible,
+.credential-input:focus-visible,
 .appearance-option input:focus-visible + .appearance-option__content {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
@@ -339,7 +340,9 @@ button {
 .empty-state,
 .settings-card,
 .library-toolbar,
-.movie-card {
+.movie-card,
+.discover-card,
+.tmdb-attribution {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--card);
@@ -482,6 +485,48 @@ button {
   background: var(--background);
 }
 
+.credential-setting {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--background);
+}
+
+.credential-setting__status,
+.field-help,
+.field-success {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.credential-setting__status,
+.field-help {
+  color: var(--muted-foreground);
+}
+
+.credential-setting .field-label {
+  display: block;
+  margin-top: 0.75rem;
+}
+
+.credential-input {
+  display: block;
+  width: 100%;
+  min-height: 2rem;
+  margin-top: 0.375rem;
+  padding: 0.375rem 0.5rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius);
+  background: var(--background);
+  color: var(--foreground);
+}
+
+.field-help {
+  margin-top: 0.375rem;
+}
+
 .folder-setting__empty,
 .field-label,
 .folder-path,
@@ -522,7 +567,13 @@ button {
   line-height: 1.5;
 }
 
-.library-content {
+.field-success {
+  margin-top: 0.75rem;
+  color: var(--foreground);
+}
+
+.library-content,
+.discover-content {
   margin-top: 1.25rem;
 }
 
@@ -575,13 +626,115 @@ button {
   min-height: 12rem;
 }
 
-.movie-grid {
+.discover-state {
+  min-height: 12rem;
+}
+
+.empty-state__action {
+  margin-top: 1rem;
+}
+
+.movie-grid,
+.discover-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.75rem;
   margin: 0.75rem 0 0;
   padding: 0;
   list-style: none;
+}
+
+.discover-card {
+  min-height: 100%;
+  overflow: hidden;
+}
+
+.discover-card__poster {
+  display: grid;
+  aspect-ratio: 2 / 3;
+  place-items: center;
+  overflow: hidden;
+  background: var(--muted);
+}
+
+.discover-card__poster img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.discover-card__poster-fallback {
+  display: grid;
+  gap: 0.5rem;
+  place-items: center;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  text-align: center;
+}
+
+.discover-card__poster-fallback .app-icon {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.discover-card__body {
+  padding: 0.75rem;
+}
+
+.discover-card h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  letter-spacing: -0.01em;
+  white-space: pre-wrap;
+}
+
+.discover-card dl {
+  display: grid;
+  gap: 0.375rem;
+  margin: 0.75rem 0 0;
+}
+
+.discover-card dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  line-height: 1.4;
+}
+
+.discover-card dt,
+.discover-card dd {
+  margin: 0;
+}
+
+.discover-card dd {
+  color: var(--card-foreground);
+  text-align: right;
+}
+
+.tmdb-attribution {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+}
+
+.tmdb-attribution img {
+  display: block;
+  width: 5rem;
+  height: auto;
+}
+
+.tmdb-attribution p {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  line-height: 1.4;
 }
 
 .movie-card {
