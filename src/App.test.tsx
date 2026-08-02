@@ -6,7 +6,15 @@ import {
   render,
   screen,
 } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  type Mock,
+  vi,
+} from "vitest";
 
 import App from "./App";
 
@@ -17,7 +25,21 @@ const openFolderMock = vi.mocked(open);
 
 let systemPrefersDark = false;
 let mediaQueryListeners = new Set<(event: MediaQueryListEvent) => void>();
-let invokeMock: ReturnType<typeof vi.fn>;
+let invokeMock: Mock<
+  (
+    command: string,
+    parameters?: Record<string, unknown>,
+  ) => Promise<unknown>
+>;
+let scanMoviesMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let loadTmdbTokenMock: Mock<() => Promise<string | null>>;
+let saveTmdbTokenMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let clearTmdbTokenMock: Mock<() => Promise<void>>;
+let fetchMock: Mock<typeof fetch>;
 
 function createMediaQueryList(query: string): MediaQueryList {
   return {
@@ -62,8 +84,19 @@ function selectLibrary() {
   fireEvent.click(screen.getByRole("button", { name: "Library" }));
 }
 
+function selectDiscover() {
+  fireEvent.click(screen.getByRole("button", { name: "Discover" }));
+}
+
 function selectSettings() {
   fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+}
+
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    headers: { "Content-Type": "application/json" },
+    status,
+  });
 }
 
 function setSystemPreference(prefersDark: boolean) {
@@ -81,12 +114,33 @@ function setSystemPreference(prefersDark: boolean) {
 beforeEach(() => {
   systemPrefersDark = false;
   mediaQueryListeners = new Set();
-  invokeMock = vi.fn().mockResolvedValue([]);
+  scanMoviesMock = vi.fn().mockResolvedValue([]);
+  loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
+  saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
+  clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
+  invokeMock = vi.fn(
+    (command: string, parameters?: Record<string, unknown>) => {
+      switch (command) {
+        case "scan_movies":
+          return scanMoviesMock(parameters);
+        case "load_tmdb_token":
+          return loadTmdbTokenMock();
+        case "save_tmdb_token":
+          return saveTmdbTokenMock(parameters);
+        case "clear_tmdb_token":
+          return clearTmdbTokenMock();
+        default:
+          return Promise.reject(new Error("Unexpected native command."));
+      }
+    },
+  );
+  fetchMock = vi.fn();
   openFolderMock.mockReset();
   openFolderMock.mockResolvedValue(null);
   window.localStorage.clear();
   vi.stubGlobal("matchMedia", vi.fn(createMediaQueryList));
   vi.stubGlobal("__TAURI__", { core: { invoke: invokeMock } });
+  vi.stubGlobal("fetch", fetchMock);
 });
 
 afterEach(() => {
@@ -139,7 +193,7 @@ describe("Auto-Video application shell", () => {
     }
   });
 
-  it("shows truthful unavailable states without fabricated product data", () => {
+  it("shows truthful unavailable states without fabricated product data", async () => {
     render(<App />);
 
     expect(
@@ -149,11 +203,11 @@ describe("Auto-Video application shell", () => {
       }),
     ).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Discover" }));
+    selectDiscover();
     expect(
-      screen.getByRole("heading", {
+      await screen.findByRole("heading", {
         level: 2,
-        name: "Discovery is not configured",
+        name: "Configure TMDB to discover movies",
       }),
     ).toBeTruthy();
 
@@ -198,6 +252,17 @@ describe("Auto-Video application shell", () => {
 
     fireEvent.keyDown(settings, { key: "ArrowDown" });
     expect(document.activeElement).toBe(dashboard);
+  });
+
+  it("returns the workspace to the page header after navigation", () => {
+    render(<App />);
+    const workspace = document.querySelector<HTMLElement>(".workspace");
+    expect(workspace).not.toBeNull();
+    (workspace as HTMLElement).scrollTop = 240;
+
+    selectSettings();
+
+    expect(workspace?.scrollTop).toBe(0);
   });
 
   it("selects light, dark, and system appearance modes", () => {
@@ -250,10 +315,282 @@ describe("Auto-Video application shell", () => {
   });
 });
 
+describe("TMDB Discover", () => {
+  it("does not request TMDB without a token and directs the user to Settings", async () => {
+    render(<App />);
+    selectDiscover();
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "Configure TMDB to discover movies",
+      }),
+    ).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("TMDB credits").textContent).toContain(
+      "This product uses the TMDB API but is not endorsed or certified by TMDB.",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: "TMDB API Read Access Token",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("saves, replaces, and clears a masked local token without rendering it", async () => {
+    const firstToken = "first-fixture-token";
+    const replacementToken = "replacement-fixture-token";
+
+    render(<App />);
+    selectSettings();
+    expect(await screen.findByText("No TMDB token configured.")).toBeTruthy();
+
+    const tokenInput = screen.getByLabelText("Token") as HTMLInputElement;
+    expect(tokenInput.type).toBe("password");
+    fireEvent.change(tokenInput, { target: { value: firstToken } });
+    fireEvent.click(screen.getByRole("button", { name: "Save token" }));
+
+    expect(await screen.findByText("TMDB token saved.")).toBeTruthy();
+    expect(saveTmdbTokenMock).toHaveBeenLastCalledWith({ token: firstToken });
+    expect(tokenInput.value).toBe("");
+    expect(document.body.textContent).not.toContain(firstToken);
+
+    fireEvent.change(screen.getByLabelText("New token"), {
+      target: { value: replacementToken },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Replace token" }));
+
+    expect(await screen.findByText("TMDB token replaced.")).toBeTruthy();
+    expect(saveTmdbTokenMock).toHaveBeenLastCalledWith({
+      token: replacementToken,
+    });
+    expect(document.body.textContent).not.toContain(replacementToken);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear token" }));
+    expect(await screen.findByText("TMDB token cleared.")).toBeTruthy();
+    expect(clearTmdbTokenMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("No TMDB token configured.")).toBeTruthy();
+  });
+
+  it("loads a persisted token without placing its saved value in the form", async () => {
+    const savedToken = "persisted-fixture-token";
+    loadTmdbTokenMock.mockResolvedValue(savedToken);
+
+    render(<App />);
+    selectSettings();
+
+    expect(
+      await screen.findByText("TMDB token configured on this device."),
+    ).toBeTruthy();
+    expect((screen.getByLabelText("New token") as HTMLInputElement).value).toBe(
+      "",
+    );
+    expect(document.body.textContent).not.toContain(savedToken);
+  });
+
+  it("renders one accessible card per valid fixture movie with poster fallbacks", async () => {
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        results: [
+          {
+            id: 81,
+            title: "映画  —  Director's “Cut”!",
+            poster_path: "/working-poster.jpg",
+            release_date: "2026-08-01",
+          },
+          {
+            id: 82,
+            title: "Posterless Movie",
+            poster_path: null,
+            release_date: "",
+          },
+          { id: "invalid", title: "Malformed movie" },
+        ],
+      }),
+    );
+
+    render(<App />);
+    selectDiscover();
+
+    const exactTitle = await screen.findByRole("heading", {
+      level: 3,
+      name: "映画 — Director's “Cut”!",
+    });
+    expect(exactTitle.textContent).toBe("映画  —  Director's “Cut”!");
+    expect(screen.getAllByRole("article")).toHaveLength(2);
+    expect(
+      screen.getByRole("article", { name: "Posterless Movie" }),
+    ).toBeTruthy();
+    expect(screen.getByText("2026-08-01")).toBeTruthy();
+    expect(screen.getAllByText("TMDB")).toHaveLength(2);
+    expect(screen.getByRole("img", { name: "TMDB" })).toBeTruthy();
+    expect(screen.getByText("Poster unavailable")).toBeTruthy();
+
+    const poster = document.querySelector<HTMLImageElement>(
+      'img[src="https://image.tmdb.org/t/p/w500/working-poster.jpg"]',
+    );
+    expect(poster).not.toBeNull();
+    fireEvent.error(poster as HTMLImageElement);
+    expect(screen.getAllByText("Poster unavailable")).toHaveLength(2);
+  });
+
+  it.each([
+    {
+      caseName: "empty feed",
+      heading: "No trending movies returned",
+      response: jsonResponse({ results: [] }),
+    },
+    {
+      caseName: "unauthorized token",
+      heading: "TMDB token was not accepted",
+      response: jsonResponse({}, 401),
+    },
+    {
+      caseName: "rate limit",
+      heading: "TMDB rate limit reached",
+      response: jsonResponse({}, 429),
+    },
+    {
+      caseName: "provider failure",
+      heading: "TMDB could not load trending Movies",
+      response: jsonResponse({}, 500),
+    },
+    {
+      caseName: "malformed response",
+      heading: "TMDB could not load trending Movies",
+      response: jsonResponse({ page: 1 }),
+    },
+  ])("shows the $caseName state as $heading", async ({ heading, response }) => {
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockResolvedValue(response);
+
+    render(<App />);
+    selectDiscover();
+
+    expect(
+      await screen.findByRole("heading", { level: 2, name: heading }),
+    ).toBeTruthy();
+  });
+
+  it("shows a distinct network failure state", async () => {
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockRejectedValue(new TypeError("offline"));
+
+    render(<App />);
+    selectDiscover();
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "TMDB could not be reached",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("keeps the newest Refresh result when an earlier request finishes late", async () => {
+    const earlierRefresh = createDeferred<Response>();
+    const latestRefresh = createDeferred<Response>();
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 1, title: "Initial result" }] }),
+      )
+      .mockReturnValueOnce(earlierRefresh.promise)
+      .mockReturnValueOnce(latestRefresh.promise);
+
+    render(<App />);
+    selectDiscover();
+    expect(await screen.findByText("Initial result")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await act(async () => {
+      latestRefresh.resolve(
+        jsonResponse({ results: [{ id: 3, title: "Latest result" }] }),
+      );
+      await latestRefresh.promise;
+    });
+    expect(await screen.findByText("Latest result")).toBeTruthy();
+
+    await act(async () => {
+      earlierRefresh.resolve(
+        jsonResponse({ results: [{ id: 2, title: "Stale result" }] }),
+      );
+      await earlierRefresh.promise;
+    });
+    expect(screen.queryByText("Stale result")).toBeNull();
+    expect(screen.getByText("Latest result")).toBeTruthy();
+  });
+
+  it("prevents pending results from returning after the token changes or clears", async () => {
+    const oldTokenRequest = createDeferred<Response>();
+    const pendingClearRequest = createDeferred<Response>();
+    loadTmdbTokenMock.mockResolvedValue("old-fixture-token");
+    fetchMock
+      .mockReturnValueOnce(oldTokenRequest.promise)
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 2, title: "New token result" }] }),
+      )
+      .mockReturnValueOnce(pendingClearRequest.promise);
+
+    render(<App />);
+    selectDiscover();
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "Loading weekly trending Movies",
+      }),
+    ).toBeTruthy();
+
+    selectSettings();
+    await screen.findByText("TMDB token configured on this device.");
+    fireEvent.change(screen.getByLabelText("New token"), {
+      target: { value: "new-fixture-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Replace token" }));
+    await screen.findByText("TMDB token replaced.");
+
+    selectDiscover();
+    expect(await screen.findByText("New token result")).toBeTruthy();
+    await act(async () => {
+      oldTokenRequest.resolve(
+        jsonResponse({ results: [{ id: 1, title: "Old token result" }] }),
+      );
+      await oldTokenRequest.promise;
+    });
+    expect(screen.queryByText("Old token result")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    selectSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Clear token" }));
+    await screen.findByText("TMDB token cleared.");
+    await act(async () => {
+      pendingClearRequest.resolve(
+        jsonResponse({ results: [{ id: 3, title: "Cleared token result" }] }),
+      );
+      await pendingClearRequest.promise;
+    });
+
+    selectDiscover();
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "Configure TMDB to discover movies",
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByText("Cleared token result")).toBeNull();
+  });
+});
+
 describe("local Movies library", () => {
   it("persists the selected folder and clearing it blocks a late scan", async () => {
     const pendingScan = createDeferred<string[]>();
-    invokeMock.mockReturnValue(pendingScan.promise);
+    scanMoviesMock.mockReturnValue(pendingScan.promise);
     openFolderMock.mockResolvedValue("/Local/Movies — 家族");
 
     render(<App />);
@@ -296,7 +633,7 @@ describe("local Movies library", () => {
 
   it("renders exact Unicode titles and removes only the final extension", async () => {
     window.localStorage.setItem("auto-video-movies-folder", "/Movies");
-    invokeMock.mockResolvedValue([
+    scanMoviesMock.mockResolvedValue([
       "/Movies/映画  —  Final.Cut.MKV",
       "C:\\Movies\\CAPS & punctuation!.MP4",
     ]);
@@ -319,7 +656,7 @@ describe("local Movies library", () => {
 
   it("refresh replaces files added or removed since the previous scan", async () => {
     window.localStorage.setItem("auto-video-movies-folder", "/Movies");
-    invokeMock
+    scanMoviesMock
       .mockResolvedValueOnce(["/Movies/First.mp4"])
       .mockResolvedValueOnce(["/Movies/Second.mkv"]);
 
@@ -331,8 +668,8 @@ describe("local Movies library", () => {
 
     expect(await screen.findByText("Second")).toBeTruthy();
     expect(screen.queryByText("First")).toBeNull();
-    expect(invokeMock).toHaveBeenCalledTimes(2);
-    expect(invokeMock).toHaveBeenNthCalledWith(2, "scan_movies", {
+    expect(scanMoviesMock).toHaveBeenCalledTimes(2);
+    expect(scanMoviesMock).toHaveBeenNthCalledWith(2, {
       folder: "/Movies",
     });
   });
@@ -340,7 +677,7 @@ describe("local Movies library", () => {
   it("shows distinct scanning and empty-folder states", async () => {
     const pendingScan = createDeferred<string[]>();
     window.localStorage.setItem("auto-video-movies-folder", "/Movies");
-    invokeMock.mockReturnValue(pendingScan.promise);
+    scanMoviesMock.mockReturnValue(pendingScan.promise);
 
     render(<App />);
     selectLibrary();
@@ -363,7 +700,7 @@ describe("local Movies library", () => {
 
   it("distinguishes an unavailable folder from a recursive scan failure", async () => {
     window.localStorage.setItem("auto-video-movies-folder", "/Movies");
-    invokeMock.mockRejectedValueOnce("movies_folder_unavailable");
+    scanMoviesMock.mockRejectedValueOnce("movies_folder_unavailable");
 
     render(<App />);
     selectLibrary();
@@ -375,7 +712,7 @@ describe("local Movies library", () => {
     ).toBeTruthy();
 
     cleanup();
-    invokeMock.mockRejectedValueOnce("movies_scan_failed");
+    scanMoviesMock.mockRejectedValueOnce("movies_scan_failed");
     render(<App />);
     selectLibrary();
     expect(
@@ -390,8 +727,8 @@ describe("local Movies library", () => {
     const earlierScan = createDeferred<string[]>();
     let oldFolderScans = 0;
     window.localStorage.setItem("auto-video-movies-folder", "/Movies/Old");
-    invokeMock.mockImplementation(
-      (_command: string, argumentsValue?: Record<string, unknown>) => {
+    scanMoviesMock.mockImplementation(
+      (argumentsValue?: Record<string, unknown>) => {
         if (argumentsValue?.folder === "/Movies/Old") {
           oldFolderScans += 1;
           return oldFolderScans === 1
