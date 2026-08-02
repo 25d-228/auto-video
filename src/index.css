@@ -681,6 +681,42 @@ button {
   padding: 0.75rem;
 }
 
+.media-title-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 4.25rem;
+  align-items: start;
+  gap: 0.5rem;
+}
+
+.media-title-row h3 {
+  min-width: 0;
+}
+
+.title-copy-button {
+  width: 4.25rem;
+  justify-self: end;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.media-title-row:hover .title-copy-button,
+.media-title-row:focus-within .title-copy-button,
+.title-copy-button[data-copy-state="success"],
+.title-copy-button[data-copy-state="error"] {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.media-title-row .title-copy-button[data-copy-state="success"] {
+  background: var(--muted);
+  color: var(--foreground);
+}
+
+.media-title-row .title-copy-button[data-copy-state="error"] {
+  background: color-mix(in oklch, var(--destructive) 10%, transparent);
+  color: var(--destructive);
+}
+
 .discover-card h3 {
   margin: 0;
   overflow-wrap: anywhere;
@@ -752,14 +788,25 @@ button {
   color: var(--primary);
 }
 
+.movie-card .media-title-row {
+  margin-top: 1rem;
+}
+
 .movie-card h3 {
-  margin: 1rem 0 0;
+  margin: 0;
   overflow-wrap: anywhere;
   font-family: "Geist Mono Variable", ui-monospace, monospace;
   font-size: 0.8125rem;
   line-height: 1.45;
   letter-spacing: -0.01em;
   white-space: pre-wrap;
+}
+
+@media (hover: none) {
+  .title-copy-button {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 @media (max-height: 36rem) {
