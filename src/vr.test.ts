@@ -142,6 +142,7 @@ describe("Sukebei identity-verified release request", () => {
           releaseItem("Extension MDVR-4190 release"),
           releaseItem("Embedded XMDVR-419 release"),
           releaseItem("Ambiguous MDVR-419 and MDVR-422 release"),
+          releaseItem("Ambiguous MDVR-419 + ABC-123 pack"),
           releaseItem("Candidate with no established code"),
         ].join(""),
       ),
@@ -176,6 +177,38 @@ describe("Sukebei identity-verified release request", () => {
       "fetch_sukebei_vr_releases",
       { code: "MDVR-419" },
     );
+  });
+
+  it("preserves an accepted Sukebei release name exactly", async () => {
+    const exactReleaseName =
+      "【VR】 MdVr_00419  Director’s Cut\t—\n特別版!?";
+    invokeMock.mockResolvedValue(
+      releaseFeed(releaseItem(exactReleaseName)),
+    );
+
+    await expect(
+      fetchVerifiedSukebeiReleases("MDVR-419"),
+    ).resolves.toEqual({
+      status: "ready",
+      releases: [
+        {
+          name: exactReleaseName,
+          source: "Sukebei",
+          size: "12.5 GiB",
+          seeders: 10,
+        },
+      ],
+    });
+  });
+
+  it("rejects a whitespace-only Sukebei release name", async () => {
+    invokeMock.mockResolvedValue(
+      releaseFeed("<item><title> \n\t </title></item>"),
+    );
+
+    await expect(
+      fetchVerifiedSukebeiReleases("MDVR-419"),
+    ).resolves.toEqual({ status: "malformed-provider" });
   });
 
   it("returns an accepted-only empty result without using raw candidates as matches", async () => {

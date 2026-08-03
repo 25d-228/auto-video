@@ -125,19 +125,20 @@ function parseJavdbCatalog(
   return { status: "no-exact-match" };
 }
 
-function directChildText(element: Element, localName: string) {
-  const child = Array.from(element.children).find(
+function directChild(element: Element, localName: string) {
+  return Array.from(element.children).find(
     (candidate) => candidate.localName === localName,
   );
+}
+
+function directChildText(element: Element, localName: string) {
+  const child = directChild(element, localName);
   return child === undefined ? null : normalizedText(child.textContent);
 }
 
 function releaseMatchesProductCode(name: string, requestedCode: string) {
-  const [prefix] = requestedCode.split("-");
-  const identityPattern = new RegExp(
-    `(^|[^A-Za-z0-9])(${prefix})[ _-]*([0-9]+)(?=$|[^A-Za-z0-9])`,
-    "gi",
-  );
+  const identityPattern =
+    /(^|[^A-Za-z0-9])([A-Za-z]{2,16})[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])/gi;
   const identities = new Set<string>();
   for (const match of name.matchAll(identityPattern)) {
     const identity = canonicalizeProductCode(`${match[2]}-${match[3]}`);
@@ -164,8 +165,8 @@ function parseSukebeiReleases(
 
   const releases: VrRelease[] = [];
   for (const item of channel.querySelectorAll(":scope > item")) {
-    const name = directChildText(item, "title");
-    if (name === null) {
+    const name = directChild(item, "title")?.textContent ?? null;
+    if (name === null || name.trim() === "") {
       return { status: "malformed-provider" };
     }
     if (!releaseMatchesProductCode(name, requestedCode)) {

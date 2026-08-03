@@ -2311,19 +2311,23 @@ describe("TMDB Discover", () => {
 
 describe("VR Discover and verified release comparison", () => {
   it("requires an explicit exact-code search and exposes only verified releases for explicit selection", async () => {
+    const exactReleaseName =
+      "【VR】 MdVr_00419  Director’s Cut\t—\n特別版!?";
+    const ambiguousPackName = "MDVR-419 + ABC-123 pack";
     fetchJavdbVrCatalogMock.mockResolvedValue(
       javdbCatalogFixture("mdvr_00419", "Exact provider title"),
     );
     fetchSukebeiVrReleasesMock.mockResolvedValue(
       sukebeiReleaseFixture([
         { name: "Exact MDVR-419 release", seeders: 10, size: "12.5 GiB" },
-        { name: "Case mdvr_00419 release", seeders: 4, size: "8.0 GiB" },
+        { name: exactReleaseName, seeders: 4, size: "8.0 GiB" },
         { name: "Neighbor MDVR-422 release", seeders: 500, size: "1 GiB" },
         { name: "Neighbor MDVR-430 release", seeders: 400, size: "2 GiB" },
         { name: "Neighbor MDVR-433 release", seeders: 300, size: "3 GiB" },
         { name: "Neighbor MDVR-374 release", seeders: 200, size: "4 GiB" },
         { name: "Extension MDVR-4190 release", seeders: 100, size: "5 GiB" },
         { name: "Embedded XMDVR-419 release", seeders: 90, size: "6 GiB" },
+        { name: ambiguousPackName, seeders: 85, size: "6.5 GiB" },
         { name: "Candidate with no established code", seeders: 80, size: "7 GiB" },
       ]),
     );
@@ -2389,6 +2393,13 @@ describe("VR Discover and verified release comparison", () => {
     expect(screen.queryByText("Neighbor MDVR-422 release")).toBeNull();
     expect(screen.queryByText("Extension MDVR-4190 release")).toBeNull();
     expect(screen.queryByText("Embedded XMDVR-419 release")).toBeNull();
+    expect(screen.queryByText(ambiguousPackName)).toBeNull();
+    const exactReleaseRow = Array.from(
+      releaseList.querySelectorAll<HTMLElement>(
+        ".vr-releases__release-name",
+      ),
+    ).find((releaseName) => releaseName.textContent === exactReleaseName);
+    expect(exactReleaseRow).toBeDefined();
     expect(screen.queryByRole("heading", { name: "Selected release" })).toBeNull();
     expect(
       screen.getByText("Select one verified release to compare its metadata."),
@@ -2408,17 +2419,17 @@ describe("VR Discover and verified release comparison", () => {
       within(selectedSummary as HTMLElement).getByText("Exact MDVR-419 release"),
     ).toBeTruthy();
 
-    fireEvent.click(
-      within(releaseList).getByRole("button", {
-        name: /Case mdvr_00419 release/,
-      }),
-    );
+    fireEvent.click(exactReleaseRow?.closest("button") as HTMLButtonElement);
     selectedSummary = screen
       .getByRole("heading", { name: "Selected release" })
       .closest("section");
-    expect(
-      within(selectedSummary as HTMLElement).getByText("Case mdvr_00419 release"),
-    ).toBeTruthy();
+    const releaseNameTerm = within(selectedSummary as HTMLElement).getByText(
+      "Release name",
+    );
+    expect(releaseNameTerm.parentElement?.querySelector("dd")?.textContent).toBe(
+      exactReleaseName,
+    );
+    expect(selectedSummary?.textContent).not.toContain(ambiguousPackName);
     expect(screen.queryByRole("button", { name: /torrent|download|save/i })).toBeNull();
 
     for (const command of [
