@@ -39,9 +39,10 @@ import {
 import tmdbLogo from "@/assets/tmdb-logo.svg";
 import { Button } from "@/components/ui/button";
 import {
+  fetchTmdbMoviesByTitle,
   fetchWeeklyTrendingMovies,
   type TmdbMovie,
-  type TmdbTrendingResult,
+  type TmdbMoviesResult,
   tmdbPosterUrl,
 } from "@/tmdb";
 
@@ -146,7 +147,7 @@ type DiscoverState =
   | { status: "credential-error" }
   | { status: "unconfigured" }
   | { status: "loading" }
-  | TmdbTrendingResult;
+  | TmdbMoviesResult;
 type CredentialMessage = {
   role: "alert" | "status";
   text: string;
@@ -278,9 +279,43 @@ const discoverMessages = {
     message: "Check the network connection and try Refresh.",
     role: "alert",
   },
+  "malformed-provider": {
+    heading: "TMDB returned invalid Movies data",
+    message: "TMDB returned an unexpected response. Try Refresh later.",
+    role: "alert",
+  },
   "provider-error": {
     heading: "TMDB could not load trending Movies",
     message: "TMDB returned an unexpected response. Try Refresh later.",
+    role: "alert",
+  },
+} as const;
+
+const discoverSearchMessages = {
+  ...discoverMessages,
+  loading: {
+    heading: "Searching TMDB Movies",
+    message: "Requesting Movies title matches from TMDB.",
+    role: "status",
+  },
+  empty: {
+    heading: "No TMDB Movies match this search",
+    message: "TMDB returned no Movies for the submitted title search.",
+    role: undefined,
+  },
+  "network-error": {
+    heading: "TMDB search could not be reached",
+    message: "Check the network connection and try Refresh.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "TMDB returned invalid search data",
+    message: "TMDB returned a malformed Movies search response.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "TMDB could not search Movies",
+    message: "TMDB returned an unexpected error. Try Refresh later.",
     role: "alert",
   },
 } as const;
@@ -983,13 +1018,27 @@ export default function App() {
   const [discoverState, setDiscoverState] = useState<DiscoverState>({
     status: "loading-credential",
   });
-  const [discoverRefreshVersion, setDiscoverRefreshVersion] = useState(0);
+  const [isDiscoverActivated, setIsDiscoverActivated] = useState(false);
+  const [discoverSearchInput, setDiscoverSearchInput] = useState("");
+  const [submittedDiscoverSearchQuery, setSubmittedDiscoverSearchQuery] =
+    useState<string | null>(null);
+  const [discoverSearchInputError, setDiscoverSearchInputError] = useState<
+    string | null
+  >(null);
+  const [trendingDiscoverRefreshVersion, setTrendingDiscoverRefreshVersion] =
+    useState(0);
+  const [searchDiscoverRefreshVersion, setSearchDiscoverRefreshVersion] =
+    useState(0);
   const [discoverSelectedPage, setDiscoverSelectedPage] = useState(1);
   const navigationItems = useRef<Array<HTMLButtonElement | null>>([]);
   const workspace = useRef<HTMLElement | null>(null);
   const scanRequestId = useRef(0);
   const storageRequestId = useRef(0);
   const discoverRequestId = useRef(0);
+  const trendingDiscoverResult = useRef<{
+    refreshVersion: number;
+    result: TmdbMoviesResult;
+  } | null>(null);
   const currentMoviesFolder = useRef(moviesFolder);
   const currentMovieScanState = useRef(movieScanState);
   // Late Trash responses read current state so an old card cannot modify replacement results.
@@ -1202,9 +1251,15 @@ export default function App() {
   }, [isMoviesFolderLoaded, moviesFolder, movieStorageRefreshVersion]);
 
   useEffect(() => {
+    if (activeDestination.id === "discover") {
+      setIsDiscoverActivated(true);
+    }
+  }, [activeDestination.id]);
+
+  useEffect(() => {
     const requestId = ++discoverRequestId.current;
 
-    if (activeDestination.id !== "discover") {
+    if (!isDiscoverActivated) {
       return;
     }
     if (!isTmdbTokenLoaded) {
@@ -1220,26 +1275,52 @@ export default function App() {
       return;
     }
 
+    if (submittedDiscoverSearchQuery === null) {
+      const cachedTrendingResult = trendingDiscoverResult.current;
+      if (
+        cachedTrendingResult?.refreshVersion ===
+        trendingDiscoverRefreshVersion
+      ) {
+        setDiscoverState(cachedTrendingResult.result);
+        return;
+      }
+    }
+
     const abortController = new AbortController();
     setDiscoverState({ status: "loading" });
-    void fetchWeeklyTrendingMovies(tmdbToken, abortController.signal).then(
-      (result) => {
-        if (requestId === discoverRequestId.current) {
-          setDiscoverState(result);
-        }
-      },
-    );
+    const request =
+      submittedDiscoverSearchQuery === null
+        ? fetchWeeklyTrendingMovies(tmdbToken, abortController.signal)
+        : fetchTmdbMoviesByTitle(
+            tmdbToken,
+            submittedDiscoverSearchQuery,
+            abortController.signal,
+          );
+    void request.then((result) => {
+      if (requestId !== discoverRequestId.current) {
+        return;
+      }
+      if (submittedDiscoverSearchQuery === null) {
+        trendingDiscoverResult.current = {
+          refreshVersion: trendingDiscoverRefreshVersion,
+          result,
+        };
+      }
+      setDiscoverState(result);
+    });
 
     return () => {
       discoverRequestId.current += 1;
       abortController.abort();
     };
   }, [
-    activeDestination.id,
-    discoverRefreshVersion,
+    isDiscoverActivated,
     isTmdbTokenLoaded,
+    searchDiscoverRefreshVersion,
+    submittedDiscoverSearchQuery,
     tmdbCredentialLoadFailed,
     tmdbToken,
+    trendingDiscoverRefreshVersion,
   ]);
 
   const moveNavigationFocus = (
@@ -1380,6 +1461,16 @@ export default function App() {
     });
   };
 
+  const reloadDiscoverMode = () => {
+    discoverRequestId.current += 1;
+    setDiscoverState({ status: "loading" });
+    if (submittedDiscoverSearchQuery === null) {
+      setTrendingDiscoverRefreshVersion((version) => version + 1);
+    } else {
+      setSearchDiscoverRefreshVersion((version) => version + 1);
+    }
+  };
+
   const saveTmdbToken = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const token = tmdbTokenInput.trim();
@@ -1389,6 +1480,7 @@ export default function App() {
 
     const previousToken = tmdbToken;
     discoverRequestId.current += 1;
+    trendingDiscoverResult.current = null;
     setDiscoverState({ status: "loading" });
     setTmdbToken(null);
     setIsSavingTmdbToken(true);
@@ -1407,7 +1499,7 @@ export default function App() {
       });
     } catch {
       setTmdbToken(previousToken);
-      setDiscoverRefreshVersion((version) => version + 1);
+      reloadDiscoverMode();
       setTmdbCredentialMessage({
         role: "alert",
         text: "The TMDB token could not be saved on this device.",
@@ -1420,6 +1512,7 @@ export default function App() {
   const clearTmdbToken = async () => {
     const tokenToRestore = tmdbToken;
     discoverRequestId.current += 1;
+    trendingDiscoverResult.current = null;
     setDiscoverState({ status: "unconfigured" });
     setTmdbToken(null);
     setIsSavingTmdbToken(true);
@@ -1437,7 +1530,7 @@ export default function App() {
       });
     } catch {
       setTmdbToken(tokenToRestore);
-      setDiscoverRefreshVersion((version) => version + 1);
+      reloadDiscoverMode();
       setTmdbCredentialMessage({
         role: "alert",
         text: "The TMDB token could not be cleared from this device.",
@@ -1452,19 +1545,57 @@ export default function App() {
       return;
     }
 
+    reloadDiscoverMode();
+  };
+
+  const searchDiscoverMovies = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (tmdbToken === null) {
+      return;
+    }
+    if (discoverSearchInput.trim() === "") {
+      setDiscoverSearchInputError("Enter a movie title to search TMDB.");
+      return;
+    }
+
     discoverRequestId.current += 1;
     setDiscoverState({ status: "loading" });
-    setDiscoverRefreshVersion((version) => version + 1);
+    setDiscoverSearchInputError(null);
+    setSubmittedDiscoverSearchQuery(discoverSearchInput);
+    setDiscoverSelectedPage(1);
+    setSearchDiscoverRefreshVersion((version) => version + 1);
+  };
+
+  const clearDiscoverSearch = () => {
+    discoverRequestId.current += 1;
+    setDiscoverSearchInput("");
+    setDiscoverSearchInputError(null);
+    setSubmittedDiscoverSearchQuery(null);
+    setDiscoverSelectedPage(1);
+
+    const cachedTrendingResult = trendingDiscoverResult.current;
+    setDiscoverState(
+      cachedTrendingResult?.refreshVersion ===
+        trendingDiscoverRefreshVersion
+        ? cachedTrendingResult.result
+        : { status: "loading" },
+    );
   };
 
   const currentMovieScanMessage =
     movieScanState.status === "ready"
       ? null
       : movieScanMessages[movieScanState.status];
+  const isDiscoverSearchActive = submittedDiscoverSearchQuery !== null;
   const currentDiscoverMessage =
     discoverState.status === "ready"
       ? null
-      : discoverMessages[discoverState.status];
+      : (isDiscoverSearchActive
+          ? discoverSearchMessages
+          : discoverMessages)[discoverState.status];
+  const discoverGalleryLabel = isDiscoverSearchActive
+    ? "TMDB Movies search results"
+    : "Weekly trending Movies";
   const isLibrarySearchActive = librarySearchQuery.trim() !== "";
   const completeLibraryMovies =
     movieScanState.status === "ready" ? movieScanState.movies : [];
@@ -1712,39 +1843,117 @@ export default function App() {
               aria-labelledby="discover-movies-heading"
               className="discover-content"
             >
-              <div className="library-toolbar">
+              <div className="library-toolbar library-toolbar--discover">
                 <div className="library-toolbar__heading">
                   <span className="empty-state__icon">
                     <AppIcon name="discover" />
                   </span>
                   <div>
                     <p className="card-eyebrow">TMDB Discover</p>
-                    <h2 id="discover-movies-heading">Weekly trending Movies</h2>
-                    <p className="library-folder">Weekly Movies feed</p>
+                    <h2 id="discover-movies-heading">
+                      {discoverGalleryLabel}
+                    </h2>
+                    <p className="library-folder">
+                      {isDiscoverSearchActive ? (
+                        <>
+                          Results for “
+                          <span className="discover-search-query">
+                            {submittedDiscoverSearchQuery}
+                          </span>
+                          ”
+                        </>
+                      ) : (
+                        "Weekly Movies feed"
+                      )}
+                    </p>
                   </div>
                 </div>
                 {isTmdbTokenLoaded &&
                 !tmdbCredentialLoadFailed &&
                 tmdbToken !== null ? (
-                  <Button
-                    onClick={refreshDiscover}
-                    type="button"
-                    variant="outline"
-                  >
-                    <AppIcon name="refresh" />
-                    Refresh
-                  </Button>
+                  <div className="discover-toolbar__controls">
+                    <form
+                      aria-label="Search TMDB Movies"
+                      className="discover-search"
+                      onSubmit={searchDiscoverMovies}
+                      role="search"
+                    >
+                      <label htmlFor="discover-movies-search">
+                        Search Movies
+                      </label>
+                      <div className="discover-search__field">
+                        <input
+                          aria-describedby={
+                            discoverSearchInputError === null
+                              ? undefined
+                              : "discover-search-error"
+                          }
+                          aria-invalid={
+                            discoverSearchInputError === null
+                              ? undefined
+                              : true
+                          }
+                          className="discover-search__input"
+                          id="discover-movies-search"
+                          onChange={(event) => {
+                            setDiscoverSearchInput(event.target.value);
+                            if (discoverSearchInputError !== null) {
+                              setDiscoverSearchInputError(null);
+                            }
+                          }}
+                          placeholder="Find a Movie"
+                          type="text"
+                          value={discoverSearchInput}
+                        />
+                        <Button type="submit">
+                          <AppIcon name="search" />
+                          Search
+                        </Button>
+                      </div>
+                      {discoverSearchInputError === null ? null : (
+                        <p
+                          className="discover-search__error"
+                          id="discover-search-error"
+                          role="alert"
+                        >
+                          {discoverSearchInputError}
+                        </p>
+                      )}
+                    </form>
+                    {isDiscoverSearchActive ? (
+                      <Button
+                        onClick={clearDiscoverSearch}
+                        type="button"
+                        variant="outline"
+                      >
+                        <AppIcon name="close" />
+                        Clear
+                      </Button>
+                    ) : null}
+                    <Button
+                      onClick={refreshDiscover}
+                      type="button"
+                      variant="outline"
+                    >
+                      <AppIcon name="refresh" />
+                      Refresh
+                    </Button>
+                  </div>
                 ) : null}
               </div>
 
               {discoverState.status === "ready" ? (
                 <ResizeAwareGallery
-                  ariaLabel="Weekly trending Movies"
+                  ariaLabel={discoverGalleryLabel}
                   getItemKey={(movie, resultIndex) =>
                     `${movie.id}-${resultIndex}-${movie.posterPath ?? "posterless"}`
                   }
                   items={discoverState.movies}
-                  key="discover-gallery"
+                  key={
+                    isDiscoverSearchActive
+                      ? "discover-search-gallery"
+                      : "discover-trending-gallery"
+                  }
                   onSelectedPageChange={setDiscoverSelectedPage}
                   renderItem={(movie, resultIndex) => (
                     <DiscoverMovieCard
@@ -1955,8 +2164,8 @@ export default function App() {
                   <div>
                     <h2 id="tmdb-token-heading">TMDB API Read Access Token</h2>
                     <p>
-                      Save one token locally for the weekly Movies feed. The
-                      saved value is never shown.
+                      Save one token locally for Discover Movies. The saved
+                      value is never shown.
                     </p>
                   </div>
                 </div>
