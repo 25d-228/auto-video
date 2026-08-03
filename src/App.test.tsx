@@ -56,6 +56,12 @@ let saveTmdbTokenMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
 let clearTmdbTokenMock: Mock<() => Promise<void>>;
+let fetchJavdbVrCatalogMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string>
+>;
+let fetchSukebeiVrReleasesMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string>
+>;
 let fetchMock: Mock<typeof fetch>;
 let clipboardWriteMock: Mock<(text: string) => Promise<void>>;
 let resizeObserverRecords: ResizeObserverRecord[] = [];
@@ -179,6 +185,10 @@ function selectDiscover() {
   fireEvent.click(screen.getByRole("button", { name: "Discover" }));
 }
 
+function selectVrDiscover() {
+  fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+}
+
 function selectSettings() {
   fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 }
@@ -188,6 +198,34 @@ function jsonResponse(body: unknown, status = 200) {
     headers: { "Content-Type": "application/json" },
     status,
   });
+}
+
+function javdbCatalogFixture(
+  code: string,
+  title = "Provider VR title",
+  cover = "https://images.example/vr-cover.jpg",
+) {
+  return `<!doctype html><html><body><div class="movie-list">
+    <div class="item"><a class="box" href="/v/item">
+      <img data-src="${cover}">
+      <div class="video-title"><strong>${code}</strong> ${title}</div>
+    </a></div>
+  </div></body></html>`;
+}
+
+function sukebeiReleaseFixture(
+  releases: Array<{ name: string; seeders?: number; size?: string }>,
+) {
+  return `<rss xmlns:nyaa="https://sukebei.nyaa.si/xmlns/nyaa" version="2.0">
+    <channel><title>Sukebei results</title>${releases
+      .map(
+        ({ name, seeders, size }) => `<item><title>${name}</title>
+          ${size === undefined ? "" : `<nyaa:size>${size}</nyaa:size>`}
+          ${seeders === undefined ? "" : `<nyaa:seeders>${seeders}</nyaa:seeders>`}
+        </item>`,
+      )
+      .join("")}</channel>
+  </rss>`;
 }
 
 function setSystemPreference(prefersDark: boolean) {
@@ -287,6 +325,12 @@ beforeEach(() => {
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
+  fetchJavdbVrCatalogMock = vi
+    .fn()
+    .mockResolvedValue('<div class="movie-list"></div>');
+  fetchSukebeiVrReleasesMock = vi
+    .fn()
+    .mockResolvedValue(sukebeiReleaseFixture([]));
   invokeMock = vi.fn(
     (command: string, parameters?: Record<string, unknown>) => {
       switch (command) {
@@ -319,6 +363,10 @@ beforeEach(() => {
           return saveTmdbTokenMock(parameters);
         case "clear_tmdb_token":
           return clearTmdbTokenMock();
+        case "fetch_javdb_vr_catalog":
+          return fetchJavdbVrCatalogMock(parameters);
+        case "fetch_sukebei_vr_releases":
+          return fetchSukebeiVrReleasesMock(parameters);
         default:
           return Promise.reject(new Error("Unexpected native command."));
       }
@@ -2258,6 +2306,348 @@ describe("TMDB Discover", () => {
       }),
     ).toBeTruthy();
     expect(screen.queryByText("Cleared token result")).toBeNull();
+  });
+});
+
+describe("VR Discover and verified release comparison", () => {
+  it("requires an explicit exact-code search and exposes only verified releases for explicit selection", async () => {
+    fetchJavdbVrCatalogMock.mockResolvedValue(
+      javdbCatalogFixture("mdvr_00419", "Exact provider title"),
+    );
+    fetchSukebeiVrReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        { name: "Exact MDVR-419 release", seeders: 10, size: "12.5 GiB" },
+        { name: "Case mdvr_00419 release", seeders: 4, size: "8.0 GiB" },
+        { name: "Neighbor MDVR-422 release", seeders: 500, size: "1 GiB" },
+        { name: "Neighbor MDVR-430 release", seeders: 400, size: "2 GiB" },
+        { name: "Neighbor MDVR-433 release", seeders: 300, size: "3 GiB" },
+        { name: "Neighbor MDVR-374 release", seeders: 200, size: "4 GiB" },
+        { name: "Extension MDVR-4190 release", seeders: 100, size: "5 GiB" },
+        { name: "Embedded XMDVR-419 release", seeders: 90, size: "6 GiB" },
+        { name: "Candidate with no established code", seeders: 80, size: "7 GiB" },
+      ]),
+    );
+    render(<App />);
+    selectDiscover();
+    selectVrDiscover();
+
+    const codeInput = screen.getByRole("textbox", {
+      name: "Search product code",
+    });
+    fireEvent.change(codeInput, { target: { value: "   " } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    expect(
+      screen.getByRole("alert", {
+        name: "",
+      }).textContent,
+    ).toContain("Enter a valid VR product code");
+    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+
+    fireEvent.change(codeInput, { target: { value: "mdvr_00419" } });
+    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    const codeHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "MDVR-419",
+    });
+    const vrCard = codeHeading.closest("article");
+    expect(vrCard).not.toBeNull();
+    expect(within(vrCard as HTMLElement).getByText("Exact provider title")).toBeTruthy();
+    expect(within(vrCard as HTMLElement).getByText("JavDB")).toBeTruthy();
+    expect(fetchJavdbVrCatalogMock).toHaveBeenCalledWith({ code: "MDVR-419" });
+    expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
+    const cover = vrCard?.querySelector("img");
+    expect(cover).not.toBeNull();
+    fireEvent.error(cover as HTMLImageElement);
+    expect(within(vrCard as HTMLElement).getByText("Cover unavailable")).toBeTruthy();
+
+    fireEvent.click(
+      within(vrCard as HTMLElement).getByRole("button", {
+        name: "Copy title: MDVR-419",
+      }),
+    );
+    await waitFor(() =>
+      expect(clipboardWriteMock).toHaveBeenCalledWith("MDVR-419"),
+    );
+
+    fireEvent.click(
+      within(vrCard as HTMLElement).getByRole("button", {
+        name: "Find releases: MDVR-419",
+      }),
+    );
+    const releaseList = await screen.findByRole("list", {
+      name: "Verified releases for MDVR-419",
+    });
+    expect(fetchSukebeiVrReleasesMock).toHaveBeenCalledWith({
+      code: "MDVR-419",
+    });
+    expect(within(releaseList).getAllByRole("button")).toHaveLength(2);
+    expect(screen.getByLabelText("Verified release totals").textContent).toBe(
+      "2 verified releases2 from SukebeiRetry",
+    );
+    expect(screen.queryByText("Neighbor MDVR-422 release")).toBeNull();
+    expect(screen.queryByText("Extension MDVR-4190 release")).toBeNull();
+    expect(screen.queryByText("Embedded XMDVR-419 release")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Selected release" })).toBeNull();
+    expect(
+      screen.getByText("Select one verified release to compare its metadata."),
+    ).toBeTruthy();
+
+    fireEvent.click(
+      within(releaseList).getByRole("button", {
+        name: /Exact MDVR-419 release/,
+      }),
+    );
+    let selectedSummary = screen
+      .getByRole("heading", { name: "Selected release" })
+      .closest("section");
+    expect(selectedSummary).not.toBeNull();
+    expect(within(selectedSummary as HTMLElement).getByText("MDVR-419")).toBeTruthy();
+    expect(
+      within(selectedSummary as HTMLElement).getByText("Exact MDVR-419 release"),
+    ).toBeTruthy();
+
+    fireEvent.click(
+      within(releaseList).getByRole("button", {
+        name: /Case mdvr_00419 release/,
+      }),
+    );
+    selectedSummary = screen
+      .getByRole("heading", { name: "Selected release" })
+      .closest("section");
+    expect(
+      within(selectedSummary as HTMLElement).getByText("Case mdvr_00419 release"),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /torrent|download|save/i })).toBeNull();
+
+    for (const command of [
+      "scan_movies",
+      "query_movies_storage",
+      "open_movie",
+      "reveal_movie",
+      "trash_movie",
+    ]) {
+      expect(invokeMock.mock.calls.some(([calledCommand]) => calledCommand === command)).toBe(
+        false,
+      );
+    }
+  });
+
+  it("keeps only the newest catalog result and blocks a late result after a category change", async () => {
+    const firstCatalog = createDeferred<string>();
+    const secondCatalog = createDeferred<string>();
+    const closedCatalog = createDeferred<string>();
+    fetchJavdbVrCatalogMock
+      .mockReturnValueOnce(firstCatalog.promise)
+      .mockReturnValueOnce(secondCatalog.promise)
+      .mockReturnValueOnce(closedCatalog.promise);
+    render(<App />);
+    selectDiscover();
+    selectVrDiscover();
+    const codeInput = screen.getByRole("textbox", {
+      name: "Search product code",
+    });
+
+    fireEvent.change(codeInput, { target: { value: "MDVR-419" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    fireEvent.change(codeInput, { target: { value: "MDVR-422" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    await act(async () => {
+      firstCatalog.resolve(javdbCatalogFixture("MDVR-419", "Stale title"));
+      await firstCatalog.promise;
+    });
+    expect(screen.queryByRole("heading", { name: "MDVR-419" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Searching JavDB" })).toBeTruthy();
+
+    await act(async () => {
+      secondCatalog.resolve(javdbCatalogFixture("MDVR-422", "Current title"));
+      await secondCatalog.promise;
+    });
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "MDVR-422" }),
+    ).toBeTruthy();
+
+    fireEvent.change(codeInput, { target: { value: "MDVR-430" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+    await act(async () => {
+      closedCatalog.resolve(javdbCatalogFixture("MDVR-430", "Closed title"));
+      await closedCatalog.promise;
+    });
+    selectVrDiscover();
+    expect(screen.queryByRole("heading", { name: "MDVR-430" })).toBeNull();
+    expect(
+      screen.getByRole("heading", {
+        name: "Search for a VR title by product code",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("dismisses pending comparison safely and restores focus without accepting a late response", async () => {
+    fetchJavdbVrCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
+    const firstReleases = createDeferred<string>();
+    const secondReleases = createDeferred<string>();
+    fetchSukebeiVrReleasesMock
+      .mockReturnValueOnce(firstReleases.promise)
+      .mockReturnValueOnce(secondReleases.promise);
+    render(<App />);
+    selectDiscover();
+    selectVrDiscover();
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Search product code" }),
+      { target: { value: "MDVR-419" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    const trigger = await screen.findByRole("button", {
+      name: "Find releases: MDVR-419",
+    });
+
+    fireEvent.click(trigger);
+    expect(
+      await screen.findByRole("heading", { name: "Finding verified releases" }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    await act(async () => {
+      firstReleases.resolve(
+        sukebeiReleaseFixture([{ name: "Late MDVR-419 release" }]),
+      );
+      await firstReleases.promise;
+    });
+    expect(screen.queryByText("Late MDVR-419 release")).toBeNull();
+
+    fireEvent.click(trigger);
+    await screen.findByRole("heading", { name: "Finding verified releases" });
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    await act(async () => {
+      secondReleases.resolve(
+        sukebeiReleaseFixture([{ name: "Escaped MDVR-419 release" }]),
+      );
+      await secondReleases.promise;
+    });
+    expect(screen.queryByText("Escaped MDVR-419 release")).toBeNull();
+  });
+
+  it("shows distinct catalog and release provider failures and a safe accepted-only no-match state", async () => {
+    fetchJavdbVrCatalogMock
+      .mockRejectedValueOnce("vr_network_error")
+      .mockResolvedValueOnce("<html>invalid</html>")
+      .mockRejectedValueOnce("vr_source_unavailable")
+      .mockRejectedValueOnce("vr_provider_error")
+      .mockResolvedValueOnce('<div class="movie-list"></div>')
+      .mockResolvedValueOnce(javdbCatalogFixture("MDVR-419"));
+    fetchSukebeiVrReleasesMock
+      .mockRejectedValueOnce("vr_source_unavailable")
+      .mockRejectedValueOnce("vr_network_error")
+      .mockResolvedValueOnce("<rss>")
+      .mockRejectedValueOnce("vr_provider_error")
+      .mockResolvedValueOnce(
+        sukebeiReleaseFixture([
+          { name: "Extension MDVR-4190 release", seeders: 999 },
+          { name: "Embedded XMDVR-419 release", seeders: 998 },
+        ]),
+      );
+    render(<App />);
+    selectDiscover();
+    selectVrDiscover();
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Search product code" }),
+      { target: { value: "MDVR-419" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    for (const heading of [
+      "JavDB could not be reached",
+      "JavDB returned invalid catalog data",
+      "JavDB is unavailable",
+      "JavDB could not complete the search",
+    ]) {
+      expect(await screen.findByRole("heading", { name: heading })).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Retry search" }));
+    }
+    expect(
+      await screen.findByRole("heading", { name: "No exact VR title found" }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    const trigger = await screen.findByRole("button", {
+      name: "Find releases: MDVR-419",
+    });
+    fireEvent.click(trigger);
+
+    for (const heading of [
+      "Sukebei is unavailable",
+      "Sukebei could not be reached",
+      "Sukebei returned invalid release data",
+      "Sukebei could not load releases",
+    ]) {
+      expect(await screen.findByRole("heading", { name: heading })).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    }
+    expect(
+      await screen.findByRole("heading", { name: "No verified releases found" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("Extension MDVR-4190 release")).toBeNull();
+    expect(screen.queryByText("Embedded XMDVR-419 release")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Selected release" })).toBeNull();
+  });
+
+  it("preserves independent Movies and VR state through navigation, appearance, and resize without duplicate requests", async () => {
+    loadTmdbTokenMock.mockResolvedValue("saved-token");
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        results: [
+          {
+            id: 501,
+            title: "Preserved Movie",
+            poster_path: null,
+            release_date: "2026-08-03",
+          },
+        ],
+      }),
+    );
+    fetchJavdbVrCatalogMock.mockResolvedValue(
+      javdbCatalogFixture("MDVR-419", "Preserved VR title"),
+    );
+    render(<App />);
+    selectDiscover();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "Preserved Movie" }),
+    ).toBeTruthy();
+    selectVrDiscover();
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Search product code" }),
+      { target: { value: "MDVR-419" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "MDVR-419" }),
+    ).toBeTruthy();
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectDiscover();
+    expect(
+      (screen.getByRole("radio", { name: "VR" }) as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(
+      (
+        screen.getByRole("textbox", {
+          name: "Search product code",
+        }) as HTMLInputElement
+      ).value,
+    ).toBe("MDVR-419");
+    expect(screen.getByRole("heading", { level: 3, name: "MDVR-419" })).toBeTruthy();
+    resizeGallery("discover", 520, 850);
+    expect(fetchJavdbVrCatalogMock).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+    expect(
+      screen.getByRole("heading", { level: 3, name: "Preserved Movie" }),
+    ).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

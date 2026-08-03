@@ -40,8 +40,18 @@ const MOVIE_TRASH_UNSUPPORTED: &str = "movie_trash_unsupported";
 const TMDB_TOKEN_FILE_NAME: &str = ".tmdb-api-read-access-token";
 const TMDB_TOKEN_INVALID: &str = "tmdb_token_invalid";
 const TMDB_TOKEN_STORAGE_FAILED: &str = "tmdb_token_storage_failed";
+const VR_NETWORK_ERROR: &str = "vr_network_error";
+const VR_PROVIDER_ERROR: &str = "vr_provider_error";
+const VR_SOURCE_UNAVAILABLE: &str = "vr_source_unavailable";
 // API Read Access Tokens are much shorter; this rejects arbitrary oversized IPC or file input.
 const TMDB_TOKEN_MAX_LENGTH: usize = 4096;
+// Provider documents are small result pages; this limits data returned across the native boundary.
+const PROVIDER_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const PROVIDER_HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
+#[cfg(target_os = "macos")]
+const PROVIDER_HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_code}";
+const JAVDB_CATALOG_URL: &str = "https://javdb.com/search?q=";
+const SUKEBEI_RELEASES_URL: &str = "https://sukebei.nyaa.si/?page=rss&q=%22";
 
 #[derive(Default)]
 struct MoviesLibraryContext {
@@ -56,6 +66,13 @@ struct TrashMovieRequest {
     path: String,
     folder: Option<String>,
     library_paths: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ProviderRequestError {
+    SourceUnavailable,
+    Network,
+    Provider,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -513,6 +530,131 @@ fn clear_tmdb_token_file(path: &Path) -> Result<(), &'static str> {
     }
 }
 
+fn is_canonical_product_code(code: &str) -> bool {
+    let Some((prefix, number)) = code.split_once('-') else {
+        return false;
+    };
+
+    (2..=16).contains(&prefix.len())
+        && prefix
+            .bytes()
+            .all(|character| character.is_ascii_uppercase())
+        && (1..=10).contains(&number.len())
+        && !number.starts_with('0')
+        && number.bytes().all(|character| character.is_ascii_digit())
+}
+
+fn provider_error_code(error: ProviderRequestError) -> &'static str {
+    match error {
+        ProviderRequestError::SourceUnavailable => VR_SOURCE_UNAVAILABLE,
+        ProviderRequestError::Network => VR_NETWORK_ERROR,
+        ProviderRequestError::Provider => VR_PROVIDER_ERROR,
+    }
+}
+
+fn parse_provider_response(output: &[u8]) -> Result<String, ProviderRequestError> {
+    let output = std::str::from_utf8(output).map_err(|_| ProviderRequestError::Provider)?;
+    let (document, status) = output
+        .rsplit_once(PROVIDER_HTTP_STATUS_MARKER)
+        .ok_or(ProviderRequestError::Provider)?;
+    let status = status
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| ProviderRequestError::Provider)?;
+
+    match status {
+        200..=299 if document.len() <= PROVIDER_RESPONSE_MAX_BYTES => Ok(document.to_owned()),
+        404 | 410 | 451 => Err(ProviderRequestError::SourceUnavailable),
+        _ => Err(ProviderRequestError::Provider),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fetch_provider_document(url: &str) -> Result<String, ProviderRequestError> {
+    let output = Command::new("/usr/bin/curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--location",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "20",
+            "--user-agent",
+            "Auto-Video/0.1",
+            "--header",
+            "Accept: text/html, application/xml;q=0.9",
+            "--write-out",
+            PROVIDER_HTTP_STATUS_WRITE_OUT,
+            url,
+        ])
+        .output()
+        .map_err(|_| ProviderRequestError::Network)?;
+    if !output.status.success() {
+        return Err(ProviderRequestError::Network);
+    }
+
+    parse_provider_response(&output.stdout)
+}
+
+#[cfg(target_os = "windows")]
+fn fetch_provider_document(url: &str) -> Result<String, ProviderRequestError> {
+    const PROVIDER_URL_ENV: &str = "AUTO_VIDEO_PROVIDER_URL";
+    const WINDOWS_PROVIDER_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  $response = Invoke-WebRequest -UseBasicParsing -Uri $env:AUTO_VIDEO_PROVIDER_URL -Headers @{ Accept = 'text/html, application/xml;q=0.9'; 'User-Agent' = 'Auto-Video/0.1' } -TimeoutSec 20
+  [Console]::Out.Write($response.Content)
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + [int]$response.StatusCode)
+} catch {
+  $status = if ($null -eq $_.Exception.Response) { 0 } else { [int]$_.Exception.Response.StatusCode }
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + $status)
+}"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(WINDOWS_PROVIDER_SCRIPT)
+        // The validated native-built URL stays out of PowerShell source and cannot become script input.
+        .env(PROVIDER_URL_ENV, url)
+        .output()
+        .map_err(|_| ProviderRequestError::Network)?;
+    if !output.status.success() {
+        return Err(ProviderRequestError::Network);
+    }
+    if output.stdout.ends_with(b"AUTO_VIDEO_HTTP_STATUS:0") {
+        return Err(ProviderRequestError::Network);
+    }
+
+    parse_provider_response(&output.stdout)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn fetch_provider_document(_url: &str) -> Result<String, ProviderRequestError> {
+    Err(ProviderRequestError::Network)
+}
+
+fn fetch_javdb_vr_catalog_with(
+    code: &str,
+    request: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+) -> Result<String, &'static str> {
+    if !is_canonical_product_code(code) {
+        return Err(VR_PROVIDER_ERROR);
+    }
+
+    request(&format!("{JAVDB_CATALOG_URL}{code}&f=all")).map_err(provider_error_code)
+}
+
+fn fetch_sukebei_vr_releases_with(
+    code: &str,
+    request: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+) -> Result<String, &'static str> {
+    if !is_canonical_product_code(code) {
+        return Err(VR_PROVIDER_ERROR);
+    }
+
+    request(&format!("{SUKEBEI_RELEASES_URL}{code}%22&c=0_0&f=0")).map_err(provider_error_code)
+}
+
 fn tmdb_token_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -702,6 +844,24 @@ fn clear_tmdb_token(app: tauri::AppHandle) -> Result<(), String> {
     clear_tmdb_token_file(&tmdb_token_path(&app)?).map_err(str::to_owned)
 }
 
+#[tauri::command]
+async fn fetch_javdb_vr_catalog(code: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_javdb_vr_catalog_with(&code, fetch_provider_document).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| VR_PROVIDER_ERROR.to_owned())?
+}
+
+#[tauri::command]
+async fn fetch_sukebei_vr_releases(code: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_sukebei_vr_releases_with(&code, fetch_provider_document).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| VR_PROVIDER_ERROR.to_owned())?
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -717,7 +877,9 @@ fn main() {
             trash_movie,
             load_tmdb_token,
             save_tmdb_token,
-            clear_tmdb_token
+            clear_tmdb_token,
+            fetch_javdb_vr_catalog,
+            fetch_sukebei_vr_releases
         ])
         .run(tauri::generate_context!())
         .expect("failed to run the Auto-Video desktop application");
@@ -737,18 +899,19 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::parse_windows_volume_storage;
     use super::{
-        clear_movies_folder_file, clear_tmdb_token_file, load_movies_folder_file,
-        load_tmdb_token_file, movie_metadata_error, open_movie_path_with,
+        clear_movies_folder_file, clear_tmdb_token_file, fetch_javdb_vr_catalog_with,
+        fetch_sukebei_vr_releases_with, load_movies_folder_file, load_tmdb_token_file,
+        movie_metadata_error, open_movie_path_with, parse_provider_response,
         query_movies_volume_storage_with, reveal_movie_path_with, save_movies_folder_file,
         save_tmdb_token_file, scan_movie_paths, trash_movie_path_with, trash_movie_request_with,
         MoviePathValidationError, MoviesLibraryContext, MoviesVolumeStorageQueryError,
-        TrashMovieRequest, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
+        ProviderRequestError, TrashMovieRequest, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
         MOVIES_STORAGE_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND,
         MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE,
         MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED,
         MOVIE_TRASH_FAILED, MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE,
         MOVIE_TRASH_NOT_FOUND, MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE,
-        MOVIE_TRASH_UNAVAILABLE, MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID,
+        MOVIE_TRASH_UNAVAILABLE, MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID, VR_PROVIDER_ERROR,
     };
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -788,6 +951,69 @@ mod tests {
         path.into_os_string()
             .into_string()
             .expect("fixture paths must be valid Unicode")
+    }
+
+    #[test]
+    fn constructs_literal_exact_code_provider_requests() {
+        let javdb_url = RefCell::new(None);
+        let sukebei_url = RefCell::new(None);
+
+        assert_eq!(
+            fetch_javdb_vr_catalog_with("MDVR-419", |url| {
+                javdb_url.replace(Some(url.to_owned()));
+                Ok("catalog".to_owned())
+            }),
+            Ok("catalog".to_owned())
+        );
+        assert_eq!(
+            fetch_sukebei_vr_releases_with("MDVR-419", |url| {
+                sukebei_url.replace(Some(url.to_owned()));
+                Ok("releases".to_owned())
+            }),
+            Ok("releases".to_owned())
+        );
+        assert_eq!(
+            javdb_url.into_inner().as_deref(),
+            Some("https://javdb.com/search?q=MDVR-419&f=all")
+        );
+        assert_eq!(
+            sukebei_url.into_inner().as_deref(),
+            Some("https://sukebei.nyaa.si/?page=rss&q=%22MDVR-419%22&c=0_0&f=0")
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_provider_codes_before_dispatch() {
+        for code in ["", "mdvr-419", "MDVR_419", "MDVR-0419", "MDVR-4190 extra"] {
+            let dispatched = RefCell::new(false);
+            let result = fetch_javdb_vr_catalog_with(code, |_| {
+                dispatched.replace(true);
+                Err(ProviderRequestError::Network)
+            });
+
+            assert_eq!(result, Err(VR_PROVIDER_ERROR));
+            assert!(!dispatched.into_inner());
+        }
+    }
+
+    #[test]
+    fn distinguishes_provider_response_statuses_at_the_native_boundary() {
+        assert_eq!(
+            parse_provider_response(b"document\nAUTO_VIDEO_HTTP_STATUS:200"),
+            Ok("document".to_owned())
+        );
+        assert_eq!(
+            parse_provider_response(b"missing\nAUTO_VIDEO_HTTP_STATUS:404"),
+            Err(ProviderRequestError::SourceUnavailable)
+        );
+        assert_eq!(
+            parse_provider_response(b"failure\nAUTO_VIDEO_HTTP_STATUS:500"),
+            Err(ProviderRequestError::Provider)
+        );
+        assert_eq!(
+            parse_provider_response(b"invalid"),
+            Err(ProviderRequestError::Provider)
+        );
     }
 
     #[test]
