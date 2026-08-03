@@ -1,0 +1,1439 @@
+use std::{
+    collections::{BTreeSet, HashSet},
+    io,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex},
+};
+
+const SUKEBEI_DOWNLOAD_PREFIX: &str = "https://sukebei.nyaa.si/download/";
+const SUKEBEI_VIEW_PREFIX: &str = "https://sukebei.nyaa.si/view/";
+const PROVIDER_ITEM_ID_MAX_DIGITS: usize = 20;
+const TORRENT_MAX_BYTES: usize = 2 * 1024 * 1024;
+const TORRENT_MAX_REDIRECTS: usize = 3;
+const TORRENT_STATUS_MARKER: &[u8] = b"\nAUTO_VIDEO_TORRENT_STATUS:";
+const TORRENT_REDIRECT_MARKER: &[u8] = b"\nAUTO_VIDEO_TORRENT_REDIRECT:";
+
+pub const VR_TORRENT_CONTEXT_INVALID: &str = "vr_torrent_context_invalid";
+pub const VR_TORRENT_INFOHASH_MISMATCH: &str = "vr_torrent_infohash_mismatch";
+pub const VR_TORRENT_MALFORMED: &str = "vr_torrent_malformed";
+pub const VR_TORRENT_NETWORK_ERROR: &str = "vr_torrent_network_error";
+pub const VR_TORRENT_PROVIDER_ERROR: &str = "vr_torrent_provider_error";
+pub const VR_TORRENT_SAVE_FAILED: &str = "vr_torrent_save_failed";
+pub const VR_TORRENT_SOURCE_UNAVAILABLE: &str = "vr_torrent_source_unavailable";
+pub const VR_TORRENT_STALE: &str = "vr_torrent_stale";
+pub const VR_TORRENT_UNSUPPORTED: &str = "vr_torrent_unsupported";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrustedArtifact {
+    code: String,
+    release_name: String,
+    provider_item_id: String,
+    torrent_url: String,
+    expected_infohash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TorrentInspectionRequest {
+    pub code: String,
+    pub release_name: String,
+    pub provider_item_id: String,
+    pub torrent_url: String,
+    pub expected_infohash: String,
+}
+
+impl From<TorrentInspectionRequest> for TrustedArtifact {
+    fn from(request: TorrentInspectionRequest) -> Self {
+        Self {
+            code: request.code,
+            release_name: request.release_name,
+            provider_item_id: request.provider_item_id,
+            torrent_url: request.torrent_url,
+            expected_infohash: request.expected_infohash,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TrustedReleaseFeed {
+    generation: u64,
+    code: String,
+    artifacts: Vec<TrustedArtifact>,
+}
+
+struct CachedTorrent {
+    generation: u64,
+    inspection_id: String,
+    default_file_name: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct VrTorrentContext {
+    release_generation: u64,
+    inspection_generation: u64,
+    release_feed: Option<TrustedReleaseFeed>,
+    cached_torrent: Option<CachedTorrent>,
+}
+
+#[derive(Clone, Default)]
+pub struct VrTorrentState(Arc<Mutex<VrTorrentContext>>);
+
+impl VrTorrentState {
+    pub fn begin_release_lookup(&self) -> Result<u64, &'static str> {
+        let mut context = self.0.lock().map_err(|_| VR_TORRENT_PROVIDER_ERROR)?;
+        context.release_generation = context.release_generation.wrapping_add(1);
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.release_feed = None;
+        context.cached_torrent = None;
+        Ok(context.release_generation)
+    }
+
+    pub fn finish_release_lookup(
+        &self,
+        generation: u64,
+        code: &str,
+        document: &str,
+    ) -> Result<(), &'static str> {
+        let artifacts = trusted_artifacts_from_feed(document, code);
+        let mut context = self.0.lock().map_err(|_| VR_TORRENT_PROVIDER_ERROR)?;
+        if context.release_generation != generation {
+            return Err(VR_TORRENT_STALE);
+        }
+        context.release_feed = Some(TrustedReleaseFeed {
+            generation,
+            code: code.to_owned(),
+            artifacts,
+        });
+        Ok(())
+    }
+
+    pub fn invalidate_inspection(&self) -> Result<(), &'static str> {
+        let mut context = self.0.lock().map_err(|_| VR_TORRENT_PROVIDER_ERROR)?;
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.cached_torrent = None;
+        Ok(())
+    }
+
+    fn begin_inspection(
+        &self,
+        requested_artifact: &TrustedArtifact,
+    ) -> Result<(u64, u64), &'static str> {
+        let mut context = self.0.lock().map_err(|_| VR_TORRENT_PROVIDER_ERROR)?;
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.cached_torrent = None;
+
+        let release_feed = context
+            .release_feed
+            .as_ref()
+            .filter(|feed| {
+                feed.generation == context.release_generation
+                    && feed.code == requested_artifact.code
+            })
+            .ok_or(VR_TORRENT_CONTEXT_INVALID)?;
+        if !release_feed.artifacts.contains(requested_artifact) {
+            return Err(VR_TORRENT_CONTEXT_INVALID);
+        }
+
+        Ok((context.release_generation, context.inspection_generation))
+    }
+
+    fn finish_inspection(
+        &self,
+        release_generation: u64,
+        inspection_generation: u64,
+        artifact: &TrustedArtifact,
+        bytes: Vec<u8>,
+    ) -> Result<String, &'static str> {
+        let mut context = self.0.lock().map_err(|_| VR_TORRENT_PROVIDER_ERROR)?;
+        let feed_is_current = context.release_feed.as_ref().is_some_and(|feed| {
+            feed.generation == release_generation && feed.artifacts.contains(artifact)
+        });
+        if context.release_generation != release_generation
+            || context.inspection_generation != inspection_generation
+            || !feed_is_current
+        {
+            return Err(VR_TORRENT_STALE);
+        }
+
+        let inspection_id = format!(
+            "{release_generation}-{inspection_generation}-{}",
+            artifact.provider_item_id
+        );
+        context.cached_torrent = Some(CachedTorrent {
+            generation: inspection_generation,
+            inspection_id: inspection_id.clone(),
+            default_file_name: format!("{}-{}.torrent", artifact.code, artifact.provider_item_id),
+            bytes,
+        });
+        Ok(inspection_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactRequestError {
+    Network,
+    TooLarge,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactResponse {
+    pub status: u16,
+    pub redirect_url: Option<String>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TorrentInspectionError {
+    SourceUnavailable,
+    Network,
+    Provider,
+    Malformed,
+    Unsupported,
+}
+
+impl TorrentInspectionError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::SourceUnavailable => VR_TORRENT_SOURCE_UNAVAILABLE,
+            Self::Network => VR_TORRENT_NETWORK_ERROR,
+            Self::Provider => VR_TORRENT_PROVIDER_ERROR,
+            Self::Malformed => VR_TORRENT_MALFORMED,
+            Self::Unsupported => VR_TORRENT_UNSUPPORTED,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TorrentFile {
+    path: String,
+    size: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TorrentMetadata {
+    display_name: String,
+    infohash: String,
+    total_size: u64,
+    files: Vec<TorrentFile>,
+}
+
+pub fn inspect_sukebei_torrent_with(
+    state: &VrTorrentState,
+    request: TorrentInspectionRequest,
+    fetch: impl FnMut(&str) -> Result<ArtifactResponse, ArtifactRequestError>,
+) -> Result<Vec<String>, &'static str> {
+    let artifact = TrustedArtifact::from(request);
+    let (release_generation, inspection_generation) = state.begin_inspection(&artifact)?;
+    let bytes = fetch_torrent_artifact(&artifact, fetch).map_err(TorrentInspectionError::code)?;
+    let metadata = parse_torrent_metadata(&bytes).map_err(TorrentInspectionError::code)?;
+    if metadata.infohash != artifact.expected_infohash {
+        return Err(VR_TORRENT_INFOHASH_MISMATCH);
+    }
+
+    let inspection_id =
+        state.finish_inspection(release_generation, inspection_generation, &artifact, bytes)?;
+    let mut response = vec![
+        inspection_id,
+        metadata.display_name,
+        metadata.infohash,
+        metadata.total_size.to_string(),
+    ];
+    for file in metadata.files {
+        response.push(file.path);
+        response.push(file.size.to_string());
+    }
+    Ok(response)
+}
+
+pub fn save_verified_torrent_with(
+    state: &VrTorrentState,
+    inspection_id: &str,
+    choose_destination: impl FnOnce(&str) -> Option<PathBuf>,
+    write: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+) -> Result<bool, &'static str> {
+    let default_file_name = {
+        let context = state.0.lock().map_err(|_| VR_TORRENT_SAVE_FAILED)?;
+        context
+            .cached_torrent
+            .as_ref()
+            .filter(|torrent| {
+                torrent.inspection_id == inspection_id
+                    && torrent.generation == context.inspection_generation
+            })
+            .map(|torrent| torrent.default_file_name.clone())
+            .ok_or(VR_TORRENT_STALE)?
+    };
+    let Some(destination) = choose_destination(&default_file_name) else {
+        return Ok(false);
+    };
+
+    let context = state.0.lock().map_err(|_| VR_TORRENT_SAVE_FAILED)?;
+    let torrent = context
+        .cached_torrent
+        .as_ref()
+        .filter(|torrent| {
+            torrent.inspection_id == inspection_id
+                && torrent.generation == context.inspection_generation
+        })
+        .ok_or(VR_TORRENT_STALE)?;
+    write(&destination, &torrent.bytes).map_err(|_| VR_TORRENT_SAVE_FAILED)?;
+    Ok(true)
+}
+
+fn fetch_torrent_artifact(
+    artifact: &TrustedArtifact,
+    mut fetch: impl FnMut(&str) -> Result<ArtifactResponse, ArtifactRequestError>,
+) -> Result<Vec<u8>, TorrentInspectionError> {
+    if artifact_item_id(&artifact.torrent_url).as_deref()
+        != Some(artifact.provider_item_id.as_str())
+    {
+        return Err(TorrentInspectionError::Provider);
+    }
+
+    let mut current_url = artifact.torrent_url.clone();
+    for redirect_count in 0..=TORRENT_MAX_REDIRECTS {
+        let response = fetch(&current_url).map_err(|error| match error {
+            ArtifactRequestError::Network => TorrentInspectionError::Network,
+            ArtifactRequestError::TooLarge => TorrentInspectionError::Malformed,
+        })?;
+        if response.body.len() > TORRENT_MAX_BYTES {
+            return Err(TorrentInspectionError::Malformed);
+        }
+
+        match response.status {
+            200..=299 => {
+                if response.body.is_empty() {
+                    return Err(TorrentInspectionError::Malformed);
+                }
+                return Ok(response.body);
+            }
+            301 | 302 | 303 | 307 | 308 if redirect_count < TORRENT_MAX_REDIRECTS => {
+                let redirect_url = response
+                    .redirect_url
+                    .filter(|url| {
+                        artifact_item_id(url).as_deref() == Some(artifact.provider_item_id.as_str())
+                    })
+                    .ok_or(TorrentInspectionError::Provider)?;
+                current_url = redirect_url;
+            }
+            404 | 410 | 451 => return Err(TorrentInspectionError::SourceUnavailable),
+            _ => return Err(TorrentInspectionError::Provider),
+        }
+    }
+
+    Err(TorrentInspectionError::Provider)
+}
+
+pub fn fetch_artifact_response(url: &str) -> Result<ArtifactResponse, ArtifactRequestError> {
+    fetch_artifact_response_platform(url)
+}
+
+#[cfg(target_os = "macos")]
+fn fetch_artifact_response_platform(url: &str) -> Result<ArtifactResponse, ArtifactRequestError> {
+    let output = Command::new("/usr/bin/curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "20",
+            "--max-filesize",
+            &TORRENT_MAX_BYTES.to_string(),
+            "--user-agent",
+            "Auto-Video/0.1",
+            "--header",
+            "Accept: application/x-bittorrent",
+            "--write-out",
+            "\nAUTO_VIDEO_TORRENT_STATUS:%{http_code}\nAUTO_VIDEO_TORRENT_REDIRECT:%{redirect_url}",
+            url,
+        ])
+        .output()
+        .map_err(|_| ArtifactRequestError::Network)?;
+    if !output.status.success() {
+        return match output.status.code() {
+            Some(63) => Err(ArtifactRequestError::TooLarge),
+            _ => Err(ArtifactRequestError::Network),
+        };
+    }
+
+    parse_artifact_command_output(&output.stdout)
+}
+
+#[cfg(target_os = "windows")]
+fn fetch_artifact_response_platform(url: &str) -> Result<ArtifactResponse, ArtifactRequestError> {
+    const ARTIFACT_URL_ENV: &str = "AUTO_VIDEO_TORRENT_URL";
+    const WINDOWS_ARTIFACT_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Net.Http
+$handler = [System.Net.Http.HttpClientHandler]::new()
+$handler.AllowAutoRedirect = $false
+$client = [System.Net.Http.HttpClient]::new($handler)
+$client.Timeout = [TimeSpan]::FromSeconds(20)
+$client.DefaultRequestHeaders.UserAgent.ParseAdd('Auto-Video/0.1')
+$client.DefaultRequestHeaders.Accept.ParseAdd('application/x-bittorrent')
+try {
+  $response = $client.GetAsync($env:AUTO_VIDEO_TORRENT_URL, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+  $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+  $memory = [System.IO.MemoryStream]::new()
+  $buffer = [byte[]]::new(65536)
+  while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+    if ($memory.Length + $read -gt 2097152) { [Environment]::Exit(63) }
+    $memory.Write($buffer, 0, $read)
+  }
+  $redirect = ''
+  if ($null -ne $response.Headers.Location) {
+    $redirect = [Uri]::new([Uri]$env:AUTO_VIDEO_TORRENT_URL, $response.Headers.Location).AbsoluteUri
+  }
+  $output = [Console]::OpenStandardOutput()
+  $body = $memory.ToArray()
+  $output.Write($body, 0, $body.Length)
+  $marker = [Text.Encoding]::UTF8.GetBytes("`nAUTO_VIDEO_TORRENT_STATUS:" + [int]$response.StatusCode + "`nAUTO_VIDEO_TORRENT_REDIRECT:" + $redirect)
+  $output.Write($marker, 0, $marker.Length)
+} catch {
+  [Environment]::Exit(28)
+} finally {
+  $client.Dispose()
+  $handler.Dispose()
+}"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(WINDOWS_ARTIFACT_SCRIPT)
+        // The URL is native-validated and stays out of PowerShell source.
+        .env(ARTIFACT_URL_ENV, url)
+        .output()
+        .map_err(|_| ArtifactRequestError::Network)?;
+    if !output.status.success() {
+        return match output.status.code() {
+            Some(63) => Err(ArtifactRequestError::TooLarge),
+            _ => Err(ArtifactRequestError::Network),
+        };
+    }
+
+    parse_artifact_command_output(&output.stdout)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn fetch_artifact_response_platform(_url: &str) -> Result<ArtifactResponse, ArtifactRequestError> {
+    Err(ArtifactRequestError::Network)
+}
+
+fn parse_artifact_command_output(output: &[u8]) -> Result<ArtifactResponse, ArtifactRequestError> {
+    let status_marker = output
+        .windows(TORRENT_STATUS_MARKER.len())
+        .rposition(|window| window == TORRENT_STATUS_MARKER)
+        .ok_or(ArtifactRequestError::Network)?;
+    let redirect_marker = output[status_marker + TORRENT_STATUS_MARKER.len()..]
+        .windows(TORRENT_REDIRECT_MARKER.len())
+        .position(|window| window == TORRENT_REDIRECT_MARKER)
+        .map(|position| position + status_marker + TORRENT_STATUS_MARKER.len())
+        .ok_or(ArtifactRequestError::Network)?;
+    let status =
+        std::str::from_utf8(&output[status_marker + TORRENT_STATUS_MARKER.len()..redirect_marker])
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or(ArtifactRequestError::Network)?;
+    let redirect = std::str::from_utf8(&output[redirect_marker + TORRENT_REDIRECT_MARKER.len()..])
+        .map_err(|_| ArtifactRequestError::Network)?;
+    if status_marker > TORRENT_MAX_BYTES {
+        return Err(ArtifactRequestError::TooLarge);
+    }
+
+    Ok(ArtifactResponse {
+        status,
+        redirect_url: (!redirect.is_empty()).then(|| redirect.to_owned()),
+        body: output[..status_marker].to_vec(),
+    })
+}
+
+fn trusted_artifacts_from_feed(document: &str, requested_code: &str) -> Vec<TrustedArtifact> {
+    rss_items(document)
+        .filter_map(|item| {
+            let release_name = xml_element_text(item, "title")?;
+            if release_name.trim().is_empty()
+                || !release_matches_product_code(&release_name, requested_code)
+            {
+                return None;
+            }
+
+            let provider_item_id = view_item_id(xml_element_text(item, "guid")?.trim())?;
+            let torrent_url = xml_element_text(item, "link")?.trim().to_owned();
+            if artifact_item_id(&torrent_url).as_deref() != Some(provider_item_id.as_str()) {
+                return None;
+            }
+            let expected_infohash = canonical_infohash(xml_element_text(item, "infoHash")?.trim())?;
+
+            Some(TrustedArtifact {
+                code: requested_code.to_owned(),
+                release_name,
+                provider_item_id,
+                torrent_url,
+                expected_infohash,
+            })
+        })
+        .collect()
+}
+
+fn rss_items(document: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = document;
+    std::iter::from_fn(move || loop {
+        let start = remaining.find("<item")?;
+        let after_name = remaining.as_bytes().get(start + 5).copied()?;
+        if !after_name.is_ascii_whitespace() && after_name != b'>' {
+            remaining = &remaining[start + 5..];
+            continue;
+        }
+        let opening_end = remaining[start..].find('>')? + start + 1;
+        let end = remaining[opening_end..].find("</item>")? + opening_end;
+        let item = &remaining[opening_end..end];
+        remaining = &remaining[end + "</item>".len()..];
+        return Some(item);
+    })
+}
+
+fn xml_element_text(item: &str, local_name: &str) -> Option<String> {
+    let mut remaining = item;
+    while let Some(start) = remaining.find('<') {
+        remaining = &remaining[start + 1..];
+        if remaining.starts_with(['/', '!', '?']) {
+            continue;
+        }
+        let opening_end = remaining.find('>')?;
+        let opening = &remaining[..opening_end];
+        let tag_name = opening
+            .split(|character: char| character.is_ascii_whitespace() || character == '/')
+            .next()?;
+        if tag_name.rsplit(':').next()? != local_name {
+            remaining = &remaining[opening_end + 1..];
+            continue;
+        }
+        if opening.trim_end().ends_with('/') {
+            return None;
+        }
+
+        let content = &remaining[opening_end + 1..];
+        let closing = format!("</{tag_name}>");
+        let closing_start = content.find(&closing)?;
+        let raw_text = &content[..closing_start];
+        if raw_text.contains('<') {
+            return None;
+        }
+        return decode_xml_text(raw_text);
+    }
+    None
+}
+
+fn decode_xml_text(value: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(entity_start) = remaining.find('&') {
+        decoded.push_str(&remaining[..entity_start]);
+        let entity = &remaining[entity_start + 1..];
+        let entity_end = entity.find(';')?;
+        let replacement = match &entity[..entity_end] {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            numeric if numeric.starts_with("#x") => {
+                char::from_u32(u32::from_str_radix(&numeric[2..], 16).ok()?)?
+            }
+            numeric if numeric.starts_with('#') => {
+                char::from_u32(numeric[1..].parse::<u32>().ok()?)?
+            }
+            _ => return None,
+        };
+        decoded.push(replacement);
+        remaining = &entity[entity_end + 1..];
+    }
+    decoded.push_str(remaining);
+    Some(decoded.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+fn release_matches_product_code(name: &str, requested_code: &str) -> bool {
+    let bytes = name.as_bytes();
+    let mut identities = BTreeSet::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if index > 0 && bytes[index - 1].is_ascii_alphanumeric() {
+            index += 1;
+            continue;
+        }
+
+        let prefix_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+            index += 1;
+        }
+        let prefix_length = index - prefix_start;
+        if !(2..=16).contains(&prefix_length) {
+            index = prefix_start + 1;
+            continue;
+        }
+        while index < bytes.len() && matches!(bytes[index], b' ' | b'_' | b'-') {
+            index += 1;
+        }
+        let number_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let number_length = index - number_start;
+        if !(1..=10).contains(&number_length)
+            || (index < bytes.len() && bytes[index].is_ascii_alphanumeric())
+        {
+            index = prefix_start + 1;
+            continue;
+        }
+
+        let number = std::str::from_utf8(&bytes[number_start..index])
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok());
+        if let Some(number) = number.filter(|number| *number > 0) {
+            let prefix = std::str::from_utf8(&bytes[prefix_start..prefix_start + prefix_length])
+                .expect("ASCII product-code prefixes are valid UTF-8");
+            identities.insert(format!("{}-{number}", prefix.to_ascii_uppercase()));
+        }
+    }
+
+    identities.len() == 1 && identities.contains(requested_code)
+}
+
+fn view_item_id(url: &str) -> Option<String> {
+    provider_item_id(url.strip_prefix(SUKEBEI_VIEW_PREFIX)?)
+}
+
+fn artifact_item_id(url: &str) -> Option<String> {
+    let item_id = url
+        .strip_prefix(SUKEBEI_DOWNLOAD_PREFIX)?
+        .strip_suffix(".torrent")?;
+    provider_item_id(item_id)
+}
+
+fn provider_item_id(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|character| character.is_ascii_digit())
+        || value.len() > PROVIDER_ITEM_ID_MAX_DIGITS
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn canonical_infohash(value: &str) -> Option<String> {
+    (value.len() == 40 && value.bytes().all(|character| character.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_lowercase())
+}
+
+#[derive(Debug)]
+struct BencodedNode<'a> {
+    start: usize,
+    end: usize,
+    value: BencodedValue<'a>,
+}
+
+#[derive(Debug)]
+enum BencodedValue<'a> {
+    Bytes(&'a [u8]),
+    Integer(i64),
+    List(Vec<BencodedNode<'a>>),
+    Dictionary(Vec<(&'a [u8], BencodedNode<'a>)>),
+}
+
+struct BencodeParser<'a> {
+    input: &'a [u8],
+    position: usize,
+    value_count: usize,
+}
+
+impl<'a> BencodeParser<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            position: 0,
+            value_count: 0,
+        }
+    }
+
+    fn parse(mut self) -> Result<BencodedNode<'a>, TorrentInspectionError> {
+        let value = self.parse_value(0)?;
+        if self.position != self.input.len() {
+            return Err(TorrentInspectionError::Malformed);
+        }
+        Ok(value)
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<BencodedNode<'a>, TorrentInspectionError> {
+        if depth > 64 || self.value_count >= 100_000 {
+            return Err(TorrentInspectionError::Malformed);
+        }
+        self.value_count += 1;
+        let start = self.position;
+        let value = match self.input.get(self.position).copied() {
+            Some(b'i') => self.parse_integer()?,
+            Some(b'l') => self.parse_list(depth + 1)?,
+            Some(b'd') => self.parse_dictionary(depth + 1)?,
+            Some(character) if character.is_ascii_digit() => {
+                BencodedValue::Bytes(self.parse_bytes()?)
+            }
+            _ => return Err(TorrentInspectionError::Malformed),
+        };
+        Ok(BencodedNode {
+            start,
+            end: self.position,
+            value,
+        })
+    }
+
+    fn parse_integer(&mut self) -> Result<BencodedValue<'a>, TorrentInspectionError> {
+        self.position += 1;
+        let end = self.input[self.position..]
+            .iter()
+            .position(|character| *character == b'e')
+            .map(|offset| offset + self.position)
+            .ok_or(TorrentInspectionError::Malformed)?;
+        let encoded = &self.input[self.position..end];
+        if encoded.is_empty()
+            || encoded == b"-0"
+            || (encoded.starts_with(b"0") && encoded.len() > 1)
+            || (encoded.starts_with(b"-0") && encoded.len() > 2)
+        {
+            return Err(TorrentInspectionError::Malformed);
+        }
+        let value = std::str::from_utf8(encoded)
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .ok_or(TorrentInspectionError::Malformed)?;
+        self.position = end + 1;
+        Ok(BencodedValue::Integer(value))
+    }
+
+    fn parse_bytes(&mut self) -> Result<&'a [u8], TorrentInspectionError> {
+        let separator = self.input[self.position..]
+            .iter()
+            .position(|character| *character == b':')
+            .map(|offset| offset + self.position)
+            .ok_or(TorrentInspectionError::Malformed)?;
+        let encoded_length = &self.input[self.position..separator];
+        if encoded_length.is_empty()
+            || (encoded_length.starts_with(b"0") && encoded_length.len() > 1)
+            || !encoded_length
+                .iter()
+                .all(|character| character.is_ascii_digit())
+        {
+            return Err(TorrentInspectionError::Malformed);
+        }
+        let length = std::str::from_utf8(encoded_length)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or(TorrentInspectionError::Malformed)?;
+        let start = separator + 1;
+        let end = start
+            .checked_add(length)
+            .filter(|end| *end <= self.input.len())
+            .ok_or(TorrentInspectionError::Malformed)?;
+        self.position = end;
+        Ok(&self.input[start..end])
+    }
+
+    fn parse_list(&mut self, depth: usize) -> Result<BencodedValue<'a>, TorrentInspectionError> {
+        self.position += 1;
+        let mut values = Vec::new();
+        while self.input.get(self.position) != Some(&b'e') {
+            values.push(self.parse_value(depth)?);
+        }
+        self.position += 1;
+        Ok(BencodedValue::List(values))
+    }
+
+    fn parse_dictionary(
+        &mut self,
+        depth: usize,
+    ) -> Result<BencodedValue<'a>, TorrentInspectionError> {
+        self.position += 1;
+        let mut entries = Vec::new();
+        let mut previous_key: Option<&[u8]> = None;
+        while self.input.get(self.position) != Some(&b'e') {
+            let key = self.parse_bytes()?;
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return Err(TorrentInspectionError::Malformed);
+            }
+            previous_key = Some(key);
+            entries.push((key, self.parse_value(depth)?));
+        }
+        self.position += 1;
+        Ok(BencodedValue::Dictionary(entries))
+    }
+}
+
+fn parse_torrent_metadata(bytes: &[u8]) -> Result<TorrentMetadata, TorrentInspectionError> {
+    let root = BencodeParser::new(bytes).parse()?;
+    let root_dictionary = dictionary(&root)?;
+    let info =
+        dictionary_value(root_dictionary, b"info").ok_or(TorrentInspectionError::Unsupported)?;
+    let info_dictionary = dictionary(info)?;
+    if dictionary_value(info_dictionary, b"meta version").is_some() {
+        return Err(TorrentInspectionError::Unsupported);
+    }
+    let piece_length = integer_value(info_dictionary, b"piece length")?;
+    let pieces = bytes_value(info_dictionary, b"pieces")?;
+    if piece_length <= 0 || pieces.is_empty() || pieces.len() % 20 != 0 {
+        return Err(TorrentInspectionError::Unsupported);
+    }
+
+    let display_name = match dictionary_value(info_dictionary, b"name.utf-8") {
+        Some(name) => node_text(name)?,
+        None => text_value(info_dictionary, b"name")?,
+    };
+    validate_display_text(&display_name)?;
+
+    let single_length = dictionary_value(info_dictionary, b"length");
+    let multi_files = dictionary_value(info_dictionary, b"files");
+    let files = match (single_length, multi_files) {
+        (Some(length), None) => vec![TorrentFile {
+            path: display_name.clone(),
+            size: nonnegative_integer(length)?,
+        }],
+        (None, Some(files)) => parse_multi_file_list(files)?,
+        _ => return Err(TorrentInspectionError::Unsupported),
+    };
+    let total_size = files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(file.size)
+            .ok_or(TorrentInspectionError::Unsupported)
+    })?;
+    let infohash = hex_sha1(&bytes[info.start..info.end]);
+
+    Ok(TorrentMetadata {
+        display_name,
+        infohash,
+        total_size,
+        files,
+    })
+}
+
+fn parse_multi_file_list(
+    files: &BencodedNode<'_>,
+) -> Result<Vec<TorrentFile>, TorrentInspectionError> {
+    let BencodedValue::List(files) = &files.value else {
+        return Err(TorrentInspectionError::Unsupported);
+    };
+    if files.is_empty() {
+        return Err(TorrentInspectionError::Unsupported);
+    }
+
+    let mut parsed_files = Vec::with_capacity(files.len());
+    let mut paths = HashSet::new();
+    for file in files {
+        let file = dictionary(file)?;
+        let size = nonnegative_integer(
+            dictionary_value(file, b"length").ok_or(TorrentInspectionError::Unsupported)?,
+        )?;
+        let path = dictionary_value(file, b"path.utf-8")
+            .or_else(|| dictionary_value(file, b"path"))
+            .ok_or(TorrentInspectionError::Unsupported)?;
+        let BencodedValue::List(components) = &path.value else {
+            return Err(TorrentInspectionError::Unsupported);
+        };
+        if components.is_empty() {
+            return Err(TorrentInspectionError::Unsupported);
+        }
+        let path = components
+            .iter()
+            .map(|component| match &component.value {
+                BencodedValue::Bytes(value) => std::str::from_utf8(value)
+                    .map(str::to_owned)
+                    .map_err(|_| TorrentInspectionError::Unsupported),
+                _ => Err(TorrentInspectionError::Unsupported),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if path.iter().any(|component| {
+            validate_display_text(component).is_err()
+                || matches!(component.as_str(), "." | "..")
+                || component.contains(['/', '\\'])
+        }) {
+            return Err(TorrentInspectionError::Unsupported);
+        }
+        let path = path.join("/");
+        if !paths.insert(path.clone()) {
+            return Err(TorrentInspectionError::Unsupported);
+        }
+        parsed_files.push(TorrentFile { path, size });
+    }
+    Ok(parsed_files)
+}
+
+fn dictionary<'a>(
+    node: &'a BencodedNode<'a>,
+) -> Result<&'a [(&'a [u8], BencodedNode<'a>)], TorrentInspectionError> {
+    match &node.value {
+        BencodedValue::Dictionary(entries) => Ok(entries),
+        _ => Err(TorrentInspectionError::Unsupported),
+    }
+}
+
+fn dictionary_value<'a>(
+    dictionary: &'a [(&'a [u8], BencodedNode<'a>)],
+    key: &[u8],
+) -> Option<&'a BencodedNode<'a>> {
+    dictionary
+        .iter()
+        .find_map(|(candidate, value)| (*candidate == key).then_some(value))
+}
+
+fn bytes_value<'a>(
+    dictionary: &'a [(&'a [u8], BencodedNode<'a>)],
+    key: &[u8],
+) -> Result<&'a [u8], TorrentInspectionError> {
+    match &dictionary_value(dictionary, key)
+        .ok_or(TorrentInspectionError::Unsupported)?
+        .value
+    {
+        BencodedValue::Bytes(value) => Ok(value),
+        _ => Err(TorrentInspectionError::Unsupported),
+    }
+}
+
+fn integer_value(
+    dictionary: &[(&[u8], BencodedNode<'_>)],
+    key: &[u8],
+) -> Result<i64, TorrentInspectionError> {
+    match dictionary_value(dictionary, key)
+        .ok_or(TorrentInspectionError::Unsupported)?
+        .value
+    {
+        BencodedValue::Integer(value) => Ok(value),
+        _ => Err(TorrentInspectionError::Unsupported),
+    }
+}
+
+fn nonnegative_integer(node: &BencodedNode<'_>) -> Result<u64, TorrentInspectionError> {
+    match node.value {
+        BencodedValue::Integer(value) if value >= 0 => Ok(value as u64),
+        _ => Err(TorrentInspectionError::Unsupported),
+    }
+}
+
+fn text_value(
+    dictionary: &[(&[u8], BencodedNode<'_>)],
+    key: &[u8],
+) -> Result<String, TorrentInspectionError> {
+    std::str::from_utf8(bytes_value(dictionary, key)?)
+        .map(str::to_owned)
+        .map_err(|_| TorrentInspectionError::Unsupported)
+}
+
+fn node_text(node: &BencodedNode<'_>) -> Result<String, TorrentInspectionError> {
+    match &node.value {
+        BencodedValue::Bytes(value) => std::str::from_utf8(value)
+            .map(str::to_owned)
+            .map_err(|_| TorrentInspectionError::Unsupported),
+        _ => Err(TorrentInspectionError::Unsupported),
+    }
+}
+
+fn validate_display_text(value: &str) -> Result<(), TorrentInspectionError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(TorrentInspectionError::Unsupported);
+    }
+    Ok(())
+}
+
+fn hex_sha1(input: &[u8]) -> String {
+    sha1(input)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn sha1(input: &[u8]) -> [u8; 20] {
+    let mut message = input.to_vec();
+    let bit_length = (input.len() as u64).wrapping_mul(8);
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_length.to_be_bytes());
+
+    let mut hash = [
+        0x6745_2301_u32,
+        0xefcd_ab89,
+        0x98ba_dcfe,
+        0x1032_5476,
+        0xc3d2_e1f0,
+    ];
+    for chunk in message.chunks_exact(64) {
+        let mut words = [0_u32; 80];
+        for (index, word) in words[..16].iter_mut().enumerate() {
+            *word = u32::from_be_bytes(
+                chunk[index * 4..index * 4 + 4]
+                    .try_into()
+                    .expect("SHA-1 chunks have complete words"),
+            );
+        }
+        for index in 16..80 {
+            words[index] =
+                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                    .rotate_left(1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e] = hash;
+        for (index, word) in words.iter().enumerate() {
+            let (function, constant) = match index {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+                _ => (b ^ c ^ d, 0xca62_c1d6),
+            };
+            let next = a
+                .rotate_left(5)
+                .wrapping_add(function)
+                .wrapping_add(e)
+                .wrapping_add(constant)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = next;
+        }
+        hash[0] = hash[0].wrapping_add(a);
+        hash[1] = hash[1].wrapping_add(b);
+        hash[2] = hash[2].wrapping_add(c);
+        hash[3] = hash[3].wrapping_add(d);
+        hash[4] = hash[4].wrapping_add(e);
+    }
+
+    let mut result = [0_u8; 20];
+    for (index, word) in hash.iter().enumerate() {
+        result[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, fs};
+
+    use super::*;
+
+    fn single_file_torrent() -> Vec<u8> {
+        b"d4:infod6:lengthi5e4:name12:Movie  A.mp412:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec()
+    }
+
+    fn push_bencoded_bytes(encoded: &mut Vec<u8>, value: &str) {
+        encoded.extend_from_slice(value.len().to_string().as_bytes());
+        encoded.push(b':');
+        encoded.extend_from_slice(value.as_bytes());
+    }
+
+    fn multi_file_torrent() -> Vec<u8> {
+        let mut encoded = b"d4:infod5:filesl".to_vec();
+        encoded.extend_from_slice(b"d6:lengthi3e4:pathl");
+        push_bencoded_bytes(&mut encoded, "Folder");
+        push_bencoded_bytes(&mut encoded, "Part  1 — 映画.mkv");
+        encoded.extend_from_slice(b"eed6:lengthi7e10:path.utf-8l");
+        push_bencoded_bytes(&mut encoded, "Folder");
+        push_bencoded_bytes(&mut encoded, "特別版  B.mp4");
+        encoded.extend_from_slice(b"eee4:name");
+        push_bencoded_bytes(&mut encoded, "VR  — 作品");
+        encoded.extend_from_slice(b"12:piece lengthi16384e6:pieces20:bbbbbbbbbbbbbbbbbbbbee");
+        encoded
+    }
+
+    fn release_feed(name: &str, item_id: &str, torrent_url: &str, infohash: &str) -> String {
+        format!(
+            "<rss><channel><item><title>{name}</title><guid>https://sukebei.nyaa.si/view/{item_id}</guid><link>{torrent_url}</link><nyaa:infoHash>{infohash}</nyaa:infoHash></item></channel></rss>"
+        )
+    }
+
+    fn trusted_request(name: &str, infohash: &str) -> TorrentInspectionRequest {
+        TorrentInspectionRequest {
+            code: "MDVR-419".to_owned(),
+            release_name: name.to_owned(),
+            provider_item_id: "123".to_owned(),
+            torrent_url: "https://sukebei.nyaa.si/download/123.torrent".to_owned(),
+            expected_infohash: infohash.to_owned(),
+        }
+    }
+
+    fn state_with_release(name: &str, infohash: &str) -> VrTorrentState {
+        let state = VrTorrentState::default();
+        let generation = state.begin_release_lookup().expect("lookup must start");
+        state
+            .finish_release_lookup(
+                generation,
+                "MDVR-419",
+                &release_feed(
+                    name,
+                    "123",
+                    "https://sukebei.nyaa.si/download/123.torrent",
+                    infohash,
+                ),
+            )
+            .expect("feed must be current");
+        state
+    }
+
+    #[test]
+    fn computes_the_standard_sha1_vector() {
+        assert_eq!(hex_sha1(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn retains_only_complete_same_item_artifacts_for_the_exact_identity() {
+        let valid_hash = "0123456789abcdef0123456789abcdef01234567";
+        let document = format!(
+            "<rss><channel>{}{}{}{}{}{}{}{} </channel></rss>",
+            release_feed(
+                "MDVR-419 exact",
+                "123",
+                "https://sukebei.nyaa.si/download/123.torrent",
+                valid_hash,
+            ),
+            release_feed(
+                "MDVR-419 + ABC-123 pack",
+                "124",
+                "https://sukebei.nyaa.si/download/124.torrent",
+                valid_hash,
+            ),
+            release_feed(
+                "MDVR-419 wrong host",
+                "125",
+                "https://example.com/download/125.torrent",
+                valid_hash,
+            ),
+            release_feed(
+                "MDVR-419 credentials",
+                "126",
+                "https://user@sukebei.nyaa.si/download/126.torrent",
+                valid_hash,
+            ),
+            release_feed(
+                "MDVR-419 mismatched item",
+                "127",
+                "https://sukebei.nyaa.si/download/128.torrent",
+                valid_hash,
+            ),
+            release_feed(
+                "MDVR-419 invalid hash",
+                "129",
+                "https://sukebei.nyaa.si/download/129.torrent",
+                "not-a-hash",
+            ),
+            release_feed(
+                "MDVR-419 unsupported scheme",
+                "130",
+                "http://sukebei.nyaa.si/download/130.torrent",
+                valid_hash,
+            ),
+            release_feed(
+                "MDVR-419 malformed location",
+                "131",
+                "https://sukebei.nyaa.si/download/131.torrent?alternate=1",
+                valid_hash,
+            ),
+        );
+
+        assert_eq!(
+            trusted_artifacts_from_feed(&document, "MDVR-419"),
+            vec![TrustedArtifact {
+                code: "MDVR-419".to_owned(),
+                release_name: "MDVR-419 exact".to_owned(),
+                provider_item_id: "123".to_owned(),
+                torrent_url: "https://sukebei.nyaa.si/download/123.torrent".to_owned(),
+                expected_infohash: valid_hash.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn verifies_single_and_multi_file_metainfo_with_exact_paths() {
+        let single = parse_torrent_metadata(&single_file_torrent()).expect("valid single file");
+        assert_eq!(single.display_name, "Movie  A.mp4");
+        assert_eq!(single.infohash, "8b16011989123e1d68a8aaf18f5a599e6a4a0bc7");
+        assert_eq!(single.total_size, 5);
+        assert_eq!(
+            single.files,
+            vec![TorrentFile {
+                path: "Movie  A.mp4".to_owned(),
+                size: 5
+            }]
+        );
+
+        let multi = parse_torrent_metadata(&multi_file_torrent()).expect("valid multi file");
+        assert_eq!(multi.display_name, "VR  — 作品");
+        assert_eq!(multi.total_size, 10);
+        assert_eq!(multi.files[0].path, "Folder/Part  1 — 映画.mkv");
+        assert_eq!(multi.files[1].path, "Folder/特別版  B.mp4");
+    }
+
+    #[test]
+    fn rejects_malformed_unsupported_and_unsafe_metainfo() {
+        assert_eq!(
+            parse_torrent_metadata(b"not-bencode"),
+            Err(TorrentInspectionError::Malformed)
+        );
+        assert_eq!(
+            parse_torrent_metadata(b"d4:infod12:meta versioni2eee"),
+            Err(TorrentInspectionError::Unsupported)
+        );
+        assert_eq!(
+            parse_torrent_metadata(b"d4:infod5:filesld6:lengthi1e4:pathl2:..eee4:name4:Root12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee"),
+            Err(TorrentInspectionError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn rejects_fabricated_context_before_artifact_dispatch() {
+        let bytes = single_file_torrent();
+        let infohash = parse_torrent_metadata(&bytes)
+            .expect("valid torrent")
+            .infohash;
+        let state = state_with_release("MDVR-419 exact", &infohash);
+        let mut fabricated_requests = Vec::new();
+        let mut wrong_code = trusted_request("MDVR-419 exact", &infohash);
+        wrong_code.code = "MDVR-422".to_owned();
+        fabricated_requests.push(wrong_code);
+        let mut wrong_name = trusted_request("MDVR-419 exact", &infohash);
+        wrong_name.release_name = "MDVR-419 fabricated".to_owned();
+        fabricated_requests.push(wrong_name);
+        let mut wrong_item = trusted_request("MDVR-419 exact", &infohash);
+        wrong_item.provider_item_id = "999".to_owned();
+        fabricated_requests.push(wrong_item);
+        let mut wrong_url = trusted_request("MDVR-419 exact", &infohash);
+        wrong_url.torrent_url = "https://sukebei.nyaa.si/download/999.torrent".to_owned();
+        fabricated_requests.push(wrong_url);
+        let mut wrong_hash = trusted_request("MDVR-419 exact", &infohash);
+        wrong_hash.expected_infohash = "0000000000000000000000000000000000000001".to_owned();
+        fabricated_requests.push(wrong_hash);
+
+        for request in fabricated_requests {
+            let dispatched = RefCell::new(false);
+            assert_eq!(
+                inspect_sukebei_torrent_with(&state, request, |_| {
+                    dispatched.replace(true);
+                    unreachable!()
+                }),
+                Err(VR_TORRENT_CONTEXT_INVALID)
+            );
+            assert!(!dispatched.into_inner());
+        }
+    }
+
+    #[test]
+    fn rejects_boundary_escaping_redirects_and_infohash_mismatches() {
+        let bytes = single_file_torrent();
+        let infohash = parse_torrent_metadata(&bytes)
+            .expect("valid torrent")
+            .infohash;
+        let state = state_with_release("MDVR-419 exact", &infohash);
+        assert_eq!(
+            inspect_sukebei_torrent_with(
+                &state,
+                trusted_request("MDVR-419 exact", &infohash),
+                |_| Ok(ArtifactResponse {
+                    status: 302,
+                    redirect_url: Some("https://example.com/123.torrent".to_owned()),
+                    body: Vec::new(),
+                })
+            ),
+            Err(VR_TORRENT_PROVIDER_ERROR)
+        );
+
+        let wrong_hash = "0000000000000000000000000000000000000001";
+        let state = state_with_release("MDVR-419 exact", wrong_hash);
+        assert_eq!(
+            inspect_sukebei_torrent_with(
+                &state,
+                trusted_request("MDVR-419 exact", wrong_hash),
+                |_| Ok(ArtifactResponse {
+                    status: 200,
+                    redirect_url: None,
+                    body: bytes.clone(),
+                })
+            ),
+            Err(VR_TORRENT_INFOHASH_MISMATCH)
+        );
+    }
+
+    #[test]
+    fn distinguishes_artifact_fetch_failures_and_accepts_only_bounded_bytes() {
+        let bytes = single_file_torrent();
+        let infohash = parse_torrent_metadata(&bytes)
+            .expect("valid torrent")
+            .infohash;
+        for (response, expected_error) in [
+            (
+                Ok(ArtifactResponse {
+                    status: 404,
+                    redirect_url: None,
+                    body: Vec::new(),
+                }),
+                VR_TORRENT_SOURCE_UNAVAILABLE,
+            ),
+            (
+                Ok(ArtifactResponse {
+                    status: 500,
+                    redirect_url: None,
+                    body: Vec::new(),
+                }),
+                VR_TORRENT_PROVIDER_ERROR,
+            ),
+            (Err(ArtifactRequestError::Network), VR_TORRENT_NETWORK_ERROR),
+            (Err(ArtifactRequestError::TooLarge), VR_TORRENT_MALFORMED),
+        ] {
+            let state = state_with_release("MDVR-419 exact", &infohash);
+            assert_eq!(
+                inspect_sukebei_torrent_with(
+                    &state,
+                    trusted_request("MDVR-419 exact", &infohash),
+                    |_| response.clone(),
+                ),
+                Err(expected_error)
+            );
+        }
+
+        let state = state_with_release("MDVR-419 exact", &infohash);
+        let requests = RefCell::new(Vec::new());
+        let response = inspect_sukebei_torrent_with(
+            &state,
+            trusted_request("MDVR-419 exact", &infohash),
+            |url| {
+                let request_number = requests.borrow().len();
+                requests.borrow_mut().push(url.to_owned());
+                if request_number == 0 {
+                    Ok(ArtifactResponse {
+                        status: 302,
+                        redirect_url: Some(
+                            "https://sukebei.nyaa.si/download/123.torrent".to_owned(),
+                        ),
+                        body: Vec::new(),
+                    })
+                } else {
+                    Ok(ArtifactResponse {
+                        status: 200,
+                        redirect_url: None,
+                        body: bytes.clone(),
+                    })
+                }
+            },
+        )
+        .expect("same-artifact redirects must remain inspectable");
+        assert_eq!(response[2], infohash);
+        assert_eq!(requests.into_inner().len(), 2);
+    }
+
+    #[test]
+    fn parses_binary_command_output_without_treating_markers_as_torrent_bytes() {
+        let mut output = single_file_torrent();
+        output.extend_from_slice(b"\nAUTO_VIDEO_TORRENT_STATUS:200\nAUTO_VIDEO_TORRENT_REDIRECT:");
+        assert_eq!(
+            parse_artifact_command_output(&output),
+            Ok(ArtifactResponse {
+                status: 200,
+                redirect_url: None,
+                body: single_file_torrent(),
+            })
+        );
+    }
+
+    #[test]
+    fn saves_only_the_exact_cached_bytes_and_treats_cancellation_as_no_write() {
+        let bytes = single_file_torrent();
+        let infohash = parse_torrent_metadata(&bytes)
+            .expect("valid torrent")
+            .infohash;
+        let state = state_with_release("MDVR-419 exact", &infohash);
+        let response = inspect_sukebei_torrent_with(
+            &state,
+            trusted_request("MDVR-419 exact", &infohash),
+            |_| {
+                Ok(ArtifactResponse {
+                    status: 200,
+                    redirect_url: None,
+                    body: bytes.clone(),
+                })
+            },
+        )
+        .expect("inspection must succeed");
+        let inspection_id = &response[0];
+
+        let wrote_cancelled = RefCell::new(false);
+        assert_eq!(
+            save_verified_torrent_with(
+                &state,
+                inspection_id,
+                |_| None,
+                |_, _| {
+                    wrote_cancelled.replace(true);
+                    Ok(())
+                },
+            ),
+            Ok(false)
+        );
+        assert!(!wrote_cancelled.into_inner());
+
+        let destination = std::env::temp_dir().join(format!(
+            "auto-video-torrent-save-{}-{}.torrent",
+            std::process::id(),
+            inspection_id
+        ));
+        assert_eq!(
+            save_verified_torrent_with(
+                &state,
+                inspection_id,
+                |default_name| {
+                    assert_eq!(default_name, "MDVR-419-123.torrent");
+                    Some(destination.clone())
+                },
+                |path, bytes| fs::write(path, bytes),
+            ),
+            Ok(true)
+        );
+        assert_eq!(fs::read(&destination).expect("saved bytes"), bytes);
+        fs::remove_file(destination).expect("fixture must be removable");
+    }
+
+    #[test]
+    fn invalidation_blocks_a_late_save_before_writing() {
+        let bytes = single_file_torrent();
+        let infohash = parse_torrent_metadata(&bytes)
+            .expect("valid torrent")
+            .infohash;
+        let state = state_with_release("MDVR-419 exact", &infohash);
+        let response = inspect_sukebei_torrent_with(
+            &state,
+            trusted_request("MDVR-419 exact", &infohash),
+            |_| {
+                Ok(ArtifactResponse {
+                    status: 200,
+                    redirect_url: None,
+                    body: bytes.clone(),
+                })
+            },
+        )
+        .expect("inspection must succeed");
+        let wrote = RefCell::new(false);
+
+        assert_eq!(
+            save_verified_torrent_with(
+                &state,
+                &response[0],
+                |_| {
+                    state
+                        .invalidate_inspection()
+                        .expect("invalidation must work");
+                    Some(PathBuf::from("unused.torrent"))
+                },
+                |_, _| {
+                    wrote.replace(true);
+                    Ok(())
+                },
+            ),
+            Err(VR_TORRENT_STALE)
+        );
+        assert!(!wrote.into_inner());
+    }
+}

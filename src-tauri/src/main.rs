@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod vr_torrent;
+
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -12,6 +14,10 @@ use std::process::{Command, Stdio};
 
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
+use vr_torrent::{
+    fetch_artifact_response, inspect_sukebei_torrent_with, save_verified_torrent_with,
+    TorrentInspectionRequest, VrTorrentState, VR_TORRENT_PROVIDER_ERROR, VR_TORRENT_SAVE_FAILED,
+};
 
 const MOVIES_FOLDER_FILE_NAME: &str = ".movies-folder";
 const MOVIES_FOLDER_UNAVAILABLE: &str = "movies_folder_unavailable";
@@ -854,18 +860,90 @@ async fn fetch_javdb_vr_catalog(code: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn fetch_sukebei_vr_releases(code: String) -> Result<String, String> {
+async fn fetch_sukebei_vr_releases(
+    code: String,
+    state: tauri::State<'_, VrTorrentState>,
+) -> Result<String, String> {
+    let state = state.inner().clone();
+    let generation = state.begin_release_lookup().map_err(str::to_owned)?;
     tauri::async_runtime::spawn_blocking(move || {
-        fetch_sukebei_vr_releases_with(&code, fetch_provider_document).map_err(str::to_owned)
+        let document = fetch_sukebei_vr_releases_with(&code, fetch_provider_document)
+            .map_err(str::to_owned)?;
+        state
+            .finish_release_lookup(generation, &code, &document)
+            .map_err(str::to_owned)?;
+        Ok(document)
     })
     .await
     .map_err(|_| VR_PROVIDER_ERROR.to_owned())?
+}
+
+#[tauri::command]
+async fn inspect_sukebei_vr_torrent(
+    code: String,
+    release_name: String,
+    provider_item_id: String,
+    torrent_url: String,
+    expected_infohash: String,
+    state: tauri::State<'_, VrTorrentState>,
+) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        inspect_sukebei_torrent_with(
+            &state,
+            TorrentInspectionRequest {
+                code,
+                release_name,
+                provider_item_id,
+                torrent_url,
+                expected_infohash,
+            },
+            fetch_artifact_response,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| VR_TORRENT_PROVIDER_ERROR.to_owned())?
+}
+
+#[tauri::command]
+fn invalidate_verified_vr_torrent(state: tauri::State<'_, VrTorrentState>) -> Result<(), String> {
+    state.invalidate_inspection().map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn save_verified_vr_torrent(
+    app: tauri::AppHandle,
+    inspection_id: String,
+    state: tauri::State<'_, VrTorrentState>,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        save_verified_torrent_with(
+            &state,
+            &inspection_id,
+            |default_file_name| {
+                app.dialog()
+                    .file()
+                    .set_title("Save verified torrent")
+                    .add_filter("Torrent", &["torrent"])
+                    .set_file_name(default_file_name)
+                    .blocking_save_file()
+                    .and_then(|path| path.into_path().ok())
+            },
+            |path, bytes| fs::write(path, bytes),
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| VR_TORRENT_SAVE_FAILED.to_owned())?
 }
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(MoviesLibraryState::default())
+        .manage(VrTorrentState::default())
         .invoke_handler(tauri::generate_handler![
             load_movies_folder,
             choose_movies_folder,
@@ -879,7 +957,10 @@ fn main() {
             save_tmdb_token,
             clear_tmdb_token,
             fetch_javdb_vr_catalog,
-            fetch_sukebei_vr_releases
+            fetch_sukebei_vr_releases,
+            inspect_sukebei_vr_torrent,
+            invalidate_verified_vr_torrent,
+            save_verified_vr_torrent
         ])
         .run(tauri::generate_context!())
         .expect("failed to run the Auto-Video desktop application");
