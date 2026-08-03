@@ -47,6 +47,7 @@ let revealMovieMock: Mock<
 let trashMovieMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
+let loadMoviesFolderMock: Mock<() => Promise<string | null>>;
 let openFolderMock: Mock<() => Promise<string | null>>;
 let clearMoviesFolderMock: Mock<() => Promise<void>>;
 let loadTmdbTokenMock: Mock<() => Promise<string | null>>;
@@ -57,6 +58,10 @@ let clearTmdbTokenMock: Mock<() => Promise<void>>;
 let fetchMock: Mock<typeof fetch>;
 let clipboardWriteMock: Mock<(text: string) => Promise<void>>;
 let resizeObserverRecords: ResizeObserverRecord[] = [];
+let gallerySizes: Record<
+  "discover" | "library",
+  { width: number; height: number }
+>;
 let savedMoviesFolder: string | null;
 
 function createResizeEntry(
@@ -99,8 +104,14 @@ class TestResizeObserver implements ResizeObserver {
 
   observe(target: Element) {
     this.record.targets.add(target);
+    const gallery = target.closest<HTMLElement>("[data-gallery]");
+    const variant = gallery?.dataset.gallery;
+    const size =
+      variant === "discover" || variant === "library"
+        ? gallerySizes[variant]
+        : { width: 2000, height: 3000 };
     this.record.callback(
-      [createResizeEntry(target, 2000, 3000)],
+      [createResizeEntry(target, size.width, size.height)],
       this,
     );
   }
@@ -157,6 +168,10 @@ function selectLibrary() {
   fireEvent.click(screen.getByRole("button", { name: "Library" }));
 }
 
+function selectDashboard() {
+  fireEvent.click(screen.getByRole("button", { name: "Dashboard" }));
+}
+
 function selectDiscover() {
   fireEvent.click(screen.getByRole("button", { name: "Discover" }));
 }
@@ -197,6 +212,7 @@ function resizeGallery(
   }
 
   act(() => {
+    gallerySizes[variant] = { width, height };
     for (const record of resizeObserverRecords) {
       if (record.targets.has(viewport)) {
         record.callback(
@@ -218,11 +234,18 @@ beforeEach(() => {
   systemPrefersDark = false;
   mediaQueryListeners = new Set();
   resizeObserverRecords = [];
+  gallerySizes = {
+    discover: { width: 2000, height: 3000 },
+    library: { width: 2000, height: 3000 },
+  };
   savedMoviesFolder = null;
   scanMoviesMock = vi.fn().mockResolvedValue([]);
   openMovieMock = vi.fn().mockResolvedValue(undefined);
   revealMovieMock = vi.fn().mockResolvedValue(undefined);
   trashMovieMock = vi.fn().mockResolvedValue(undefined);
+  loadMoviesFolderMock = vi
+    .fn()
+    .mockImplementation(() => Promise.resolve(savedMoviesFolder));
   openFolderMock = vi.fn().mockResolvedValue(null);
   clearMoviesFolderMock = vi.fn().mockResolvedValue(undefined);
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
@@ -232,7 +255,7 @@ beforeEach(() => {
     (command: string, parameters?: Record<string, unknown>) => {
       switch (command) {
         case "load_movies_folder":
-          return Promise.resolve(savedMoviesFolder);
+          return loadMoviesFolderMock();
         case "choose_movies_folder":
           return openFolderMock().then((selectedFolder) => {
             if (selectedFolder !== null) {
@@ -332,9 +355,9 @@ describe("Auto-Video application shell", () => {
     render(<App />);
 
     expect(
-      screen.getByRole("heading", {
-        level: 2,
-        name: "Dashboard data is not available yet",
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "Movies Library is not configured",
       }),
     ).toBeTruthy();
 
@@ -447,6 +470,258 @@ describe("Auto-Video application shell", () => {
 
     setSystemPreference(false);
     expect(document.documentElement.dataset.theme).toBe("light");
+  });
+});
+
+describe("Movies Library Dashboard", () => {
+  it("shows configuration loading before the unconfigured state and opens Settings", async () => {
+    const pendingFolder = createDeferred<string | null>();
+    loadMoviesFolderMock.mockReturnValue(pendingFolder.promise);
+
+    render(<App />);
+
+    const summary = screen.getByRole("region", { name: "Movies Library" });
+    expect(summary.getAttribute("aria-busy")).toBe("true");
+    expect(
+      screen.getByRole("heading", {
+        level: 3,
+        name: "Loading Movies Library",
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
+
+    await act(async () => {
+      pendingFolder.resolve(null);
+      await pendingFolder.promise;
+    });
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "Movies Library is not configured",
+      }),
+    ).toBeTruthy();
+    const openSettings = screen.getByRole("button", {
+      name: "Open Settings",
+    });
+    openSettings.focus();
+    expect(document.activeElement).toBe(openSettings);
+    fireEvent.click(openSettings);
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Settings" }),
+    ).toBeTruthy();
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+  });
+
+  it("shows the exact configured path and complete scan count without rescanning on navigation or resize", async () => {
+    const folder =
+      "C:\\映像ライブラリ\\Family — Archive & Restored Editions\\A very long configured Movies folder name";
+    const paths = Array.from(
+      { length: 25 },
+      (_, index) => `${folder}\\Movie ${index + 1}.mkv`,
+    );
+    savedMoviesFolder = folder;
+    scanMoviesMock.mockResolvedValue(paths);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "25 supported Movies",
+      }),
+    ).toBeTruthy();
+    expect(
+      document.querySelector(".dashboard-library-summary__folder")
+        ?.textContent,
+    ).toBe(folder);
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fireEvent(window, new Event("resize"));
+    const openLibrary = screen.getByRole("button", { name: "Open Library" });
+    openLibrary.focus();
+    expect(document.activeElement).toBe(openLibrary);
+    fireEvent.click(openLibrary);
+    await screen.findByText("Movie 1");
+    resizeGallery("library", 1528, 136);
+    expect(visibleCardCount("Movies")).toBe(7);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Next Movies page" }),
+    );
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+    expect(screen.getByText("Movie 8")).toBeTruthy();
+
+    selectDashboard();
+    expect(
+      screen.getByRole("heading", {
+        level: 3,
+        name: "25 supported Movies",
+      }),
+    ).toBeTruthy();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+    expect(screen.getByText("Movie 8")).toBeTruthy();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an available empty folder as exactly zero Movies", async () => {
+    savedMoviesFolder = "/Movies/Empty";
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "0 supported Movies",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open Library" })).toBeTruthy();
+  });
+
+  it("distinguishes unavailable and failed scans and routes each action appropriately", async () => {
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockRejectedValueOnce("movies_folder_unavailable");
+
+    render(<App />);
+
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      expect.stringContaining("Movies folder is unavailable"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Settings" }),
+    ).toBeTruthy();
+
+    cleanup();
+    scanMoviesMock.mockRejectedValueOnce("movies_scan_failed");
+    render(<App />);
+
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      expect.stringContaining("Movies Library scan failed"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Library" }),
+    ).toBeTruthy();
+  });
+
+  it("routes a native folder configuration failure to Settings without claiming the Library is unconfigured", async () => {
+    loadMoviesFolderMock.mockRejectedValue(new Error("store unavailable"));
+
+    render(<App />);
+
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      expect.stringContaining("Movies Library needs attention"),
+    );
+    expect(
+      screen.queryByRole("heading", {
+        level: 3,
+        name: "Movies Library is not configured",
+      }),
+    ).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
+    expect(
+      screen.getByText("The Movies folder configuration could not be loaded."),
+    ).toBeTruthy();
+  });
+
+  it("tracks folder choices, refresh results, successful Trash actions, and clearing", async () => {
+    const folderA = "/Movies/Family — 家族";
+    const folderB = "D:\\Movies & Archive";
+    const currentMovie = `${folderB}\\Current.mp4`;
+    const newMovie = `${folderB}\\New arrival.mkv`;
+    const pendingRefresh = createDeferred<string[]>();
+    openFolderMock
+      .mockResolvedValueOnce(folderA)
+      .mockResolvedValueOnce(folderB);
+    scanMoviesMock
+      .mockResolvedValueOnce([
+        `${folderA}/First.mp4`,
+        `${folderA}/Second.mkv`,
+      ])
+      .mockResolvedValueOnce([currentMovie])
+      .mockReturnValueOnce(pendingRefresh.promise);
+
+    render(<App />);
+    await screen.findByRole("heading", {
+      level: 3,
+      name: "Movies Library is not configured",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+    await screen.findByText(folderA);
+    selectDashboard();
+    await screen.findByRole("heading", {
+      level: 3,
+      name: "2 supported Movies",
+    });
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Change folder" }));
+    await screen.findByText(folderB);
+    selectDashboard();
+    await screen.findByRole("heading", {
+      level: 3,
+      name: "1 supported Movie",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
+    await screen.findByText("Current");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    selectDashboard();
+    await screen.findByRole("heading", {
+      level: 3,
+      name: "Scanning Movies Library",
+    });
+    await act(async () => {
+      pendingRefresh.resolve([currentMovie, newMovie]);
+      await pendingRefresh.promise;
+    });
+    await screen.findByRole("heading", {
+      level: 3,
+      name: "2 supported Movies",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Move movie to Trash or Recycle Bin: Current",
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Confirm moving movie to Trash or Recycle Bin: Current",
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText("Current")).toBeNull());
+    selectDashboard();
+    expect(
+      screen.getByRole("heading", {
+        level: 3,
+        name: "1 supported Movie",
+      }),
+    ).toBeTruthy();
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Clear folder" }));
+    await screen.findByText("No Movies folder configured.");
+    selectDashboard();
+    expect(
+      screen.getByRole("heading", {
+        level: 3,
+        name: "Movies Library is not configured",
+      }),
+    ).toBeTruthy();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(3);
+    expect(trashMovieMock).toHaveBeenCalledTimes(1);
   });
 });
 
