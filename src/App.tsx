@@ -2245,6 +2245,7 @@ export default function App() {
     status: "loading",
   });
   const [isChoosingVrFolder, setIsChoosingVrFolder] = useState(false);
+  const [isRevalidatingVrFolder, setIsRevalidatingVrFolder] = useState(false);
   const [vrFolderActionError, setVrFolderActionError] = useState<string | null>(
     null,
   );
@@ -2271,6 +2272,7 @@ export default function App() {
   const torrentSaveRequestId = useRef(0);
   const torrentStartRequestId = useRef(0);
   const vrDownloadsRequestId = useRef(0);
+  const vrFolderRequestId = useRef(0);
   const vrLibraryScanRequestId = useRef(0);
   const vrStorageRequestId = useRef(0);
   const torrentSavePending = useRef(false);
@@ -2334,20 +2336,20 @@ export default function App() {
   }, [appearance, resolvedTheme]);
 
   useEffect(() => {
-    let isCurrent = true;
+    const requestId = ++vrFolderRequestId.current;
     void loadVrFolder()
       .then((folderState) => {
-        if (isCurrent) {
+        if (requestId === vrFolderRequestId.current) {
           setVrFolderState(folderState);
         }
       })
       .catch(() => {
-        if (isCurrent) {
+        if (requestId === vrFolderRequestId.current) {
           setVrFolderState({ status: "error" });
         }
       });
     return () => {
-      isCurrent = false;
+      vrFolderRequestId.current += 1;
     };
   }, []);
 
@@ -2976,11 +2978,16 @@ export default function App() {
     if (isChoosingVrFolder) {
       return;
     }
+    const requestId = ++vrFolderRequestId.current;
+    setIsRevalidatingVrFolder(false);
     setVrFolderActionError(null);
     setIsChoosingVrFolder(true);
     try {
       const selectedFolder = await chooseVrFolder();
-      if (selectedFolder !== null) {
+      if (
+        requestId === vrFolderRequestId.current &&
+        selectedFolder !== null
+      ) {
         vrLibraryScanRequestId.current += 1;
         vrStorageRequestId.current += 1;
         setVrLibraryScanState({ status: "scanning" });
@@ -2988,27 +2995,61 @@ export default function App() {
         setVrFolderState({ status: "ready", path: selectedFolder });
       }
     } catch {
-      setVrFolderActionError("The VR folder picker could not be opened.");
+      if (requestId === vrFolderRequestId.current) {
+        setVrFolderActionError("The VR folder picker could not be opened.");
+      }
     } finally {
       setIsChoosingVrFolder(false);
     }
   };
 
   const clearConfiguredVrFolder = async () => {
+    const requestId = ++vrFolderRequestId.current;
+    setIsRevalidatingVrFolder(false);
     vrLibraryScanRequestId.current += 1;
     vrStorageRequestId.current += 1;
     setVrFolderActionError(null);
     try {
       await clearVrFolder();
-      setVrFolderState({ status: "unconfigured" });
+      if (requestId === vrFolderRequestId.current) {
+        setVrFolderState({ status: "unconfigured" });
+      }
     } catch {
-      setVrFolderActionError(
-        "The VR folder configuration could not be cleared.",
-      );
+      if (requestId === vrFolderRequestId.current) {
+        setVrFolderActionError(
+          "The VR folder configuration could not be cleared.",
+        );
+      }
     }
   };
 
   const refreshVrLibrary = () => {
+    if (vrFolderState.status === "unavailable") {
+      if (isRevalidatingVrFolder) {
+        return;
+      }
+      const requestId = ++vrFolderRequestId.current;
+      vrLibraryScanRequestId.current += 1;
+      vrStorageRequestId.current += 1;
+      setIsRevalidatingVrFolder(true);
+      void loadVrFolder()
+        .then((folderState) => {
+          if (requestId === vrFolderRequestId.current) {
+            setVrFolderState(folderState);
+          }
+        })
+        .catch(() => {
+          if (requestId === vrFolderRequestId.current) {
+            setVrFolderState({ status: "error" });
+          }
+        })
+        .finally(() => {
+          if (requestId === vrFolderRequestId.current) {
+            setIsRevalidatingVrFolder(false);
+          }
+        });
+      return;
+    }
     if (vrFolderState.status !== "ready") {
       return;
     }
@@ -4487,13 +4528,16 @@ export default function App() {
                       </select>
                     </div>
                     <Button
-                      disabled={vrLibraryScanState.status === "scanning"}
+                      disabled={
+                        vrLibraryScanState.status === "scanning" ||
+                        isRevalidatingVrFolder
+                      }
                       onClick={refreshVrLibrary}
                       type="button"
                       variant="outline"
                     >
                       <AppIcon name="refresh" />
-                      Refresh
+                      {isRevalidatingVrFolder ? "Refreshing…" : "Refresh"}
                     </Button>
                   </div>
                 ) : null}

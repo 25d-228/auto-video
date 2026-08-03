@@ -2048,16 +2048,26 @@ mod tests {
     }
 
     #[test]
-    fn reports_a_persisted_future_folder_as_unavailable_without_replacing_it() {
+    fn revalidates_the_same_persisted_future_folder_after_it_is_restored() {
         let fixture = FilesystemFixture::new();
         let config_path = fixture.path.join("vr-folder");
-        let missing = fixture.path.join("missing");
+        let missing = fs::canonicalize(&fixture.path)
+            .expect("fixture must canonicalize")
+            .join("missing");
         save_vr_folder_file(&config_path, &missing).expect("folder must persist");
         let state = VrDownloadState::default();
         assert_eq!(
             load_vr_folder_with(&state, &config_path),
             Ok(vec![
                 "unavailable".to_owned(),
+                missing.to_string_lossy().into_owned()
+            ])
+        );
+        fs::create_dir(&missing).expect("persisted folder must be restored");
+        assert_eq!(
+            load_vr_folder_with(&state, &config_path),
+            Ok(vec![
+                "ready".to_owned(),
                 missing.to_string_lossy().into_owned()
             ])
         );

@@ -609,6 +609,127 @@ describe("parsed VR Library and Dashboard", () => {
     );
   });
 
+  it("revalidates a restored persisted VR folder before refreshing its current scan and storage", async () => {
+    const folder = "/missing/VR — 作品";
+    const restoredFolder = createDeferred<string[]>();
+    loadVrFolderMock
+      .mockResolvedValueOnce(["unavailable", folder])
+      .mockReturnValueOnce(restoredFolder.promise);
+    scanVrLibraryMock.mockResolvedValue([`${folder}/MDVR-419.mp4`, "7"]);
+    queryVrStorageMock.mockResolvedValue(["4096", "1024"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "VR folder is unavailable",
+      }),
+    ).toBeTruthy();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+
+    const refresh = screen.getByRole("button", { name: "Refresh" });
+    expect(refresh).toHaveProperty("disabled", false);
+    fireEvent.click(refresh);
+    expect(loadVrFolderMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: "Refreshing…" })).toHaveProperty(
+      "disabled",
+      true,
+    );
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      restoredFolder.resolve(["ready", folder]);
+      await restoredFolder.promise;
+    });
+    expect(await screen.findByText("MDVR-419")).toBeTruthy();
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+      expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+    });
+
+    selectDashboard();
+    const summary = screen.getByRole("region", { name: "VR Library" });
+    expect(within(summary).getByText(folder)).toBeTruthy();
+    expect(within(summary).getByText("4.0 KiB")).toBeTruthy();
+    expect(within(summary).getByText("3.0 KiB")).toBeTruthy();
+    expect(within(summary).getByText("1.0 KiB")).toBeTruthy();
+  });
+
+  it("keeps a persisted VR folder unavailable when Refresh cannot restore it", async () => {
+    const folder = "/missing/VR";
+    loadVrFolderMock.mockResolvedValue(["unavailable", folder]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "VR folder is unavailable",
+      }),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(loadVrFolderMock).toHaveBeenCalledTimes(2));
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: "VR folder is unavailable",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Refresh" })).toHaveProperty(
+      "disabled",
+      false,
+    );
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores an unavailable-folder revalidation after the folder is replaced", async () => {
+    const staleRevalidation = createDeferred<string[]>();
+    loadVrFolderMock
+      .mockResolvedValueOnce(["unavailable", "/VR/A"])
+      .mockReturnValueOnce(staleRevalidation.promise);
+    chooseVrFolderMock.mockResolvedValue("/VR/B");
+    scanVrLibraryMock.mockResolvedValue(["/VR/B/MDVR-422.mp4", "2"]);
+    queryVrStorageMock.mockResolvedValue(["4096", "1024"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "VR folder is unavailable",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(loadVrFolderMock).toHaveBeenCalledTimes(2);
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Change VR folder" }));
+    expect(await screen.findByText("/VR/B")).toBeTruthy();
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+      expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      staleRevalidation.resolve(["ready", "/VR/A"]);
+      await staleRevalidation.promise;
+    });
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(await screen.findByText("MDVR-422")).toBeTruthy();
+    expect(screen.queryByText("/VR/A")).toBeNull();
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+  });
+
   it("shows scanning until the complete VR result becomes ready", async () => {
     const pendingScan = createDeferred<string[]>();
     savedVrFolder = "/VR";
