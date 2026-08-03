@@ -16,6 +16,8 @@ import {
   type Icon,
   KeyIcon,
   MagnifyingGlassIcon,
+  GogglesIcon,
+  ListMagnifyingGlassIcon,
   MonitorIcon,
   MoonIcon,
   PlayIcon,
@@ -49,6 +51,15 @@ import {
   type TmdbMoviesResult,
   tmdbPosterUrl,
 } from "@/tmdb";
+import {
+  canonicalizeProductCode,
+  fetchExactJavdbVrItem,
+  fetchVerifiedSukebeiReleases,
+  type VrCatalogItem,
+  type VrCatalogResult,
+  type VrRelease,
+  type VrReleasesResult,
+} from "@/vr";
 
 import "./index.css";
 
@@ -64,7 +75,7 @@ const destinations = [
   {
     id: "discover",
     label: "Discover",
-    description: "Browse TMDB's weekly trending Movies feed.",
+    description: "Browse TMDB Movies or find VR titles by exact product code.",
     emptyHeading: "Discovery is not configured",
     emptyMessage:
       "Add a TMDB API Read Access Token in Settings to load weekly trending Movies.",
@@ -127,6 +138,8 @@ const appIcons = {
   "copy-error": WarningCircleIcon,
   search: MagnifyingGlassIcon,
   details: InfoIcon,
+  vr: GogglesIcon,
+  releases: ListMagnifyingGlassIcon,
 } satisfies Record<string, Icon>;
 
 type AppearanceMode = (typeof appearanceModes)[number]["id"];
@@ -161,6 +174,12 @@ type CredentialMessage = {
   text: string;
 };
 type CopyTitleState = "idle" | "success" | "error";
+type DiscoverCategory = "movies" | "vr";
+type VrCatalogState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | VrCatalogResult;
+type VrReleaseComparisonState = { status: "loading" } | VrReleasesResult;
 type GalleryVariant = "discover" | "library";
 type GalleryLayout = {
   capacity: number;
@@ -357,6 +376,72 @@ const movieDetailsMessages = {
   "provider-error": {
     heading: "TMDB could not load Movie details",
     message: "TMDB returned an unexpected error. Try again later.",
+    role: "alert",
+  },
+} as const;
+
+const vrCatalogMessages = {
+  idle: {
+    heading: "Search for a VR title by product code",
+    message: "Submit one exact product code to search JavDB.",
+    role: undefined,
+  },
+  loading: {
+    heading: "Searching JavDB",
+    message: "Verifying the requested VR product-code identity.",
+    role: "status",
+  },
+  "no-exact-match": {
+    heading: "No exact VR title found",
+    message: "JavDB returned no media item with the requested product code.",
+    role: undefined,
+  },
+  "source-unavailable": {
+    heading: "JavDB is unavailable",
+    message: "The catalog source is not available. Try the search again later.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "JavDB could not be reached",
+    message: "Check the network connection and try the search again.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "JavDB returned invalid catalog data",
+    message: "The response could not establish the requested product identity.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "JavDB could not complete the search",
+    message: "The catalog provider returned an unexpected error. Try again later.",
+    role: "alert",
+  },
+} as const;
+
+const vrReleaseMessages = {
+  loading: {
+    heading: "Finding verified releases",
+    message: "Requesting candidates from Sukebei and verifying each identity.",
+    role: "status",
+  },
+  "source-unavailable": {
+    heading: "Sukebei is unavailable",
+    message: "The release source is not available. Try again later.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "Sukebei could not be reached",
+    message: "Check the network connection and try again.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "Sukebei returned invalid release data",
+    message: "The response could not be verified safely.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "Sukebei could not load releases",
+    message: "The release provider returned an unexpected error. Try again later.",
     role: "alert",
   },
 } as const;
@@ -689,6 +774,232 @@ function DiscoverMovieCard({
         </dl>
       </div>
     </article>
+  );
+}
+
+function DiscoverVrCard({
+  item,
+  onFindReleases,
+}: {
+  item: VrCatalogItem;
+  onFindReleases: (item: VrCatalogItem, triggerId: string) => void;
+}) {
+  const [coverFailed, setCoverFailed] = useState(false);
+  const releasesTriggerId = useId();
+  const titleId = useId();
+
+  return (
+    <article
+      aria-labelledby={titleId}
+      className="discover-card discover-card--vr"
+    >
+      <div className="discover-card__poster">
+        {item.coverUrl !== null && !coverFailed ? (
+          <img
+            alt=""
+            onError={() => setCoverFailed(true)}
+            src={item.coverUrl}
+          />
+        ) : (
+          <div className="discover-card__poster-fallback">
+            <AppIcon name="poster" />
+            <span>Cover unavailable</span>
+          </div>
+        )}
+      </div>
+      <div className="discover-card__body">
+        <div className="media-title-row">
+          <h3 id={titleId}>{item.code}</h3>
+          <div className="discover-card__title-actions">
+            <CopyTitleAction title={item.code} />
+            <Button
+              aria-label={`Find releases: ${item.code}`}
+              className="discover-card__releases-action"
+              id={releasesTriggerId}
+              onClick={(event) => {
+                event.stopPropagation();
+                onFindReleases(item, releasesTriggerId);
+              }}
+              onKeyDown={(event) => event.stopPropagation()}
+              onPointerDown={(event) => event.stopPropagation()}
+              size="xs"
+              type="button"
+              variant="outline"
+            >
+              <AppIcon name="releases" />
+              Find releases
+            </Button>
+          </div>
+        </div>
+        <dl>
+          <div>
+            <dt>Title</dt>
+            <dd>{item.title ?? "Unavailable"}</dd>
+          </div>
+          <div>
+            <dt>Source</dt>
+            <dd>{item.source}</dd>
+          </div>
+        </dl>
+      </div>
+    </article>
+  );
+}
+
+function VrReleaseComparison({
+  item,
+  onRetry,
+  onSelectRelease,
+  selectedRelease,
+  state,
+  triggerId,
+}: {
+  item: VrCatalogItem;
+  onRetry: () => void;
+  onSelectRelease: (release: VrRelease) => void;
+  selectedRelease: VrRelease | null;
+  state: VrReleaseComparisonState;
+  triggerId: string;
+}) {
+  const releases = state.status === "ready" ? state.releases : null;
+  const noVerifiedReleases = releases !== null && releases.length === 0;
+  const currentMessage =
+    state.status === "ready" ? null : vrReleaseMessages[state.status];
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="vr-releases__backdrop" />
+      <Dialog.Viewport className="vr-releases__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading"}
+          className="vr-releases__popup"
+          finalFocus={() => document.getElementById(triggerId)}
+          onClick={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <div className="vr-releases__heading">
+            <div>
+              <p className="card-eyebrow">Sukebei release comparison</p>
+              <Dialog.Title>{item.code}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="vr-releases__description">
+            Metadata-only comparison of releases verified for this product code.
+          </Dialog.Description>
+
+          {releases === null || noVerifiedReleases ? (
+            <div
+              className="vr-releases__state"
+              role={noVerifiedReleases ? undefined : currentMessage?.role}
+            >
+              <span className="empty-state__icon">
+                <AppIcon name="releases" />
+              </span>
+              <div>
+                <h3>
+                  {noVerifiedReleases
+                    ? "No verified releases found"
+                    : currentMessage?.heading}
+                </h3>
+                <p>
+                  {noVerifiedReleases
+                    ? `Sukebei returned no releases verified as ${item.code}.`
+                    : currentMessage?.message}
+                </p>
+                {state.status !== "loading" && !noVerifiedReleases ? (
+                  <Button onClick={onRetry} type="button" variant="outline">
+                    <AppIcon name="refresh" />
+                    Retry
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <div className="vr-releases__content">
+              <div
+                aria-label="Verified release totals"
+                className="vr-releases__totals"
+              >
+                <p>
+                  <strong>{releases.length}</strong> verified releases
+                </p>
+                <p>
+                  <strong>{releases.length}</strong> from Sukebei
+                </p>
+                <Button onClick={onRetry} size="sm" type="button" variant="outline">
+                  <AppIcon name="refresh" />
+                  Retry
+                </Button>
+              </div>
+              <ul aria-label={`Verified releases for ${item.code}`}>
+                {releases.map((release, releaseIndex) => (
+                  <li key={`${release.name}-${releaseIndex}`}>
+                    <button
+                      aria-pressed={selectedRelease === release}
+                      onClick={() => onSelectRelease(release)}
+                      type="button"
+                    >
+                      <span className="vr-releases__release-name">
+                        {release.name}
+                      </span>
+                      <span className="vr-releases__release-metadata">
+                        <span>Source {release.source}</span>
+                        <span>Size {release.size ?? "Unavailable"}</span>
+                        <span>
+                          Seeders {release.seeders ?? "Unavailable"}
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {selectedRelease === null ? (
+                <p className="vr-releases__selection-prompt">
+                  Select one verified release to compare its metadata.
+                </p>
+              ) : (
+                <section
+                  aria-labelledby="selected-vr-release-heading"
+                  className="vr-releases__selection"
+                >
+                  <h3 id="selected-vr-release-heading">Selected release</h3>
+                  <dl>
+                    <div>
+                      <dt>Product code</dt>
+                      <dd>{item.code}</dd>
+                    </div>
+                    <div>
+                      <dt>Release name</dt>
+                      <dd>{selectedRelease.name}</dd>
+                    </div>
+                    <div>
+                      <dt>Source</dt>
+                      <dd>{selectedRelease.source}</dd>
+                    </div>
+                    <div>
+                      <dt>Size</dt>
+                      <dd>{selectedRelease.size ?? "Unavailable"}</dd>
+                    </div>
+                    <div>
+                      <dt>Seeders</dt>
+                      <dd>{selectedRelease.seeders ?? "Unavailable"}</dd>
+                    </div>
+                  </dl>
+                </section>
+              )}
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
   );
 }
 
@@ -1192,6 +1503,8 @@ export default function App() {
   const [discoverState, setDiscoverState] = useState<DiscoverState>({
     status: "loading-credential",
   });
+  const [discoverCategory, setDiscoverCategory] =
+    useState<DiscoverCategory>("movies");
   const [isDiscoverActivated, setIsDiscoverActivated] = useState(false);
   const [discoverSearchInput, setDiscoverSearchInput] = useState("");
   const [submittedDiscoverSearchQuery, setSubmittedDiscoverSearchQuery] =
@@ -1213,12 +1526,33 @@ export default function App() {
   >(null);
   const [movieDetailsRequestVersion, setMovieDetailsRequestVersion] =
     useState(0);
+  const [vrSearchInput, setVrSearchInput] = useState("");
+  const [vrSearchInputError, setVrSearchInputError] = useState<string | null>(
+    null,
+  );
+  const [submittedVrCode, setSubmittedVrCode] = useState<string | null>(null);
+  const [vrCatalogState, setVrCatalogState] = useState<VrCatalogState>({
+    status: "idle",
+  });
+  const [vrCatalogRequestVersion, setVrCatalogRequestVersion] = useState(0);
+  const [vrSelectedPage, setVrSelectedPage] = useState(1);
+  const [releaseComparisonItem, setReleaseComparisonItem] =
+    useState<VrCatalogItem | null>(null);
+  const [releaseComparisonState, setReleaseComparisonState] =
+    useState<VrReleaseComparisonState | null>(null);
+  const [releaseComparisonTriggerId, setReleaseComparisonTriggerId] =
+    useState<string | null>(null);
+  const [selectedVrRelease, setSelectedVrRelease] =
+    useState<VrRelease | null>(null);
+  const [releaseRequestVersion, setReleaseRequestVersion] = useState(0);
   const navigationItems = useRef<Array<HTMLButtonElement | null>>([]);
   const workspace = useRef<HTMLElement | null>(null);
   const scanRequestId = useRef(0);
   const storageRequestId = useRef(0);
   const discoverRequestId = useRef(0);
   const movieDetailsRequestId = useRef(0);
+  const vrCatalogRequestId = useRef(0);
+  const releaseRequestId = useRef(0);
   const trendingDiscoverResult = useRef<{
     refreshVersion: number;
     result: TmdbMoviesResult;
@@ -1540,6 +1874,44 @@ export default function App() {
     tmdbToken,
   ]);
 
+  useEffect(() => {
+    const requestId = ++vrCatalogRequestId.current;
+    if (submittedVrCode === null) {
+      return;
+    }
+
+    setVrCatalogState({ status: "loading" });
+    void fetchExactJavdbVrItem(submittedVrCode).then((result) => {
+      if (requestId === vrCatalogRequestId.current) {
+        setVrCatalogState(result);
+      }
+    });
+
+    return () => {
+      vrCatalogRequestId.current += 1;
+    };
+  }, [submittedVrCode, vrCatalogRequestVersion]);
+
+  useEffect(() => {
+    const requestId = ++releaseRequestId.current;
+    if (releaseComparisonItem === null) {
+      return;
+    }
+
+    setReleaseComparisonState({ status: "loading" });
+    void fetchVerifiedSukebeiReleases(releaseComparisonItem.code).then(
+      (result) => {
+        if (requestId === releaseRequestId.current) {
+          setReleaseComparisonState(result);
+        }
+      },
+    );
+
+    return () => {
+      releaseRequestId.current += 1;
+    };
+  }, [releaseComparisonItem, releaseRequestVersion]);
+
   const moveNavigationFocus = (
     event: ReactKeyboardEvent<HTMLButtonElement>,
     currentIndex: number,
@@ -1695,6 +2067,92 @@ export default function App() {
     setMovieDetailsState(null);
   };
 
+  const closeVrReleaseComparison = () => {
+    releaseRequestId.current += 1;
+    setReleaseComparisonItem(null);
+    setReleaseComparisonState(null);
+    setSelectedVrRelease(null);
+  };
+
+  const changeDiscoverCategory = (category: DiscoverCategory) => {
+    if (category === discoverCategory) {
+      return;
+    }
+
+    closeDiscoverMovieDetails();
+    closeVrReleaseComparison();
+    if (discoverCategory === "vr") {
+      vrCatalogRequestId.current += 1;
+      setVrCatalogState((currentState) =>
+        currentState.status === "loading"
+          ? { status: "idle" }
+          : currentState,
+      );
+    }
+    setDiscoverCategory(category);
+  };
+
+  const searchVrCatalog = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const canonicalCode = canonicalizeProductCode(vrSearchInput);
+    if (canonicalCode === null) {
+      setVrSearchInputError("Enter a valid VR product code, such as MDVR-419.");
+      return;
+    }
+
+    closeVrReleaseComparison();
+    vrCatalogRequestId.current += 1;
+    setVrSearchInput(canonicalCode);
+    setVrSearchInputError(null);
+    setSubmittedVrCode(canonicalCode);
+    setVrCatalogState({ status: "loading" });
+    setVrSelectedPage(1);
+    setVrCatalogRequestVersion((version) => version + 1);
+  };
+
+  const retryVrCatalog = () => {
+    if (submittedVrCode === null) {
+      return;
+    }
+
+    closeVrReleaseComparison();
+    vrCatalogRequestId.current += 1;
+    setVrCatalogState({ status: "loading" });
+    setVrCatalogRequestVersion((version) => version + 1);
+  };
+
+  const openVrReleaseComparison = (
+    item: VrCatalogItem,
+    triggerId: string,
+  ) => {
+    releaseRequestId.current += 1;
+    setReleaseComparisonItem(item);
+    setReleaseComparisonState({ status: "loading" });
+    setReleaseComparisonTriggerId(triggerId);
+    setSelectedVrRelease(null);
+    setReleaseRequestVersion((version) => version + 1);
+  };
+
+  const retryVrReleaseComparison = () => {
+    if (releaseComparisonItem === null) {
+      return;
+    }
+
+    releaseRequestId.current += 1;
+    setReleaseComparisonState({ status: "loading" });
+    setSelectedVrRelease(null);
+    setReleaseRequestVersion((version) => version + 1);
+  };
+
+  const selectVrRelease = (release: VrRelease) => {
+    if (
+      releaseComparisonState?.status === "ready" &&
+      releaseComparisonState.releases.includes(release)
+    ) {
+      setSelectedVrRelease(release);
+    }
+  };
+
   const reloadDiscoverMode = () => {
     discoverRequestId.current += 1;
     setDiscoverState({ status: "loading" });
@@ -1832,6 +2290,14 @@ export default function App() {
   const discoverGalleryLabel = isDiscoverSearchActive
     ? "TMDB Movies search results"
     : "Weekly trending Movies";
+  const currentVrCatalogMessage =
+    vrCatalogState.status === "ready"
+      ? null
+      : vrCatalogMessages[vrCatalogState.status];
+  const vrGalleryLabel =
+    submittedVrCode === null
+      ? "VR product-code search"
+      : `VR result for ${submittedVrCode}`;
   const isLibrarySearchActive = librarySearchQuery.trim() !== "";
   const completeLibraryMovies =
     movieScanState.status === "ready" ? movieScanState.movies : [];
@@ -2076,22 +2542,40 @@ export default function App() {
             </section>
           ) : activeDestination.id === "discover" ? (
             <section
-              aria-busy={discoverState.status === "loading"}
+              aria-busy={
+                discoverCategory === "movies"
+                  ? discoverState.status === "loading"
+                  : vrCatalogState.status === "loading"
+              }
               aria-labelledby="discover-movies-heading"
               className="discover-content"
             >
               <div className="library-toolbar library-toolbar--discover">
                 <div className="library-toolbar__heading">
                   <span className="empty-state__icon">
-                    <AppIcon name="discover" />
+                    <AppIcon
+                      name={discoverCategory === "movies" ? "discover" : "vr"}
+                    />
                   </span>
                   <div>
-                    <p className="card-eyebrow">TMDB Discover</p>
+                    <p className="card-eyebrow">
+                      {discoverCategory === "movies"
+                        ? "TMDB Discover"
+                        : "JavDB VR Discover"}
+                    </p>
                     <h2 id="discover-movies-heading">
-                      {discoverGalleryLabel}
+                      {discoverCategory === "movies"
+                        ? discoverGalleryLabel
+                        : vrGalleryLabel}
                     </h2>
                     <p className="library-folder">
-                      {isDiscoverSearchActive ? (
+                      {discoverCategory === "vr" ? (
+                        submittedVrCode === null ? (
+                          "Exact product-code lookup"
+                        ) : (
+                          <>Requested code {submittedVrCode}</>
+                        )
+                      ) : isDiscoverSearchActive ? (
                         <>
                           Results for “
                           <span className="discover-search-query">
@@ -2105,134 +2589,250 @@ export default function App() {
                     </p>
                   </div>
                 </div>
-                {isTmdbTokenLoaded &&
-                !tmdbCredentialLoadFailed &&
-                tmdbToken !== null ? (
-                  <div className="discover-toolbar__controls">
+                <div className="discover-toolbar__controls">
+                  <fieldset className="discover-category">
+                    <legend>Discover category</legend>
+                    <div>
+                      {([
+                        ["movies", "Movies"],
+                        ["vr", "VR"],
+                      ] as const).map(([category, label]) => (
+                        <label key={category}>
+                          <input
+                            checked={discoverCategory === category}
+                            name="discover-category"
+                            onChange={() => changeDiscoverCategory(category)}
+                            type="radio"
+                            value={category}
+                          />
+                          <span>{label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                  {discoverCategory === "vr" ? (
                     <form
-                      aria-label="Search TMDB Movies"
+                      aria-label="Search JavDB VR titles"
                       className="discover-search"
-                      onSubmit={searchDiscoverMovies}
+                      onSubmit={searchVrCatalog}
                       role="search"
                     >
-                      <label htmlFor="discover-movies-search">
-                        Search Movies
+                      <label htmlFor="discover-vr-search">
+                        Search product code
                       </label>
                       <div className="discover-search__field">
                         <input
                           aria-describedby={
-                            discoverSearchInputError === null
+                            vrSearchInputError === null
                               ? undefined
-                              : "discover-search-error"
+                              : "discover-vr-search-error"
                           }
                           aria-invalid={
-                            discoverSearchInputError === null
+                            vrSearchInputError === null
                               ? undefined
                               : true
                           }
                           className="discover-search__input"
-                          id="discover-movies-search"
+                          id="discover-vr-search"
                           onChange={(event) => {
-                            setDiscoverSearchInput(event.target.value);
-                            if (discoverSearchInputError !== null) {
-                              setDiscoverSearchInputError(null);
+                            setVrSearchInput(event.target.value);
+                            if (vrSearchInputError !== null) {
+                              setVrSearchInputError(null);
                             }
                           }}
-                          placeholder="Find a Movie"
+                          placeholder="MDVR-419"
                           type="text"
-                          value={discoverSearchInput}
+                          value={vrSearchInput}
                         />
                         <Button type="submit">
                           <AppIcon name="search" />
                           Search
                         </Button>
                       </div>
-                      {discoverSearchInputError === null ? null : (
+                      {vrSearchInputError === null ? null : (
                         <p
                           className="discover-search__error"
-                          id="discover-search-error"
+                          id="discover-vr-search-error"
                           role="alert"
                         >
-                          {discoverSearchInputError}
+                          {vrSearchInputError}
                         </p>
                       )}
                     </form>
-                    {isDiscoverSearchActive ? (
+                  ) : isTmdbTokenLoaded &&
+                    !tmdbCredentialLoadFailed &&
+                    tmdbToken !== null ? (
+                    <>
+                      <form
+                        aria-label="Search TMDB Movies"
+                        className="discover-search"
+                        onSubmit={searchDiscoverMovies}
+                        role="search"
+                      >
+                        <label htmlFor="discover-movies-search">
+                          Search Movies
+                        </label>
+                        <div className="discover-search__field">
+                          <input
+                            aria-describedby={
+                              discoverSearchInputError === null
+                                ? undefined
+                                : "discover-search-error"
+                            }
+                            aria-invalid={
+                              discoverSearchInputError === null
+                                ? undefined
+                                : true
+                            }
+                            className="discover-search__input"
+                            id="discover-movies-search"
+                            onChange={(event) => {
+                              setDiscoverSearchInput(event.target.value);
+                              if (discoverSearchInputError !== null) {
+                                setDiscoverSearchInputError(null);
+                              }
+                            }}
+                            placeholder="Find a Movie"
+                            type="text"
+                            value={discoverSearchInput}
+                          />
+                          <Button type="submit">
+                            <AppIcon name="search" />
+                            Search
+                          </Button>
+                        </div>
+                        {discoverSearchInputError === null ? null : (
+                          <p
+                            className="discover-search__error"
+                            id="discover-search-error"
+                            role="alert"
+                          >
+                            {discoverSearchInputError}
+                          </p>
+                        )}
+                      </form>
+                      {isDiscoverSearchActive ? (
+                        <Button
+                          onClick={clearDiscoverSearch}
+                          type="button"
+                          variant="outline"
+                        >
+                          <AppIcon name="close" />
+                          Clear
+                        </Button>
+                      ) : null}
                       <Button
-                        onClick={clearDiscoverSearch}
+                        onClick={refreshDiscover}
                         type="button"
                         variant="outline"
                       >
-                        <AppIcon name="close" />
-                        Clear
+                        <AppIcon name="refresh" />
+                        Refresh
                       </Button>
-                    ) : null}
-                    <Button
-                      onClick={refreshDiscover}
-                      type="button"
-                      variant="outline"
-                    >
-                      <AppIcon name="refresh" />
-                      Refresh
-                    </Button>
-                  </div>
-                ) : null}
-              </div>
-
-              {discoverState.status === "ready" ? (
-                <ResizeAwareGallery
-                  ariaLabel={discoverGalleryLabel}
-                  getItemKey={(movie, resultIndex) =>
-                    `${movie.id}-${resultIndex}-${movie.posterPath ?? "posterless"}`
-                  }
-                  items={discoverState.movies}
-                  key={
-                    isDiscoverSearchActive
-                      ? "discover-search-gallery"
-                      : "discover-trending-gallery"
-                  }
-                  onSelectedPageChange={setDiscoverSelectedPage}
-                  renderItem={(movie, resultIndex) => (
-                    <DiscoverMovieCard
-                      movie={movie}
-                      onViewDetails={openDiscoverMovieDetails}
-                      resultIndex={resultIndex}
-                    />
-                  )}
-                  selectedPage={discoverSelectedPage}
-                  variant="discover"
-                />
-              ) : (
-                <div
-                  className="empty-state discover-state"
-                  role={currentDiscoverMessage?.role}
-                >
-                  <span className="empty-state__icon">
-                    <AppIcon name="discover" />
-                  </span>
-                  <h2>{currentDiscoverMessage?.heading}</h2>
-                  <p>{currentDiscoverMessage?.message}</p>
-                  {discoverState.status === "unconfigured" ||
-                  discoverState.status === "credential-error" ||
-                  discoverState.status === "unauthorized" ? (
-                    <Button
-                      className="empty-state__action"
-                      onClick={() => navigateTo(settingsDestination)}
-                      type="button"
-                    >
-                      Open Settings
-                    </Button>
+                    </>
                   ) : null}
                 </div>
-              )}
+              </div>
 
-              <footer aria-label="TMDB credits" className="tmdb-attribution">
-                <img alt="TMDB" src={tmdbLogo} />
-                <p>
-                  This product uses the TMDB API but is not endorsed or certified
-                  by TMDB.
-                </p>
-              </footer>
+              {discoverCategory === "vr" ? (
+                vrCatalogState.status === "ready" ? (
+                  <ResizeAwareGallery
+                    ariaLabel={vrGalleryLabel}
+                    getItemKey={(item) => item.code}
+                    items={[vrCatalogState.item]}
+                    key={`vr-gallery-${vrCatalogState.item.code}`}
+                    onSelectedPageChange={setVrSelectedPage}
+                    renderItem={(item) => (
+                      <DiscoverVrCard
+                        item={item}
+                        onFindReleases={openVrReleaseComparison}
+                      />
+                    )}
+                    selectedPage={vrSelectedPage}
+                    variant="discover"
+                  />
+                ) : (
+                  <div
+                    className="empty-state discover-state"
+                    role={currentVrCatalogMessage?.role}
+                  >
+                    <span className="empty-state__icon">
+                      <AppIcon name="vr" />
+                    </span>
+                    <h2>{currentVrCatalogMessage?.heading}</h2>
+                    <p>{currentVrCatalogMessage?.message}</p>
+                    {vrCatalogState.status === "source-unavailable" ||
+                    vrCatalogState.status === "network-error" ||
+                    vrCatalogState.status === "malformed-provider" ||
+                    vrCatalogState.status === "provider-error" ? (
+                      <Button
+                        className="empty-state__action"
+                        onClick={retryVrCatalog}
+                        type="button"
+                        variant="outline"
+                      >
+                        <AppIcon name="refresh" />
+                        Retry search
+                      </Button>
+                    ) : null}
+                  </div>
+                )
+              ) : discoverState.status === "ready" ? (
+                  <ResizeAwareGallery
+                    ariaLabel={discoverGalleryLabel}
+                    getItemKey={(movie, resultIndex) =>
+                      `${movie.id}-${resultIndex}-${movie.posterPath ?? "posterless"}`
+                    }
+                    items={discoverState.movies}
+                    key={
+                      isDiscoverSearchActive
+                        ? "discover-search-gallery"
+                        : "discover-trending-gallery"
+                    }
+                    onSelectedPageChange={setDiscoverSelectedPage}
+                    renderItem={(movie, resultIndex) => (
+                      <DiscoverMovieCard
+                        movie={movie}
+                        onViewDetails={openDiscoverMovieDetails}
+                        resultIndex={resultIndex}
+                      />
+                    )}
+                    selectedPage={discoverSelectedPage}
+                    variant="discover"
+                  />
+                ) : (
+                  <div
+                    className="empty-state discover-state"
+                    role={currentDiscoverMessage?.role}
+                  >
+                    <span className="empty-state__icon">
+                      <AppIcon name="discover" />
+                    </span>
+                    <h2>{currentDiscoverMessage?.heading}</h2>
+                    <p>{currentDiscoverMessage?.message}</p>
+                    {discoverState.status === "unconfigured" ||
+                    discoverState.status === "credential-error" ||
+                    discoverState.status === "unauthorized" ? (
+                      <Button
+                        className="empty-state__action"
+                        onClick={() => navigateTo(settingsDestination)}
+                        type="button"
+                      >
+                        Open Settings
+                      </Button>
+                    ) : null}
+                  </div>
+                )}
+
+              {discoverCategory === "movies" ? (
+                <footer aria-label="TMDB credits" className="tmdb-attribution">
+                  <img alt="TMDB" src={tmdbLogo} />
+                  <p>
+                    This product uses the TMDB API but is not endorsed or certified
+                    by TMDB.
+                  </p>
+                </footer>
+              ) : null}
             </section>
           ) : activeDestination.id === "library" ? (
             <section
@@ -2623,6 +3223,27 @@ export default function App() {
             movie={selectedDiscoverMovie}
             state={movieDetailsState}
             triggerId={movieDetailsTriggerId}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeVrReleaseComparison();
+          }
+        }}
+        open={releaseComparisonItem !== null}
+      >
+        {releaseComparisonItem === null ||
+        releaseComparisonState === null ||
+        releaseComparisonTriggerId === null ? null : (
+          <VrReleaseComparison
+            item={releaseComparisonItem}
+            onRetry={retryVrReleaseComparison}
+            onSelectRelease={selectVrRelease}
+            selectedRelease={selectedVrRelease}
+            state={releaseComparisonState}
+            triggerId={releaseComparisonTriggerId}
           />
         )}
       </Dialog.Root>
