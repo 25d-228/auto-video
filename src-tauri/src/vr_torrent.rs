@@ -63,10 +63,12 @@ struct TrustedReleaseFeed {
 }
 
 struct CachedTorrent {
+    artifact: TrustedArtifact,
     generation: u64,
     inspection_id: String,
     default_file_name: String,
     bytes: Vec<u8>,
+    metadata: TorrentMetadata,
 }
 
 #[derive(Default)]
@@ -145,6 +147,7 @@ impl VrTorrentState {
         inspection_generation: u64,
         artifact: &TrustedArtifact,
         bytes: Vec<u8>,
+        metadata: TorrentMetadata,
     ) -> Result<String, &'static str> {
         let mut context = self.0.lock().map_err(|_| VR_TORRENT_PROVIDER_ERROR)?;
         let feed_is_current = context.release_feed.as_ref().is_some_and(|feed| {
@@ -162,13 +165,143 @@ impl VrTorrentState {
             artifact.provider_item_id
         );
         context.cached_torrent = Some(CachedTorrent {
+            artifact: artifact.clone(),
             generation: inspection_generation,
             inspection_id: inspection_id.clone(),
             default_file_name: format!("{}-{}.torrent", artifact.code, artifact.provider_item_id),
             bytes,
+            metadata,
         });
         Ok(inspection_id)
     }
+
+    pub fn verified_download_source(
+        &self,
+        inspection_id: &str,
+        selected_file_ids: &[usize],
+    ) -> Result<VerifiedDownloadSource, VerifiedDownloadSourceError> {
+        let cached = {
+            let context = self
+                .0
+                .lock()
+                .map_err(|_| VerifiedDownloadSourceError::Context)?;
+            context
+                .cached_torrent
+                .as_ref()
+                .filter(|torrent| {
+                    torrent.inspection_id == inspection_id
+                        && torrent.generation == context.inspection_generation
+                })
+                .map(|torrent| {
+                    (
+                        torrent.artifact.clone(),
+                        torrent.bytes.clone(),
+                        torrent.metadata.clone(),
+                    )
+                })
+                .ok_or(VerifiedDownloadSourceError::Context)?
+        };
+
+        let (artifact, bytes, cached_metadata) = cached;
+        let metadata =
+            parse_torrent_metadata(&bytes).map_err(|_| VerifiedDownloadSourceError::Metainfo)?;
+        if metadata != cached_metadata || metadata.infohash != artifact.expected_infohash {
+            return Err(VerifiedDownloadSourceError::Metainfo);
+        }
+        let selected_files = verified_selected_files(&metadata, selected_file_ids)?;
+
+        Ok(VerifiedDownloadSource {
+            bytes,
+            code: artifact.code,
+            infohash: metadata.infohash,
+            release_name: artifact.release_name,
+            selected_files,
+        })
+    }
+}
+
+pub fn revalidate_persisted_download_source(
+    bytes: &[u8],
+    code: &str,
+    release_name: &str,
+    expected_infohash: &str,
+    selected_file_ids: &[usize],
+) -> Result<VerifiedDownloadSource, VerifiedDownloadSourceError> {
+    if !crate::is_canonical_product_code(code)
+        || release_name.trim().is_empty()
+        || !release_matches_product_code(release_name, code)
+        || expected_infohash.len() != SHA1_DIGEST_BYTES * 2
+        || !expected_infohash
+            .bytes()
+            .all(|character| character.is_ascii_digit() || (b'a'..=b'f').contains(&character))
+    {
+        return Err(VerifiedDownloadSourceError::Context);
+    }
+
+    let metadata =
+        parse_torrent_metadata(bytes).map_err(|_| VerifiedDownloadSourceError::Metainfo)?;
+    if metadata.infohash != expected_infohash {
+        return Err(VerifiedDownloadSourceError::Metainfo);
+    }
+    let selected_files = verified_selected_files(&metadata, selected_file_ids)?;
+
+    Ok(VerifiedDownloadSource {
+        bytes: bytes.to_vec(),
+        code: code.to_owned(),
+        infohash: metadata.infohash,
+        release_name: release_name.to_owned(),
+        selected_files,
+    })
+}
+
+fn verified_selected_files(
+    metadata: &TorrentMetadata,
+    selected_file_ids: &[usize],
+) -> Result<Vec<VerifiedDownloadFile>, VerifiedDownloadSourceError> {
+    let selected = selected_file_ids.iter().copied().collect::<BTreeSet<_>>();
+    if selected.is_empty()
+        || selected.len() != selected_file_ids.len()
+        || selected
+            .iter()
+            .any(|file_id| *file_id >= metadata.files.len())
+    {
+        return Err(VerifiedDownloadSourceError::Selection);
+    }
+
+    Ok(metadata
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(file_id, _)| selected.contains(file_id))
+        .map(|(file_id, file)| VerifiedDownloadFile {
+            file_id,
+            path: file.path.clone(),
+            size: file.size,
+        })
+        .collect())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifiedDownloadSourceError {
+    Context,
+    Metainfo,
+    Selection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedDownloadFile {
+    pub file_id: usize,
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedDownloadSource {
+    pub bytes: Vec<u8>,
+    pub code: String,
+    pub infohash: String,
+    pub release_name: String,
+    pub selected_files: Vec<VerifiedDownloadFile>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,13 +338,13 @@ impl TorrentInspectionError {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TorrentFile {
     path: String,
     size: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TorrentMetadata {
     display_name: String,
     infohash: String,
@@ -232,8 +365,13 @@ pub fn inspect_sukebei_torrent_with(
         return Err(VR_TORRENT_INFOHASH_MISMATCH);
     }
 
-    let inspection_id =
-        state.finish_inspection(release_generation, inspection_generation, &artifact, bytes)?;
+    let inspection_id = state.finish_inspection(
+        release_generation,
+        inspection_generation,
+        &artifact,
+        bytes,
+        metadata.clone(),
+    )?;
     let mut response = vec![
         inspection_id,
         metadata.display_name,
@@ -948,7 +1086,7 @@ fn validate_display_text(value: &str) -> Result<(), TorrentInspectionError> {
     Ok(())
 }
 
-fn hex_sha1(input: &[u8]) -> String {
+pub(crate) fn hex_sha1(input: &[u8]) -> String {
     sha1(input)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1552,5 +1690,100 @@ mod tests {
             Err(VR_TORRENT_STALE)
         );
         assert!(!wrote.into_inner());
+    }
+
+    #[test]
+    fn download_source_uses_only_the_current_native_inspection_and_selected_ids() {
+        let bytes = multi_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let exact_release_name = "【VR】 MDVR-419  Exact\t—\n特別版";
+        let state = state_with_release(exact_release_name, &infohash);
+        let response = inspect_sukebei_torrent_with(
+            &state,
+            trusted_request(exact_release_name, &infohash),
+            |_| {
+                Ok(ArtifactResponse {
+                    status: 200,
+                    redirect_url: None,
+                    body: bytes.clone(),
+                })
+            },
+        )
+        .expect("trusted inspection must succeed");
+
+        let source = state
+            .verified_download_source(&response[0], &[1])
+            .expect("current selected file must resolve from native state");
+        assert_eq!(source.bytes, bytes);
+        assert_eq!(source.code, "MDVR-419");
+        assert_eq!(source.release_name, exact_release_name);
+        assert_eq!(source.infohash, infohash);
+        assert_eq!(
+            source.selected_files,
+            vec![VerifiedDownloadFile {
+                file_id: 1,
+                path: "Folder/特別版  B.mp4".to_owned(),
+                size: 7,
+            }]
+        );
+        assert_eq!(
+            state.verified_download_source(&response[0], &[1, 1]),
+            Err(VerifiedDownloadSourceError::Selection)
+        );
+
+        state
+            .invalidate_inspection()
+            .expect("invalidation must succeed");
+        assert_eq!(
+            state.verified_download_source(&response[0], &[1]),
+            Err(VerifiedDownloadSourceError::Context)
+        );
+    }
+
+    #[test]
+    fn persisted_download_revalidation_rejects_changed_or_ambiguous_identity() {
+        let bytes = single_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let exact_release_name = "【VR】 MDVR-419  Exact\t—\n特別版";
+        let source = revalidate_persisted_download_source(
+            &bytes,
+            "MDVR-419",
+            exact_release_name,
+            &infohash,
+            &[0],
+        )
+        .expect("exact persisted identity must revalidate");
+        assert_eq!(source.release_name, exact_release_name);
+
+        assert_eq!(
+            revalidate_persisted_download_source(
+                &bytes,
+                "MDVR-419",
+                "MDVR-419 + ABC-123 pack",
+                &infohash,
+                &[0],
+            ),
+            Err(VerifiedDownloadSourceError::Context)
+        );
+        assert_eq!(
+            revalidate_persisted_download_source(
+                &bytes,
+                "MDVR-419",
+                exact_release_name,
+                "0000000000000000000000000000000000000000",
+                &[0],
+            ),
+            Err(VerifiedDownloadSourceError::Metainfo)
+        );
+        assert_eq!(
+            revalidate_persisted_download_source(
+                &bytes,
+                "MDVR-419",
+                exact_release_name,
+                &infohash,
+                &[1],
+            ),
+            Err(VerifiedDownloadSourceError::Selection)
+        );
     }
 }

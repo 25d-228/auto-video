@@ -5,6 +5,9 @@ import {
   fetchExactJavdbVrItem,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedSukebeiTorrent,
+  loadVrDownloads,
+  loadVrFolder,
+  startVerifiedVrDownload,
 } from "./vr";
 
 const catalogFixture = `
@@ -428,5 +431,70 @@ describe("verified Sukebei torrent inspection", () => {
       }),
     ).resolves.toEqual({ status: "malformed-torrent" });
     expect(invokeMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("trusted VR download boundary", () => {
+  it("parses exact persisted identities and selected-file progress", async () => {
+    const exactReleaseName = "【VR】 MDVR-419  Exact\t—\n特別版";
+    invokeMock.mockResolvedValue([
+      "transfer-123",
+      "MDVR-419",
+      exactReleaseName,
+      "2",
+      "12",
+      "7",
+      "1024",
+      "paused",
+    ]);
+
+    await expect(loadVrDownloads()).resolves.toEqual([
+      {
+        transferId: "transfer-123",
+        code: "MDVR-419",
+        releaseName: exactReleaseName,
+        selectedFileCount: 2,
+        totalBytes: "12",
+        downloadedBytes: "7",
+        speedBytesPerSecond: "1024",
+        state: "paused",
+      },
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith("load_vr_downloads");
+  });
+
+  it("starts with only the current inspection and selected file IDs", async () => {
+    invokeMock.mockResolvedValue("transfer-123");
+
+    await expect(
+      startVerifiedVrDownload("inspection-123", [0, 2]),
+    ).resolves.toBe("transfer-123");
+    expect(invokeMock).toHaveBeenCalledWith("start_verified_vr_download", {
+      inspectionId: "inspection-123",
+      selectedFileIds: [0, 2],
+    });
+
+    invokeMock.mockClear();
+    await expect(
+      startVerifiedVrDownload("inspection-123", [2, 2]),
+    ).rejects.toThrow("valid file selection");
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes configured, unavailable, and malformed VR folder state", async () => {
+    invokeMock.mockResolvedValueOnce(["ready", "/Volumes/VR — 作品"]);
+    await expect(loadVrFolder()).resolves.toEqual({
+      status: "ready",
+      path: "/Volumes/VR — 作品",
+    });
+
+    invokeMock.mockResolvedValueOnce(["unavailable", "/missing/VR"]);
+    await expect(loadVrFolder()).resolves.toEqual({
+      status: "unavailable",
+      path: "/missing/VR",
+    });
+
+    invokeMock.mockResolvedValueOnce(["ready", ""]);
+    await expect(loadVrFolder()).rejects.toThrow("invalid data");
   });
 });

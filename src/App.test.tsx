@@ -69,6 +69,26 @@ let invalidateVerifiedVrTorrentMock: Mock<() => Promise<void>>;
 let saveVerifiedVrTorrentMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<boolean>
 >;
+let loadVrFolderMock: Mock<() => Promise<string[]>>;
+let chooseVrFolderMock: Mock<() => Promise<string | null>>;
+let clearVrFolderMock: Mock<() => Promise<void>>;
+let loadVrDownloadsMock: Mock<() => Promise<string[]>>;
+let listVrDownloadsMock: Mock<() => Promise<string[]>>;
+let startVerifiedVrDownloadMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string>
+>;
+let pauseVrDownloadMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let resumeVrDownloadMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let cancelVrDownloadMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let dismissVrDownloadMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
 let fetchMock: Mock<typeof fetch>;
 let clipboardWriteMock: Mock<(text: string) => Promise<void>>;
 let resizeObserverRecords: ResizeObserverRecord[] = [];
@@ -77,6 +97,7 @@ let gallerySizes: Record<
   { width: number; height: number }
 >;
 let savedMoviesFolder: string | null;
+let savedVrFolder: string | null;
 
 function createResizeEntry(
   target: Element,
@@ -263,6 +284,37 @@ function sukebeiReleaseFixture(
   </rss>`;
 }
 
+function vrDownloadFixture({
+  code = "MDVR-419",
+  downloadedBytes = "5",
+  releaseName,
+  selectedFileCount = "1",
+  speedBytesPerSecond = "1024",
+  state,
+  totalBytes = "10",
+  transferId,
+}: {
+  code?: string;
+  downloadedBytes?: string;
+  releaseName: string;
+  selectedFileCount?: string;
+  speedBytesPerSecond?: string;
+  state: string;
+  totalBytes?: string;
+  transferId: string;
+}) {
+  return [
+    transferId,
+    code,
+    releaseName,
+    selectedFileCount,
+    totalBytes,
+    downloadedBytes,
+    speedBytesPerSecond,
+    state,
+  ];
+}
+
 function setSystemPreference(prefersDark: boolean) {
   systemPrefersDark = prefersDark;
   act(() => {
@@ -345,6 +397,7 @@ beforeEach(() => {
     library: { width: 2000, height: 3000 },
   };
   savedMoviesFolder = null;
+  savedVrFolder = null;
   scanMoviesMock = vi.fn().mockResolvedValue([]);
   queryMoviesStorageMock = vi
     .fn()
@@ -376,6 +429,20 @@ beforeEach(() => {
   ]);
   invalidateVerifiedVrTorrentMock = vi.fn().mockResolvedValue(undefined);
   saveVerifiedVrTorrentMock = vi.fn().mockResolvedValue(true);
+  loadVrFolderMock = vi.fn().mockImplementation(() =>
+    Promise.resolve(
+      savedVrFolder === null ? ["unconfigured"] : ["ready", savedVrFolder],
+    ),
+  );
+  chooseVrFolderMock = vi.fn().mockResolvedValue(null);
+  clearVrFolderMock = vi.fn().mockResolvedValue(undefined);
+  loadVrDownloadsMock = vi.fn().mockResolvedValue([]);
+  listVrDownloadsMock = vi.fn().mockResolvedValue([]);
+  startVerifiedVrDownloadMock = vi.fn().mockResolvedValue("transfer-123");
+  pauseVrDownloadMock = vi.fn().mockResolvedValue(undefined);
+  resumeVrDownloadMock = vi.fn().mockResolvedValue(undefined);
+  cancelVrDownloadMock = vi.fn().mockResolvedValue(undefined);
+  dismissVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   invokeMock = vi.fn(
     (command: string, parameters?: Record<string, unknown>) => {
       switch (command) {
@@ -418,6 +485,33 @@ beforeEach(() => {
           return invalidateVerifiedVrTorrentMock();
         case "save_verified_vr_torrent":
           return saveVerifiedVrTorrentMock(parameters);
+        case "load_vr_folder":
+          return loadVrFolderMock();
+        case "choose_vr_folder":
+          return chooseVrFolderMock().then((selectedFolder) => {
+            if (selectedFolder !== null) {
+              savedVrFolder = selectedFolder;
+            }
+            return selectedFolder;
+          });
+        case "clear_vr_folder":
+          return clearVrFolderMock().then(() => {
+            savedVrFolder = null;
+          });
+        case "load_vr_downloads":
+          return loadVrDownloadsMock();
+        case "list_vr_downloads":
+          return listVrDownloadsMock();
+        case "start_verified_vr_download":
+          return startVerifiedVrDownloadMock(parameters);
+        case "pause_vr_download":
+          return pauseVrDownloadMock(parameters);
+        case "resume_vr_download":
+          return resumeVrDownloadMock(parameters);
+        case "cancel_vr_download":
+          return cancelVrDownloadMock(parameters);
+        case "dismiss_vr_download":
+          return dismissVrDownloadMock(parameters);
         default:
           return Promise.reject(new Error("Unexpected native command."));
       }
@@ -521,7 +615,7 @@ describe("Auto-Video application shell", () => {
     expect(
       screen.getByRole("heading", {
         level: 2,
-        name: "Downloads are not available yet",
+        name: "No VR downloads",
       }),
     ).toBeTruthy();
 
@@ -529,7 +623,7 @@ describe("Auto-Video application shell", () => {
     expect(
       screen.getByRole("heading", {
         level: 2,
-        name: "Other settings are not configured",
+        name: "VR folder",
       }),
     ).toBeTruthy();
   });
@@ -3012,6 +3106,206 @@ describe("VR Discover and verified release comparison", () => {
       screen.getByRole("heading", { level: 3, name: "Preserved Movie" }),
     ).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("starts only explicitly selected files without sending destination or torrent identity", async () => {
+    const exactReleaseName = "【VR】 MDVR-419  Exact\t—\n特別版";
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    savedVrFolder = "/Volumes/VR — 作品";
+    fetchJavdbVrCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
+    fetchSukebeiVrReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        {
+          infohash: expectedInfohash,
+          itemId: "123",
+          name: exactReleaseName,
+        },
+      ]),
+    );
+    inspectSukebeiVrTorrentMock.mockResolvedValue([
+      "inspection-123",
+      "VR  — 作品",
+      expectedInfohash,
+      "12",
+      "Folder/Part  1 — 映画.mkv",
+      "5",
+      "Folder/特別版  B.mp4",
+      "7",
+    ]);
+    const startRequest = createDeferred<string>();
+    startVerifiedVrDownloadMock.mockReturnValue(startRequest.promise);
+    listVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        downloadedBytes: "7",
+        releaseName: exactReleaseName,
+        selectedFileCount: "1",
+        speedBytesPerSecond: "0",
+        state: "paused",
+        totalBytes: "7",
+        transferId: "transfer-123",
+      }),
+    );
+
+    const releaseList = await openVrReleaseComparison();
+    fireEvent.click(within(releaseList).getByRole("button"));
+    fireEvent.click(screen.getByRole("button", { name: "Inspect torrent" }));
+    const checkboxes = await screen.findAllByRole("checkbox");
+    expect(checkboxes).toHaveLength(2);
+    expect(checkboxes.every((checkbox) => !(checkbox as HTMLInputElement).checked)).toBe(
+      true,
+    );
+    const startButton = screen.getByRole("button", { name: "Start download" });
+    expect((startButton as HTMLButtonElement).disabled).toBe(true);
+
+    expect(checkboxes[1].closest("label")?.textContent).toContain(
+      "Folder/特別版  B.mp4",
+    );
+    fireEvent.click(checkboxes[1]);
+    expect((startButton as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(startButton);
+    fireEvent.click(startButton);
+    expect(startVerifiedVrDownloadMock).toHaveBeenCalledOnce();
+    expect(startVerifiedVrDownloadMock).toHaveBeenCalledWith({
+      inspectionId: "inspection-123",
+      selectedFileIds: [1],
+    });
+    expect(startVerifiedVrDownloadMock.mock.calls[0]?.[0]).toEqual({
+      inspectionId: "inspection-123",
+      selectedFileIds: [1],
+    });
+
+    await act(async () => {
+      startRequest.resolve("transfer-123");
+      await startRequest.promise;
+    });
+    expect(
+      await screen.findByText("Selected files were added to Downloads."),
+    ).toBeTruthy();
+    expect(document.querySelector(".vr-torrent__release-name")?.textContent).toBe(
+      exactReleaseName,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "View Downloads" }));
+    const downloadHeading = await screen.findByText(
+      (_text, element) =>
+        element?.tagName === "H2" && element.textContent === exactReleaseName,
+    );
+    const card = downloadHeading.closest("article");
+    expect(card).not.toBeNull();
+    expect(within(card as HTMLElement).getByText("1", { selector: "dd" })).toBeTruthy();
+    expect(within(card as HTMLElement).getByText("100%")).toBeTruthy();
+  });
+
+  it("persists unavailable, changed, and cleared future-transfer VR folders", async () => {
+    loadVrFolderMock.mockResolvedValue(["unavailable", "/missing/VR — 旧"]);
+    chooseVrFolderMock.mockResolvedValue("/Volumes/VR — 新");
+    render(<App />);
+    selectSettings();
+
+    expect(await screen.findByText("/missing/VR — 旧")).toBeTruthy();
+    expect(
+      screen.getByText(/Existing transfers will not fall back/),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Change VR folder" }));
+    expect(await screen.findByText("/Volumes/VR — 新")).toBeTruthy();
+    expect(chooseVrFolderMock).toHaveBeenCalledOnce();
+
+    const vrFolderCard = screen
+      .getByRole("heading", { name: "VR folder" })
+      .closest("section");
+    expect(vrFolderCard).not.toBeNull();
+    fireEvent.click(
+      within(vrFolderCard as HTMLElement).getByRole("button", {
+        name: "Clear folder",
+      }),
+    );
+    expect(await within(vrFolderCard as HTMLElement).findByText("No VR folder configured."))
+      .toBeTruthy();
+    expect(clearVrFolderMock).toHaveBeenCalledOnce();
+  });
+
+  it("isolates transfer actions and confirms cancellation while keeping files", async () => {
+    const releaseA = "MDVR-419 Active — A";
+    const releaseB = "MDVR-420 Paused — B";
+    let downloadRows = [
+      ...vrDownloadFixture({
+        releaseName: releaseA,
+        state: "downloading",
+        transferId: "transfer-a",
+      }),
+      ...vrDownloadFixture({
+        code: "MDVR-420",
+        downloadedBytes: "3",
+        releaseName: releaseB,
+        speedBytesPerSecond: "0",
+        state: "paused",
+        transferId: "transfer-b",
+      }),
+    ];
+    loadVrDownloadsMock.mockImplementation(() => Promise.resolve(downloadRows));
+    listVrDownloadsMock.mockImplementation(() => Promise.resolve(downloadRows));
+    pauseVrDownloadMock.mockImplementation(async () => {
+      downloadRows[7] = "paused";
+      downloadRows[6] = "0";
+    });
+    cancelVrDownloadMock.mockImplementation(async () => {
+      downloadRows[7] = "cancelled";
+      downloadRows[6] = "0";
+    });
+    dismissVrDownloadMock.mockImplementation(async () => {
+      downloadRows = downloadRows.slice(8);
+    });
+    resumeVrDownloadMock.mockRejectedValueOnce("vr_download_failed");
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+
+    const releaseAHeading = await screen.findByRole("heading", {
+      level: 2,
+      name: releaseA,
+    });
+    const cardA = releaseAHeading.closest("article") as HTMLElement;
+    const cardB = screen
+      .getByRole("heading", { level: 2, name: releaseB })
+      .closest("article") as HTMLElement;
+    fireEvent.click(within(cardA).getByRole("button", { name: "Pause" }));
+    expect(await within(cardA).findByRole("button", { name: "Resume" })).toBeTruthy();
+    expect(pauseVrDownloadMock).toHaveBeenCalledWith({ transferId: "transfer-a" });
+    expect(within(cardB).getByRole("button", { name: "Resume" })).toBeTruthy();
+
+    fireEvent.click(within(cardB).getByRole("button", { name: "Resume" }));
+    expect(
+      await within(cardB).findByText(/resume action could not be completed/),
+    ).toBeTruthy();
+    expect(within(cardA).queryByRole("alert")).toBeNull();
+
+    const cancelTrigger = within(cardA).getByRole("button", { name: "Cancel" });
+    cancelTrigger.focus();
+    fireEvent.click(cancelTrigger);
+    let confirmation = await screen.findByRole("alertdialog");
+    expect(within(confirmation).getByText(/Downloaded files and partial data will remain/))
+      .toBeTruthy();
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "Keep downloading" }),
+    );
+    await waitFor(() => expect(document.activeElement).toBe(cancelTrigger));
+    expect(cancelVrDownloadMock).not.toHaveBeenCalled();
+
+    fireEvent.click(cancelTrigger);
+    confirmation = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "Cancel download" }),
+    );
+    const dismissButton = await within(cardA).findByRole("button", {
+      name: "Dismiss",
+    });
+    await waitFor(() => expect(document.activeElement).toBe(dismissButton));
+    expect(cancelVrDownloadMock).toHaveBeenCalledWith({ transferId: "transfer-a" });
+    fireEvent.click(dismissButton);
+    await waitFor(() => expect(screen.queryByText(releaseA)).toBeNull());
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Refresh" }),
+    );
+    expect(screen.getByRole("heading", { name: releaseB })).toBeTruthy();
+    expect(dismissVrDownloadMock).toHaveBeenCalledWith({ transferId: "transfer-a" });
   });
 });
 
