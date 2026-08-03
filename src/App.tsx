@@ -132,6 +132,12 @@ type MovieScanState =
   | { status: "unavailable" }
   | { status: "error" }
   | { status: "ready"; movies: Movie[] };
+type MoviesStorageState =
+  | { status: "unconfigured" }
+  | { status: "loading" }
+  | { status: "unavailable" }
+  | { status: "error" }
+  | { status: "ready"; totalBytes: bigint; freeBytes: bigint };
 type DiscoverState =
   | { status: "loading-credential" }
   | { status: "credential-error" }
@@ -152,6 +158,7 @@ type GalleryLayout = {
 
 const appearanceStorageKey = "auto-video-appearance";
 const moviesFolderUnavailable = "movies_folder_unavailable";
+const moviesStorageUnavailable = "movies_storage_unavailable";
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
 // Two seconds confirms a successful copy without leaving stale feedback on the card.
 const copySuccessDuration = 2000;
@@ -885,6 +892,29 @@ function movieTitleFromPath(path: string) {
   return extensionStart > 0 ? filename.slice(0, extensionStart) : filename;
 }
 
+function formatStorageBytes(bytes: bigint) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+  const bytesPerUnit = 1024n;
+  const tenthsPerUnit = 10n;
+  let unitIndex = 0;
+  let unitSize = 1n;
+
+  while (
+    unitIndex < units.length - 1 &&
+    bytes >= unitSize * bytesPerUnit
+  ) {
+    unitIndex += 1;
+    unitSize *= bytesPerUnit;
+  }
+  if (unitIndex === 0) {
+    return `${bytes} ${units[unitIndex]}`;
+  }
+
+  const roundedTenths =
+    (bytes * tenthsPerUnit + unitSize / 2n) / unitSize;
+  return `${roundedTenths / tenthsPerUnit}.${roundedTenths % tenthsPerUnit} ${units[unitIndex]}`;
+}
+
 export default function App() {
   const [activeDestination, setActiveDestination] = useState<
     (typeof destinations)[number]
@@ -902,6 +932,10 @@ export default function App() {
     status: "unconfigured",
   });
   const [movieRefreshVersion, setMovieRefreshVersion] = useState(0);
+  const [movieStorageRefreshVersion, setMovieStorageRefreshVersion] =
+    useState(0);
+  const [moviesStorageState, setMoviesStorageState] =
+    useState<MoviesStorageState>({ status: "unconfigured" });
   const [librarySelectedPage, setLibrarySelectedPage] = useState(1);
   const [movieTrashAnnouncement, setMovieTrashAnnouncement] = useState<
     string | null
@@ -926,6 +960,7 @@ export default function App() {
   const navigationItems = useRef<Array<HTMLButtonElement | null>>([]);
   const workspace = useRef<HTMLElement | null>(null);
   const scanRequestId = useRef(0);
+  const storageRequestId = useRef(0);
   const discoverRequestId = useRef(0);
   const currentMoviesFolder = useRef(moviesFolder);
   const currentMovieScanState = useRef(movieScanState);
@@ -1081,6 +1116,64 @@ export default function App() {
   }, [isMoviesFolderLoaded, moviesFolder, movieRefreshVersion]);
 
   useEffect(() => {
+    const requestId = ++storageRequestId.current;
+
+    if (!isMoviesFolderLoaded || moviesFolder === null) {
+      setMoviesStorageState({ status: "unconfigured" });
+      return;
+    }
+
+    setMoviesStorageState({ status: "loading" });
+    void window.__TAURI__.core
+      .invoke<unknown>("query_movies_storage")
+      .then((values) => {
+        if (requestId !== storageRequestId.current) {
+          return;
+        }
+        if (
+          !Array.isArray(values) ||
+          values.length !== 2 ||
+          values.some(
+            (value) =>
+              typeof value !== "string" || !/^\d+$/.test(value),
+          )
+        ) {
+          throw new Error("The native storage query returned invalid data.");
+        }
+
+        const totalBytes = BigInt(values[0]);
+        const freeBytes = BigInt(values[1]);
+        if (totalBytes === 0n || freeBytes > totalBytes) {
+          throw new Error("The native storage values were inconsistent.");
+        }
+
+        setMoviesStorageState({ status: "ready", totalBytes, freeBytes });
+      })
+      .catch((error: unknown) => {
+        if (requestId !== storageRequestId.current) {
+          return;
+        }
+
+        const errorCode =
+          typeof error === "string"
+            ? error
+            : error instanceof Error
+              ? error.message
+              : "";
+        setMoviesStorageState({
+          status:
+            errorCode === moviesStorageUnavailable
+              ? "unavailable"
+              : "error",
+        });
+      });
+
+    return () => {
+      storageRequestId.current += 1;
+    };
+  }, [isMoviesFolderLoaded, moviesFolder, movieStorageRefreshVersion]);
+
+  useEffect(() => {
     const requestId = ++discoverRequestId.current;
 
     if (activeDestination.id !== "discover") {
@@ -1176,6 +1269,7 @@ export default function App() {
       setMovieScanState({ status: "scanning" });
       if (selectedFolder === moviesFolder) {
         setMovieRefreshVersion((version) => version + 1);
+        setMovieStorageRefreshVersion((version) => version + 1);
       } else {
         setMoviesFolder(selectedFolder);
       }
@@ -1209,6 +1303,7 @@ export default function App() {
     scanRequestId.current += 1;
     setMovieScanState({ status: "scanning" });
     setMovieRefreshVersion((version) => version + 1);
+    setMovieStorageRefreshVersion((version) => version + 1);
   };
 
   const recordTrashedMovie = (movie: Movie, confirmedFolder: string) => {
@@ -1219,6 +1314,7 @@ export default function App() {
     setMovieTrashAnnouncement(
       `${movie.title} was moved to Trash or the Recycle Bin.`,
     );
+    setMovieStorageRefreshVersion((version) => version + 1);
 
     if (currentMovieScanState.current.status === "scanning") {
       scanRequestId.current += 1;
@@ -1380,6 +1476,37 @@ export default function App() {
       dashboardMoviesDestination = libraryDestination;
     }
   }
+  let dashboardStorageHeading = "Waiting for Movies folder configuration";
+  let dashboardStorageMessage =
+    "Storage will load after the configured Movies folder is known.";
+  let dashboardStorageRole: "alert" | "status" | undefined;
+
+  if (isMoviesFolderLoaded) {
+    if (moviesFolder === null) {
+      dashboardStorageHeading = "Storage unavailable";
+      dashboardStorageMessage =
+        folderSelectionError ??
+        "Configure a Movies folder before loading volume storage.";
+    } else if (
+      moviesStorageState.status === "loading" ||
+      moviesStorageState.status === "unconfigured"
+    ) {
+      dashboardStorageHeading = "Loading storage";
+      dashboardStorageMessage =
+        "Reading the volume capacity for the configured Movies folder.";
+      dashboardStorageRole = "status";
+    } else if (moviesStorageState.status === "unavailable") {
+      dashboardStorageHeading = "Movies volume is unavailable";
+      dashboardStorageMessage =
+        "The configured folder or its containing volume is not accessible.";
+      dashboardStorageRole = "alert";
+    } else if (moviesStorageState.status === "error") {
+      dashboardStorageHeading = "Storage could not be loaded";
+      dashboardStorageMessage =
+        "Auto-Video could not read the containing volume capacity.";
+      dashboardStorageRole = "alert";
+    }
+  }
 
   return (
     <div className="app-shell">
@@ -1472,6 +1599,44 @@ export default function App() {
                 <p className="card-eyebrow">Current status</p>
                 <h3>{dashboardMoviesHeading}</h3>
                 <p>{dashboardMoviesMessage}</p>
+              </div>
+
+              <div
+                aria-busy={moviesStorageState.status === "loading"}
+                className="dashboard-library-summary__storage"
+              >
+                <p className="card-eyebrow">Storage</p>
+                {moviesStorageState.status === "ready" &&
+                moviesFolder !== null ? (
+                  <dl aria-label="Movies volume storage">
+                    <div>
+                      <dt>Total</dt>
+                      <dd>
+                        {formatStorageBytes(moviesStorageState.totalBytes)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Used</dt>
+                      <dd>
+                        {formatStorageBytes(
+                          moviesStorageState.totalBytes -
+                            moviesStorageState.freeBytes,
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Free</dt>
+                      <dd>
+                        {formatStorageBytes(moviesStorageState.freeBytes)}
+                      </dd>
+                    </div>
+                  </dl>
+                ) : (
+                  <div role={dashboardStorageRole}>
+                    <h3>{dashboardStorageHeading}</h3>
+                    <p>{dashboardStorageMessage}</p>
+                  </div>
+                )}
               </div>
 
               {dashboardMoviesDestination === null ? null : (

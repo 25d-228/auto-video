@@ -38,6 +38,7 @@ let invokeMock: Mock<
 let scanMoviesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
+let queryMoviesStorageMock: Mock<() => Promise<[string, string]>>;
 let openMovieMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
@@ -230,6 +231,11 @@ function visibleCardCount(listName: string) {
   ).length;
 }
 
+function storageValue(label: "Total" | "Used" | "Free") {
+  const term = screen.getByText(label, { selector: "dt" });
+  return term.parentElement?.querySelector("dd")?.textContent;
+}
+
 beforeEach(() => {
   systemPrefersDark = false;
   mediaQueryListeners = new Set();
@@ -240,6 +246,9 @@ beforeEach(() => {
   };
   savedMoviesFolder = null;
   scanMoviesMock = vi.fn().mockResolvedValue([]);
+  queryMoviesStorageMock = vi
+    .fn()
+    .mockResolvedValue(["1099511627776", "274877906944"]);
   openMovieMock = vi.fn().mockResolvedValue(undefined);
   revealMovieMock = vi.fn().mockResolvedValue(undefined);
   trashMovieMock = vi.fn().mockResolvedValue(undefined);
@@ -269,6 +278,8 @@ beforeEach(() => {
           });
         case "scan_movies":
           return scanMoviesMock(parameters);
+        case "query_movies_storage":
+          return queryMoviesStorageMock();
         case "open_movie":
           return openMovieMock(parameters);
         case "reveal_movie":
@@ -359,6 +370,9 @@ describe("Auto-Video application shell", () => {
         level: 3,
         name: "Movies Library is not configured",
       }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { level: 3, name: "Storage unavailable" }),
     ).toBeTruthy();
 
     selectDiscover();
@@ -511,6 +525,7 @@ describe("Movies Library Dashboard", () => {
       screen.getByRole("heading", { level: 1, name: "Settings" }),
     ).toBeTruthy();
     expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(queryMoviesStorageMock).not.toHaveBeenCalled();
   });
 
   it("shows the exact configured path and complete scan count without rescanning on navigation or resize", async () => {
@@ -536,6 +551,7 @@ describe("Movies Library Dashboard", () => {
         ?.textContent,
     ).toBe(folder);
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).not.toHaveBeenCalled();
 
     fireEvent(window, new Event("resize"));
@@ -560,12 +576,26 @@ describe("Movies Library Dashboard", () => {
       }),
     ).toBeTruthy();
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
     expect(screen.getByText("Page 2 of 4")).toBeTruthy();
     expect(screen.getByText("Movie 8")).toBeTruthy();
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectDashboard();
+    fireEvent(window, new Event("resize"));
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+    expect(screen.getByText("Movie 8")).toBeTruthy();
   });
 
   it("reports an available empty folder as exactly zero Movies", async () => {
@@ -605,6 +635,8 @@ describe("Movies Library Dashboard", () => {
       "textContent",
       expect.stringContaining("Movies Library scan failed"),
     );
+    await waitFor(() => expect(storageValue("Total")).toBe("1.0 TiB"));
+    expect(storageValue("Used")).toBe("768.0 GiB");
     fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
     expect(
       screen.getByRole("heading", { level: 1, name: "Library" }),
@@ -630,6 +662,7 @@ describe("Movies Library Dashboard", () => {
     expect(
       screen.getByText("The Movies folder configuration could not be loaded."),
     ).toBeTruthy();
+    expect(queryMoviesStorageMock).not.toHaveBeenCalled();
   });
 
   it("tracks folder choices, refresh results, successful Trash actions, and clearing", async () => {
@@ -648,6 +681,11 @@ describe("Movies Library Dashboard", () => {
       ])
       .mockResolvedValueOnce([currentMovie])
       .mockReturnValueOnce(pendingRefresh.promise);
+    queryMoviesStorageMock
+      .mockResolvedValueOnce(["4398046511104", "2199023255552"])
+      .mockResolvedValueOnce(["6597069766656", "2199023255552"])
+      .mockResolvedValueOnce(["6597069766656", "3298534883328"])
+      .mockResolvedValueOnce(["6597069766656", "4398046511104"]);
 
     render(<App />);
     await screen.findByRole("heading", {
@@ -663,6 +701,8 @@ describe("Movies Library Dashboard", () => {
       level: 3,
       name: "2 supported Movies",
     });
+    await waitFor(() => expect(storageValue("Total")).toBe("4.0 TiB"));
+    expect(storageValue("Used")).toBe("2.0 TiB");
 
     selectSettings();
     fireEvent.click(screen.getByRole("button", { name: "Change folder" }));
@@ -672,6 +712,8 @@ describe("Movies Library Dashboard", () => {
       level: 3,
       name: "1 supported Movie",
     });
+    await waitFor(() => expect(storageValue("Total")).toBe("6.0 TiB"));
+    expect(storageValue("Used")).toBe("4.0 TiB");
 
     fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
     await screen.findByText("Current");
@@ -689,6 +731,7 @@ describe("Movies Library Dashboard", () => {
       level: 3,
       name: "2 supported Movies",
     });
+    await waitFor(() => expect(storageValue("Used")).toBe("3.0 TiB"));
 
     fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
     fireEvent.click(
@@ -709,6 +752,7 @@ describe("Movies Library Dashboard", () => {
         name: "1 supported Movie",
       }),
     ).toBeTruthy();
+    await waitFor(() => expect(storageValue("Used")).toBe("2.0 TiB"));
 
     selectSettings();
     fireEvent.click(screen.getByRole("button", { name: "Clear folder" }));
@@ -720,8 +764,140 @@ describe("Movies Library Dashboard", () => {
         name: "Movies Library is not configured",
       }),
     ).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { level: 3, name: "Storage unavailable" }),
+    ).toBeTruthy();
     expect(scanMoviesMock).toHaveBeenCalledTimes(3);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(4);
     expect(trashMovieMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Movies volume storage Dashboard", () => {
+  it("keeps the Library count visible while loading and formats consistent total, used, and free values", async () => {
+    const pendingStorage = createDeferred<[string, string]>();
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(["/Movies/Current.mp4"]);
+    queryMoviesStorageMock.mockReturnValue(pendingStorage.promise);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "1 supported Movie",
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { level: 3, name: "Loading storage" }),
+    ).toBeTruthy();
+
+    await act(async () => {
+      pendingStorage.resolve(["2199023255552", "549755813888"]);
+      await pendingStorage.promise;
+    });
+
+    expect(storageValue("Total")).toBe("2.0 TiB");
+    expect(storageValue("Used")).toBe("1.5 TiB");
+    expect(storageValue("Free")).toBe("512.0 GiB");
+    expect(invokeMock).toHaveBeenCalledWith("query_movies_storage");
+  });
+
+  it.each([
+    ["zero capacity", ["0", "0"]],
+    ["free bytes above total", ["1024", "1025"]],
+    ["non-integer bytes", ["1024", "unknown"]],
+  ] as const)("rejects %s without hiding a valid Movies count", async (_case, values) => {
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(["/Movies/Current.mp4"]);
+    queryMoviesStorageMock.mockResolvedValue([...values]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "Storage could not be loaded",
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("heading", {
+        level: 3,
+        name: "1 supported Movie",
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByLabelText("Movies volume storage")).toBeNull();
+  });
+
+  it("distinguishes an unavailable volume from a failed storage query", async () => {
+    savedMoviesFolder = "/Movies";
+    queryMoviesStorageMock.mockRejectedValueOnce(
+      "movies_storage_unavailable",
+    );
+
+    render(<App />);
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "Movies volume is unavailable",
+      }),
+    ).toBeTruthy();
+
+    cleanup();
+    queryMoviesStorageMock.mockRejectedValueOnce("movies_storage_failed");
+    render(<App />);
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "Storage could not be loaded",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("ignores old-folder and superseded-refresh storage responses", async () => {
+    const oldFolderStorage = createDeferred<[string, string]>();
+    const supersededStorage = createDeferred<[string, string]>();
+    const oldFolder = "/Movies/Old";
+    const newFolder = "/Movies/New";
+    savedMoviesFolder = oldFolder;
+    openFolderMock.mockResolvedValue(newFolder);
+    scanMoviesMock
+      .mockResolvedValueOnce([`${oldFolder}/Old.mp4`])
+      .mockResolvedValueOnce([`${newFolder}/Current.mp4`])
+      .mockResolvedValueOnce([`${newFolder}/Current.mp4`]);
+    queryMoviesStorageMock
+      .mockReturnValueOnce(oldFolderStorage.promise)
+      .mockReturnValueOnce(supersededStorage.promise)
+      .mockResolvedValueOnce(["4398046511104", "1099511627776"]);
+
+    render(<App />);
+    await screen.findByRole("heading", {
+      level: 3,
+      name: "1 supported Movie",
+    });
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Change folder" }));
+    await screen.findByText(newFolder);
+    selectLibrary();
+    await screen.findByText("Current");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    selectDashboard();
+    await waitFor(() => expect(storageValue("Total")).toBe("4.0 TiB"));
+    expect(storageValue("Used")).toBe("3.0 TiB");
+
+    await act(async () => {
+      supersededStorage.resolve(["6597069766656", "1099511627776"]);
+      oldFolderStorage.resolve(["8796093022208", "1099511627776"]);
+      await Promise.all([
+        supersededStorage.promise,
+        oldFolderStorage.promise,
+      ]);
+    });
+
+    expect(storageValue("Total")).toBe("4.0 TiB");
+    expect(storageValue("Used")).toBe("3.0 TiB");
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(3);
   });
 });
 
