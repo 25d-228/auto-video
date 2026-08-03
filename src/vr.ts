@@ -72,6 +72,22 @@ export type VrDownload = {
   downloadedBytes: string;
   speedBytesPerSecond: string;
   state: VrDownloadState;
+  isCurrentFolder: boolean;
+};
+
+export type VrLibraryFile = {
+  path: string;
+  filename: string;
+  title: string;
+  sizeBytes: string;
+  partLabel: string | null;
+};
+
+export type VrLibraryItem = {
+  id: string;
+  title: string;
+  code: string | null;
+  files: VrLibraryFile[];
 };
 
 export type VrReleasesResult =
@@ -85,6 +101,9 @@ const productCodePattern = /^([A-Za-z]{2,16})[ _-]*([0-9]{1,10})$/;
 const unsignedU64Pattern = /^\d{1,20}$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const maximumSelectedVrFiles = 100_000;
+const vrLibraryPartPattern =
+  /(^|[^A-Za-z0-9])((?:part|pt|cd|disc|disk)[ _-]*0*([0-9]{1,4}))(?=$|[^A-Za-z0-9])/gi;
+const vrLibraryPartPrefixes = new Set(["PART", "PT", "CD", "DISC", "DISK"]);
 const javdbBaseUrl = "https://javdb.com";
 
 function invokeErrorStatus(error: unknown): Exclude<
@@ -254,17 +273,23 @@ function releaseArtifact(item: Element): VrReleaseArtifact | null {
   };
 }
 
-function releaseMatchesProductCode(name: string, requestedCode: string) {
+function productCodeCandidates(value: string) {
   const identityPattern =
     /(^|[^A-Za-z0-9])([A-Za-z]{2,16})[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])/gi;
-  const identities = new Set<string>();
-  for (const match of name.matchAll(identityPattern)) {
+  const candidates: Array<{ code: string; prefix: string }> = [];
+  for (const match of value.matchAll(identityPattern)) {
     const identity = canonicalizeProductCode(`${match[2]}-${match[3]}`);
     if (identity !== null) {
-      identities.add(identity);
+      candidates.push({ code: identity, prefix: match[2].toUpperCase() });
     }
   }
+  return candidates;
+}
 
+function releaseMatchesProductCode(name: string, requestedCode: string) {
+  const identities = new Set(
+    productCodeCandidates(name).map((candidate) => candidate.code),
+  );
   return identities.size === 1 && identities.has(requestedCode);
 }
 
@@ -529,6 +554,119 @@ export function clearVrFolder() {
   return window.__TAURI__.core.invoke<void>("clear_vr_folder");
 }
 
+function vrFilename(path: string) {
+  const separatorIndex = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return path.slice(separatorIndex + 1);
+}
+
+function vrTitle(filename: string) {
+  const extensionIndex = filename.lastIndexOf(".");
+  const title = extensionIndex > 0 ? filename.slice(0, extensionIndex) : filename;
+  return title === "" ? filename : title;
+}
+
+function vrPartLabel(title: string) {
+  const matches = Array.from(title.matchAll(vrLibraryPartPattern));
+  if (matches.length === 0) {
+    return null;
+  }
+  const partNumbers = new Set(matches.map((match) => BigInt(match[3]).toString()));
+  return partNumbers.size === 1 && !partNumbers.has("0") ? matches[0][2] : null;
+}
+
+function vrLibraryCode(title: string) {
+  const candidates = productCodeCandidates(title)
+    .filter((candidate) => !vrLibraryPartPrefixes.has(candidate.prefix))
+    .map((candidate) => candidate.code);
+  const uniqueCandidates = new Set(candidates);
+  return uniqueCandidates.size === 1 ? candidates[0] : null;
+}
+
+function parseVrLibrary(value: unknown): VrLibraryItem[] {
+  if (
+    !Array.isArray(value) ||
+    value.length % 2 !== 0 ||
+    !value.every((entry) => typeof entry === "string")
+  ) {
+    throw new Error("The native VR Library scanner returned invalid data.");
+  }
+
+  const files: VrLibraryFile[] = [];
+  const paths = new Set<string>();
+  for (let index = 0; index < value.length; index += 2) {
+    const [path, sizeBytes] = value.slice(index, index + 2) as string[];
+    if (
+      path === "" ||
+      paths.has(path) ||
+      !unsignedU64Pattern.test(sizeBytes) ||
+      BigInt(sizeBytes) > maximumU64
+    ) {
+      throw new Error("The native VR Library scanner returned invalid data.");
+    }
+    paths.add(path);
+    const filename = vrFilename(path);
+    if (filename === "") {
+      throw new Error("The native VR Library scanner returned invalid data.");
+    }
+    const title = vrTitle(filename);
+    files.push({
+      path,
+      filename,
+      title,
+      sizeBytes,
+      partLabel: vrPartLabel(title),
+    });
+  }
+
+  const groupedItems = new Map<string, VrLibraryItem>();
+  const unassociatedItems: VrLibraryItem[] = [];
+  for (const file of files) {
+    const code = vrLibraryCode(file.title);
+    if (code === null) {
+      unassociatedItems.push({
+        id: `file:${file.path}`,
+        title: file.title,
+        code: null,
+        files: [file],
+      });
+      continue;
+    }
+    const existingItem = groupedItems.get(code);
+    if (existingItem === undefined) {
+      groupedItems.set(code, {
+        id: `code:${code}`,
+        title: code,
+        code,
+        files: [file],
+      });
+    } else {
+      existingItem.files.push(file);
+    }
+  }
+
+  return [...groupedItems.values(), ...unassociatedItems];
+}
+
+export async function scanVrLibrary() {
+  return parseVrLibrary(
+    await window.__TAURI__.core.invoke<unknown>("scan_vr_library"),
+  );
+}
+
+export function openVrFile(path: string) {
+  if (path === "") {
+    throw new Error("A VR Library file path is required.");
+  }
+  return window.__TAURI__.core.invoke<void>("open_vr_file", { path });
+}
+
+export function revealVrFile(path: string) {
+  if (path === "") {
+    throw new Error("A VR Library file path is required.");
+  }
+  return window.__TAURI__.core.invoke<void>("reveal_vr_file", { path });
+}
+
 const vrDownloadStates = new Set<VrDownloadState>([
   "queued",
   "downloading",
@@ -542,7 +680,7 @@ const vrDownloadStates = new Set<VrDownloadState>([
 function parseVrDownloads(value: unknown): VrDownload[] {
   if (
     !Array.isArray(value) ||
-    value.length % 8 !== 0 ||
+    value.length % 9 !== 0 ||
     !value.every((entry) => typeof entry === "string")
   ) {
     throw new Error("The native VR download store returned invalid data.");
@@ -550,7 +688,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
 
   const downloads: VrDownload[] = [];
   const transferIds = new Set<string>();
-  for (let index = 0; index < value.length; index += 8) {
+  for (let index = 0; index < value.length; index += 9) {
     const [
       transferId,
       code,
@@ -560,7 +698,8 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       downloadedBytes,
       speedBytesPerSecond,
       state,
-    ] = value.slice(index, index + 8) as string[];
+      currentFolder,
+    ] = value.slice(index, index + 9) as string[];
     const count = Number(selectedFileCount);
     if (
       transferId === "" ||
@@ -577,7 +716,8 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       BigInt(downloadedBytes) > maximumU64 ||
       BigInt(speedBytesPerSecond) > maximumU64 ||
       BigInt(downloadedBytes) > BigInt(totalBytes) ||
-      !vrDownloadStates.has(state as VrDownloadState)
+      !vrDownloadStates.has(state as VrDownloadState) ||
+      (currentFolder !== "true" && currentFolder !== "false")
     ) {
       throw new Error("The native VR download store returned invalid data.");
     }
@@ -591,6 +731,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       downloadedBytes,
       speedBytesPerSecond,
       state: state as VrDownloadState,
+      isCurrentFolder: currentFolder === "true",
     });
   }
   return downloads;

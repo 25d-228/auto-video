@@ -65,12 +65,17 @@ import {
   listVrDownloads,
   loadVrDownloads,
   loadVrFolder,
+  openVrFile,
   pauseVrDownload,
+  revealVrFile,
   resumeVrDownload,
   saveVerifiedVrTorrent,
+  scanVrLibrary,
   startVerifiedVrDownload,
   type VrDownload,
   type VrFolderState,
+  type VrLibraryFile,
+  type VrLibraryItem,
   type VrCatalogItem,
   type VrCatalogResult,
   type VrRelease,
@@ -84,7 +89,7 @@ const destinations = [
   {
     id: "dashboard",
     label: "Dashboard",
-    description: "Current status for your local Movies Library.",
+    description: "Current status for your local Movies and VR Libraries.",
     emptyHeading: "Dashboard data is not available yet",
     emptyMessage:
       "Metrics and storage details will appear here only after their data sources are implemented.",
@@ -100,7 +105,7 @@ const destinations = [
   {
     id: "library",
     label: "Library",
-    description: "Browse supported video files from your local Movies folder.",
+    description: "Browse supported video files from your local Movies and VR folders.",
     emptyHeading: "Choose a Movies folder to begin",
     emptyMessage:
       "Configure one local Movies folder in Settings before scanning your library.",
@@ -172,7 +177,7 @@ type MovieScanState =
   | { status: "unavailable" }
   | { status: "error" }
   | { status: "ready"; movies: Movie[] };
-type MoviesStorageState =
+type VolumeStorageState =
   | { status: "unconfigured" }
   | { status: "loading" }
   | { status: "unavailable" }
@@ -193,6 +198,15 @@ type CredentialMessage = {
 };
 type CopyTitleState = "idle" | "success" | "error";
 type DiscoverCategory = "movies" | "vr";
+type LibraryCategory = "movies" | "vr";
+type VrLibraryScanState =
+  | { status: "loading" }
+  | { status: "unconfigured" }
+  | { status: "scanning" }
+  | { status: "empty" }
+  | { status: "unavailable" }
+  | { status: "error" }
+  | { status: "ready"; items: VrLibraryItem[] };
 type VrCatalogState =
   | { status: "idle" }
   | { status: "loading" }
@@ -230,6 +244,7 @@ type GalleryLayout = {
 const appearanceStorageKey = "auto-video-appearance";
 const moviesFolderUnavailable = "movies_folder_unavailable";
 const moviesStorageUnavailable = "movies_storage_unavailable";
+const vrStorageUnavailable = "vr_storage_unavailable";
 const activeVrDownloadStates = new Set(["queued", "downloading", "paused"]);
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
 // Two seconds confirms a successful copy without leaving stale feedback on the card.
@@ -273,6 +288,59 @@ const movieScanMessages = {
     role: "alert",
   },
 } as const;
+
+const vrLibraryScanMessages = {
+  loading: {
+    heading: "Loading VR folder",
+    message: "Checking the configured VR folder.",
+    role: "status",
+  },
+  unconfigured: {
+    heading: "Choose a VR folder to begin",
+    message: "Configure one local VR folder in Settings before scanning your library.",
+    role: undefined,
+  },
+  scanning: {
+    heading: "Scanning VR folder",
+    message: "Looking recursively for .mp4 and .mkv files.",
+    role: "status",
+  },
+  empty: {
+    heading: "No supported VR videos found",
+    message: "This folder does not contain any .mp4 or .mkv files.",
+    role: undefined,
+  },
+  unavailable: {
+    heading: "VR folder is unavailable",
+    message: "The configured folder may have moved or become inaccessible. Check it in Settings or try Refresh.",
+    role: "alert",
+  },
+  error: {
+    heading: "VR folder could not be scanned",
+    message: "Auto-Video could not read every item in this folder. Check its access and try Refresh.",
+    role: "alert",
+  },
+} as const;
+
+const vrFileOpenErrorMessages: Record<string, string> = {
+  vr_file_open_not_found: "This file is no longer available.",
+  vr_file_open_unavailable: "Auto-Video could not access this file.",
+  vr_file_open_not_file: "This item is not an eligible video file.",
+  vr_file_open_unsupported: "This item is not a supported .mp4 or .mkv file.",
+  vr_file_open_outside_folder: "This file is outside the configured VR folder.",
+  vr_file_open_stale: "This file is no longer part of the current VR Library.",
+  vr_file_open_failed: "The operating system could not open this file.",
+};
+
+const vrFileRevealErrorMessages: Record<string, string> = {
+  vr_file_reveal_not_found: "This file is no longer available.",
+  vr_file_reveal_unavailable: "Auto-Video could not access this file.",
+  vr_file_reveal_not_file: "This item is not an eligible video file.",
+  vr_file_reveal_unsupported: "This item is not a supported .mp4 or .mkv file.",
+  vr_file_reveal_outside_folder: "This file is outside the configured VR folder.",
+  vr_file_reveal_stale: "This file is no longer part of the current VR Library.",
+  vr_file_reveal_failed: "The operating system could not reveal this file.",
+};
 
 const movieOpenErrorMessages: Record<string, string> = {
   movie_open_not_found: "This movie is no longer available.",
@@ -1703,6 +1771,106 @@ function LibraryMovieCard({
   );
 }
 
+function VrLibraryFileRow({ file }: { file: VrLibraryFile }) {
+  const [pendingAction, setPendingAction] = useState<"open" | "reveal" | null>(
+    null,
+  );
+  const [actionError, setActionError] = useState<string | null>(null);
+  const actionPending = useRef(false);
+
+  const runAction = async (action: "open" | "reveal") => {
+    if (actionPending.current) {
+      return;
+    }
+    actionPending.current = true;
+    setPendingAction(action);
+    setActionError(null);
+    try {
+      if (action === "open") {
+        await openVrFile(file.path);
+      } else {
+        await revealVrFile(file.path);
+      }
+    } catch (error: unknown) {
+      const errorCode = nativeErrorCode(error);
+      setActionError(
+        action === "open"
+          ? (vrFileOpenErrorMessages[errorCode] ??
+              "Auto-Video could not open this VR file.")
+          : (vrFileRevealErrorMessages[errorCode] ??
+              "Auto-Video could not reveal this VR file."),
+      );
+    } finally {
+      actionPending.current = false;
+      setPendingAction(null);
+    }
+  };
+
+  return (
+    <li className="vr-library-file" data-vr-file-path={file.path}>
+      <div className="vr-library-file__identity">
+        <span title={file.path}>{file.path}</span>
+        <small>
+          {file.partLabel === null ? null : `${file.partLabel} · `}
+          {formatStorageBytes(BigInt(file.sizeBytes))}
+        </small>
+      </div>
+      <div className="vr-library-file__actions">
+        <Button
+          aria-label={`${pendingAction === "open" ? "Opening" : "Open"} VR file: ${file.path}`}
+          disabled={pendingAction !== null}
+          onClick={() => void runAction("open")}
+          size="icon-xs"
+          title="Open file"
+          type="button"
+          variant="outline"
+        >
+          <AppIcon name="open" />
+        </Button>
+        <Button
+          aria-label={`${pendingAction === "reveal" ? "Revealing" : "Reveal"} VR file: ${file.path}`}
+          disabled={pendingAction !== null}
+          onClick={() => void runAction("reveal")}
+          size="icon-xs"
+          title="Reveal file"
+          type="button"
+          variant="outline"
+        >
+          <AppIcon name="reveal" />
+        </Button>
+      </div>
+      {actionError === null ? null : (
+        <p aria-atomic="true" role="alert">
+          {actionError}
+        </p>
+      )}
+    </li>
+  );
+}
+
+function VrLibraryCard({ item }: { item: VrLibraryItem }) {
+  return (
+    <article className="movie-card vr-library-card">
+      <div className="media-title-row">
+        <div>
+          <p className="card-eyebrow">
+            {item.code === null
+              ? "Unassociated file"
+              : `${item.files.length} ${item.files.length === 1 ? "file" : "files"}`}
+          </p>
+          <h3>{item.title}</h3>
+        </div>
+        <CopyTitleAction title={item.title} />
+      </div>
+      <ul aria-label={`Files for ${item.title}`} className="vr-library-card__files">
+        {item.files.map((file) => (
+          <VrLibraryFileRow file={file} key={file.path} />
+        ))}
+      </ul>
+    </article>
+  );
+}
+
 function VrDownloadCard({
   download,
   error,
@@ -1896,6 +2064,23 @@ function compareLibraryMoviesByTitle(
   return leftMovie.path < rightMovie.path ? -1 : 1;
 }
 
+function compareVrLibraryItemsByTitle(
+  leftItem: VrLibraryItem,
+  rightItem: VrLibraryItem,
+  direction: LibraryTitleSortDirection,
+) {
+  const leftTitle = leftItem.title.toLowerCase();
+  const rightTitle = rightItem.title.toLowerCase();
+  const titleOrder = leftTitle < rightTitle ? -1 : leftTitle > rightTitle ? 1 : 0;
+  if (titleOrder !== 0) {
+    return direction === "ascending" ? titleOrder : -titleOrder;
+  }
+  if (leftItem.title !== rightItem.title) {
+    return leftItem.title < rightItem.title ? -1 : 1;
+  }
+  return leftItem.id < rightItem.id ? -1 : leftItem.id > rightItem.id ? 1 : 0;
+}
+
 function formatStorageBytes(bytes: bigint) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
   const bytesPerUnit = 1024n;
@@ -1965,10 +2150,23 @@ export default function App() {
   const [movieStorageRefreshVersion, setMovieStorageRefreshVersion] =
     useState(0);
   const [moviesStorageState, setMoviesStorageState] =
-    useState<MoviesStorageState>({ status: "unconfigured" });
+    useState<VolumeStorageState>({ status: "unconfigured" });
   const [librarySelectedPage, setLibrarySelectedPage] = useState(1);
   const [librarySearchQuery, setLibrarySearchQuery] = useState("");
   const [libraryTitleSortDirection, setLibraryTitleSortDirection] =
+    useState<LibraryTitleSortDirection>("ascending");
+  const [libraryCategory, setLibraryCategory] =
+    useState<LibraryCategory>("movies");
+  const [vrLibraryScanState, setVrLibraryScanState] =
+    useState<VrLibraryScanState>({ status: "loading" });
+  const [vrLibraryRefreshVersion, setVrLibraryRefreshVersion] = useState(0);
+  const [vrStorageRefreshVersion, setVrStorageRefreshVersion] = useState(0);
+  const [vrStorageState, setVrStorageState] = useState<VolumeStorageState>({
+    status: "unconfigured",
+  });
+  const [vrLibrarySelectedPage, setVrLibrarySelectedPage] = useState(1);
+  const [vrLibrarySearchQuery, setVrLibrarySearchQuery] = useState("");
+  const [vrLibraryTitleSortDirection, setVrLibraryTitleSortDirection] =
     useState<LibraryTitleSortDirection>("ascending");
   const [movieTrashAnnouncement, setMovieTrashAnnouncement] = useState<
     string | null
@@ -2073,6 +2271,8 @@ export default function App() {
   const torrentSaveRequestId = useRef(0);
   const torrentStartRequestId = useRef(0);
   const vrDownloadsRequestId = useRef(0);
+  const vrLibraryScanRequestId = useRef(0);
+  const vrStorageRequestId = useRef(0);
   const torrentSavePending = useRef(false);
   const torrentStartPending = useRef(false);
   const vrDownloadsRefreshPending = useRef(false);
@@ -2084,6 +2284,11 @@ export default function App() {
   const currentMoviesFolder = useRef(moviesFolder);
   const currentMovieScanState = useRef(movieScanState);
   const currentVrDownloadsState = useRef(vrDownloadsState);
+  const previousVrDownloadStates = useRef<Map<string, VrDownload["state"]>>(
+    new Map(),
+  );
+  const hasObservedVrDownloads = useRef(false);
+  const pendingCompletedVrRefresh = useRef(false);
   // Late Trash responses read current state so an old card cannot modify replacement results.
   currentMoviesFolder.current = moviesFolder;
   currentMovieScanState.current = movieScanState;
@@ -2198,6 +2403,142 @@ export default function App() {
     }, vrDownloadRefreshInterval);
     return () => window.clearInterval(interval);
   }, [vrDownloadsState]);
+
+  useEffect(() => {
+    if (vrDownloadsState.status !== "ready") {
+      return;
+    }
+    const nextStates = new Map(
+      vrDownloadsState.downloads.map((download) => [
+        download.transferId,
+        download.state,
+      ]),
+    );
+    const completedTransferAppeared =
+      hasObservedVrDownloads.current &&
+      vrDownloadsState.downloads.some(
+        (download) =>
+          download.state === "completed" &&
+          download.isCurrentFolder &&
+          previousVrDownloadStates.current.get(download.transferId) !==
+            "completed",
+      );
+    previousVrDownloadStates.current = nextStates;
+    hasObservedVrDownloads.current = true;
+    if (completedTransferAppeared) {
+      pendingCompletedVrRefresh.current = true;
+    }
+    if (
+      pendingCompletedVrRefresh.current &&
+      vrFolderState.status === "ready"
+    ) {
+      pendingCompletedVrRefresh.current = false;
+      setVrLibraryRefreshVersion((version) => version + 1);
+      setVrStorageRefreshVersion((version) => version + 1);
+    }
+  }, [vrDownloadsState, vrFolderState.status]);
+
+  useEffect(() => {
+    const requestId = ++vrLibraryScanRequestId.current;
+    if (vrFolderState.status === "loading") {
+      setVrLibraryScanState({ status: "loading" });
+      return;
+    }
+    if (vrFolderState.status === "unconfigured") {
+      setVrLibraryScanState({ status: "unconfigured" });
+      return;
+    }
+    if (vrFolderState.status === "unavailable") {
+      setVrLibraryScanState({ status: "unavailable" });
+      return;
+    }
+    if (vrFolderState.status === "error") {
+      setVrLibraryScanState({ status: "error" });
+      return;
+    }
+
+    setVrLibraryScanState({ status: "scanning" });
+    void scanVrLibrary()
+      .then((items) => {
+        if (requestId !== vrLibraryScanRequestId.current) {
+          return;
+        }
+        setVrLibraryScanState(
+          items.length === 0 ? { status: "empty" } : { status: "ready", items },
+        );
+      })
+      .catch((error: unknown) => {
+        if (requestId !== vrLibraryScanRequestId.current) {
+          return;
+        }
+        setVrLibraryScanState({
+          status:
+            nativeErrorCode(error) === "vr_library_folder_unavailable"
+              ? "unavailable"
+              : "error",
+        });
+      });
+
+    return () => {
+      vrLibraryScanRequestId.current += 1;
+    };
+  }, [vrFolderState, vrLibraryRefreshVersion]);
+
+  useEffect(() => {
+    const requestId = ++vrStorageRequestId.current;
+    if (vrFolderState.status === "loading") {
+      setVrStorageState({ status: "loading" });
+      return;
+    }
+    if (vrFolderState.status === "unconfigured") {
+      setVrStorageState({ status: "unconfigured" });
+      return;
+    }
+    if (vrFolderState.status === "unavailable") {
+      setVrStorageState({ status: "unavailable" });
+      return;
+    }
+    if (vrFolderState.status === "error") {
+      setVrStorageState({ status: "error" });
+      return;
+    }
+
+    setVrStorageState({ status: "loading" });
+    void window.__TAURI__.core
+      .invoke<unknown>("query_vr_storage")
+      .then((values) => {
+        if (requestId !== vrStorageRequestId.current) {
+          return;
+        }
+        if (
+          !Array.isArray(values) ||
+          values.length !== 2 ||
+          values.some((value) => typeof value !== "string" || !/^\d+$/.test(value))
+        ) {
+          throw new Error("The native VR storage query returned invalid data.");
+        }
+        const totalBytes = BigInt(values[0]);
+        const freeBytes = BigInt(values[1]);
+        if (totalBytes === 0n || freeBytes > totalBytes) {
+          throw new Error("The native VR storage values were inconsistent.");
+        }
+        setVrStorageState({ status: "ready", totalBytes, freeBytes });
+      })
+      .catch((error: unknown) => {
+        if (requestId === vrStorageRequestId.current) {
+          setVrStorageState({
+            status:
+              nativeErrorCode(error) === vrStorageUnavailable
+                ? "unavailable"
+                : "error",
+          });
+        }
+      });
+
+    return () => {
+      vrStorageRequestId.current += 1;
+    };
+  }, [vrFolderState, vrStorageRefreshVersion]);
 
   useEffect(() => {
     let isCurrent = true;
@@ -2640,6 +2981,10 @@ export default function App() {
     try {
       const selectedFolder = await chooseVrFolder();
       if (selectedFolder !== null) {
+        vrLibraryScanRequestId.current += 1;
+        vrStorageRequestId.current += 1;
+        setVrLibraryScanState({ status: "scanning" });
+        setVrStorageState({ status: "loading" });
         setVrFolderState({ status: "ready", path: selectedFolder });
       }
     } catch {
@@ -2650,6 +2995,8 @@ export default function App() {
   };
 
   const clearConfiguredVrFolder = async () => {
+    vrLibraryScanRequestId.current += 1;
+    vrStorageRequestId.current += 1;
     setVrFolderActionError(null);
     try {
       await clearVrFolder();
@@ -2659,6 +3006,30 @@ export default function App() {
         "The VR folder configuration could not be cleared.",
       );
     }
+  };
+
+  const refreshVrLibrary = () => {
+    if (vrFolderState.status !== "ready") {
+      return;
+    }
+    vrLibraryScanRequestId.current += 1;
+    vrStorageRequestId.current += 1;
+    setVrLibraryScanState({ status: "scanning" });
+    setVrStorageState({ status: "loading" });
+    setVrLibraryRefreshVersion((version) => version + 1);
+    setVrStorageRefreshVersion((version) => version + 1);
+  };
+
+  const updateVrLibrarySearchQuery = (query: string) => {
+    setVrLibrarySearchQuery(query);
+    setVrLibrarySelectedPage(1);
+  };
+
+  const updateVrLibraryTitleSortDirection = (
+    direction: LibraryTitleSortDirection,
+  ) => {
+    setVrLibraryTitleSortDirection(direction);
+    setVrLibrarySelectedPage(1);
   };
 
   const refreshVrDownloads = async () => {
@@ -3231,6 +3602,33 @@ export default function App() {
         libraryTitleSortDirection,
       ),
   );
+  const currentVrLibraryScanMessage =
+    vrLibraryScanState.status === "ready"
+      ? null
+      : vrLibraryScanMessages[vrLibraryScanState.status];
+  const completeVrLibraryItems =
+    vrLibraryScanState.status === "ready" ? vrLibraryScanState.items : [];
+  const vrLibrarySearch = vrLibrarySearchQuery.toLowerCase();
+  const isVrLibrarySearchActive = vrLibrarySearchQuery.trim() !== "";
+  const matchingVrLibraryItems = isVrLibrarySearchActive
+    ? completeVrLibraryItems.filter(
+        (item) =>
+          item.title.toLowerCase().includes(vrLibrarySearch) ||
+          item.code?.toLowerCase().includes(vrLibrarySearch),
+      )
+    : completeVrLibraryItems;
+  const orderedVrLibraryItems = [...matchingVrLibraryItems].sort(
+    (leftItem, rightItem) =>
+      compareVrLibraryItemsByTitle(
+        leftItem,
+        rightItem,
+        vrLibraryTitleSortDirection,
+      ),
+  );
+  const completeVrLibraryFileCount = completeVrLibraryItems.reduce(
+    (count, item) => count + item.files.length,
+    0,
+  );
   let dashboardMoviesHeading = "Loading Movies Library";
   let dashboardMoviesMessage = "Loading the configured Movies folder.";
   let dashboardMoviesRole: "alert" | "status" | undefined = "status";
@@ -3313,6 +3711,66 @@ export default function App() {
       dashboardStorageRole = "alert";
     }
   }
+  let dashboardVrHeading = "Loading VR Library";
+  let dashboardVrMessage = "Loading the configured VR folder.";
+  let dashboardVrRole: "alert" | "status" | undefined = "status";
+  let dashboardVrDestination: (typeof destinations)[number] = libraryDestination;
+
+  if (vrFolderState.status === "unconfigured") {
+    dashboardVrHeading = "VR Library is not configured";
+    dashboardVrMessage = "Choose one local VR folder in Settings.";
+    dashboardVrRole = undefined;
+    dashboardVrDestination = settingsDestination;
+  } else if (vrFolderState.status === "unavailable") {
+    dashboardVrHeading = "VR folder is unavailable";
+    dashboardVrMessage = "The configured folder may have moved or become inaccessible.";
+    dashboardVrRole = "alert";
+    dashboardVrDestination = settingsDestination;
+  } else if (vrFolderState.status === "error") {
+    dashboardVrHeading = "VR Library needs attention";
+    dashboardVrMessage = "The VR folder configuration could not be loaded.";
+    dashboardVrRole = "alert";
+    dashboardVrDestination = settingsDestination;
+  } else if (vrLibraryScanState.status === "scanning") {
+    dashboardVrHeading = "Scanning VR Library";
+    dashboardVrMessage = "Looking recursively for supported .mp4 and .mkv files.";
+  } else if (vrLibraryScanState.status === "empty") {
+    dashboardVrHeading = "0 VR titles · 0 files";
+    dashboardVrMessage = "The configured folder contains no supported video files.";
+    dashboardVrRole = undefined;
+  } else if (vrLibraryScanState.status === "ready") {
+    const titleCount = vrLibraryScanState.items.length;
+    dashboardVrHeading = `${titleCount} VR ${titleCount === 1 ? "title" : "titles"} · ${completeVrLibraryFileCount} ${completeVrLibraryFileCount === 1 ? "file" : "files"}`;
+    dashboardVrMessage = "These totals come from the latest complete VR folder scan.";
+    dashboardVrRole = undefined;
+  } else if (vrLibraryScanState.status === "unavailable") {
+    dashboardVrHeading = "VR folder is unavailable";
+    dashboardVrMessage = "The configured folder may have moved or become inaccessible.";
+    dashboardVrRole = "alert";
+    dashboardVrDestination = settingsDestination;
+  } else if (vrLibraryScanState.status === "error") {
+    dashboardVrHeading = "VR Library scan failed";
+    dashboardVrMessage = "Auto-Video could not read every item in the configured folder.";
+    dashboardVrRole = "alert";
+  }
+
+  let dashboardVrStorageHeading = "Waiting for VR folder configuration";
+  let dashboardVrStorageMessage =
+    "Storage will load after the configured VR folder is known.";
+  let dashboardVrStorageRole: "alert" | "status" | undefined;
+  if (vrStorageState.status === "loading") {
+    dashboardVrStorageHeading = "Loading storage";
+    dashboardVrStorageMessage = "Reading the volume capacity for the configured VR folder.";
+    dashboardVrStorageRole = "status";
+  } else if (vrStorageState.status === "unavailable") {
+    dashboardVrStorageHeading = "VR volume is unavailable";
+    dashboardVrStorageMessage = "The configured folder or its containing volume is not accessible.";
+    dashboardVrStorageRole = "alert";
+  } else if (vrStorageState.status === "error") {
+    dashboardVrStorageHeading = "Storage could not be loaded";
+    dashboardVrStorageMessage = "Auto-Video could not read the containing volume capacity.";
+    dashboardVrStorageRole = "alert";
+  }
 
   return (
     <>
@@ -3374,6 +3832,7 @@ export default function App() {
           )}
 
           {activeDestination.id === "dashboard" ? (
+            <>
             <section
               aria-busy={
                 !isMoviesFolderLoaded ||
@@ -3457,6 +3916,92 @@ export default function App() {
                 </Button>
               )}
             </section>
+            <section
+              aria-busy={
+                vrFolderState.status === "loading" ||
+                vrLibraryScanState.status === "scanning"
+              }
+              aria-labelledby="dashboard-vr-heading"
+              className="dashboard-library-summary"
+            >
+              <div className="dashboard-library-summary__heading">
+                <span className="empty-state__icon">
+                  <AppIcon name="vr" />
+                </span>
+                <div>
+                  <p className="card-eyebrow">Local library</p>
+                  <h2 id="dashboard-vr-heading">VR Library</h2>
+                  <p className="dashboard-library-summary__folder">
+                    {vrFolderState.status === "loading"
+                      ? "Loading configured VR folder…"
+                      : vrFolderState.status === "ready" ||
+                          vrFolderState.status === "unavailable"
+                        ? vrFolderState.path
+                        : "No VR folder configured"}
+                  </p>
+                </div>
+              </div>
+
+              <div
+                className="dashboard-library-summary__status"
+                role={dashboardVrRole}
+              >
+                <p className="card-eyebrow">Current status</p>
+                <h3>{dashboardVrHeading}</h3>
+                <p>{dashboardVrMessage}</p>
+              </div>
+
+              <div
+                aria-busy={vrStorageState.status === "loading"}
+                className="dashboard-library-summary__storage"
+              >
+                <p className="card-eyebrow">Storage</p>
+                {vrStorageState.status === "ready" ? (
+                  <dl aria-label="VR volume storage">
+                    <div>
+                      <dt>Total</dt>
+                      <dd>{formatStorageBytes(vrStorageState.totalBytes)}</dd>
+                    </div>
+                    <div>
+                      <dt>Used</dt>
+                      <dd>
+                        {formatStorageBytes(
+                          vrStorageState.totalBytes - vrStorageState.freeBytes,
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Free</dt>
+                      <dd>{formatStorageBytes(vrStorageState.freeBytes)}</dd>
+                    </div>
+                  </dl>
+                ) : (
+                  <div role={dashboardVrStorageRole}>
+                    <h3>{dashboardVrStorageHeading}</h3>
+                    <p>{dashboardVrStorageMessage}</p>
+                  </div>
+                )}
+              </div>
+
+              {vrFolderState.status === "loading" ? null : (
+                <Button
+                  className="dashboard-library-summary__action"
+                  onClick={() => {
+                    if (dashboardVrDestination.id === "library") {
+                      setLibraryCategory("vr");
+                    }
+                    navigateTo(dashboardVrDestination);
+                  }}
+                  type="button"
+                >
+                  <AppIcon name={dashboardVrDestination.id} />
+                  {dashboardVrDestination.id === "library"
+                    ? "Open VR Library"
+                    : "Open VR Settings"}
+                </Button>
+              )}
+            </section>
+            </>
           ) : activeDestination.id === "discover" ? (
             <section
               aria-busy={
@@ -3753,24 +4298,58 @@ export default function App() {
             </section>
           ) : activeDestination.id === "library" ? (
             <section
-              aria-busy={movieScanState.status === "scanning"}
-              aria-labelledby="movies-heading"
+              aria-busy={
+                libraryCategory === "movies"
+                  ? movieScanState.status === "scanning"
+                  : vrLibraryScanState.status === "scanning"
+              }
+              aria-labelledby="library-heading"
               className="library-content"
             >
               <div className="library-toolbar library-toolbar--movies">
                 <div className="library-toolbar__heading">
                   <span className="empty-state__icon">
-                    <AppIcon name="library" />
+                    <AppIcon name={libraryCategory === "movies" ? "library" : "vr"} />
                   </span>
                   <div>
                     <p className="card-eyebrow">Local library</p>
-                    <h2 id="movies-heading">Movies</h2>
+                    <h2 id="library-heading">
+                      {libraryCategory === "movies" ? "Movies" : "VR"}
+                    </h2>
                     <p className="library-folder">
-                      {moviesFolder ?? "No Movies folder configured"}
+                      {libraryCategory === "movies"
+                        ? (moviesFolder ?? "No Movies folder configured")
+                        : vrFolderState.status === "ready" ||
+                            vrFolderState.status === "unavailable"
+                          ? vrFolderState.path
+                          : vrFolderState.status === "loading"
+                            ? "Loading configured VR folder…"
+                            : "No VR folder configured"}
                     </p>
                   </div>
                 </div>
-                {moviesFolder === null ? null : (
+                <div className="library-toolbar__controls">
+                  <fieldset className="discover-category">
+                    <legend>Library category</legend>
+                    <div>
+                      {([
+                        ["movies", "Movies"],
+                        ["vr", "VR"],
+                      ] as const).map(([category, label]) => (
+                        <label key={category}>
+                          <input
+                            checked={libraryCategory === category}
+                            name="library-category"
+                            onChange={() => setLibraryCategory(category)}
+                            type="radio"
+                            value={category}
+                          />
+                          <span>{label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                {libraryCategory === "movies" && moviesFolder !== null ? (
                   <div className="library-toolbar__controls">
                     <div
                       aria-label="Movies title search"
@@ -3844,10 +4423,85 @@ export default function App() {
                       Refresh
                     </Button>
                   </div>
-                )}
+                ) : libraryCategory === "vr" &&
+                  (vrFolderState.status === "ready" ||
+                    vrFolderState.status === "unavailable") ? (
+                  <div className="library-toolbar__controls">
+                    <div
+                      aria-label="VR title search"
+                      className="movie-search"
+                      role="search"
+                    >
+                      <label htmlFor="vr-library-title-search">Search titles</label>
+                      <div className="movie-search__field">
+                        <span className="movie-search__icon">
+                          <AppIcon name="search" />
+                        </span>
+                        <input
+                          aria-describedby={
+                            vrLibraryScanState.status === "ready"
+                              ? "vr-library-search-results"
+                              : undefined
+                          }
+                          className="movie-search__input"
+                          id="vr-library-title-search"
+                          onChange={(event) =>
+                            updateVrLibrarySearchQuery(event.target.value)
+                          }
+                          placeholder="Find a VR title or code"
+                          type="text"
+                          value={vrLibrarySearchQuery}
+                        />
+                        {vrLibrarySearchQuery === "" ? null : (
+                          <Button
+                            aria-label="Clear VR search"
+                            className="movie-search__clear"
+                            onClick={() => updateVrLibrarySearchQuery("")}
+                            size="icon-sm"
+                            type="button"
+                            variant="ghost"
+                          >
+                            <AppIcon name="close" />
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="movie-sort">
+                      <label htmlFor="vr-library-title-sort">Sort titles</label>
+                      <select
+                        className="movie-sort__select"
+                        id="vr-library-title-sort"
+                        onChange={(event) => {
+                          const direction = event.target.value;
+                          if (direction !== "ascending" && direction !== "descending") {
+                            throw new Error(
+                              "The VR title sort returned an invalid direction.",
+                            );
+                          }
+                          updateVrLibraryTitleSortDirection(direction);
+                        }}
+                        value={vrLibraryTitleSortDirection}
+                      >
+                        <option value="ascending">Title A–Z</option>
+                        <option value="descending">Title Z–A</option>
+                      </select>
+                    </div>
+                    <Button
+                      disabled={vrLibraryScanState.status === "scanning"}
+                      onClick={refreshVrLibrary}
+                      type="button"
+                      variant="outline"
+                    >
+                      <AppIcon name="refresh" />
+                      Refresh
+                    </Button>
+                  </div>
+                ) : null}
+                </div>
               </div>
 
-              {movieScanState.status === "ready" && moviesFolder !== null ? (
+              {libraryCategory === "movies" ? (
+                movieScanState.status === "ready" && moviesFolder !== null ? (
                 <>
                   <p
                     aria-atomic="true"
@@ -3903,6 +4557,58 @@ export default function App() {
                   </span>
                   <h2>{currentMovieScanMessage?.heading}</h2>
                   <p>{currentMovieScanMessage?.message}</p>
+                </div>
+                )
+              ) : vrLibraryScanState.status === "ready" ? (
+                <>
+                  <p
+                    aria-atomic="true"
+                    aria-live="polite"
+                    className="sr-only"
+                    id="vr-library-search-results"
+                  >
+                    {isVrLibrarySearchActive
+                      ? `${matchingVrLibraryItems.length} VR titles match the current search.`
+                      : `${completeVrLibraryItems.length} VR titles and ${completeVrLibraryFileCount} files in the complete current result.`}
+                  </p>
+                  {matchingVrLibraryItems.length === 0 &&
+                  isVrLibrarySearchActive ? (
+                    <div className="empty-state library-state library-search-empty">
+                      <span className="empty-state__icon">
+                        <AppIcon name="search" />
+                      </span>
+                      <h2>No VR titles match this search</h2>
+                      <p>
+                        No titles or codes match “
+                        <span className="library-search-empty__query">
+                          {vrLibrarySearchQuery}
+                        </span>
+                        ”. Clear the search to restore the complete Library.
+                      </p>
+                    </div>
+                  ) : (
+                    <ResizeAwareGallery
+                      ariaLabel="VR titles"
+                      getItemKey={(item) => item.id}
+                      items={orderedVrLibraryItems}
+                      key="vr-library-gallery"
+                      onSelectedPageChange={setVrLibrarySelectedPage}
+                      renderItem={(item) => <VrLibraryCard item={item} />}
+                      selectedPage={vrLibrarySelectedPage}
+                      variant="library"
+                    />
+                  )}
+                </>
+              ) : (
+                <div
+                  className="empty-state library-state"
+                  role={currentVrLibraryScanMessage?.role}
+                >
+                  <span className="empty-state__icon">
+                    <AppIcon name="vr" />
+                  </span>
+                  <h2>{currentVrLibraryScanMessage?.heading}</h2>
+                  <p>{currentVrLibraryScanMessage?.message}</p>
                 </div>
               )}
             </section>

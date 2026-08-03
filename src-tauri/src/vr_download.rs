@@ -146,6 +146,24 @@ struct VrDownloadContext {
 #[derive(Clone, Default)]
 pub struct VrDownloadState(Arc<Mutex<VrDownloadContext>>);
 
+pub(crate) fn configured_vr_folder(
+    state: &VrDownloadState,
+) -> Result<Option<PathBuf>, &'static str> {
+    state
+        .0
+        .lock()
+        .map_err(|_| VR_FOLDER_STORAGE_FAILED)
+        .map(|context| context.future_folder.clone())
+}
+
+pub(crate) fn with_configured_vr_folder<T>(
+    state: &VrDownloadState,
+    operation: impl FnOnce(Option<&Path>) -> T,
+) -> Result<T, &'static str> {
+    let context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
+    Ok(operation(context.future_folder.as_deref()))
+}
+
 pub fn load_vr_folder_file(path: &Path) -> Result<Option<PathBuf>, &'static str> {
     match fs::read_to_string(path) {
         Ok(folder) if !folder.is_empty() => Ok(Some(PathBuf::from(folder))),
@@ -1485,6 +1503,7 @@ fn selected_progress(record: &TransferRecord, handle: &ManagedTorrentHandle) -> 
 
 fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
     let mut rows = Vec::new();
+    let current_folder = context.future_folder.clone();
     for transfer in &mut context.transfers {
         match transfer {
             StoredTransfer::Valid(record) => {
@@ -1513,6 +1532,7 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                     record.downloaded_bytes.to_string(),
                     speed.to_string(),
                     record.state.as_str().to_owned(),
+                    (current_folder.as_ref() == Some(&record.destination)).to_string(),
                 ]);
             }
             StoredTransfer::Corrupt(record) => rows.extend([
@@ -1524,6 +1544,7 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                 "0".to_owned(),
                 "0".to_owned(),
                 TransferState::Offline.as_str().to_owned(),
+                "false".to_owned(),
             ]),
         }
     }
@@ -1880,6 +1901,26 @@ mod tests {
                 size: 5,
             }],
         }
+    }
+
+    #[test]
+    fn download_rows_mark_only_the_current_configured_destination() {
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("current");
+        let record = transfer_from_source(
+            fixture_source(),
+            destination.clone(),
+            TransferState::Cancelled,
+        );
+        let mut context = VrDownloadContext {
+            future_folder: Some(destination),
+            transfers: vec![StoredTransfer::Valid(record)],
+            ..VrDownloadContext::default()
+        };
+
+        assert_eq!(download_rows(&mut context)[8], "true");
+        context.future_folder = Some(fixture.path.join("replacement"));
+        assert_eq!(download_rows(&mut context)[8], "false");
     }
 
     fn push_bencoded_text(encoded: &mut Vec<u8>, value: &str) {

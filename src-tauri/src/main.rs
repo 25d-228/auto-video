@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod vr_download;
+mod vr_library;
 mod vr_torrent;
 
 use std::{
@@ -16,10 +17,14 @@ use std::process::{Command, Stdio};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use vr_download::{
-    cancel_download, clear_vr_folder as clear_trusted_vr_folder, dismiss_download, list_downloads,
-    load_downloads, load_vr_folder_with, pause_download, resume_download, set_vr_folder,
-    start_download, VrDownloadState, VR_DOWNLOAD_FAILED, VR_DOWNLOAD_PERSISTENCE_FAILED,
-    VR_FOLDER_STORAGE_FAILED, VR_FOLDER_UNAVAILABLE,
+    cancel_download, clear_vr_folder as clear_trusted_vr_folder, configured_vr_folder,
+    dismiss_download, list_downloads, load_downloads, load_vr_folder_with, pause_download,
+    resume_download, set_vr_folder, start_download, VrDownloadState, VR_DOWNLOAD_FAILED,
+    VR_DOWNLOAD_PERSISTENCE_FAILED, VR_FOLDER_STORAGE_FAILED, VR_FOLDER_UNAVAILABLE,
+};
+use vr_library::{
+    invalidate_vr_library, open_vr_file_with, reveal_vr_file_with, scan_vr_library_with,
+    VrLibraryState, VR_FILE_OPEN_FAILED, VR_FILE_REVEAL_FAILED, VR_LIBRARY_SCAN_FAILED,
 };
 use vr_torrent::{
     fetch_artifact_response, inspect_sukebei_torrent_with, save_verified_torrent_with,
@@ -34,6 +39,8 @@ const MOVIES_FOLDER_UNAVAILABLE: &str = "movies_folder_unavailable";
 const MOVIES_FOLDER_STORAGE_FAILED: &str = "movies_folder_storage_failed";
 const MOVIES_STORAGE_FAILED: &str = "movies_storage_failed";
 const MOVIES_STORAGE_UNAVAILABLE: &str = "movies_storage_unavailable";
+const VR_STORAGE_FAILED: &str = "vr_storage_failed";
+const VR_STORAGE_UNAVAILABLE: &str = "vr_storage_unavailable";
 const MOVIES_SCAN_FAILED: &str = "movies_scan_failed";
 const MOVIE_OPEN_FAILED: &str = "movie_open_failed";
 const MOVIE_OPEN_NOT_FILE: &str = "movie_open_not_file";
@@ -101,18 +108,32 @@ fn query_movies_volume_storage_with(
     folder: Option<&Path>,
     query: impl FnOnce(&Path) -> Result<[u64; 2], MoviesVolumeStorageQueryError>,
 ) -> Result<[u64; 2], &'static str> {
-    let folder = folder.ok_or(MOVIES_STORAGE_UNAVAILABLE)?;
-    let metadata = fs::metadata(folder).map_err(|_| MOVIES_STORAGE_UNAVAILABLE)?;
+    query_volume_storage_with(
+        folder,
+        MOVIES_STORAGE_UNAVAILABLE,
+        MOVIES_STORAGE_FAILED,
+        query,
+    )
+}
+
+fn query_volume_storage_with(
+    folder: Option<&Path>,
+    unavailable_error: &'static str,
+    failed_error: &'static str,
+    query: impl FnOnce(&Path) -> Result<[u64; 2], MoviesVolumeStorageQueryError>,
+) -> Result<[u64; 2], &'static str> {
+    let folder = folder.ok_or(unavailable_error)?;
+    let metadata = fs::metadata(folder).map_err(|_| unavailable_error)?;
     if !metadata.is_dir() {
-        return Err(MOVIES_STORAGE_UNAVAILABLE);
+        return Err(unavailable_error);
     }
 
     let [total_bytes, free_bytes] = query(folder).map_err(|error| match error {
-        MoviesVolumeStorageQueryError::Unavailable => MOVIES_STORAGE_UNAVAILABLE,
-        MoviesVolumeStorageQueryError::Failed => MOVIES_STORAGE_FAILED,
+        MoviesVolumeStorageQueryError::Unavailable => unavailable_error,
+        MoviesVolumeStorageQueryError::Failed => failed_error,
     })?;
     if total_bytes == 0 || free_bytes > total_bytes {
-        return Err(MOVIES_STORAGE_FAILED);
+        return Err(failed_error);
     }
 
     Ok([total_bytes, free_bytes])
@@ -885,14 +906,19 @@ fn clear_tmdb_token(app: tauri::AppHandle) -> Result<(), String> {
 fn load_vr_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, VrDownloadState>,
+    library_state: tauri::State<'_, VrLibraryState>,
 ) -> Result<Vec<String>, String> {
-    load_vr_folder_with(state.inner(), &vr_folder_path(&app)?).map_err(str::to_owned)
+    let response =
+        load_vr_folder_with(state.inner(), &vr_folder_path(&app)?).map_err(str::to_owned)?;
+    invalidate_vr_library(library_state.inner()).map_err(str::to_owned)?;
+    Ok(response)
 }
 
 #[tauri::command]
 async fn choose_vr_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, VrDownloadState>,
+    library_state: tauri::State<'_, VrLibraryState>,
 ) -> Result<Option<String>, String> {
     let dialog_app = app.clone();
     let selected_folder = tauri::async_runtime::spawn_blocking(move || {
@@ -910,17 +936,104 @@ async fn choose_vr_folder(
     let folder = selected_folder
         .into_path()
         .map_err(|_| VR_FOLDER_UNAVAILABLE.to_owned())?;
-    set_vr_folder(state.inner(), &vr_folder_path(&app)?, folder)
-        .map(Some)
-        .map_err(str::to_owned)
+    let folder =
+        set_vr_folder(state.inner(), &vr_folder_path(&app)?, folder).map_err(str::to_owned)?;
+    invalidate_vr_library(library_state.inner()).map_err(str::to_owned)?;
+    Ok(Some(folder))
 }
 
 #[tauri::command]
 fn clear_vr_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, VrDownloadState>,
+    library_state: tauri::State<'_, VrLibraryState>,
 ) -> Result<(), String> {
-    clear_trusted_vr_folder(state.inner(), &vr_folder_path(&app)?).map_err(str::to_owned)
+    clear_trusted_vr_folder(state.inner(), &vr_folder_path(&app)?).map_err(str::to_owned)?;
+    invalidate_vr_library(library_state.inner()).map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn scan_vr_library(
+    download_state: tauri::State<'_, VrDownloadState>,
+    library_state: tauri::State<'_, VrLibraryState>,
+) -> Result<Vec<String>, String> {
+    let download_state = download_state.inner().clone();
+    let library_state = library_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_vr_library_with(&download_state, &library_state).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| VR_LIBRARY_SCAN_FAILED.to_owned())?
+}
+
+#[tauri::command]
+async fn query_vr_storage(state: tauri::State<'_, VrDownloadState>) -> Result<[String; 2], String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let folder = configured_vr_folder(&state).map_err(str::to_owned)?;
+        let folder = folder
+            .as_deref()
+            .ok_or_else(|| VR_STORAGE_UNAVAILABLE.to_owned())?;
+        if fs::canonicalize(folder)
+            .ok()
+            .as_deref()
+            .is_none_or(|canonical_folder| canonical_folder != folder)
+        {
+            return Err(VR_STORAGE_UNAVAILABLE.to_owned());
+        }
+        let [total_bytes, free_bytes] = query_volume_storage_with(
+            Some(folder),
+            VR_STORAGE_UNAVAILABLE,
+            VR_STORAGE_FAILED,
+            query_movies_volume_storage,
+        )
+        .map_err(str::to_owned)?;
+        Ok([total_bytes.to_string(), free_bytes.to_string()])
+    })
+    .await
+    .map_err(|_| VR_STORAGE_FAILED.to_owned())?
+}
+
+#[tauri::command]
+async fn open_vr_file(
+    path: String,
+    download_state: tauri::State<'_, VrDownloadState>,
+    library_state: tauri::State<'_, VrLibraryState>,
+) -> Result<(), String> {
+    let download_state = download_state.inner().clone();
+    let library_state = library_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        open_vr_file_with(
+            Path::new(&path),
+            &download_state,
+            &library_state,
+            |file_path| tauri_plugin_opener::open_path(file_path, None::<&str>).map_err(|_| ()),
+        )
+    })
+    .await
+    .map_err(|_| VR_FILE_OPEN_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn reveal_vr_file(
+    path: String,
+    download_state: tauri::State<'_, VrDownloadState>,
+    library_state: tauri::State<'_, VrLibraryState>,
+) -> Result<(), String> {
+    let download_state = download_state.inner().clone();
+    let library_state = library_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        reveal_vr_file_with(
+            Path::new(&path),
+            &download_state,
+            &library_state,
+            |file_path| tauri_plugin_opener::reveal_item_in_dir(file_path).map_err(|_| ()),
+        )
+    })
+    .await
+    .map_err(|_| VR_FILE_REVEAL_FAILED.to_owned())?
+    .map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -1102,6 +1215,7 @@ fn main() {
         .manage(MoviesLibraryState::default())
         .manage(VrTorrentState::default())
         .manage(VrDownloadState::default())
+        .manage(VrLibraryState::default())
         .invoke_handler(tauri::generate_handler![
             load_movies_folder,
             choose_movies_folder,
@@ -1117,6 +1231,10 @@ fn main() {
             load_vr_folder,
             choose_vr_folder,
             clear_vr_folder,
+            scan_vr_library,
+            query_vr_storage,
+            open_vr_file,
+            reveal_vr_file,
             load_vr_downloads,
             list_vr_downloads,
             start_verified_vr_download,
