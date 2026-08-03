@@ -72,6 +72,10 @@ let saveVerifiedVrTorrentMock: Mock<
 let loadVrFolderMock: Mock<() => Promise<string[]>>;
 let chooseVrFolderMock: Mock<() => Promise<string | null>>;
 let clearVrFolderMock: Mock<() => Promise<void>>;
+let scanVrLibraryMock: Mock<() => Promise<string[]>>;
+let queryVrStorageMock: Mock<() => Promise<[string, string]>>;
+let openVrFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
+let revealVrFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
 let loadVrDownloadsMock: Mock<() => Promise<string[]>>;
 let listVrDownloadsMock: Mock<() => Promise<string[]>>;
 let startVerifiedVrDownloadMock: Mock<
@@ -293,6 +297,7 @@ function vrDownloadFixture({
   state,
   totalBytes = "10",
   transferId,
+  isCurrentFolder = "true",
 }: {
   code?: string;
   downloadedBytes?: string;
@@ -302,6 +307,7 @@ function vrDownloadFixture({
   state: string;
   totalBytes?: string;
   transferId: string;
+  isCurrentFolder?: string;
 }) {
   return [
     transferId,
@@ -312,6 +318,7 @@ function vrDownloadFixture({
     downloadedBytes,
     speedBytesPerSecond,
     state,
+    isCurrentFolder,
   ];
 }
 
@@ -436,6 +443,12 @@ beforeEach(() => {
   );
   chooseVrFolderMock = vi.fn().mockResolvedValue(null);
   clearVrFolderMock = vi.fn().mockResolvedValue(undefined);
+  scanVrLibraryMock = vi.fn().mockResolvedValue([]);
+  queryVrStorageMock = vi
+    .fn()
+    .mockResolvedValue(["2199023255552", "549755813888"]);
+  openVrFileMock = vi.fn().mockResolvedValue(undefined);
+  revealVrFileMock = vi.fn().mockResolvedValue(undefined);
   loadVrDownloadsMock = vi.fn().mockResolvedValue([]);
   listVrDownloadsMock = vi.fn().mockResolvedValue([]);
   startVerifiedVrDownloadMock = vi.fn().mockResolvedValue("transfer-123");
@@ -498,6 +511,14 @@ beforeEach(() => {
           return clearVrFolderMock().then(() => {
             savedVrFolder = null;
           });
+        case "scan_vr_library":
+          return scanVrLibraryMock();
+        case "query_vr_storage":
+          return queryVrStorageMock();
+        case "open_vr_file":
+          return openVrFileMock(parameters);
+        case "reveal_vr_file":
+          return revealVrFileMock(parameters);
         case "load_vr_downloads":
           return loadVrDownloadsMock();
         case "list_vr_downloads":
@@ -538,6 +559,493 @@ afterEach(() => {
   Reflect.deleteProperty(navigator, "clipboard");
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+describe("parsed VR Library and Dashboard", () => {
+  it("distinguishes VR folder loading from an unconfigured Library", async () => {
+    const pendingFolder = createDeferred<string[]>();
+    loadVrFolderMock.mockReturnValue(pendingFolder.promise);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Loading VR folder" }),
+    ).toBeTruthy();
+    await act(async () => {
+      pendingFolder.resolve(["unconfigured"]);
+      await pendingFolder.promise;
+    });
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "Choose a VR folder to begin",
+      }),
+    ).toBeTruthy();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      folderResponse: ["ready", "/VR"],
+      heading: "No supported VR videos found",
+    },
+    {
+      folderResponse: ["unavailable", "/missing/VR"],
+      heading: "VR folder is unavailable",
+    },
+  ])("shows the truthful $heading state", async ({ folderResponse, heading }) => {
+    loadVrFolderMock.mockResolvedValue(folderResponse);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      await screen.findByRole("heading", { level: 2, name: heading }),
+    ).toBeTruthy();
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(
+      folderResponse[0] === "ready" ? 1 : 0,
+    );
+  });
+
+  it("revalidates a restored persisted VR folder before refreshing its current scan and storage", async () => {
+    const folder = "/missing/VR — 作品";
+    const restoredFolder = createDeferred<string[]>();
+    loadVrFolderMock
+      .mockResolvedValueOnce(["unavailable", folder])
+      .mockReturnValueOnce(restoredFolder.promise);
+    scanVrLibraryMock.mockResolvedValue([`${folder}/MDVR-419.mp4`, "7"]);
+    queryVrStorageMock.mockResolvedValue(["4096", "1024"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "VR folder is unavailable",
+      }),
+    ).toBeTruthy();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+
+    const refresh = screen.getByRole("button", { name: "Refresh" });
+    expect(refresh).toHaveProperty("disabled", false);
+    fireEvent.click(refresh);
+    expect(loadVrFolderMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: "Refreshing…" })).toHaveProperty(
+      "disabled",
+      true,
+    );
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      restoredFolder.resolve(["ready", folder]);
+      await restoredFolder.promise;
+    });
+    expect(await screen.findByText("MDVR-419")).toBeTruthy();
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+      expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+    });
+
+    selectDashboard();
+    const summary = screen.getByRole("region", { name: "VR Library" });
+    expect(within(summary).getByText(folder)).toBeTruthy();
+    expect(within(summary).getByText("4.0 KiB")).toBeTruthy();
+    expect(within(summary).getByText("3.0 KiB")).toBeTruthy();
+    expect(within(summary).getByText("1.0 KiB")).toBeTruthy();
+  });
+
+  it("keeps a persisted VR folder unavailable when Refresh cannot restore it", async () => {
+    const folder = "/missing/VR";
+    loadVrFolderMock.mockResolvedValue(["unavailable", folder]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "VR folder is unavailable",
+      }),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(loadVrFolderMock).toHaveBeenCalledTimes(2));
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: "VR folder is unavailable",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Refresh" })).toHaveProperty(
+      "disabled",
+      false,
+    );
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores an unavailable-folder revalidation after the folder is replaced", async () => {
+    const staleRevalidation = createDeferred<string[]>();
+    loadVrFolderMock
+      .mockResolvedValueOnce(["unavailable", "/VR/A"])
+      .mockReturnValueOnce(staleRevalidation.promise);
+    chooseVrFolderMock.mockResolvedValue("/VR/B");
+    scanVrLibraryMock.mockResolvedValue(["/VR/B/MDVR-422.mp4", "2"]);
+    queryVrStorageMock.mockResolvedValue(["4096", "1024"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "VR folder is unavailable",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(loadVrFolderMock).toHaveBeenCalledTimes(2);
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Change VR folder" }));
+    expect(await screen.findByText("/VR/B")).toBeTruthy();
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+      expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      staleRevalidation.resolve(["ready", "/VR/A"]);
+      await staleRevalidation.promise;
+    });
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(await screen.findByText("MDVR-422")).toBeTruthy();
+    expect(screen.queryByText("/VR/A")).toBeNull();
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows scanning until the complete VR result becomes ready", async () => {
+    const pendingScan = createDeferred<string[]>();
+    savedVrFolder = "/VR";
+    scanVrLibraryMock.mockReturnValue(pendingScan.promise);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      await screen.findByRole("heading", { level: 2, name: "Scanning VR folder" }),
+    ).toBeTruthy();
+    await act(async () => {
+      pendingScan.resolve(["/VR/MDVR-419.mp4", "1"]);
+      await pendingScan.promise;
+    });
+    expect(await screen.findByText("MDVR-419")).toBeTruthy();
+  });
+
+  it("shows grouped counts while preserving exact member copy, open, and reveal actions", async () => {
+    const firstPath = "/VR/作品/MDVR-419  Disc 01 — 前編.mp4";
+    const secondPath = "/VR/mdvr_00419_CD2  特別版.MKV";
+    const unassociatedPath = "/VR/MDVR-419 + ABC-123  pack.mp4";
+    savedVrFolder = "/VR";
+    scanVrLibraryMock.mockResolvedValue([
+      firstPath,
+      "1073741824",
+      secondPath,
+      "2147483648",
+      unassociatedPath,
+      "3",
+    ]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "2 VR titles · 3 files",
+      }),
+    ).toBeTruthy();
+    const vrSummary = screen.getByRole("region", { name: "VR Library" });
+    expect(within(vrSummary).getByText("2.0 TiB")).toBeTruthy();
+    expect(within(vrSummary).getByText("1.5 TiB")).toBeTruthy();
+    expect(within(vrSummary).getByText("512.0 GiB")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open VR Library" }));
+    expect(
+      (screen.getByRole("radio", { name: "VR" }) as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(await screen.findByRole("heading", { level: 3, name: "MDVR-419" })).toBeTruthy();
+    const renderedFileRows = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-vr-file-path]"),
+    );
+    expect(renderedFileRows.map((row) => row.dataset.vrFilePath)).toEqual([
+      firstPath,
+      secondPath,
+      unassociatedPath,
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy title: MDVR-419" }));
+    await waitFor(() => expect(clipboardWriteMock).toHaveBeenCalledWith("MDVR-419"));
+    const unassociatedTitle = "MDVR-419 + ABC-123  pack";
+    const unassociatedCopy = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("button[aria-label]"),
+    ).find(
+      (button) =>
+        button.getAttribute("aria-label") === `Copy title: ${unassociatedTitle}`,
+    );
+    expect(unassociatedCopy).toBeDefined();
+    fireEvent.click(unassociatedCopy as HTMLButtonElement);
+    await waitFor(() =>
+      expect(clipboardWriteMock).toHaveBeenCalledWith(unassociatedTitle),
+    );
+    const firstOpen = within(renderedFileRows[0]).getByTitle("Open file");
+    const secondReveal = within(renderedFileRows[1]).getByTitle("Reveal file");
+    expect(firstOpen.getAttribute("aria-label")).toBe(`Open VR file: ${firstPath}`);
+    expect(secondReveal.getAttribute("aria-label")).toBe(
+      `Reveal VR file: ${secondPath}`,
+    );
+    fireEvent.click(firstOpen);
+    fireEvent.click(secondReveal);
+    await waitFor(() => {
+      expect(openVrFileMock).toHaveBeenCalledWith({ path: firstPath });
+      expect(revealVrFileMock).toHaveBeenCalledWith({ path: secondPath });
+    });
+  });
+
+  it("searches before sorting and pagination without rescanning across resize or navigation", async () => {
+    savedVrFolder = "/VR";
+    scanVrLibraryMock.mockResolvedValue(
+      Array.from({ length: 25 }, (_, index) => {
+        const code = `MDVR-${String(index + 101)}`;
+        return [`/VR/${code}.mp4`, "1"];
+      }).flat(),
+    );
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    await screen.findByText("MDVR-101");
+
+    resizeGallery("library", 1088, 728);
+    expect(visibleCardCount("VR titles")).toBe(25);
+    resizeGallery("library", 1528, 136);
+    expect(visibleCardCount("VR titles")).toBe(7);
+    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Next VR titles page" }),
+    );
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+    resizeGallery("library", 1088, 284);
+    expect(visibleCardCount("VR titles")).toBe(10);
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(screen.getByText("MDVR-111")).toBeTruthy();
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "MDVR-125" },
+    });
+    expect(await screen.findByText("MDVR-125")).toBeTruthy();
+    expect(visibleCardCount("VR titles")).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: "Clear VR search" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort titles" }), {
+      target: { value: "descending" },
+    });
+    const sortedTitles = within(screen.getByRole("list", { name: "VR titles" }))
+      .getAllByRole("heading", { level: 3 })
+      .map((heading) => heading.textContent);
+    expect(sortedTitles.slice(0, 2)).toEqual(["MDVR-125", "MDVR-124"]);
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "MDVR-125" },
+    });
+
+    selectDashboard();
+    selectLibrary();
+    expect(
+      (screen.getByRole("radio", { name: "VR" }) as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("textbox", { name: "Search titles" }) as HTMLInputElement)
+        .value,
+    ).toBe("MDVR-125");
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectLibrary();
+    expect(
+      (screen.getByRole("radio", { name: "VR" }) as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("combobox", { name: "Sort titles" }) as HTMLSelectElement)
+        .value,
+    ).toBe("descending");
+    resizeGallery("library", 720, 520);
+    expect(screen.getByText("MDVR-125")).toBeTruthy();
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(pauseVrDownloadMock).not.toHaveBeenCalled();
+    expect(resumeVrDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("isolates file action errors and keeps storage ready when a refresh scan fails", async () => {
+    const firstPath = "/VR/MDVR-419.mp4";
+    const secondPath = "/VR/MDVR-422.mkv";
+    savedVrFolder = "/VR";
+    scanVrLibraryMock.mockResolvedValue([
+      firstPath,
+      "1",
+      secondPath,
+      "2",
+    ]);
+    openVrFileMock.mockRejectedValueOnce("vr_file_open_stale");
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    await screen.findByText("MDVR-419");
+    fireEvent.click(screen.getByRole("button", { name: `Open VR file: ${firstPath}` }));
+    expect(
+      await screen.findByText("This file is no longer part of the current VR Library."),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: `Reveal VR file: ${secondPath}` }));
+    await waitFor(() =>
+      expect(revealVrFileMock).toHaveBeenCalledWith({ path: secondPath }),
+    );
+    expect(screen.getByText("MDVR-422")).toBeTruthy();
+
+    scanVrLibraryMock.mockRejectedValueOnce("vr_library_scan_failed");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    selectDashboard();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "VR Library scan failed" }),
+    ).toBeTruthy();
+    expect(
+      within(screen.getByRole("region", { name: "VR Library" })).getByText(
+        "2.0 TiB",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("ignores late scan and storage results from a replaced VR folder", async () => {
+    const oldScan = createDeferred<string[]>();
+    const oldStorage = createDeferred<[string, string]>();
+    savedVrFolder = "/VR/A";
+    chooseVrFolderMock.mockResolvedValue("/VR/B");
+    scanVrLibraryMock
+      .mockReturnValueOnce(oldScan.promise)
+      .mockResolvedValueOnce(["/VR/B/MDVR-422.mp4", "2"]);
+    queryVrStorageMock
+      .mockReturnValueOnce(oldStorage.promise)
+      .mockResolvedValueOnce(["4096", "1024"]);
+
+    render(<App />);
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+      expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+    });
+    selectSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Change VR folder" }));
+    expect(await screen.findByText("/VR/B")).toBeTruthy();
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
+      expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
+    });
+
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(await screen.findByText("MDVR-422")).toBeTruthy();
+    await act(async () => {
+      oldScan.resolve(["/VR/A/MDVR-419.mp4", "1"]);
+      oldStorage.resolve(["8192", "4096"]);
+      await Promise.all([oldScan.promise, oldStorage.promise]);
+    });
+    expect(screen.queryByText("MDVR-419")).toBeNull();
+
+    selectDashboard();
+    const summary = screen.getByRole("region", { name: "VR Library" });
+    expect(within(summary).getByText("4.0 KiB")).toBeTruthy();
+    expect(within(summary).getByText("3.0 KiB")).toBeTruthy();
+    expect(within(summary).getByText("1.0 KiB")).toBeTruthy();
+  });
+
+  it("refreshes scan and storage once when a transfer first completes", async () => {
+    vi.useFakeTimers();
+    savedVrFolder = "/VR";
+    loadVrDownloadsMock.mockResolvedValue(
+      [
+        ...vrDownloadFixture({
+          releaseName: "MDVR-419 release",
+          state: "downloading",
+          transferId: "transfer-419",
+        }),
+        ...vrDownloadFixture({
+          isCurrentFolder: "false",
+          releaseName: "MDVR-422 old-folder release",
+          state: "downloading",
+          transferId: "transfer-422",
+        }),
+      ],
+    );
+    listVrDownloadsMock
+      .mockResolvedValueOnce([
+        ...vrDownloadFixture({
+          releaseName: "MDVR-419 release",
+          state: "downloading",
+          transferId: "transfer-419",
+        }),
+        ...vrDownloadFixture({
+          downloadedBytes: "10",
+          isCurrentFolder: "false",
+          releaseName: "MDVR-422 old-folder release",
+          speedBytesPerSecond: "0",
+          state: "completed",
+          transferId: "transfer-422",
+        }),
+      ])
+      .mockResolvedValueOnce([
+        ...vrDownloadFixture({
+          downloadedBytes: "10",
+          releaseName: "MDVR-419 release",
+          speedBytesPerSecond: "0",
+          state: "completed",
+          transferId: "transfer-419",
+        }),
+        ...vrDownloadFixture({
+          downloadedBytes: "10",
+          isCurrentFolder: "false",
+          releaseName: "MDVR-422 old-folder release",
+          speedBytesPerSecond: "0",
+          state: "completed",
+          transferId: "transfer-422",
+        }),
+      ]);
+
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("Mira visual preset", () => {
@@ -3252,7 +3760,7 @@ describe("VR Discover and verified release comparison", () => {
       downloadRows[6] = "0";
     });
     dismissVrDownloadMock.mockImplementation(async () => {
-      downloadRows = downloadRows.slice(8);
+      downloadRows = downloadRows.slice(9);
     });
     resumeVrDownloadMock.mockRejectedValueOnce("vr_download_failed");
     render(<App />);

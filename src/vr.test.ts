@@ -7,6 +7,7 @@ import {
   inspectVerifiedSukebeiTorrent,
   loadVrDownloads,
   loadVrFolder,
+  scanVrLibrary,
   startVerifiedVrDownload,
 } from "./vr";
 
@@ -81,6 +82,105 @@ describe("VR product-code identity", () => {
   it("rejects missing, malformed, and zero product codes", () => {
     for (const value of ["", "   ", "MDVR", "419", "MDVR-0", "MDVR-41A"])
       expect(canonicalizeProductCode(value)).toBeNull();
+  });
+});
+
+describe("parsed VR Library identity", () => {
+  it("groups only equivalent exact codes and preserves every exact file identity", async () => {
+    const firstPath = "/VR/作品/MDVR-419  Disc 01 — 前編.mp4";
+    const secondPath = "/VR/mdvr_00419_CD2  特別版.MKV";
+    const mixedPath = "/VR/MDVR-419 + ABC-123  pack.mp4";
+    invokeMock.mockResolvedValue([
+      firstPath,
+      "10",
+      secondPath,
+      "20",
+      "/VR/MDVR-422.mp4",
+      "30",
+      "/VR/MDVR-430.mp4",
+      "40",
+      "/VR/MDVR-433.mp4",
+      "50",
+      "/VR/MDVR-374.mp4",
+      "60",
+      "/VR/MDVR-4190.mp4",
+      "70",
+      "/VR/XMDVR-419.mp4",
+      "80",
+      mixedPath,
+      "90",
+    ]);
+    const items = await scanVrLibrary();
+
+    const mdvr419 = items.find((item) => item.code === "MDVR-419");
+    expect(mdvr419).toEqual({
+      id: "code:MDVR-419",
+      title: "MDVR-419",
+      code: "MDVR-419",
+      files: [
+        {
+          path: firstPath,
+          filename: "MDVR-419  Disc 01 — 前編.mp4",
+          title: "MDVR-419  Disc 01 — 前編",
+          sizeBytes: "10",
+          partLabel: "Disc 01",
+        },
+        {
+          path: secondPath,
+          filename: "mdvr_00419_CD2  特別版.MKV",
+          title: "mdvr_00419_CD2  特別版",
+          sizeBytes: "20",
+          partLabel: "CD2",
+        },
+      ],
+    });
+    expect(mdvr419?.files).toHaveLength(2);
+    for (const protectedCode of [
+      "MDVR-422",
+      "MDVR-430",
+      "MDVR-433",
+      "MDVR-374",
+      "MDVR-4190",
+      "XMDVR-419",
+    ]) {
+      expect(items.find((item) => item.code === protectedCode)?.files).toHaveLength(1);
+    }
+    expect(items.find((item) => item.id === `file:${mixedPath}`)).toMatchObject({
+      title: "MDVR-419 + ABC-123  pack",
+      code: null,
+    });
+  });
+
+  it("rejects malformed native rows and duplicate paths", async () => {
+    invokeMock.mockResolvedValueOnce(["/VR/MDVR-419.mp4"]);
+    await expect(scanVrLibrary()).rejects.toThrow("invalid data");
+    invokeMock.mockResolvedValueOnce([
+        "/VR/MDVR-419.mp4",
+        "1",
+        "/VR/MDVR-419.mp4",
+        "1",
+      ]);
+    await expect(scanVrLibrary()).rejects.toThrow("invalid data");
+  });
+
+  it("records only unambiguous multipart labels without inventing missing members", async () => {
+    invokeMock.mockResolvedValue([
+      "/VR/Folder A/MDVR-777 Part 01.mp4",
+      "1",
+      "/VR/Folder C/MDVR-777 Part 03.mkv",
+      "3",
+      "/VR/Folder D/MDVR-777 Part 01 Disc 02.mp4",
+      "4",
+    ]);
+
+    const items = await scanVrLibrary();
+
+    expect(items).toHaveLength(1);
+    expect(items[0].files.map((file) => [file.path, file.partLabel])).toEqual([
+      ["/VR/Folder A/MDVR-777 Part 01.mp4", "Part 01"],
+      ["/VR/Folder C/MDVR-777 Part 03.mkv", "Part 03"],
+      ["/VR/Folder D/MDVR-777 Part 01 Disc 02.mp4", null],
+    ]);
   });
 });
 
@@ -446,6 +546,7 @@ describe("trusted VR download boundary", () => {
       "7",
       "1024",
       "paused",
+      "true",
     ]);
 
     await expect(loadVrDownloads()).resolves.toEqual([
@@ -458,6 +559,7 @@ describe("trusted VR download boundary", () => {
         downloadedBytes: "7",
         speedBytesPerSecond: "1024",
         state: "paused",
+        isCurrentFolder: true,
       },
     ]);
     expect(invokeMock).toHaveBeenCalledWith("load_vr_downloads");
