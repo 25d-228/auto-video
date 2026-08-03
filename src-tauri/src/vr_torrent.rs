@@ -9,6 +9,7 @@ use std::{
 const SUKEBEI_DOWNLOAD_PREFIX: &str = "https://sukebei.nyaa.si/download/";
 const SUKEBEI_VIEW_PREFIX: &str = "https://sukebei.nyaa.si/view/";
 const PROVIDER_ITEM_ID_MAX_DIGITS: usize = 20;
+const SHA1_DIGEST_BYTES: usize = 20;
 const TORRENT_MAX_BYTES: usize = 2 * 1024 * 1024;
 const TORRENT_MAX_REDIRECTS: usize = 3;
 const TORRENT_STATUS_MARKER: &[u8] = b"\nAUTO_VIDEO_TORRENT_STATUS:";
@@ -694,10 +695,10 @@ impl<'a> BencodeParser<'a> {
             .map(|offset| offset + self.position)
             .ok_or(TorrentInspectionError::Malformed)?;
         let encoded = &self.input[self.position..end];
-        if encoded.is_empty()
-            || encoded == b"-0"
-            || (encoded.starts_with(b"0") && encoded.len() > 1)
-            || (encoded.starts_with(b"-0") && encoded.len() > 2)
+        let digits = encoded.strip_prefix(b"-").unwrap_or(encoded);
+        if digits.is_empty()
+            || !digits.iter().all(|character| character.is_ascii_digit())
+            || (digits.starts_with(b"0") && (digits.len() > 1 || encoded.starts_with(b"-")))
         {
             return Err(TorrentInspectionError::Malformed);
         }
@@ -778,9 +779,11 @@ fn parse_torrent_metadata(bytes: &[u8]) -> Result<TorrentMetadata, TorrentInspec
     }
     let piece_length = integer_value(info_dictionary, b"piece length")?;
     let pieces = bytes_value(info_dictionary, b"pieces")?;
-    if piece_length <= 0 || pieces.is_empty() || pieces.len() % 20 != 0 {
+    if piece_length <= 0 || pieces.is_empty() || pieces.len() % SHA1_DIGEST_BYTES != 0 {
         return Err(TorrentInspectionError::Unsupported);
     }
+    let piece_length =
+        u64::try_from(piece_length).map_err(|_| TorrentInspectionError::Unsupported)?;
 
     let display_name = match dictionary_value(info_dictionary, b"name.utf-8") {
         Some(name) => node_text(name)?,
@@ -803,6 +806,11 @@ fn parse_torrent_metadata(bytes: &[u8]) -> Result<TorrentMetadata, TorrentInspec
             .checked_add(file.size)
             .ok_or(TorrentInspectionError::Unsupported)
     })?;
+    let piece_hash_count = u64::try_from(pieces.len() / SHA1_DIGEST_BYTES)
+        .map_err(|_| TorrentInspectionError::Unsupported)?;
+    if piece_hash_count != total_size.div_ceil(piece_length) {
+        return Err(TorrentInspectionError::Unsupported);
+    }
     let infohash = hex_sha1(&bytes[info.start..info.end]);
 
     Ok(TorrentMetadata {
@@ -1018,8 +1026,26 @@ mod tests {
 
     use super::*;
 
+    fn single_file_torrent_with_fields(
+        length: &str,
+        piece_length: &str,
+        piece_hash_count: usize,
+    ) -> Vec<u8> {
+        let piece_bytes = piece_hash_count * SHA1_DIGEST_BYTES;
+        let mut encoded = b"d4:infod6:lengthi".to_vec();
+        encoded.extend_from_slice(length.as_bytes());
+        encoded.extend_from_slice(b"e4:name12:Movie  A.mp412:piece lengthi");
+        encoded.extend_from_slice(piece_length.as_bytes());
+        encoded.extend_from_slice(b"e6:pieces");
+        encoded.extend_from_slice(piece_bytes.to_string().as_bytes());
+        encoded.push(b':');
+        encoded.extend(std::iter::repeat_n(b'a', piece_bytes));
+        encoded.extend_from_slice(b"ee");
+        encoded
+    }
+
     fn single_file_torrent() -> Vec<u8> {
-        b"d4:infod6:lengthi5e4:name12:Movie  A.mp412:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec()
+        single_file_torrent_with_fields("5", "16384", 1)
     }
 
     fn push_bencoded_bytes(encoded: &mut Vec<u8>, value: &str) {
@@ -1028,7 +1054,10 @@ mod tests {
         encoded.extend_from_slice(value.as_bytes());
     }
 
-    fn multi_file_torrent() -> Vec<u8> {
+    fn multi_file_torrent_with_piece_fields(
+        piece_length: &str,
+        piece_hash_count: usize,
+    ) -> Vec<u8> {
         let mut encoded = b"d4:infod5:filesl".to_vec();
         encoded.extend_from_slice(b"d6:lengthi3e4:pathl");
         push_bencoded_bytes(&mut encoded, "Folder");
@@ -1038,8 +1067,25 @@ mod tests {
         push_bencoded_bytes(&mut encoded, "特別版  B.mp4");
         encoded.extend_from_slice(b"eee4:name");
         push_bencoded_bytes(&mut encoded, "VR  — 作品");
-        encoded.extend_from_slice(b"12:piece lengthi16384e6:pieces20:bbbbbbbbbbbbbbbbbbbbee");
+        encoded.extend_from_slice(b"12:piece lengthi");
+        encoded.extend_from_slice(piece_length.as_bytes());
+        encoded.extend_from_slice(b"e6:pieces");
+        let piece_bytes = piece_hash_count * SHA1_DIGEST_BYTES;
+        encoded.extend_from_slice(piece_bytes.to_string().as_bytes());
+        encoded.push(b':');
+        encoded.extend(std::iter::repeat_n(b'b', piece_bytes));
+        encoded.extend_from_slice(b"ee");
         encoded
+    }
+
+    fn multi_file_torrent() -> Vec<u8> {
+        multi_file_torrent_with_piece_fields("16384", 1)
+    }
+
+    fn fixture_infohash(bytes: &[u8]) -> String {
+        let info_start = b"d4:info".len();
+        assert!(bytes.starts_with(b"d4:info") && bytes.ends_with(b"e"));
+        hex_sha1(&bytes[info_start..bytes.len() - 1])
     }
 
     fn release_feed(name: &str, item_id: &str, torrent_url: &str, infohash: &str) -> String {
@@ -1074,6 +1120,52 @@ mod tests {
             )
             .expect("feed must be current");
         state
+    }
+
+    fn assert_inspection_rejected_without_cached_save(
+        bytes: Vec<u8>,
+        expected_error: &'static str,
+    ) {
+        let infohash = fixture_infohash(&bytes);
+        let state = state_with_release("MDVR-419 exact", &infohash);
+        assert_eq!(
+            inspect_sukebei_torrent_with(
+                &state,
+                trusted_request("MDVR-419 exact", &infohash),
+                |_| Ok(ArtifactResponse {
+                    status: 200,
+                    redirect_url: None,
+                    body: bytes.clone(),
+                }),
+            ),
+            Err(expected_error)
+        );
+        assert!(state
+            .0
+            .lock()
+            .expect("torrent state must remain readable")
+            .cached_torrent
+            .is_none());
+
+        let chose_destination = RefCell::new(false);
+        let wrote = RefCell::new(false);
+        assert_eq!(
+            save_verified_torrent_with(
+                &state,
+                "rejected-inspection",
+                |_| {
+                    chose_destination.replace(true);
+                    Some(PathBuf::from("unused.torrent"))
+                },
+                |_, _| {
+                    wrote.replace(true);
+                    Ok(())
+                },
+            ),
+            Err(VR_TORRENT_STALE)
+        );
+        assert!(!chose_destination.into_inner());
+        assert!(!wrote.into_inner());
     }
 
     #[test]
@@ -1182,6 +1274,31 @@ mod tests {
         assert_eq!(
             parse_torrent_metadata(b"d4:infod5:filesld6:lengthi1e4:pathl2:..eee4:name4:Root12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee"),
             Err(TorrentInspectionError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn rejects_plus_prefixed_required_integers_without_caching_for_save() {
+        for bytes in [
+            single_file_torrent_with_fields("+1", "16384", 1),
+            single_file_torrent_with_fields("5", "+03", 2),
+        ] {
+            assert_inspection_rejected_without_cached_save(bytes, VR_TORRENT_MALFORMED);
+        }
+    }
+
+    #[test]
+    fn rejects_too_many_and_too_few_piece_hashes_without_caching_for_save() {
+        let too_many_single_file_hashes = single_file_torrent_with_fields("5", "16384", 2);
+        assert_inspection_rejected_without_cached_save(
+            too_many_single_file_hashes,
+            VR_TORRENT_UNSUPPORTED,
+        );
+
+        let too_few_multi_file_hashes = multi_file_torrent_with_piece_fields("4", 2);
+        assert_inspection_rejected_without_cached_save(
+            too_few_multi_file_hashes,
+            VR_TORRENT_UNSUPPORTED,
         );
     }
 
