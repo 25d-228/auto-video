@@ -102,6 +102,7 @@ struct TransferRecord {
     fingerprints: Vec<String>,
     state: TransferState,
     downloaded_bytes: u64,
+    boundary_segments: Arc<Mutex<BTreeMap<usize, Vec<SparseSegment>>>>,
     handle: Option<ManagedTorrentHandle>,
     handle_generation: u64,
     pending_action: Option<TransferAction>,
@@ -350,6 +351,7 @@ fn transfer_from_source(
         fingerprints: Vec::new(),
         state,
         downloaded_bytes: 0,
+        boundary_segments: Arc::new(Mutex::new(BTreeMap::new())),
         handle: None,
         handle_generation: 0,
         pending_action: None,
@@ -414,8 +416,28 @@ fn encoded_fingerprints(record: &TransferRecord) -> String {
         .join(",")
 }
 
-fn encode_transfer(record: &TransferRecord) -> Vec<u8> {
-    [
+fn encoded_boundary_segments(record: &TransferRecord) -> Result<String, &'static str> {
+    let segments = record
+        .boundary_segments
+        .lock()
+        .map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    Ok(segments
+        .iter()
+        .flat_map(|(file_id, segments)| {
+            segments.iter().map(move |segment| {
+                format!(
+                    "{file_id}:{}:{}",
+                    segment.offset,
+                    encode_hex(&segment.bytes)
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(";"))
+}
+
+fn encode_transfer(record: &TransferRecord) -> Result<Vec<u8>, &'static str> {
+    Ok([
         encode_hex(record.transfer_id.as_bytes()),
         encode_hex(record.code.as_bytes()),
         encode_hex(record.release_name.as_bytes()),
@@ -426,9 +448,10 @@ fn encode_transfer(record: &TransferRecord) -> Vec<u8> {
         encoded_selected_ids(record),
         encoded_fingerprints(record),
         record.downloaded_bytes.to_string(),
+        encoded_boundary_segments(record)?,
     ]
     .join("\t")
-    .into_bytes()
+    .into_bytes())
 }
 
 fn parse_selected_ids(value: &[u8]) -> Option<Vec<usize>> {
@@ -451,13 +474,74 @@ fn parse_fingerprints(value: &[u8]) -> Option<Vec<String>> {
     value.split(|byte| *byte == b',').map(decode_text).collect()
 }
 
+fn parse_boundary_segments(value: &[u8]) -> Option<BTreeMap<usize, Vec<SparseSegment>>> {
+    let value = std::str::from_utf8(value).ok()?;
+    let mut retained = BTreeMap::<usize, Vec<SparseSegment>>::new();
+    if value.is_empty() {
+        return Some(retained);
+    }
+    for encoded in value.split(';') {
+        let mut fields = encoded.split(':');
+        let file_id = fields.next()?.parse::<usize>().ok()?;
+        let offset = fields.next()?.parse::<u64>().ok()?;
+        let bytes = decode_hex(fields.next()?.as_bytes())?;
+        if fields.next().is_some() || bytes.is_empty() {
+            return None;
+        }
+        offset.checked_add(bytes.len() as u64)?;
+        let segments = retained.entry(file_id).or_default();
+        if let Some(previous) = segments.last() {
+            let previous_end = previous.offset.checked_add(previous.bytes.len() as u64)?;
+            if previous_end >= offset {
+                return None;
+            }
+        }
+        segments.push(SparseSegment { offset, bytes });
+    }
+    (retained.len() <= MAX_SELECTED_FILES).then_some(retained)
+}
+
 fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
     let fields = line.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-    let [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes] =
-        fields.as_slice()
-    else {
-        return None;
+    let (fields, boundary_segments) = match fields.as_slice() {
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes] => {
+            (
+                [
+                    *transfer_id,
+                    *code,
+                    *release_name,
+                    *infohash,
+                    *destination,
+                    *state,
+                    *metainfo,
+                    *selected_ids,
+                    *fingerprints,
+                    *downloaded_bytes,
+                ],
+                BTreeMap::new(),
+            )
+        }
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments] => {
+            (
+                [
+                    *transfer_id,
+                    *code,
+                    *release_name,
+                    *infohash,
+                    *destination,
+                    *state,
+                    *metainfo,
+                    *selected_ids,
+                    *fingerprints,
+                    *downloaded_bytes,
+                ],
+                parse_boundary_segments(boundary_segments)?,
+            )
+        }
+        _ => return None,
     };
+    let [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes] =
+        fields;
     let transfer_id = decode_text(transfer_id)?;
     let code = decode_text(code)?;
     let release_name = decode_text(release_name)?;
@@ -505,6 +589,7 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
         fingerprints,
         state,
         downloaded_bytes,
+        boundary_segments: Arc::new(Mutex::new(boundary_segments)),
         handle: None,
         handle_generation: 0,
         pending_action: None,
@@ -582,13 +667,16 @@ fn write_persisted_transfers(
     let mut bytes = PERSISTENCE_HEADER.to_vec();
     for transfer in transfers.iter().take(MAX_PERSISTED_TRANSFERS) {
         match transfer {
-            StoredTransfer::Valid(record) => bytes.extend_from_slice(&encode_transfer(record)),
+            StoredTransfer::Valid(record) => bytes.extend_from_slice(&encode_transfer(record)?),
             StoredTransfer::Corrupt(record) => {
                 bytes.push(b'!');
                 bytes.extend_from_slice(encode_hex(&record.raw_line).as_bytes());
             }
         }
         bytes.push(b'\n');
+    }
+    if bytes.len() as u64 > MAX_PERSISTENCE_BYTES {
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
     }
     fs::write(path, bytes).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)
 }
@@ -644,11 +732,17 @@ async fn session_for(
 struct SelectedFileStorageFactory {
     destination: PathBuf,
     selected_files: Arc<BTreeMap<usize, VerifiedDownloadFile>>,
+    boundary_segments: Arc<Mutex<BTreeMap<usize, Vec<SparseSegment>>>>,
     resume: bool,
 }
 
 impl SelectedFileStorageFactory {
-    fn new(destination: PathBuf, selected_files: &[VerifiedDownloadFile], resume: bool) -> Self {
+    fn new(
+        destination: PathBuf,
+        selected_files: &[VerifiedDownloadFile],
+        boundary_segments: Arc<Mutex<BTreeMap<usize, Vec<SparseSegment>>>>,
+        resume: bool,
+    ) -> Self {
         Self {
             destination,
             selected_files: Arc::new(
@@ -658,6 +752,7 @@ impl SelectedFileStorageFactory {
                     .map(|file| (file.file_id, file))
                     .collect(),
             ),
+            boundary_segments,
             resume,
         }
     }
@@ -674,6 +769,7 @@ impl StorageFactory for SelectedFileStorageFactory {
         Ok(SelectedFileStorage {
             destination: self.destination.clone(),
             selected_files: self.selected_files.clone(),
+            boundary_segments: self.boundary_segments.clone(),
             resume: self.resume,
             slots: Vec::new(),
         })
@@ -692,14 +788,12 @@ struct SparseSegment {
 
 struct SelectedStorageSlot {
     file: Mutex<Option<File>>,
-    sparse_segments: Mutex<Vec<SparseSegment>>,
 }
 
 impl SelectedStorageSlot {
     fn new(file: Option<File>) -> Self {
         Self {
             file: Mutex::new(file),
-            sparse_segments: Mutex::new(Vec::new()),
         }
     }
 
@@ -709,24 +803,71 @@ impl SelectedStorageSlot {
             .lock()
             .map_err(|_| anyhow!("selected file lock failed"))?
             .take();
-        let segments = std::mem::take(
-            &mut *self
-                .sparse_segments
-                .lock()
-                .map_err(|_| anyhow!("boundary-byte lock failed"))?,
-        );
-        Ok(Self {
-            file: Mutex::new(file),
-            sparse_segments: Mutex::new(segments),
-        })
+        Ok(Self::new(file))
     }
 }
 
 struct SelectedFileStorage {
     destination: PathBuf,
     selected_files: Arc<BTreeMap<usize, VerifiedDownloadFile>>,
+    boundary_segments: Arc<Mutex<BTreeMap<usize, Vec<SparseSegment>>>>,
     resume: bool,
     slots: Vec<SelectedStorageSlot>,
+}
+
+fn write_sparse_segment(
+    segments: &mut Vec<SparseSegment>,
+    offset: u64,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let mut merged_start = offset;
+    let mut merged_end = offset
+        .checked_add(bytes.len() as u64)
+        .context("boundary write overflow")?;
+    let first = segments
+        .iter()
+        .position(|segment| {
+            segment
+                .offset
+                .checked_add(segment.bytes.len() as u64)
+                .is_none_or(|end| end >= merged_start)
+        })
+        .unwrap_or(segments.len());
+    let mut last = first;
+    while let Some(segment) = segments.get(last) {
+        if segment.offset > merged_end {
+            break;
+        }
+        merged_start = merged_start.min(segment.offset);
+        merged_end = merged_end.max(
+            segment
+                .offset
+                .checked_add(segment.bytes.len() as u64)
+                .context("boundary segment overflow")?,
+        );
+        last += 1;
+    }
+
+    let merged_length =
+        usize::try_from(merged_end - merged_start).context("boundary segment is too large")?;
+    let mut merged_bytes = vec![0; merged_length];
+    for segment in &segments[first..last] {
+        let start = usize::try_from(segment.offset - merged_start)?;
+        merged_bytes[start..start + segment.bytes.len()].copy_from_slice(&segment.bytes);
+    }
+    let write_start = usize::try_from(offset - merged_start)?;
+    merged_bytes[write_start..write_start + bytes.len()].copy_from_slice(bytes);
+    segments.splice(
+        first..last,
+        [SparseSegment {
+            offset: merged_start,
+            bytes: merged_bytes,
+        }],
+    );
+    Ok(())
 }
 
 fn librqbit_relative_path(path: &Path) -> anyhow::Result<String> {
@@ -777,6 +918,30 @@ impl TorrentStorage for SelectedFileStorage {
         _shared: &librqbit::ManagedTorrentShared,
         metadata: &librqbit::TorrentMetadata,
     ) -> anyhow::Result<()> {
+        {
+            let boundary_segments = self
+                .boundary_segments
+                .lock()
+                .map_err(|_| anyhow!("boundary-byte lock failed"))?;
+            for (file_id, segments) in boundary_segments.iter() {
+                let file_info = metadata
+                    .file_infos
+                    .get(*file_id)
+                    .context("retained boundary file is outside parsed torrent")?;
+                if self.selected_files.contains_key(file_id) {
+                    return Err(anyhow!("retained boundary file is selected"));
+                }
+                for segment in segments {
+                    let end = segment
+                        .offset
+                        .checked_add(segment.bytes.len() as u64)
+                        .context("retained boundary segment overflow")?;
+                    if end > file_info.len {
+                        return Err(anyhow!("retained boundary segment exceeds its file"));
+                    }
+                }
+            }
+        }
         let mut slots = Vec::with_capacity(metadata.file_infos.len());
         for (file_id, file_info) in metadata.file_infos.iter().enumerate() {
             let selected = self.selected_files.get(&file_id);
@@ -824,24 +989,25 @@ impl TorrentStorage for SelectedFileStorage {
         let read_end = offset
             .checked_add(buffer.len() as u64)
             .context("boundary read overflow")?;
-        for segment in slot
-            .sparse_segments
+        let boundary_segments = self
+            .boundary_segments
             .lock()
-            .map_err(|_| anyhow!("boundary-byte lock failed"))?
-            .iter()
-        {
-            let segment_end = segment
-                .offset
-                .checked_add(segment.bytes.len() as u64)
-                .context("boundary segment overflow")?;
-            let overlap_start = offset.max(segment.offset);
-            let overlap_end = read_end.min(segment_end);
-            if overlap_start < overlap_end {
-                let source_start = (overlap_start - segment.offset) as usize;
-                let destination_start = (overlap_start - offset) as usize;
-                let length = (overlap_end - overlap_start) as usize;
-                buffer[destination_start..destination_start + length]
-                    .copy_from_slice(&segment.bytes[source_start..source_start + length]);
+            .map_err(|_| anyhow!("boundary-byte lock failed"))?;
+        if let Some(segments) = boundary_segments.get(&file_id) {
+            for segment in segments {
+                let segment_end = segment
+                    .offset
+                    .checked_add(segment.bytes.len() as u64)
+                    .context("boundary segment overflow")?;
+                let overlap_start = offset.max(segment.offset);
+                let overlap_end = read_end.min(segment_end);
+                if overlap_start < overlap_end {
+                    let source_start = (overlap_start - segment.offset) as usize;
+                    let destination_start = (overlap_start - offset) as usize;
+                    let length = (overlap_end - overlap_start) as usize;
+                    buffer[destination_start..destination_start + length]
+                        .copy_from_slice(&segment.bytes[source_start..source_start + length]);
+                }
             }
         }
         Ok(())
@@ -859,14 +1025,15 @@ impl TorrentStorage for SelectedFileStorage {
             file.write_all(buffer)?;
             return Ok(());
         }
-        slot.sparse_segments
+        let mut boundary_segments = self
+            .boundary_segments
             .lock()
-            .map_err(|_| anyhow!("boundary-byte lock failed"))?
-            .push(SparseSegment {
-                offset,
-                bytes: buffer.to_vec(),
-            });
-        Ok(())
+            .map_err(|_| anyhow!("boundary-byte lock failed"))?;
+        write_sparse_segment(
+            boundary_segments.entry(file_id).or_default(),
+            offset,
+            buffer,
+        )
     }
 
     fn remove_file(&self, file_id: usize, _filename: &Path) -> anyhow::Result<()> {
@@ -911,6 +1078,7 @@ impl TorrentStorage for SelectedFileStorage {
         Ok(Box::new(Self {
             destination: self.destination.clone(),
             selected_files: self.selected_files.clone(),
+            boundary_segments: self.boundary_segments.clone(),
             resume: self.resume,
             slots: self
                 .slots
@@ -1027,8 +1195,12 @@ async fn add_record_to_session(
     resume: bool,
 ) -> Result<ManagedTorrentHandle, &'static str> {
     let selected_file_ids = record.selected_file_ids();
-    let storage =
-        SelectedFileStorageFactory::new(record.destination.clone(), &record.selected_files, resume);
+    let storage = SelectedFileStorageFactory::new(
+        record.destination.clone(),
+        &record.selected_files,
+        record.boundary_segments.clone(),
+        resume,
+    );
     let response = session
         .add_torrent(
             AddTorrent::from_bytes(record.metainfo.clone()),
@@ -1155,6 +1327,7 @@ async fn restore_record(
             fingerprints: record.fingerprints.clone(),
             state: record.state,
             downloaded_bytes: record.downloaded_bytes,
+            boundary_segments: record.boundary_segments.clone(),
             handle: None,
             handle_generation: record.handle_generation,
             pending_action: None,
@@ -1168,12 +1341,29 @@ async fn restore_record(
             if let Ok(mut context) = state.0.lock() {
                 if let Some(record) = find_valid_record_mut(&mut context.transfers, transfer_id) {
                     record.state = TransferState::Offline;
+                    record.downloaded_bytes = 0;
                 }
                 let _ = write_persisted_transfers(persistence_path, &context.transfers);
             }
             return;
         }
     };
+    let restored_downloaded_bytes = verified_selected_bytes(&record_snapshot, &handle)
+        .unwrap_or_default()
+        .min(record_snapshot.selected_total());
+    if restored_downloaded_bytes < record_snapshot.downloaded_bytes {
+        let _ = session.delete(handle.id().into(), false).await;
+        if let Ok(mut context) = state.0.lock() {
+            if let Some(record) = find_valid_record_mut(&mut context.transfers, transfer_id) {
+                record.state = TransferState::Offline;
+                record.downloaded_bytes = restored_downloaded_bytes;
+                record.handle = None;
+                record.pending_action = None;
+            }
+            let _ = write_persisted_transfers(persistence_path, &context.transfers);
+        }
+        return;
+    }
 
     let handle_generation = {
         let mut context = match state.0.lock() {
@@ -1183,6 +1373,7 @@ async fn restore_record(
         let Some(record) = find_valid_record_mut(&mut context.transfers, transfer_id) else {
             return;
         };
+        record.downloaded_bytes = restored_downloaded_bytes;
         record.handle_generation = record.handle_generation.wrapping_add(1);
         record.handle = Some(handle.clone());
         record.state = if should_resume {
@@ -1264,11 +1455,9 @@ pub async fn load_downloads(
     list_downloads(state, persistence_path)
 }
 
-fn selected_progress(record: &TransferRecord, handle: &ManagedTorrentHandle) -> (u64, u64) {
+fn verified_selected_bytes(record: &TransferRecord, handle: &ManagedTorrentHandle) -> Option<u64> {
     let stats = handle.stats();
-    let downloaded = if stats.file_progress.is_empty() {
-        record.downloaded_bytes
-    } else {
+    (!stats.file_progress.is_empty()).then(|| {
         record
             .selected_files
             .iter()
@@ -1281,7 +1470,12 @@ fn selected_progress(record: &TransferRecord, handle: &ManagedTorrentHandle) -> 
                     .min(file.size)
             })
             .sum()
-    };
+    })
+}
+
+fn selected_progress(record: &TransferRecord, handle: &ManagedTorrentHandle) -> (u64, u64) {
+    let stats = handle.stats();
+    let downloaded = verified_selected_bytes(record, handle).unwrap_or(record.downloaded_bytes);
     let speed = stats
         .live
         .map(|live| (live.download_speed.mbps.max(0.0) * 1024.0 * 1024.0) as u64)
@@ -1420,6 +1614,7 @@ pub async fn start_download(
                         fingerprints: Vec::new(),
                         state: record.state,
                         downloaded_bytes: 0,
+                        boundary_segments: record.boundary_segments.clone(),
                         handle: None,
                         handle_generation: 0,
                         pending_action: None,
@@ -1516,6 +1711,11 @@ async fn controlled_transfer(
         if !valid {
             return Err(VR_DOWNLOAD_ACTION_INVALID);
         }
+        if let Some(handle) = record.handle.as_ref() {
+            if let Some(downloaded_bytes) = verified_selected_bytes(record, handle) {
+                record.downloaded_bytes = downloaded_bytes.min(record.selected_total());
+            }
+        }
         record.pending_action = Some(action);
         if action == TransferAction::Cancel {
             record.handle_generation = record.handle_generation.wrapping_add(1);
@@ -1552,6 +1752,11 @@ async fn controlled_transfer(
         find_valid_record_mut(&mut context.transfers, transfer_id).ok_or(VR_DOWNLOAD_STALE)?;
     if record.pending_action != Some(action) || record.handle_generation != handle_generation {
         return Err(VR_DOWNLOAD_STALE);
+    }
+    if let Some(handle) = handle.as_ref() {
+        if let Some(downloaded_bytes) = verified_selected_bytes(record, handle) {
+            record.downloaded_bytes = downloaded_bytes.min(record.selected_total());
+        }
     }
     record.pending_action = None;
     if result.is_err() {
@@ -1696,7 +1901,11 @@ mod tests {
         push_bencoded_text(&mut encoded, "特別版  B.mp4");
         encoded.extend_from_slice(b"eee4:name");
         push_bencoded_text(&mut encoded, "VR  — 作品");
-        encoded.extend_from_slice(b"12:piece lengthi16384e6:pieces20:bbbbbbbbbbbbbbbbbbbbee");
+        encoded.extend_from_slice(b"12:piece lengthi16384e6:pieces20:");
+        encoded.extend_from_slice(
+            &decode_hex(hex_sha1(b"abc1234567").as_bytes()).expect("piece hash must decode"),
+        );
+        encoded.extend_from_slice(b"ee");
         encoded
     }
 
@@ -1709,6 +1918,43 @@ mod tests {
         );
         encoded.extend_from_slice(b"ee");
         encoded
+    }
+
+    fn completed_selected_boundary_record(
+        fixture: &FilesystemFixture,
+        boundary_bytes: Option<&[u8]>,
+    ) -> TransferRecord {
+        let destination = fixture.path.join("VR — retained boundary");
+        fs::create_dir_all(destination.join("Folder")).expect("selected file parent must exist");
+        let destination = fs::canonicalize(destination).expect("destination must canonicalize");
+        let metainfo = selected_file_torrent();
+        let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+        let source = revalidate_persisted_download_source(
+            &metainfo,
+            "MDVR-419",
+            "【VR】 MDVR-419  Exact — 特別版",
+            &infohash,
+            &[1],
+        )
+        .expect("selected boundary fixture must revalidate");
+        let mut record = transfer_from_source(source, destination, TransferState::Downloading);
+        fs::write(record.destination.join("Folder/特別版  B.mp4"), b"1234567")
+            .expect("completed selected file must exist");
+        record.fingerprints = capture_fingerprints(&record).expect("fingerprint must resolve");
+        record.downloaded_bytes = 7;
+        if let Some(boundary_bytes) = boundary_bytes {
+            let storage = SelectedFileStorage {
+                destination: record.destination.clone(),
+                selected_files: Arc::new(BTreeMap::new()),
+                boundary_segments: record.boundary_segments.clone(),
+                resume: true,
+                slots: vec![SelectedStorageSlot::new(None)],
+            };
+            storage
+                .pwrite_all(0, 0, boundary_bytes)
+                .expect("boundary bytes must be retained");
+        }
+        record
     }
 
     #[test]
@@ -1856,7 +2102,7 @@ mod tests {
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
         let record = transfer_from_source(source, destination, TransferState::Cancelled);
         let mut bytes = PERSISTENCE_HEADER.to_vec();
-        bytes.extend_from_slice(&encode_transfer(&record));
+        bytes.extend_from_slice(&encode_transfer(&record).expect("valid transfer must encode"));
         bytes.extend_from_slice(b"\nnot-a-record\n");
         fs::write(&path, bytes).expect("persistence fixture must write");
 
@@ -1874,6 +2120,7 @@ mod tests {
         let storage = SelectedFileStorage {
             destination: destination.clone(),
             selected_files: Arc::new(BTreeMap::new()),
+            boundary_segments: Arc::new(Mutex::new(BTreeMap::new())),
             resume: false,
             slots: vec![slot],
         };
@@ -2004,6 +2251,91 @@ mod tests {
             fs::read(destination.join("Movie.mp4")).expect("completed file must remain"),
             contents
         );
+    }
+
+    #[test]
+    fn relaunch_preserves_a_completed_selected_boundary_piece_without_a_deselected_file() {
+        const COMPLETION_ATTEMPTS: usize = 100;
+        const COMPLETION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+        let fixture = FilesystemFixture::new();
+        let record = completed_selected_boundary_record(&fixture, Some(b"abc"));
+        let transfer_id = record.transfer_id.clone();
+        let destination = record.destination.clone();
+        let persistence_path = fixture.path.join("downloads");
+        write_persisted_transfers(&persistence_path, &[StoredTransfer::Valid(record)])
+            .expect("completed boundary fixture must persist");
+        let state = VrDownloadState::default();
+
+        tauri::async_runtime::block_on(async {
+            load_downloads(
+                &state,
+                &persistence_path,
+                &fixture.path.join("boundary-session"),
+            )
+            .await
+            .expect("retained boundary state must restore without a peer");
+            let mut completed_rows = None;
+            let mut last_rows = Vec::new();
+            // One second bounds deterministic local completion without relying on a network peer.
+            for _ in 0..COMPLETION_ATTEMPTS {
+                let rows = list_downloads(&state, &persistence_path)
+                    .expect("restored boundary progress must remain readable");
+                if rows[7] == "completed" {
+                    completed_rows = Some(rows);
+                    break;
+                }
+                last_rows = rows;
+                std::thread::sleep(COMPLETION_POLL_INTERVAL);
+            }
+            let rows = completed_rows.unwrap_or_else(|| {
+                panic!("retained boundary piece must complete locally: {last_rows:?}")
+            });
+            assert_eq!(rows[0], transfer_id);
+            assert_eq!(rows[4], "7");
+            assert_eq!(rows[5], "7");
+            let context = state.0.lock().expect("state must lock");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("completed boundary transfer must remain valid");
+            };
+            assert!(record.handle.is_none());
+        });
+        assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
+        assert_eq!(
+            fs::read(destination.join("Folder/特別版  B.mp4")).expect("selected file must remain"),
+            b"1234567"
+        );
+    }
+
+    #[test]
+    fn missing_or_corrupt_retained_boundary_state_restores_offline_without_false_progress() {
+        for (case, boundary_bytes) in [("missing", None), ("corrupt", Some(&b"abd"[..]))] {
+            let fixture = FilesystemFixture::new();
+            let record = completed_selected_boundary_record(&fixture, boundary_bytes);
+            let destination = record.destination.clone();
+            let persistence_path = fixture.path.join("downloads");
+            write_persisted_transfers(&persistence_path, &[StoredTransfer::Valid(record)])
+                .expect("invalid boundary fixture must persist");
+            let state = VrDownloadState::default();
+
+            let rows = tauri::async_runtime::block_on(load_downloads(
+                &state,
+                &persistence_path,
+                &fixture.path.join(format!("{case}-boundary-session")),
+            ))
+            .expect("invalid retained state must remain dismissable");
+            assert_eq!(rows[5], "0", "{case} boundary state reported progress");
+            assert_eq!(rows[7], "offline", "{case} boundary state resumed");
+            let context = state.0.lock().expect("state must lock");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("{case} boundary transfer must remain valid");
+            };
+            assert!(
+                record.handle.is_none(),
+                "{case} boundary handle remained active"
+            );
+            assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
+        }
     }
 
     #[test]
