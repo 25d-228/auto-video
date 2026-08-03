@@ -16,6 +16,8 @@ use tauri_plugin_dialog::DialogExt;
 const MOVIES_FOLDER_FILE_NAME: &str = ".movies-folder";
 const MOVIES_FOLDER_UNAVAILABLE: &str = "movies_folder_unavailable";
 const MOVIES_FOLDER_STORAGE_FAILED: &str = "movies_folder_storage_failed";
+const MOVIES_STORAGE_FAILED: &str = "movies_storage_failed";
+const MOVIES_STORAGE_UNAVAILABLE: &str = "movies_storage_unavailable";
 const MOVIES_SCAN_FAILED: &str = "movies_scan_failed";
 const MOVIE_OPEN_FAILED: &str = "movie_open_failed";
 const MOVIE_OPEN_NOT_FILE: &str = "movie_open_not_file";
@@ -54,6 +56,125 @@ struct TrashMovieRequest {
     path: String,
     folder: Option<String>,
     library_paths: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MoviesVolumeStorageQueryError {
+    Unavailable,
+    Failed,
+}
+
+fn query_movies_volume_storage_with(
+    folder: Option<&Path>,
+    query: impl FnOnce(&Path) -> Result<[u64; 2], MoviesVolumeStorageQueryError>,
+) -> Result<[u64; 2], &'static str> {
+    let folder = folder.ok_or(MOVIES_STORAGE_UNAVAILABLE)?;
+    let metadata = fs::metadata(folder).map_err(|_| MOVIES_STORAGE_UNAVAILABLE)?;
+    if !metadata.is_dir() {
+        return Err(MOVIES_STORAGE_UNAVAILABLE);
+    }
+
+    let [total_bytes, free_bytes] = query(folder).map_err(|error| match error {
+        MoviesVolumeStorageQueryError::Unavailable => MOVIES_STORAGE_UNAVAILABLE,
+        MoviesVolumeStorageQueryError::Failed => MOVIES_STORAGE_FAILED,
+    })?;
+    if total_bytes == 0 || free_bytes > total_bytes {
+        return Err(MOVIES_STORAGE_FAILED);
+    }
+
+    Ok([total_bytes, free_bytes])
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_volume_storage(output: &[u8]) -> Result<[u64; 2], MoviesVolumeStorageQueryError> {
+    let output = std::str::from_utf8(output).map_err(|_| MoviesVolumeStorageQueryError::Failed)?;
+    let values = output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|fields| fields.len() >= 4)
+        .ok_or(MoviesVolumeStorageQueryError::Failed)?;
+    const BYTES_PER_DF_BLOCK: u64 = 1024;
+    let total_bytes = values[1]
+        .parse::<u64>()
+        .ok()
+        .and_then(|blocks| blocks.checked_mul(BYTES_PER_DF_BLOCK))
+        .ok_or(MoviesVolumeStorageQueryError::Failed)?;
+    let free_bytes = values[3]
+        .parse::<u64>()
+        .ok()
+        .and_then(|blocks| blocks.checked_mul(BYTES_PER_DF_BLOCK))
+        .ok_or(MoviesVolumeStorageQueryError::Failed)?;
+
+    Ok([total_bytes, free_bytes])
+}
+
+#[cfg(target_os = "macos")]
+fn query_movies_volume_storage(folder: &Path) -> Result<[u64; 2], MoviesVolumeStorageQueryError> {
+    // POSIX output keeps the selected volume on one row even when its mount path contains spaces.
+    let output = Command::new("/bin/df")
+        .args(["-k", "-P"])
+        .arg("--")
+        .arg(folder)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| MoviesVolumeStorageQueryError::Failed)?;
+    if !output.status.success() {
+        return Err(MoviesVolumeStorageQueryError::Unavailable);
+    }
+
+    parse_macos_volume_storage(&output.stdout)
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_volume_storage(output: &[u8]) -> Result<[u64; 2], MoviesVolumeStorageQueryError> {
+    let output = std::str::from_utf8(output).map_err(|_| MoviesVolumeStorageQueryError::Failed)?;
+    let mut values = output.split_whitespace();
+    let total_bytes = values
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(MoviesVolumeStorageQueryError::Failed)?;
+    let free_bytes = values
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(MoviesVolumeStorageQueryError::Failed)?;
+    if values.next().is_some() {
+        return Err(MoviesVolumeStorageQueryError::Failed);
+    }
+
+    Ok([total_bytes, free_bytes])
+}
+
+#[cfg(target_os = "windows")]
+fn query_movies_volume_storage(folder: &Path) -> Result<[u64; 2], MoviesVolumeStorageQueryError> {
+    const WINDOWS_MOVIES_FOLDER_ENV: &str = "AUTO_VIDEO_MOVIES_FOLDER";
+    const WINDOWS_VOLUME_STORAGE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+$root = [System.IO.Path]::GetPathRoot($env:AUTO_VIDEO_MOVIES_FOLDER)
+if ([string]::IsNullOrEmpty($root)) { throw 'Movies volume root is unavailable.' }
+$volume = [System.IO.DriveInfo]::new($root)
+$culture = [Globalization.CultureInfo]::InvariantCulture
+[Console]::Out.WriteLine($volume.TotalSize.ToString($culture) + ' ' + $volume.AvailableFreeSpace.ToString($culture))"#;
+    // Passing the trusted path through the environment avoids treating path text as script input.
+    let output = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(WINDOWS_VOLUME_STORAGE_SCRIPT)
+        .env(WINDOWS_MOVIES_FOLDER_ENV, folder.as_os_str())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| MoviesVolumeStorageQueryError::Failed)?;
+    if !output.status.success() {
+        return Err(MoviesVolumeStorageQueryError::Unavailable);
+    }
+
+    parse_windows_volume_storage(&output.stdout)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn query_movies_volume_storage(_folder: &Path) -> Result<[u64; 2], MoviesVolumeStorageQueryError> {
+    Err(MoviesVolumeStorageQueryError::Failed)
 }
 
 fn collect_movie_paths(directory: &Path, movie_paths: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -497,6 +618,27 @@ async fn scan_movies(state: tauri::State<'_, MoviesLibraryState>) -> Result<Vec<
 }
 
 #[tauri::command]
+async fn query_movies_storage(
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<[String; 2], String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let folder = state
+            .0
+            .lock()
+            .map_err(|_| MOVIES_STORAGE_FAILED.to_owned())?
+            .folder
+            .clone();
+        let [total_bytes, free_bytes] =
+            query_movies_volume_storage_with(folder.as_deref(), query_movies_volume_storage)
+                .map_err(str::to_owned)?;
+        Ok([total_bytes.to_string(), free_bytes.to_string()])
+    })
+    .await
+    .map_err(|_| MOVIES_STORAGE_FAILED.to_owned())?
+}
+
+#[tauri::command]
 async fn open_movie(path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         open_movie_path_with(Path::new(&path), |movie_path| {
@@ -569,6 +711,7 @@ fn main() {
             choose_movies_folder,
             clear_movies_folder,
             scan_movies,
+            query_movies_storage,
             open_movie,
             reveal_movie,
             trash_movie,
@@ -589,16 +732,22 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    #[cfg(target_os = "macos")]
+    use super::parse_macos_volume_storage;
+    #[cfg(target_os = "windows")]
+    use super::parse_windows_volume_storage;
     use super::{
         clear_movies_folder_file, clear_tmdb_token_file, load_movies_folder_file,
-        load_tmdb_token_file, movie_metadata_error, open_movie_path_with, reveal_movie_path_with,
-        save_movies_folder_file, save_tmdb_token_file, scan_movie_paths, trash_movie_path_with,
-        trash_movie_request_with, MoviePathValidationError, MoviesLibraryContext,
-        TrashMovieRequest, MOVIES_FOLDER_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE,
-        MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED,
-        MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE,
-        MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED, MOVIE_TRASH_FOLDER_UNAVAILABLE,
-        MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND, MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE,
+        load_tmdb_token_file, movie_metadata_error, open_movie_path_with,
+        query_movies_volume_storage_with, reveal_movie_path_with, save_movies_folder_file,
+        save_tmdb_token_file, scan_movie_paths, trash_movie_path_with, trash_movie_request_with,
+        MoviePathValidationError, MoviesLibraryContext, MoviesVolumeStorageQueryError,
+        TrashMovieRequest, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
+        MOVIES_STORAGE_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND,
+        MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE,
+        MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED,
+        MOVIE_TRASH_FAILED, MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE,
+        MOVIE_TRASH_NOT_FOUND, MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE,
         MOVIE_TRASH_UNAVAILABLE, MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID,
     };
 
@@ -674,6 +823,102 @@ mod tests {
             Err(MOVIES_FOLDER_UNAVAILABLE)
         );
         assert_eq!(scan_movie_paths(&file_path), Err(MOVIES_FOLDER_UNAVAILABLE));
+    }
+
+    #[test]
+    fn queries_valid_volume_storage_for_the_trusted_movies_folder() {
+        let fixture = FilesystemFixture::new();
+        let queried_folder = RefCell::new(None);
+        let total_bytes = 4 * 1024 * 1024 * 1024_u64;
+        let free_bytes = 1024 * 1024 * 1024_u64;
+
+        let result = query_movies_volume_storage_with(Some(&fixture.path), |folder| {
+            queried_folder.replace(Some(folder.to_path_buf()));
+            Ok([total_bytes, free_bytes])
+        });
+
+        assert_eq!(result, Ok([total_bytes, free_bytes]));
+        assert_eq!(queried_folder.into_inner(), Some(fixture.path.clone()));
+    }
+
+    #[test]
+    fn rejects_missing_and_non_directory_storage_roots_before_querying_the_volume() {
+        let fixture = FilesystemFixture::new();
+        let file_path = fixture.create_file("not-a-folder.mp4");
+        let missing_path = fixture.path.join("missing");
+
+        for folder in [
+            None,
+            Some(missing_path.as_path()),
+            Some(file_path.as_path()),
+        ] {
+            let queried = RefCell::new(false);
+            let result = query_movies_volume_storage_with(folder, |_| {
+                queried.replace(true);
+                Ok([1024, 512])
+            });
+
+            assert_eq!(result, Err(MOVIES_STORAGE_UNAVAILABLE));
+            assert!(!queried.into_inner());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_volume_storage_values() {
+        let fixture = FilesystemFixture::new();
+
+        for invalid_values in [[0, 0], [1024, 1025]] {
+            assert_eq!(
+                query_movies_volume_storage_with(Some(&fixture.path), |_| Ok(invalid_values)),
+                Err(MOVIES_STORAGE_FAILED)
+            );
+        }
+    }
+
+    #[test]
+    fn distinguishes_an_unavailable_volume_from_a_storage_query_failure() {
+        let fixture = FilesystemFixture::new();
+
+        assert_eq!(
+            query_movies_volume_storage_with(Some(&fixture.path), |_| {
+                Err(MoviesVolumeStorageQueryError::Unavailable)
+            }),
+            Err(MOVIES_STORAGE_UNAVAILABLE)
+        );
+        assert_eq!(
+            query_movies_volume_storage_with(Some(&fixture.path), |_| {
+                Err(MoviesVolumeStorageQueryError::Failed)
+            }),
+            Err(MOVIES_STORAGE_FAILED)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parses_deterministic_macos_volume_storage_output() {
+        let output = b"Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk3s5 4294967296 3145728 1073741824 75% /System/Volumes/Data\n";
+
+        assert_eq!(
+            parse_macos_volume_storage(output),
+            Ok([4_398_046_511_104, 1_099_511_627_776])
+        );
+        assert_eq!(
+            parse_macos_volume_storage(b"invalid output"),
+            Err(MoviesVolumeStorageQueryError::Failed)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_deterministic_windows_volume_storage_output() {
+        assert_eq!(
+            parse_windows_volume_storage(b"4398046511104 1099511627776\r\n"),
+            Ok([4_398_046_511_104, 1_099_511_627_776])
+        );
+        assert_eq!(
+            parse_windows_volume_storage(b"4398046511104 1099511627776 extra"),
+            Err(MoviesVolumeStorageQueryError::Failed)
+        );
     }
 
     #[test]
