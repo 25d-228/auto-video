@@ -293,6 +293,7 @@ button {
 .navigation-item:focus-visible,
 [data-slot="button"]:focus-visible,
 .credential-input:focus-visible,
+.discover-search__input:focus-visible,
 .movie-search__input:focus-visible,
 .movie-sort__select:focus-visible,
 .appearance-option input:focus-visible + .appearance-option__content {
@@ -697,6 +698,68 @@ button {
 .library-toolbar--movies {
   align-items: flex-end;
   flex-wrap: wrap;
+}
+
+.library-toolbar--discover {
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.discover-toolbar__controls {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 20rem;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.discover-search {
+  display: grid;
+  min-width: 12rem;
+  flex: 1 1 12rem;
+  gap: 0.25rem;
+}
+
+.discover-search > label {
+  color: var(--foreground);
+  font-size: 0.6875rem;
+  font-weight: 650;
+}
+
+.discover-search__field {
+  display: flex;
+  min-width: 0;
+  gap: 0.5rem;
+}
+
+.discover-search__input {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 1.75rem;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius);
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 0.75rem;
+}
+
+.discover-search__input::placeholder {
+  color: var(--muted-foreground);
+}
+
+.discover-search__error {
+  margin: 0;
+  color: var(--destructive);
+  font-size: 0.6875rem;
+  line-height: 1.4;
+}
+
+.discover-search-query {
+  white-space: pre-wrap;
 }
 
 .library-toolbar__controls {

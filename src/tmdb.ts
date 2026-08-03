@@ -5,16 +5,18 @@ export type TmdbMovie = {
   releaseDate: string | null;
 };
 
-export type TmdbTrendingResult =
+export type TmdbMoviesResult =
   | { status: "ready"; movies: TmdbMovie[] }
   | { status: "empty" }
   | { status: "unauthorized" }
   | { status: "rate-limited" }
   | { status: "network-error" }
+  | { status: "malformed-provider" }
   | { status: "provider-error" };
 
 const weeklyTrendingMoviesUrl =
   "https://api.themoviedb.org/3/trending/movie/week";
+const movieSearchUrl = "https://api.themoviedb.org/3/search/movie";
 // The documented w500 size is sufficient for this fixed two-column surface without another API call.
 const posterBaseUrl = "https://image.tmdb.org/t/p/w500";
 const releaseDatePattern = /^\d{4}-\d{2}-\d{2}$/;
@@ -54,9 +56,12 @@ function parseMovie(value: unknown): TmdbMovie | null {
   };
 }
 
-function parseTrendingResponse(value: unknown): TmdbTrendingResult {
+function parseMoviesResponse(
+  value: unknown,
+  malformedResponseStatus: "malformed-provider" | "provider-error",
+): TmdbMoviesResult {
   if (!isRecord(value) || !Array.isArray(value.results)) {
-    return { status: "provider-error" };
+    return { status: malformedResponseStatus };
   }
 
   const movies = value.results.flatMap((result) => {
@@ -73,14 +78,16 @@ export function tmdbPosterUrl(posterPath: string) {
   return `${posterBaseUrl}${posterPath}`;
 }
 
-export async function fetchWeeklyTrendingMovies(
+async function fetchTmdbMovies(
+  url: string,
   token: string,
+  malformedResponseStatus: "malformed-provider" | "provider-error",
   signal?: AbortSignal,
-): Promise<TmdbTrendingResult> {
+): Promise<TmdbMoviesResult> {
   let response: Response;
 
   try {
-    response = await fetch(weeklyTrendingMoviesUrl, {
+    response = await fetch(url, {
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${token}`,
@@ -102,8 +109,37 @@ export async function fetchWeeklyTrendingMovies(
   }
 
   try {
-    return parseTrendingResponse((await response.json()) as unknown);
+    return parseMoviesResponse(
+      (await response.json()) as unknown,
+      malformedResponseStatus,
+    );
   } catch {
-    return { status: "provider-error" };
+    return { status: malformedResponseStatus };
   }
+}
+
+export function fetchWeeklyTrendingMovies(
+  token: string,
+  signal?: AbortSignal,
+) {
+  return fetchTmdbMovies(
+    weeklyTrendingMoviesUrl,
+    token,
+    "provider-error",
+    signal,
+  );
+}
+
+export function fetchTmdbMoviesByTitle(
+  token: string,
+  query: string,
+  signal?: AbortSignal,
+) {
+  if (query.trim() === "") {
+    throw new Error("A TMDB Movies search query is required.");
+  }
+
+  const url = new URL(movieSearchUrl);
+  url.searchParams.set("query", query);
+  return fetchTmdbMovies(url.toString(), token, "malformed-provider", signal);
 }
