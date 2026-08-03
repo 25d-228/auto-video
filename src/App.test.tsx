@@ -236,6 +236,12 @@ function storageValue(label: "Total" | "Used" | "Free") {
   return term.parentElement?.querySelector("dd")?.textContent;
 }
 
+function searchMovies(query: string) {
+  fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+    target: { value: query },
+  });
+}
+
 beforeEach(() => {
   systemPrefersDark = false;
   mediaQueryListeners = new Set();
@@ -2257,6 +2263,295 @@ describe("local Movies library", () => {
       "The Movies folder picker could not be opened.",
     );
     expect(savedMoviesFolder).toBeNull();
+  });
+});
+
+describe("Movies Library title search", () => {
+  it("finds a case-insensitive title match outside the visible page without changing the complete Library", async () => {
+    const exactTitle = "Needle — TARGET  22";
+    const paths = Array.from(
+      { length: 25 },
+      (_, index) =>
+        `/Movies/Title ${String(index + 1).padStart(2, "0")}.mkv`,
+    );
+    paths[21] = `/Movies/${exactTitle}.MKV`;
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(paths);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByText("Title 01");
+    resizeGallery("library", 1528, 136);
+    expect(visibleCardCount("Movies")).toBe(7);
+    expect(screen.queryByText(exactTitle)).toBeNull();
+
+    searchMovies("target");
+
+    const matchingHeading = screen.getByRole("heading", {
+      level: 3,
+      name: "Needle — TARGET 22",
+    });
+    expect(matchingHeading.textContent).toBe(exactTitle);
+    expect(visibleCardCount("Movies")).toBe(1);
+    expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+
+    selectDashboard();
+    expect(
+      screen.getByRole("heading", {
+        level: 3,
+        name: "25 supported Movies",
+      }),
+    ).toBeTruthy();
+
+    selectLibrary();
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "target",
+    );
+    expect(screen.getByRole("heading", { level: 3 }).textContent).toBe(
+      exactTitle,
+    );
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves title identity, treats whitespace as no filter, and clears from the keyboard", async () => {
+    const exactTitle = "映画  —  Final.CUT!";
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([
+      `/Movies/${exactTitle}.MKV`,
+      "/Movies/Other title.mp4",
+    ]);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByText("Other title");
+
+    searchMovies("final.cut!");
+    const matchingHeading = screen.getByRole("heading", {
+      level: 3,
+      name: "映画 — Final.CUT!",
+    });
+    expect(matchingHeading.textContent).toBe(exactTitle);
+    expect(visibleCardCount("Movies")).toBe(1);
+
+    searchMovies(" \t ");
+    expect(visibleCardCount("Movies")).toBe(2);
+    const clearSearch = screen.getByRole("button", {
+      name: "Clear Movies search",
+    });
+    clearSearch.focus();
+    fireEvent.keyDown(clearSearch, { key: "Enter" });
+    fireEvent.click(clearSearch);
+
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "",
+    );
+    expect(
+      screen.queryByRole("button", { name: "Clear Movies search" }),
+    ).toBeNull();
+    expect(visibleCardCount("Movies")).toBe(2);
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not search paths and shows an active-search no-match state", async () => {
+    savedMoviesFolder = "/Movies/Searchable Folder";
+    scanMoviesMock.mockResolvedValue([
+      "/Movies/Searchable Folder/Actual title.mkv",
+    ]);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByText("Actual title");
+
+    searchMovies("Searchable Folder");
+
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: "No Movies match this search",
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("list", { name: "Movies" })).toBeNull();
+    expect(
+      screen.queryByRole("heading", {
+        level: 2,
+        name: "No supported videos found",
+      }),
+    ).toBeNull();
+    expect(screen.getByText(/0 Movies match the current title search/)).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear Movies search" }),
+    );
+    expect(screen.getByText("Actual title")).toBeTruthy();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves a valid filtered page through navigation, appearance, and resize before resetting on query changes", async () => {
+    const paths = [
+      ...Array.from(
+        { length: 18 },
+        (_, index) =>
+          `/Movies/Match ${String(index + 1).padStart(2, "0")}.mkv`,
+      ),
+      ...Array.from(
+        { length: 7 },
+        (_, index) =>
+          `/Movies/Other ${String(index + 1).padStart(2, "0")}.mp4`,
+      ),
+    ];
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(paths);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByText("Match 01");
+    resizeGallery("library", 1528, 136);
+    searchMovies("Match");
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
+    fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
+    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+
+    selectDashboard();
+    expect(
+      screen.getByRole("heading", {
+        level: 3,
+        name: "25 supported Movies",
+      }),
+    ).toBeTruthy();
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectLibrary();
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "Match",
+    );
+    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+
+    resizeGallery("library", 1088, 136);
+    expect(screen.getByText("Page 3 of 4")).toBeTruthy();
+    expect(screen.getByText("Match 11")).toBeTruthy();
+
+    searchMovies("Match 0");
+    expect(screen.getByText("Page 1 of 2")).toBeTruthy();
+    expect(screen.getByText("Match 01")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear Movies search" }),
+    );
+    expect(screen.getByText("Page 1 of 5")).toBeTruthy();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the query current through refresh, folder replacement, and a stale scan", async () => {
+    const earlierScan = createDeferred<string[]>();
+    savedMoviesFolder = "/Movies/Old";
+    scanMoviesMock
+      .mockResolvedValueOnce(["/Movies/Old/Old Current.mkv"])
+      .mockReturnValueOnce(earlierScan.promise)
+      .mockResolvedValueOnce(["/Movies/New/New Current.mp4"])
+      .mockResolvedValueOnce(["/Movies/New/Replacement Current.mkv"]);
+    openFolderMock.mockResolvedValue("/Movies/New");
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByText("Old Current");
+    searchMovies("Current");
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    selectSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Change folder" }));
+    expect(await screen.findByText("/Movies/New")).toBeTruthy();
+
+    selectLibrary();
+    expect(await screen.findByText("New Current")).toBeTruthy();
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "Current",
+    );
+
+    await act(async () => {
+      earlierScan.resolve(["/Movies/Old/Obsolete Current.mp4"]);
+      await earlierScan.promise;
+    });
+    expect(screen.queryByText("Obsolete Current")).toBeNull();
+    expect(screen.getByText("New Current")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText("Replacement Current")).toBeTruthy();
+    expect(screen.queryByText("New Current")).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "Current",
+    );
+    expect(scanMoviesMock).toHaveBeenCalledTimes(4);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("isolates every card action to the exact filtered movie and updates the filtered result after Trash", async () => {
+    const exactTitle = "映画  —  Action.CUT!";
+    const exactPath = `/Movies/${exactTitle}.MKV`;
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([exactPath, "/Movies/Other movie.mp4"]);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByText("Other movie");
+    searchMovies("action.cut!");
+
+    const matchingHeading = screen.getByRole("heading", {
+      level: 3,
+      name: "映画 — Action.CUT!",
+    });
+    expect(matchingHeading.textContent).toBe(exactTitle);
+    const card = matchingHeading.closest("article") as HTMLElement;
+
+    fireEvent.click(within(card).getByRole("button", { name: /Copy title:/ }));
+    expect(clipboardWriteMock).toHaveBeenCalledWith(exactTitle);
+    fireEvent.click(within(card).getByRole("button", { name: /Open movie:/ }));
+    fireEvent.click(within(card).getByRole("button", { name: /Reveal movie:/ }));
+    await waitFor(() => {
+      expect(openMovieMock).toHaveBeenCalledWith({ path: exactPath });
+      expect(revealMovieMock).toHaveBeenCalledWith({ path: exactPath });
+    });
+
+    fireEvent.click(
+      within(card).getByRole("button", {
+        name: /Move movie to Trash or Recycle Bin:/,
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: /Confirm moving movie to Trash or Recycle Bin:/,
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "No Movies match this search",
+      }),
+    ).toBeTruthy();
+    expect(trashMovieMock).toHaveBeenCalledTimes(1);
+    expect(trashMovieMock).toHaveBeenCalledWith({ path: exactPath });
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "action.cut!",
+    );
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
