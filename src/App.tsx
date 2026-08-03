@@ -127,6 +127,7 @@ type AppearanceMode = (typeof appearanceModes)[number]["id"];
 type IconName = keyof typeof appIcons;
 type ResolvedTheme = Exclude<AppearanceMode, "system">;
 type Movie = { path: string; title: string };
+type LibraryTitleSortDirection = "ascending" | "descending";
 type MovieScanState =
   | { status: "unconfigured" }
   | { status: "scanning" }
@@ -894,6 +895,28 @@ function movieTitleFromPath(path: string) {
   return extensionStart > 0 ? filename.slice(0, extensionStart) : filename;
 }
 
+function compareLibraryMoviesByTitle(
+  leftMovie: Movie,
+  rightMovie: Movie,
+  direction: LibraryTitleSortDirection,
+) {
+  const leftTitle = leftMovie.title.toLowerCase();
+  const rightTitle = rightMovie.title.toLowerCase();
+  const titleOrder =
+    leftTitle < rightTitle ? -1 : leftTitle > rightTitle ? 1 : 0;
+  if (titleOrder !== 0) {
+    return direction === "ascending" ? titleOrder : -titleOrder;
+  }
+
+  if (leftMovie.title !== rightMovie.title) {
+    return leftMovie.title < rightMovie.title ? -1 : 1;
+  }
+  if (leftMovie.path === rightMovie.path) {
+    return 0;
+  }
+  return leftMovie.path < rightMovie.path ? -1 : 1;
+}
+
 function formatStorageBytes(bytes: bigint) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
   const bytesPerUnit = 1024n;
@@ -940,6 +963,8 @@ export default function App() {
     useState<MoviesStorageState>({ status: "unconfigured" });
   const [librarySelectedPage, setLibrarySelectedPage] = useState(1);
   const [librarySearchQuery, setLibrarySearchQuery] = useState("");
+  const [libraryTitleSortDirection, setLibraryTitleSortDirection] =
+    useState<LibraryTitleSortDirection>("ascending");
   const [movieTrashAnnouncement, setMovieTrashAnnouncement] = useState<
     string | null
   >(null);
@@ -1314,6 +1339,13 @@ export default function App() {
     setLibrarySelectedPage(1);
   };
 
+  const updateLibraryTitleSortDirection = (
+    direction: LibraryTitleSortDirection,
+  ) => {
+    setLibraryTitleSortDirection(direction);
+    setLibrarySelectedPage(1);
+  };
+
   const recordTrashedMovie = (movie: Movie, confirmedFolder: string) => {
     if (currentMoviesFolder.current !== confirmedFolder) {
       return;
@@ -1441,6 +1473,14 @@ export default function App() {
         movie.title.toLowerCase().includes(librarySearchQuery.toLowerCase()),
       )
     : completeLibraryMovies;
+  const orderedLibraryMovies = [...matchingLibraryMovies].sort(
+    (leftMovie, rightMovie) =>
+      compareLibraryMoviesByTitle(
+        leftMovie,
+        rightMovie,
+        libraryTitleSortDirection,
+      ),
+  );
   let dashboardMoviesHeading = "Loading Movies Library";
   let dashboardMoviesMessage = "Loading the configured Movies folder.";
   let dashboardMoviesRole: "alert" | "status" | undefined = "status";
@@ -1807,6 +1847,29 @@ export default function App() {
                         )}
                       </div>
                     </div>
+                    <div className="movie-sort">
+                      <label htmlFor="movies-title-sort">Sort titles</label>
+                      <select
+                        className="movie-sort__select"
+                        id="movies-title-sort"
+                        onChange={(event) => {
+                          const direction = event.target.value;
+                          if (
+                            direction !== "ascending" &&
+                            direction !== "descending"
+                          ) {
+                            throw new Error(
+                              "The Movies title sort returned an invalid direction.",
+                            );
+                          }
+                          updateLibraryTitleSortDirection(direction);
+                        }}
+                        value={libraryTitleSortDirection}
+                      >
+                        <option value="ascending">Title A–Z</option>
+                        <option value="descending">Title Z–A</option>
+                      </select>
+                    </div>
                     <Button
                       disabled={movieScanState.status === "scanning"}
                       onClick={refreshMovies}
@@ -1851,7 +1914,7 @@ export default function App() {
                     <ResizeAwareGallery
                       ariaLabel="Movies"
                       getItemKey={(movie) => movie.path}
-                      items={matchingLibraryMovies}
+                      items={orderedLibraryMovies}
                       key="library-gallery"
                       onSelectedPageChange={setLibrarySelectedPage}
                       renderItem={(movie) => (
