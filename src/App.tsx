@@ -1,4 +1,5 @@
 import { AlertDialog } from "@base-ui/react/alert-dialog";
+import { Dialog } from "@base-ui/react/dialog";
 import {
   ArrowClockwiseIcon,
   CheckIcon,
@@ -11,6 +12,7 @@ import {
   FolderSimpleIcon,
   GearSixIcon,
   ImageSquareIcon,
+  InfoIcon,
   type Icon,
   KeyIcon,
   MagnifyingGlassIcon,
@@ -39,9 +41,11 @@ import {
 import tmdbLogo from "@/assets/tmdb-logo.svg";
 import { Button } from "@/components/ui/button";
 import {
+  fetchTmdbMovieDetails,
   fetchTmdbMoviesByTitle,
   fetchWeeklyTrendingMovies,
   type TmdbMovie,
+  type TmdbMovieDetailsResult,
   type TmdbMoviesResult,
   tmdbPosterUrl,
 } from "@/tmdb";
@@ -122,6 +126,7 @@ const appIcons = {
   copied: CheckIcon,
   "copy-error": WarningCircleIcon,
   search: MagnifyingGlassIcon,
+  details: InfoIcon,
 } satisfies Record<string, Icon>;
 
 type AppearanceMode = (typeof appearanceModes)[number]["id"];
@@ -148,6 +153,9 @@ type DiscoverState =
   | { status: "unconfigured" }
   | { status: "loading" }
   | TmdbMoviesResult;
+type MovieDetailsState =
+  | { status: "loading" }
+  | TmdbMovieDetailsResult;
 type CredentialMessage = {
   role: "alert" | "status";
   text: string;
@@ -316,6 +324,39 @@ const discoverSearchMessages = {
   "provider-error": {
     heading: "TMDB could not search Movies",
     message: "TMDB returned an unexpected error. Try Refresh later.",
+    role: "alert",
+  },
+} as const;
+
+const movieDetailsMessages = {
+  loading: {
+    heading: "Loading Movie details",
+    message: "Requesting the selected Movie details from TMDB.",
+    role: "status",
+  },
+  unauthorized: {
+    heading: "TMDB token was not accepted",
+    message: "Replace the API Read Access Token in Settings and try again.",
+    role: "alert",
+  },
+  "rate-limited": {
+    heading: "TMDB details rate limit reached",
+    message: "TMDB is temporarily limiting requests. Wait before trying again.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "TMDB Movie details could not be reached",
+    message: "Check the network connection and try View details again.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "TMDB returned invalid Movie details",
+    message: "The response did not verify the selected TMDB Movie identity.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "TMDB could not load Movie details",
+    message: "TMDB returned an unexpected error. Try again later.",
     role: "alert",
   },
 } as const;
@@ -584,12 +625,15 @@ function ResizeAwareGallery<Item>({
 
 function DiscoverMovieCard({
   movie,
+  onViewDetails,
   resultIndex,
 }: {
   movie: TmdbMovie;
+  onViewDetails: (movie: TmdbMovie, triggerId: string) => void;
   resultIndex: number;
 }) {
   const [posterFailed, setPosterFailed] = useState(false);
+  const detailsTriggerId = useId();
   const titleId = `tmdb-movie-${movie.id}-${resultIndex}`;
 
   return (
@@ -611,7 +655,27 @@ function DiscoverMovieCard({
       <div className="discover-card__body">
         <div className="media-title-row">
           <h3 id={titleId}>{movie.title}</h3>
-          <CopyTitleAction title={movie.title} />
+          <div className="discover-card__title-actions">
+            <CopyTitleAction title={movie.title} />
+            <Button
+              aria-label={`View details: ${movie.title}`}
+              className="discover-card__details-action"
+              id={detailsTriggerId}
+              onClick={(event) => {
+                event.stopPropagation();
+                onViewDetails(movie, detailsTriggerId);
+              }}
+              onKeyDown={(event) => event.stopPropagation()}
+              onPointerDown={(event) => event.stopPropagation()}
+              size="xs"
+              title="View details"
+              type="button"
+              variant="outline"
+            >
+              <AppIcon name="details" />
+              Details
+            </Button>
+          </div>
         </div>
         <dl>
           <div>
@@ -625,6 +689,116 @@ function DiscoverMovieCard({
         </dl>
       </div>
     </article>
+  );
+}
+
+function DiscoverMovieDetails({
+  movie,
+  state,
+  triggerId,
+}: {
+  movie: TmdbMovie;
+  state: MovieDetailsState;
+  triggerId: string;
+}) {
+  const [failedPosterPath, setFailedPosterPath] = useState<string | null>(null);
+  const details = state.status === "ready" ? state.details : null;
+  const displayedTitle = details?.title ?? movie.title;
+  const currentMessage =
+    state.status === "ready" ? null : movieDetailsMessages[state.status];
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="movie-details__backdrop" />
+      <Dialog.Viewport className="movie-details__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading"}
+          className="movie-details__popup"
+          finalFocus={() => document.getElementById(triggerId)}
+          onClick={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <div className="movie-details__heading">
+            <div>
+              <p className="card-eyebrow">TMDB Movie details</p>
+              <Dialog.Title>{displayedTitle}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="movie-details__description">
+            Provider details for the selected TMDB Movie.
+          </Dialog.Description>
+
+          {details === null ? (
+            <div
+              className="movie-details__state"
+              role={currentMessage?.role}
+            >
+              <span className="empty-state__icon">
+                <AppIcon name="details" />
+              </span>
+              <div>
+                <h3>{currentMessage?.heading}</h3>
+                <p>{currentMessage?.message}</p>
+              </div>
+            </div>
+          ) : (
+            <div className="movie-details__content">
+              <div className="movie-details__poster">
+                {details.posterPath !== null &&
+                failedPosterPath !== details.posterPath ? (
+                  <img
+                    alt=""
+                    onError={() => setFailedPosterPath(details.posterPath)}
+                    src={tmdbPosterUrl(details.posterPath)}
+                  />
+                ) : (
+                  <div className="discover-card__poster-fallback">
+                    <AppIcon name="poster" />
+                    <span>Poster unavailable</span>
+                  </div>
+                )}
+              </div>
+              <div className="movie-details__information">
+                <dl>
+                  <div>
+                    <dt>Release date</dt>
+                    <dd>{details.releaseDate ?? "Unavailable"}</dd>
+                  </div>
+                  <div>
+                    <dt>Runtime</dt>
+                    <dd>
+                      {details.runtimeMinutes === null
+                        ? "Unavailable"
+                        : `${details.runtimeMinutes} minutes`}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Genres</dt>
+                    <dd>
+                      {details.genres.length === 0
+                        ? "Unavailable"
+                        : details.genres.join(", ")}
+                    </dd>
+                  </div>
+                </dl>
+                <div className="movie-details__overview">
+                  <h3>Overview</h3>
+                  <p>{details.overview ?? "Unavailable"}</p>
+                </div>
+              </div>
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
   );
 }
 
@@ -1030,11 +1204,21 @@ export default function App() {
   const [searchDiscoverRefreshVersion, setSearchDiscoverRefreshVersion] =
     useState(0);
   const [discoverSelectedPage, setDiscoverSelectedPage] = useState(1);
+  const [selectedDiscoverMovie, setSelectedDiscoverMovie] =
+    useState<TmdbMovie | null>(null);
+  const [movieDetailsState, setMovieDetailsState] =
+    useState<MovieDetailsState | null>(null);
+  const [movieDetailsTriggerId, setMovieDetailsTriggerId] = useState<
+    string | null
+  >(null);
+  const [movieDetailsRequestVersion, setMovieDetailsRequestVersion] =
+    useState(0);
   const navigationItems = useRef<Array<HTMLButtonElement | null>>([]);
   const workspace = useRef<HTMLElement | null>(null);
   const scanRequestId = useRef(0);
   const storageRequestId = useRef(0);
   const discoverRequestId = useRef(0);
+  const movieDetailsRequestId = useRef(0);
   const trendingDiscoverResult = useRef<{
     refreshVersion: number;
     result: TmdbMoviesResult;
@@ -1323,6 +1507,39 @@ export default function App() {
     trendingDiscoverRefreshVersion,
   ]);
 
+  useEffect(() => {
+    const requestId = ++movieDetailsRequestId.current;
+
+    if (selectedDiscoverMovie === null) {
+      return;
+    }
+    if (tmdbToken === null) {
+      setMovieDetailsState({ status: "unauthorized" });
+      return;
+    }
+
+    const abortController = new AbortController();
+    setMovieDetailsState({ status: "loading" });
+    void fetchTmdbMovieDetails(
+      tmdbToken,
+      selectedDiscoverMovie.id,
+      abortController.signal,
+    ).then((result) => {
+      if (requestId === movieDetailsRequestId.current) {
+        setMovieDetailsState(result);
+      }
+    });
+
+    return () => {
+      movieDetailsRequestId.current += 1;
+      abortController.abort();
+    };
+  }, [
+    movieDetailsRequestVersion,
+    selectedDiscoverMovie,
+    tmdbToken,
+  ]);
+
   const moveNavigationFocus = (
     event: ReactKeyboardEvent<HTMLButtonElement>,
     currentIndex: number,
@@ -1461,6 +1678,23 @@ export default function App() {
     });
   };
 
+  const openDiscoverMovieDetails = (
+    movie: TmdbMovie,
+    triggerId: string,
+  ) => {
+    movieDetailsRequestId.current += 1;
+    setSelectedDiscoverMovie(movie);
+    setMovieDetailsState({ status: "loading" });
+    setMovieDetailsTriggerId(triggerId);
+    setMovieDetailsRequestVersion((version) => version + 1);
+  };
+
+  const closeDiscoverMovieDetails = () => {
+    movieDetailsRequestId.current += 1;
+    setSelectedDiscoverMovie(null);
+    setMovieDetailsState(null);
+  };
+
   const reloadDiscoverMode = () => {
     discoverRequestId.current += 1;
     setDiscoverState({ status: "loading" });
@@ -1479,6 +1713,7 @@ export default function App() {
     }
 
     const previousToken = tmdbToken;
+    closeDiscoverMovieDetails();
     discoverRequestId.current += 1;
     trendingDiscoverResult.current = null;
     setDiscoverState({ status: "loading" });
@@ -1511,6 +1746,7 @@ export default function App() {
 
   const clearTmdbToken = async () => {
     const tokenToRestore = tmdbToken;
+    closeDiscoverMovieDetails();
     discoverRequestId.current += 1;
     trendingDiscoverResult.current = null;
     setDiscoverState({ status: "unconfigured" });
@@ -1696,7 +1932,8 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
+    <>
+      <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
           <span className="brand__mark">
@@ -1958,6 +2195,7 @@ export default function App() {
                   renderItem={(movie, resultIndex) => (
                     <DiscoverMovieCard
                       movie={movie}
+                      onViewDetails={openDiscoverMovieDetails}
                       resultIndex={resultIndex}
                     />
                   )}
@@ -2368,6 +2606,26 @@ export default function App() {
           )}
         </div>
       </main>
-    </div>
+      </div>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeDiscoverMovieDetails();
+          }
+        }}
+        open={selectedDiscoverMovie !== null}
+      >
+        {selectedDiscoverMovie === null ||
+        movieDetailsState === null ||
+        movieDetailsTriggerId === null ? null : (
+          <DiscoverMovieDetails
+            key={selectedDiscoverMovie.id}
+            movie={selectedDiscoverMovie}
+            state={movieDetailsState}
+            triggerId={movieDetailsTriggerId}
+          />
+        )}
+      </Dialog.Root>
+    </>
   );
 }
