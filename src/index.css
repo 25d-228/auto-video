@@ -293,6 +293,7 @@ button {
 .navigation-item:focus-visible,
 [data-slot="button"]:focus-visible,
 .credential-input:focus-visible,
+.movie-search__input:focus-visible,
 .appearance-option input:focus-visible + .appearance-option__content {
   outline: 2px solid var(--ring);
   outline-offset: 2px;
@@ -692,6 +693,71 @@ button {
   letter-spacing: -0.01em;
 }
 
+.library-toolbar--movies {
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.library-toolbar__controls {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 18rem;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.movie-search {
+  display: grid;
+  width: min(100%, 20rem);
+  min-width: 0;
+  gap: 0.25rem;
+}
+
+.movie-search > label {
+  color: var(--foreground);
+  font-size: 0.6875rem;
+  font-weight: 650;
+}
+
+.movie-search__field {
+  position: relative;
+  min-width: 0;
+}
+
+.movie-search__icon {
+  position: absolute;
+  top: 50%;
+  left: 0.5rem;
+  display: grid;
+  color: var(--muted-foreground);
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.movie-search__input {
+  display: block;
+  width: 100%;
+  min-height: 1.75rem;
+  padding: 0.25rem 2rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius);
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 0.75rem;
+}
+
+.movie-search__input::placeholder {
+  color: var(--muted-foreground);
+}
+
+.movie-search__clear {
+  position: absolute;
+  top: 50%;
+  right: 0.25rem;
+  transform: translateY(-50%);
+}
+
 .card-eyebrow {
   margin: 0;
   color: var(--muted-foreground);
@@ -711,6 +777,10 @@ button {
 
 .library-state {
   min-height: 12rem;
+}
+
+.library-search-empty__query {
+  white-space: pre-wrap;
 }
 
 .discover-state {

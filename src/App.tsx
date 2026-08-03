@@ -13,6 +13,7 @@ import {
   ImageSquareIcon,
   type Icon,
   KeyIcon,
+  MagnifyingGlassIcon,
   MonitorIcon,
   MoonIcon,
   PlayIcon,
@@ -119,6 +120,7 @@ const appIcons = {
   copy: CopySimpleIcon,
   copied: CheckIcon,
   "copy-error": WarningCircleIcon,
+  search: MagnifyingGlassIcon,
 } satisfies Record<string, Icon>;
 
 type AppearanceMode = (typeof appearanceModes)[number]["id"];
@@ -937,6 +939,7 @@ export default function App() {
   const [moviesStorageState, setMoviesStorageState] =
     useState<MoviesStorageState>({ status: "unconfigured" });
   const [librarySelectedPage, setLibrarySelectedPage] = useState(1);
+  const [librarySearchQuery, setLibrarySearchQuery] = useState("");
   const [movieTrashAnnouncement, setMovieTrashAnnouncement] = useState<
     string | null
   >(null);
@@ -1306,6 +1309,11 @@ export default function App() {
     setMovieStorageRefreshVersion((version) => version + 1);
   };
 
+  const updateLibrarySearchQuery = (query: string) => {
+    setLibrarySearchQuery(query);
+    setLibrarySelectedPage(1);
+  };
+
   const recordTrashedMovie = (movie: Movie, confirmedFolder: string) => {
     if (currentMoviesFolder.current !== confirmedFolder) {
       return;
@@ -1425,6 +1433,14 @@ export default function App() {
     discoverState.status === "ready"
       ? null
       : discoverMessages[discoverState.status];
+  const isLibrarySearchActive = librarySearchQuery.trim() !== "";
+  const completeLibraryMovies =
+    movieScanState.status === "ready" ? movieScanState.movies : [];
+  const matchingLibraryMovies = isLibrarySearchActive
+    ? completeLibraryMovies.filter((movie) =>
+        movie.title.toLowerCase().includes(librarySearchQuery.toLowerCase()),
+      )
+    : completeLibraryMovies;
   let dashboardMoviesHeading = "Loading Movies Library";
   let dashboardMoviesMessage = "Loading the configured Movies folder.";
   let dashboardMoviesRole: "alert" | "status" | undefined = "status";
@@ -1737,7 +1753,7 @@ export default function App() {
               aria-labelledby="movies-heading"
               className="library-content"
             >
-              <div className="library-toolbar">
+              <div className="library-toolbar library-toolbar--movies">
                 <div className="library-toolbar__heading">
                   <span className="empty-state__icon">
                     <AppIcon name="library" />
@@ -1750,36 +1766,106 @@ export default function App() {
                     </p>
                   </div>
                 </div>
-                {moviesFolder !== null ? (
-                  <Button
-                    disabled={movieScanState.status === "scanning"}
-                    onClick={refreshMovies}
-                    type="button"
-                    variant="outline"
-                  >
-                    <AppIcon name="refresh" />
-                    Refresh
-                  </Button>
-                ) : null}
+                {moviesFolder === null ? null : (
+                  <div className="library-toolbar__controls">
+                    <div
+                      aria-label="Movies title search"
+                      className="movie-search"
+                      role="search"
+                    >
+                      <label htmlFor="movies-title-search">Search titles</label>
+                      <div className="movie-search__field">
+                        <span className="movie-search__icon">
+                          <AppIcon name="search" />
+                        </span>
+                        <input
+                          aria-describedby={
+                            movieScanState.status === "ready"
+                              ? "movies-search-results"
+                              : undefined
+                          }
+                          className="movie-search__input"
+                          id="movies-title-search"
+                          onChange={(event) =>
+                            updateLibrarySearchQuery(event.target.value)
+                          }
+                          placeholder="Find a Movie"
+                          type="text"
+                          value={librarySearchQuery}
+                        />
+                        {librarySearchQuery === "" ? null : (
+                          <Button
+                            aria-label="Clear Movies search"
+                            className="movie-search__clear"
+                            onClick={() => updateLibrarySearchQuery("")}
+                            size="icon-sm"
+                            type="button"
+                            variant="ghost"
+                          >
+                            <AppIcon name="close" />
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    <Button
+                      disabled={movieScanState.status === "scanning"}
+                      onClick={refreshMovies}
+                      type="button"
+                      variant="outline"
+                    >
+                      <AppIcon name="refresh" />
+                      Refresh
+                    </Button>
+                  </div>
+                )}
               </div>
 
               {movieScanState.status === "ready" && moviesFolder !== null ? (
-                <ResizeAwareGallery
-                  ariaLabel="Movies"
-                  getItemKey={(movie) => movie.path}
-                  items={movieScanState.movies}
-                  key="library-gallery"
-                  onSelectedPageChange={setLibrarySelectedPage}
-                  renderItem={(movie) => (
-                    <LibraryMovieCard
-                      folder={moviesFolder}
-                      movie={movie}
-                      onMovieTrashed={recordTrashedMovie}
+                <>
+                  <p
+                    aria-atomic="true"
+                    aria-live="polite"
+                    className="sr-only"
+                    id="movies-search-results"
+                  >
+                    {isLibrarySearchActive
+                      ? `${matchingLibraryMovies.length} Movies match the current title search.`
+                      : `${movieScanState.movies.length} Movies in the complete current result.`}
+                  </p>
+                  {matchingLibraryMovies.length === 0 &&
+                  isLibrarySearchActive ? (
+                    <div className="empty-state library-state library-search-empty">
+                      <span className="empty-state__icon">
+                        <AppIcon name="search" />
+                      </span>
+                      <h2>No Movies match this search</h2>
+                      <p>
+                        No titles match “
+                        <span className="library-search-empty__query">
+                          {librarySearchQuery}
+                        </span>
+                        ”. Clear the search to restore the complete Library.
+                      </p>
+                    </div>
+                  ) : (
+                    <ResizeAwareGallery
+                      ariaLabel="Movies"
+                      getItemKey={(movie) => movie.path}
+                      items={matchingLibraryMovies}
+                      key="library-gallery"
+                      onSelectedPageChange={setLibrarySelectedPage}
+                      renderItem={(movie) => (
+                        <LibraryMovieCard
+                          folder={moviesFolder}
+                          movie={movie}
+                          onMovieTrashed={recordTrashedMovie}
+                        />
+                      )}
+                      selectedPage={librarySelectedPage}
+                      variant="library"
                     />
                   )}
-                  selectedPage={librarySelectedPage}
-                  variant="library"
-                />
+                </>
               ) : (
                 <div
                   className="empty-state library-state"
