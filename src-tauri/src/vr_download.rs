@@ -933,18 +933,59 @@ fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
 }
 
 #[cfg(target_os = "windows")]
+#[repr(C)]
+struct WindowsFileTime {
+    _low: u32,
+    _high: u32,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct WindowsFileInformation {
+    _file_attributes: u32,
+    _creation_time: WindowsFileTime,
+    _last_access_time: WindowsFileTime,
+    _last_write_time: WindowsFileTime,
+    volume_serial_number: u32,
+    _file_size_high: u32,
+    _file_size_low: u32,
+    _number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "Kernel32")]
+extern "system" {
+    #[link_name = "GetFileInformationByHandle"]
+    fn get_file_information_by_handle(
+        file: *mut std::ffi::c_void,
+        information: *mut WindowsFileInformation,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
 fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
-    use std::os::windows::fs::MetadataExt;
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
 
     let metadata = fs::symlink_metadata(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(VR_DOWNLOAD_DESTINATION_CONFLICT);
     }
-    let volume = metadata
-        .volume_serial_number()
-        .ok_or(VR_FOLDER_UNAVAILABLE)?;
-    let file_index = metadata.file_index().ok_or(VR_FOLDER_UNAVAILABLE)?;
-    Ok(format!("{volume}:{file_index}"))
+    let file = File::open(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
+    let mut information = MaybeUninit::<WindowsFileInformation>::uninit();
+    // Rust's equivalent metadata methods are unstable, so use the stable Windows handle API.
+    let succeeded = unsafe {
+        get_file_information_by_handle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if succeeded == 0 {
+        return Err(VR_FOLDER_UNAVAILABLE);
+    }
+    // The Windows API initialized the complete structure after reporting success.
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
+    Ok(format!("{}:{file_index}", information.volume_serial_number))
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
@@ -1758,6 +1799,28 @@ mod tests {
                 Err(VR_DOWNLOAD_DESTINATION_CONFLICT)
             );
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_fingerprint_tracks_file_identity_while_content_changes() {
+        let fixture = FilesystemFixture::new();
+        let first = fixture.path.join("first.partial");
+        let second = fixture.path.join("second.partial");
+        fs::write(&first, b"initial").expect("first partial file must exist");
+        fs::write(&second, b"initial").expect("second partial file must exist");
+        let first_identity = file_fingerprint(&first).expect("first identity must resolve");
+
+        assert_ne!(
+            first_identity,
+            file_fingerprint(&second).expect("second identity must resolve")
+        );
+        fs::write(&first, b"downloaded content")
+            .expect("the same partial file must remain writable");
+        assert_eq!(
+            first_identity,
+            file_fingerprint(&first).expect("updated identity must resolve")
+        );
     }
 
     #[test]
