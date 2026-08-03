@@ -20,6 +20,7 @@ import {
   ListMagnifyingGlassIcon,
   MonitorIcon,
   MoonIcon,
+  PauseIcon,
   PlayIcon,
   SquaresFourIcon,
   SunIcon,
@@ -53,11 +54,23 @@ import {
 } from "@/tmdb";
 import {
   canonicalizeProductCode,
+  cancelVrDownload,
+  chooseVrFolder,
+  clearVrFolder,
+  dismissVrDownload,
   fetchExactJavdbVrItem,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedSukebeiTorrent,
   invalidateVerifiedVrTorrent,
+  listVrDownloads,
+  loadVrDownloads,
+  loadVrFolder,
+  pauseVrDownload,
+  resumeVrDownload,
   saveVerifiedVrTorrent,
+  startVerifiedVrDownload,
+  type VrDownload,
+  type VrFolderState,
   type VrCatalogItem,
   type VrCatalogResult,
   type VrRelease,
@@ -95,21 +108,21 @@ const destinations = [
   {
     id: "downloads",
     label: "Downloads",
-    description: "Review transfers after download support is implemented.",
-    emptyHeading: "Downloads are not available yet",
-    emptyMessage:
-      "Queue behavior, transfer controls, and torrent handling will be introduced separately.",
+    description: "Review and manage selected-file VR transfers.",
+    emptyHeading: "No VR downloads",
+    emptyMessage: "Start a selected-file transfer from a verified torrent inspection.",
   },
   {
     id: "settings",
     label: "Settings",
-    description: "Configure TMDB, your local Movies folder, and appearance.",
+    description: "Configure TMDB, local media folders, and appearance.",
     emptyHeading: "Other settings are not configured",
     emptyMessage:
       "Provider credentials and additional preferences will appear only with the features they control.",
   },
 ] as const;
 const libraryDestination = destinations[2];
+const downloadsDestination = destinations[3];
 const settingsDestination = destinations[4];
 
 const appearanceModes = [
@@ -144,6 +157,7 @@ const appIcons = {
   details: InfoIcon,
   vr: GogglesIcon,
   releases: ListMagnifyingGlassIcon,
+  pause: PauseIcon,
 } satisfies Record<string, Icon>;
 
 type AppearanceMode = (typeof appearanceModes)[number]["id"];
@@ -188,6 +202,19 @@ type VrTorrentInspectionState =
   | { status: "loading" }
   | VrTorrentInspectionResult;
 type VrTorrentSaveState = "idle" | "saving" | "success" | "error";
+type VrTorrentStartState =
+  | { status: "idle" }
+  | { status: "starting" }
+  | { status: "success" }
+  | { status: "error"; message: string };
+type VrFolderUiState =
+  | { status: "loading" }
+  | VrFolderState
+  | { status: "error" };
+type VrDownloadsUiState =
+  | { status: "loading" }
+  | { status: "error" }
+  | { status: "ready"; downloads: VrDownload[] };
 type VrTorrentInspectionContext = {
   item: VrCatalogItem;
   release: VrRelease;
@@ -203,9 +230,12 @@ type GalleryLayout = {
 const appearanceStorageKey = "auto-video-appearance";
 const moviesFolderUnavailable = "movies_folder_unavailable";
 const moviesStorageUnavailable = "movies_storage_unavailable";
+const activeVrDownloadStates = new Set(["queued", "downloading", "paused"]);
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
 // Two seconds confirms a successful copy without leaving stale feedback on the card.
 const copySuccessDuration = 2000;
+// Active rows refresh once per second so progress stays useful without overlapping native polls.
+const vrDownloadRefreshInterval = 1000;
 // These pixel values mirror the current 0.75rem gap and 13rem minimum card width.
 const galleryGap = 12;
 const minimumGalleryCardWidth = 208;
@@ -1075,19 +1105,46 @@ function VrReleaseComparison({
 
 function VrTorrentInspectionDialog({
   context,
+  downloadsReady,
+  folderState,
+  onOpenDownloads,
+  onOpenSettings,
   onRetry,
   onSave,
+  onStart,
+  onToggleFile,
   saveState,
+  selectedFileIds,
+  startState,
   state,
 }: {
   context: VrTorrentInspectionContext;
+  downloadsReady: boolean;
+  folderState: VrFolderUiState;
+  onOpenDownloads: () => void;
+  onOpenSettings: () => void;
   onRetry: () => void;
   onSave: () => void;
+  onStart: () => void;
+  onToggleFile: (fileId: number) => void;
   saveState: VrTorrentSaveState;
+  selectedFileIds: Set<number>;
+  startState: VrTorrentStartState;
   state: VrTorrentInspectionState;
 }) {
   const currentMessage =
     vrTorrentMessages[state.status === "ready" ? "loading" : state.status];
+  const isFolderReady = folderState.status === "ready";
+  const folderMessage =
+    folderState.status === "loading"
+      ? "Loading the configured VR folder…"
+      : folderState.status === "ready"
+        ? `Selected files will download to ${folderState.path}.`
+        : folderState.status === "unavailable"
+          ? "The configured VR folder is unavailable. Change or clear it in Settings."
+          : folderState.status === "unconfigured"
+            ? "Choose a VR folder in Settings before starting a download."
+            : "The VR folder configuration could not be loaded.";
 
   return (
     <Dialog.Portal>
@@ -1143,21 +1200,63 @@ function VrTorrentInspectionDialog({
                 </div>
               </dl>
               <h3>Complete file list</h3>
-              <ol aria-label={`Files in verified torrent for ${context.item.code}`}>
-                {state.inspection.files.map((file) => (
-                  <li key={file.path}>
-                    <span>{file.path}</span>
-                    <span>
-                      {formatStorageBytes(BigInt(file.sizeBytes))} ({file.sizeBytes} bytes)
-                    </span>
-                  </li>
-                ))}
-              </ol>
+              <fieldset className="vr-torrent__file-selection">
+                <legend className="sr-only">Files to download</legend>
+                <p>Select the files to download. No files are selected initially.</p>
+                <ul aria-label={`Files in verified torrent for ${context.item.code}`}>
+                  {state.inspection.files.map((file, fileId) => (
+                    <li key={file.path}>
+                      <label>
+                        <input
+                          checked={selectedFileIds.has(fileId)}
+                          disabled={
+                            startState.status === "starting" ||
+                            startState.status === "success"
+                          }
+                          onChange={() => onToggleFile(fileId)}
+                          type="checkbox"
+                        />
+                        <span>{file.path}</span>
+                        <span>
+                          {formatStorageBytes(BigInt(file.sizeBytes))} (
+                          {file.sizeBytes} bytes)
+                        </span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              </fieldset>
+              <div className="vr-torrent__destination">
+                <p>{folderMessage}</p>
+                {!isFolderReady ? (
+                  <Button onClick={onOpenSettings} type="button" variant="outline">
+                    <AppIcon name="settings" />
+                    Open Settings
+                  </Button>
+                ) : null}
+              </div>
               <div className="vr-torrent__actions">
                 <Button
-                  disabled={saveState === "saving"}
+                  disabled={
+                    selectedFileIds.size === 0 ||
+                    startState.status === "starting" ||
+                    startState.status === "success" ||
+                    !isFolderReady ||
+                    !downloadsReady
+                  }
+                  onClick={onStart}
+                  type="button"
+                >
+                  <AppIcon name="downloads" />
+                  {startState.status === "starting" ? "Starting…" : "Start download"}
+                </Button>
+                <Button
+                  disabled={
+                    saveState === "saving" || startState.status === "starting"
+                  }
                   onClick={onSave}
                   type="button"
+                  variant="outline"
                 >
                   <AppIcon name="downloads" />
                   {saveState === "saving" ? "Saving…" : "Save `.torrent`"}
@@ -1166,6 +1265,16 @@ function VrTorrentInspectionDialog({
                   <p role="status">Verified torrent file saved.</p>
                 ) : saveState === "error" ? (
                   <p role="alert">The verified torrent file could not be saved.</p>
+                ) : null}
+                {startState.status === "success" ? (
+                  <div className="vr-torrent__start-result" role="status">
+                    <p>Selected files were added to Downloads.</p>
+                    <Button onClick={onOpenDownloads} type="button" variant="outline">
+                      View Downloads
+                    </Button>
+                  </div>
+                ) : startState.status === "error" ? (
+                  <p role="alert">{startState.message}</p>
                 ) : null}
               </div>
             </div>
@@ -1594,6 +1703,167 @@ function LibraryMovieCard({
   );
 }
 
+function VrDownloadCard({
+  download,
+  error,
+  isPending,
+  onCancel,
+  onDismiss,
+  onPause,
+  onResume,
+}: {
+  download: VrDownload;
+  error: string | null;
+  isPending: boolean;
+  onCancel: () => void;
+  onDismiss: () => void;
+  onPause: () => void;
+  onResume: () => void;
+}) {
+  const totalBytes = BigInt(download.totalBytes);
+  const downloadedBytes = BigInt(download.downloadedBytes);
+  const percent =
+    totalBytes === 0n ? 0 : Number((downloadedBytes * 100n) / totalBytes);
+  const stateLabel =
+    download.state.charAt(0).toUpperCase() + download.state.slice(1);
+  const isTerminal = !activeVrDownloadStates.has(download.state);
+
+  return (
+    <article
+      aria-labelledby={`vr-download-${download.transferId}`}
+      className="vr-download-card"
+    >
+      <div className="vr-download-card__heading">
+        <div>
+          <p className="card-eyebrow">{download.code}</p>
+          <h2 id={`vr-download-${download.transferId}`}>
+            {download.releaseName}
+          </h2>
+        </div>
+        <span className={`vr-download-card__state is-${download.state}`}>
+          {stateLabel}
+        </span>
+      </div>
+      <div className="vr-download-card__progress">
+        <progress
+          aria-label={`${download.code} selected-file download progress`}
+          max={100}
+          value={percent}
+        />
+        <div>
+          <span>{percent}%</span>
+          <span>
+            {formatStorageBytes(downloadedBytes)} of {formatStorageBytes(totalBytes)}
+          </span>
+        </div>
+      </div>
+      <dl className="vr-download-card__metadata">
+        <div>
+          <dt>Selected files</dt>
+          <dd>{download.selectedFileCount}</dd>
+        </div>
+        <div>
+          <dt>Speed</dt>
+          <dd>
+            {formatStorageBytes(BigInt(download.speedBytesPerSecond))}/s
+          </dd>
+        </div>
+      </dl>
+      <div className="vr-download-card__actions">
+        {download.state === "downloading" ? (
+          <Button
+            disabled={isPending}
+            id={`vr-download-pause-${download.transferId}`}
+            onClick={onPause}
+            type="button"
+            variant="outline"
+          >
+            <AppIcon name="pause" />
+            {isPending ? "Pausing…" : "Pause"}
+          </Button>
+        ) : download.state === "paused" ? (
+          <Button
+            disabled={isPending}
+            id={`vr-download-resume-${download.transferId}`}
+            onClick={onResume}
+            type="button"
+            variant="outline"
+          >
+            <AppIcon name="brand" />
+            {isPending ? "Resuming…" : "Resume"}
+          </Button>
+        ) : null}
+        {!isTerminal ? (
+          <AlertDialog.Root>
+            <AlertDialog.Trigger
+              render={
+                <Button
+                  disabled={isPending}
+                  id={`vr-download-cancel-${download.transferId}`}
+                  type="button"
+                  variant="outline"
+                >
+                  <AppIcon name="close" />
+                  Cancel
+                </Button>
+              }
+            />
+            <AlertDialog.Portal>
+              <AlertDialog.Backdrop className="trash-dialog__backdrop" />
+              <AlertDialog.Viewport className="trash-dialog__viewport">
+                <AlertDialog.Popup className="trash-dialog__popup">
+                  <AlertDialog.Title>Cancel this download?</AlertDialog.Title>
+                  <AlertDialog.Description>
+                    The transfer will stop. Downloaded files and partial data
+                    will remain in the VR folder.
+                  </AlertDialog.Description>
+                  <div className="trash-dialog__actions">
+                    <AlertDialog.Close
+                      render={
+                        <Button type="button" variant="outline">
+                          Keep downloading
+                        </Button>
+                      }
+                    />
+                    <AlertDialog.Close
+                      render={
+                        <Button
+                          disabled={isPending}
+                          onClick={onCancel}
+                          type="button"
+                          variant="destructive"
+                        >
+                          Cancel download
+                        </Button>
+                      }
+                    />
+                  </div>
+                </AlertDialog.Popup>
+              </AlertDialog.Viewport>
+            </AlertDialog.Portal>
+          </AlertDialog.Root>
+        ) : (
+          <Button
+            disabled={isPending}
+            id={`vr-download-dismiss-${download.transferId}`}
+            onClick={onDismiss}
+            type="button"
+            variant="outline"
+          >
+            <AppIcon name="close" />
+            {isPending ? "Dismissing…" : "Dismiss"}
+          </Button>
+        )}
+      </div>
+      {error === null ? null : (
+        <p className="field-error" role="alert">
+          {error}
+        </p>
+      )}
+    </article>
+  );
+}
+
 function isAppearanceMode(value: string | null): value is AppearanceMode {
   return appearanceModes.some((mode) => mode.id === value);
 }
@@ -1647,6 +1917,32 @@ function formatStorageBytes(bytes: bigint) {
   const roundedTenths =
     (bytes * tenthsPerUnit + unitSize / 2n) / unitSize;
   return `${roundedTenths / tenthsPerUnit}.${roundedTenths % tenthsPerUnit} ${units[unitIndex]}`;
+}
+
+function nativeErrorCode(error: unknown) {
+  return typeof error === "string"
+    ? error
+    : error instanceof Error
+      ? error.message
+      : "";
+}
+
+function vrDownloadStartError(error: unknown) {
+  switch (nativeErrorCode(error)) {
+    case "vr_download_destination_conflict":
+      return "A selected file already exists in the VR folder. Nothing was overwritten.";
+    case "vr_download_duplicate":
+      return "This torrent is already active in the configured VR folder.";
+    case "vr_folder_unavailable":
+      return "The configured VR folder is unavailable. Check it in Settings.";
+    case "vr_download_stale":
+    case "vr_download_context_invalid":
+      return "This inspection or file selection is no longer current. Inspect the release again.";
+    case "vr_download_persistence_failed":
+      return "The transfer could not be saved locally, so it was not started.";
+    default:
+      return "The selected-file download could not be started.";
+  }
 }
 
 export default function App() {
@@ -1742,6 +2038,29 @@ export default function App() {
     useState(0);
   const [torrentSaveState, setTorrentSaveState] =
     useState<VrTorrentSaveState>("idle");
+  const [torrentStartState, setTorrentStartState] =
+    useState<VrTorrentStartState>({ status: "idle" });
+  const [selectedTorrentFileIds, setSelectedTorrentFileIds] = useState<
+    Set<number>
+  >(new Set());
+  const [vrFolderState, setVrFolderState] = useState<VrFolderUiState>({
+    status: "loading",
+  });
+  const [isChoosingVrFolder, setIsChoosingVrFolder] = useState(false);
+  const [vrFolderActionError, setVrFolderActionError] = useState<string | null>(
+    null,
+  );
+  const [vrDownloadsState, setVrDownloadsState] =
+    useState<VrDownloadsUiState>({ status: "loading" });
+  const [pendingVrDownloadIds, setPendingVrDownloadIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const [vrDownloadErrors, setVrDownloadErrors] = useState<
+    Record<string, string>
+  >({});
+  const [vrDownloadFocusTarget, setVrDownloadFocusTarget] = useState<
+    string | null
+  >(null);
   const navigationItems = useRef<Array<HTMLButtonElement | null>>([]);
   const workspace = useRef<HTMLElement | null>(null);
   const scanRequestId = useRef(0);
@@ -1752,16 +2071,41 @@ export default function App() {
   const releaseRequestId = useRef(0);
   const torrentInspectionRequestId = useRef(0);
   const torrentSaveRequestId = useRef(0);
+  const torrentStartRequestId = useRef(0);
+  const vrDownloadsRequestId = useRef(0);
   const torrentSavePending = useRef(false);
+  const torrentStartPending = useRef(false);
+  const vrDownloadsRefreshPending = useRef(false);
+  const vrDownloadActionsPending = useRef(new Set<string>());
   const trendingDiscoverResult = useRef<{
     refreshVersion: number;
     result: TmdbMoviesResult;
   } | null>(null);
   const currentMoviesFolder = useRef(moviesFolder);
   const currentMovieScanState = useRef(movieScanState);
+  const currentVrDownloadsState = useRef(vrDownloadsState);
   // Late Trash responses read current state so an old card cannot modify replacement results.
   currentMoviesFolder.current = moviesFolder;
   currentMovieScanState.current = movieScanState;
+  currentVrDownloadsState.current = vrDownloadsState;
+
+  useLayoutEffect(() => {
+    if (vrDownloadFocusTarget === null) {
+      return;
+    }
+    const activeElement = document.activeElement;
+    const actionCanRestoreFocus =
+      activeElement === null ||
+      activeElement === document.body ||
+      !activeElement.isConnected;
+    const terminalActionRequiresFocus =
+      vrDownloadFocusTarget === "vr-downloads-refresh" ||
+      vrDownloadFocusTarget.startsWith("vr-download-dismiss-");
+    if (actionCanRestoreFocus || terminalActionRequiresFocus) {
+      document.getElementById(vrDownloadFocusTarget)?.focus();
+    }
+    setVrDownloadFocusTarget(null);
+  }, [vrDownloadFocusTarget, vrDownloadsState]);
 
   useEffect(() => {
     const systemPreference = window.matchMedia(systemDarkModeQuery);
@@ -1783,6 +2127,77 @@ export default function App() {
     document.documentElement.dataset.theme = resolvedTheme;
     window.localStorage.setItem(appearanceStorageKey, appearance);
   }, [appearance, resolvedTheme]);
+
+  useEffect(() => {
+    let isCurrent = true;
+    void loadVrFolder()
+      .then((folderState) => {
+        if (isCurrent) {
+          setVrFolderState(folderState);
+        }
+      })
+      .catch(() => {
+        if (isCurrent) {
+          setVrFolderState({ status: "error" });
+        }
+      });
+    return () => {
+      isCurrent = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const requestId = ++vrDownloadsRequestId.current;
+    void loadVrDownloads()
+      .then((downloads) => {
+        if (requestId === vrDownloadsRequestId.current) {
+          setVrDownloadsState({ status: "ready", downloads });
+        }
+      })
+      .catch(() => {
+        if (requestId === vrDownloadsRequestId.current) {
+          setVrDownloadsState({ status: "error" });
+        }
+      });
+    return () => {
+      vrDownloadsRequestId.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (
+      vrDownloadsState.status !== "ready" ||
+      !vrDownloadsState.downloads.some(
+        (download) =>
+          download.state === "queued" || download.state === "downloading",
+      )
+    ) {
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      if (vrDownloadsRefreshPending.current) {
+        return;
+      }
+      vrDownloadsRefreshPending.current = true;
+      const requestId = ++vrDownloadsRequestId.current;
+      void listVrDownloads()
+        .then((downloads) => {
+          if (requestId === vrDownloadsRequestId.current) {
+            setVrDownloadsState({ status: "ready", downloads });
+          }
+        })
+        .catch(() => {
+          if (requestId === vrDownloadsRequestId.current) {
+            setVrDownloadsState({ status: "error" });
+          }
+        })
+        .finally(() => {
+          vrDownloadsRefreshPending.current = false;
+        });
+    }, vrDownloadRefreshInterval);
+    return () => window.clearInterval(interval);
+  }, [vrDownloadsState]);
 
   useEffect(() => {
     let isCurrent = true;
@@ -2216,6 +2631,132 @@ export default function App() {
     }
   };
 
+  const chooseConfiguredVrFolder = async () => {
+    if (isChoosingVrFolder) {
+      return;
+    }
+    setVrFolderActionError(null);
+    setIsChoosingVrFolder(true);
+    try {
+      const selectedFolder = await chooseVrFolder();
+      if (selectedFolder !== null) {
+        setVrFolderState({ status: "ready", path: selectedFolder });
+      }
+    } catch {
+      setVrFolderActionError("The VR folder picker could not be opened.");
+    } finally {
+      setIsChoosingVrFolder(false);
+    }
+  };
+
+  const clearConfiguredVrFolder = async () => {
+    setVrFolderActionError(null);
+    try {
+      await clearVrFolder();
+      setVrFolderState({ status: "unconfigured" });
+    } catch {
+      setVrFolderActionError(
+        "The VR folder configuration could not be cleared.",
+      );
+    }
+  };
+
+  const refreshVrDownloads = async () => {
+    const requestId = ++vrDownloadsRequestId.current;
+    try {
+      const downloads = await listVrDownloads();
+      if (requestId === vrDownloadsRequestId.current) {
+        setVrDownloadsState({ status: "ready", downloads });
+      }
+    } catch {
+      if (requestId === vrDownloadsRequestId.current) {
+        setVrDownloadsState({ status: "error" });
+      }
+    }
+  };
+
+  const retryVrDownloads = async () => {
+    const requestId = ++vrDownloadsRequestId.current;
+    setVrDownloadsState({ status: "loading" });
+    try {
+      const downloads = await loadVrDownloads();
+      if (requestId === vrDownloadsRequestId.current) {
+        setVrDownloadsState({ status: "ready", downloads });
+      }
+    } catch {
+      if (requestId === vrDownloadsRequestId.current) {
+        setVrDownloadsState({ status: "error" });
+      }
+    }
+  };
+
+  const runVrDownloadAction = async (
+    download: VrDownload,
+    action: "pause" | "resume" | "cancel" | "dismiss",
+  ) => {
+    if (vrDownloadActionsPending.current.has(download.transferId)) {
+      return;
+    }
+    const currentState = currentVrDownloadsState.current;
+    const currentDownload =
+      currentState.status === "ready"
+        ? currentState.downloads.find(
+            (candidate) => candidate.transferId === download.transferId,
+          )
+        : undefined;
+    const actionIsCurrent =
+      currentDownload !== undefined &&
+      ((action === "pause" && currentDownload.state === "downloading") ||
+        (action === "resume" && currentDownload.state === "paused") ||
+        (action === "cancel" &&
+          (activeVrDownloadStates.has(currentDownload.state) ||
+            currentDownload.state === "offline")) ||
+        (action === "dismiss" &&
+          !activeVrDownloadStates.has(currentDownload.state)));
+    if (!actionIsCurrent) {
+      return;
+    }
+
+    vrDownloadActionsPending.current.add(download.transferId);
+    setPendingVrDownloadIds(
+      new Set(vrDownloadActionsPending.current),
+    );
+    setVrDownloadErrors((errors) => {
+      const nextErrors = { ...errors };
+      delete nextErrors[download.transferId];
+      return nextErrors;
+    });
+    try {
+      if (action === "pause") {
+        await pauseVrDownload(download.transferId);
+      } else if (action === "resume") {
+        await resumeVrDownload(download.transferId);
+      } else if (action === "cancel") {
+        await cancelVrDownload(download.transferId);
+      } else {
+        await dismissVrDownload(download.transferId);
+      }
+      await refreshVrDownloads();
+      const focusTarget = {
+        cancel: `vr-download-dismiss-${download.transferId}`,
+        dismiss: "vr-downloads-refresh",
+        pause: `vr-download-resume-${download.transferId}`,
+        resume: `vr-download-pause-${download.transferId}`,
+      }[action];
+      setVrDownloadFocusTarget(focusTarget);
+    } catch {
+      setVrDownloadErrors((errors) => ({
+        ...errors,
+        [download.transferId]: `The ${action} action could not be completed for this transfer.`,
+      }));
+    } finally {
+      vrDownloadActionsPending.current.delete(download.transferId);
+      setPendingVrDownloadIds(
+        new Set(vrDownloadActionsPending.current),
+      );
+    }
+  };
+
   const refreshMovies = () => {
     if (moviesFolder === null) {
       return;
@@ -2293,9 +2834,12 @@ export default function App() {
   const closeVrTorrentInspection = () => {
     torrentInspectionRequestId.current += 1;
     torrentSaveRequestId.current += 1;
+    torrentStartRequestId.current += 1;
     setTorrentInspectionContext(null);
     setTorrentInspectionState(null);
     setTorrentSaveState("idle");
+    setTorrentStartState({ status: "idle" });
+    setSelectedTorrentFileIds(new Set());
     void invalidateVerifiedVrTorrent().catch(() => undefined);
   };
 
@@ -2404,6 +2948,7 @@ export default function App() {
 
     torrentInspectionRequestId.current += 1;
     torrentSaveRequestId.current += 1;
+    torrentStartRequestId.current += 1;
     setTorrentInspectionContext({
       item: releaseComparisonItem,
       release,
@@ -2411,6 +2956,8 @@ export default function App() {
     });
     setTorrentInspectionState({ status: "loading" });
     setTorrentSaveState("idle");
+    setTorrentStartState({ status: "idle" });
+    setSelectedTorrentFileIds(new Set());
     setTorrentInspectionRequestVersion((version) => version + 1);
   };
 
@@ -2420,8 +2967,11 @@ export default function App() {
     }
     torrentInspectionRequestId.current += 1;
     torrentSaveRequestId.current += 1;
+    torrentStartRequestId.current += 1;
     setTorrentInspectionState({ status: "loading" });
     setTorrentSaveState("idle");
+    setTorrentStartState({ status: "idle" });
+    setSelectedTorrentFileIds(new Set());
     setTorrentInspectionRequestVersion((version) => version + 1);
   };
 
@@ -2452,6 +3002,72 @@ export default function App() {
     } finally {
       torrentSavePending.current = false;
     }
+  };
+
+  const toggleTorrentFile = (fileId: number) => {
+    if (
+      torrentStartState.status === "starting" ||
+      torrentStartState.status === "success" ||
+      torrentInspectionState?.status !== "ready" ||
+      fileId < 0 ||
+      fileId >= torrentInspectionState.inspection.files.length
+    ) {
+      return;
+    }
+    setTorrentStartState({ status: "idle" });
+    setSelectedTorrentFileIds((selectedFileIds) => {
+      const nextSelection = new Set(selectedFileIds);
+      if (nextSelection.has(fileId)) {
+        nextSelection.delete(fileId);
+      } else {
+        nextSelection.add(fileId);
+      }
+      return nextSelection;
+    });
+  };
+
+  const startVrDownload = async () => {
+    if (
+      torrentStartPending.current ||
+      torrentInspectionState?.status !== "ready" ||
+      selectedTorrentFileIds.size === 0 ||
+      vrFolderState.status !== "ready" ||
+      vrDownloadsState.status !== "ready"
+    ) {
+      return;
+    }
+    torrentStartPending.current = true;
+    const requestId = ++torrentStartRequestId.current;
+    const selectedFileIds = [...selectedTorrentFileIds].sort(
+      (left, right) => left - right,
+    );
+    setTorrentStartState({ status: "starting" });
+    try {
+      await startVerifiedVrDownload(
+        torrentInspectionState.inspection.inspectionId,
+        selectedFileIds,
+      );
+      await refreshVrDownloads();
+      if (requestId === torrentStartRequestId.current) {
+        setTorrentStartState({ status: "success" });
+      }
+    } catch (error: unknown) {
+      if (requestId === torrentStartRequestId.current) {
+        setTorrentStartState({
+          status: "error",
+          message: vrDownloadStartError(error),
+        });
+      }
+    } finally {
+      torrentStartPending.current = false;
+    }
+  };
+
+  const openVrDestinationFromInspection = (
+    destination: typeof settingsDestination | typeof downloadsDestination,
+  ) => {
+    closeVrReleaseComparison();
+    navigateTo(destination);
   };
 
   const reloadDiscoverMode = () => {
@@ -3290,7 +3906,78 @@ export default function App() {
                 </div>
               )}
             </section>
-          ) : activeDestination.id === "settings" ? (
+          ) : activeDestination.id === "downloads" ? (
+            <section aria-labelledby="vr-downloads-heading" className="vr-downloads">
+              <div className="library-toolbar">
+                <div>
+                  <p className="card-eyebrow">Selected-file transfers</p>
+                  <h2 id="vr-downloads-heading">VR downloads</h2>
+                  <p>
+                    Each row is managed independently. Cancelling keeps all
+                    downloaded files and partial data.
+                  </p>
+                </div>
+                <Button
+                  disabled={vrDownloadsState.status === "loading"}
+                  id="vr-downloads-refresh"
+                  onClick={() => void retryVrDownloads()}
+                  type="button"
+                  variant="outline"
+                >
+                  <AppIcon name="refresh" />
+                  Refresh
+                </Button>
+              </div>
+              {vrDownloadsState.status === "ready" &&
+              vrDownloadsState.downloads.length > 0 ? (
+                <div className="vr-downloads__list">
+                  {vrDownloadsState.downloads.map((download) => (
+                    <VrDownloadCard
+                      download={download}
+                      error={vrDownloadErrors[download.transferId] ?? null}
+                      isPending={pendingVrDownloadIds.has(download.transferId)}
+                      key={download.transferId}
+                      onCancel={() =>
+                        void runVrDownloadAction(download, "cancel")
+                      }
+                      onDismiss={() =>
+                        void runVrDownloadAction(download, "dismiss")
+                      }
+                      onPause={() =>
+                        void runVrDownloadAction(download, "pause")
+                      }
+                      onResume={() =>
+                        void runVrDownloadAction(download, "resume")
+                      }
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div
+                  className="empty-state"
+                  role={vrDownloadsState.status === "error" ? "alert" : "status"}
+                >
+                  <span className="empty-state__icon">
+                    <AppIcon name="downloads" />
+                  </span>
+                  <h2>
+                    {vrDownloadsState.status === "loading"
+                      ? "Loading VR downloads"
+                      : vrDownloadsState.status === "error"
+                        ? "VR downloads could not be loaded"
+                        : activeDestination.emptyHeading}
+                  </h2>
+                  <p>
+                    {vrDownloadsState.status === "loading"
+                      ? "Validating saved transfers and their selected files."
+                      : vrDownloadsState.status === "error"
+                        ? "Retry to validate the local transfer state again."
+                        : activeDestination.emptyMessage}
+                  </p>
+                </div>
+              )}
+            </section>
+          ) : (
             <div className="settings-content">
               <section
                 aria-labelledby="tmdb-token-heading"
@@ -3443,6 +4130,89 @@ export default function App() {
               </section>
 
               <section
+                aria-labelledby="vr-folder-heading"
+                className="settings-card"
+              >
+                <div className="settings-card__heading">
+                  <span className="empty-state__icon">
+                    <AppIcon name="vr" />
+                  </span>
+                  <div>
+                    <h2 id="vr-folder-heading">VR folder</h2>
+                    <p>
+                      Selected files from future VR downloads are saved here.
+                      Changing this folder does not move or redirect existing
+                      transfers.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="folder-setting">
+                  {vrFolderState.status === "ready" ||
+                  vrFolderState.status === "unavailable" ? (
+                    <div>
+                      <p className="field-label">Configured folder</p>
+                      <p className="folder-path">{vrFolderState.path}</p>
+                      {vrFolderState.status === "unavailable" ? (
+                        <p className="field-error" role="alert">
+                          This folder has moved or is unavailable. Existing
+                          transfers will not fall back to another folder.
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <p
+                      className={
+                        vrFolderState.status === "error"
+                          ? "field-error folder-setting__empty"
+                          : "folder-setting__empty"
+                      }
+                      role={vrFolderState.status === "error" ? "alert" : undefined}
+                    >
+                      {vrFolderState.status === "loading"
+                        ? "Loading VR folder configuration…"
+                        : vrFolderState.status === "error"
+                          ? "The VR folder configuration could not be loaded."
+                          : "No VR folder configured."}
+                    </p>
+                  )}
+                  <div className="folder-setting__actions">
+                    <Button
+                      disabled={
+                        isChoosingVrFolder || vrFolderState.status === "loading"
+                      }
+                      onClick={() => void chooseConfiguredVrFolder()}
+                      type="button"
+                    >
+                      <AppIcon name="folder" />
+                      {isChoosingVrFolder
+                        ? "Choosing…"
+                        : vrFolderState.status === "ready" ||
+                            vrFolderState.status === "unavailable"
+                          ? "Change VR folder"
+                          : "Choose VR folder"}
+                    </Button>
+                    {vrFolderState.status === "ready" ||
+                    vrFolderState.status === "unavailable" ? (
+                      <Button
+                        disabled={isChoosingVrFolder}
+                        onClick={() => void clearConfiguredVrFolder()}
+                        type="button"
+                        variant="outline"
+                      >
+                        Clear folder
+                      </Button>
+                    ) : null}
+                  </div>
+                  {vrFolderActionError === null ? null : (
+                    <p className="field-error" role="alert">
+                      {vrFolderActionError}
+                    </p>
+                  )}
+                </div>
+              </section>
+
+              <section
                 aria-labelledby="appearance-heading"
                 className="settings-card"
               >
@@ -3480,30 +4250,7 @@ export default function App() {
                   </div>
                 </fieldset>
               </section>
-
-              <section
-                aria-labelledby="settings-empty-heading"
-                className="empty-state empty-state--compact"
-              >
-                <h2 id="settings-empty-heading">
-                  {activeDestination.emptyHeading}
-                </h2>
-                <p>{activeDestination.emptyMessage}</p>
-              </section>
             </div>
-          ) : (
-            <section
-              aria-labelledby={`${activeDestination.id}-empty-heading`}
-              className="empty-state"
-            >
-              <span className="empty-state__icon">
-                <AppIcon name={activeDestination.id} />
-              </span>
-              <h2 id={`${activeDestination.id}-empty-heading`}>
-                {activeDestination.emptyHeading}
-              </h2>
-              <p>{activeDestination.emptyMessage}</p>
-            </section>
           )}
         </div>
       </main>
@@ -3561,9 +4308,21 @@ export default function App() {
         torrentInspectionState === null ? null : (
           <VrTorrentInspectionDialog
             context={torrentInspectionContext}
+            downloadsReady={vrDownloadsState.status === "ready"}
+            folderState={vrFolderState}
+            onOpenDownloads={() =>
+              openVrDestinationFromInspection(downloadsDestination)
+            }
+            onOpenSettings={() =>
+              openVrDestinationFromInspection(settingsDestination)
+            }
             onRetry={retryVrTorrentInspection}
             onSave={() => void saveVrTorrent()}
+            onStart={() => void startVrDownload()}
+            onToggleFile={toggleTorrentFile}
             saveState={torrentSaveState}
+            selectedFileIds={selectedTorrentFileIds}
+            startState={torrentStartState}
             state={torrentInspectionState}
           />
         )}

@@ -49,6 +49,31 @@ export type VrTorrentInspectionResult =
   | { status: "unsupported-torrent" }
   | { status: "infohash-mismatch" };
 
+export type VrFolderState =
+  | { status: "unconfigured" }
+  | { status: "ready"; path: string }
+  | { status: "unavailable"; path: string };
+
+export type VrDownloadState =
+  | "queued"
+  | "downloading"
+  | "paused"
+  | "completed"
+  | "cancelled"
+  | "offline"
+  | "failed";
+
+export type VrDownload = {
+  transferId: string;
+  code: string;
+  releaseName: string;
+  selectedFileCount: number;
+  totalBytes: string;
+  downloadedBytes: string;
+  speedBytesPerSecond: string;
+  state: VrDownloadState;
+};
+
 export type VrReleasesResult =
   | { status: "ready"; releases: VrRelease[] }
   | { status: "source-unavailable" }
@@ -57,6 +82,9 @@ export type VrReleasesResult =
   | { status: "provider-error" };
 
 const productCodePattern = /^([A-Za-z]{2,16})[ _-]*([0-9]{1,10})$/;
+const unsignedU64Pattern = /^\d{1,20}$/;
+const maximumU64 = 18_446_744_073_709_551_615n;
+const maximumSelectedVrFiles = 100_000;
 const javdbBaseUrl = "https://javdb.com";
 
 function invokeErrorStatus(error: unknown): Exclude<
@@ -461,4 +489,169 @@ export async function saveVerifiedVrTorrent(inspectionId: string) {
 
 export function invalidateVerifiedVrTorrent() {
   return window.__TAURI__.core.invoke<void>("invalidate_verified_vr_torrent");
+}
+
+function parseVrFolder(value: unknown): VrFolderState {
+  if (
+    !Array.isArray(value) ||
+    !value.every((entry) => typeof entry === "string")
+  ) {
+    throw new Error("The native VR folder store returned invalid data.");
+  }
+  if (value.length === 1 && value[0] === "unconfigured") {
+    return { status: "unconfigured" };
+  }
+  if (
+    value.length === 2 &&
+    (value[0] === "ready" || value[0] === "unavailable") &&
+    value[1] !== ""
+  ) {
+    return { status: value[0], path: value[1] };
+  }
+  throw new Error("The native VR folder store returned invalid data.");
+}
+
+export async function loadVrFolder() {
+  return parseVrFolder(
+    await window.__TAURI__.core.invoke<unknown>("load_vr_folder"),
+  );
+}
+
+export async function chooseVrFolder() {
+  const path = await window.__TAURI__.core.invoke<unknown>("choose_vr_folder");
+  if (path !== null && (typeof path !== "string" || path === "")) {
+    throw new Error("The native VR folder picker returned an invalid path.");
+  }
+  return path as string | null;
+}
+
+export function clearVrFolder() {
+  return window.__TAURI__.core.invoke<void>("clear_vr_folder");
+}
+
+const vrDownloadStates = new Set<VrDownloadState>([
+  "queued",
+  "downloading",
+  "paused",
+  "completed",
+  "cancelled",
+  "offline",
+  "failed",
+]);
+
+function parseVrDownloads(value: unknown): VrDownload[] {
+  if (
+    !Array.isArray(value) ||
+    value.length % 8 !== 0 ||
+    !value.every((entry) => typeof entry === "string")
+  ) {
+    throw new Error("The native VR download store returned invalid data.");
+  }
+
+  const downloads: VrDownload[] = [];
+  const transferIds = new Set<string>();
+  for (let index = 0; index < value.length; index += 8) {
+    const [
+      transferId,
+      code,
+      releaseName,
+      selectedFileCount,
+      totalBytes,
+      downloadedBytes,
+      speedBytesPerSecond,
+      state,
+    ] = value.slice(index, index + 8) as string[];
+    const count = Number(selectedFileCount);
+    if (
+      transferId === "" ||
+      transferIds.has(transferId) ||
+      code === "" ||
+      releaseName.trim() === "" ||
+      !Number.isSafeInteger(count) ||
+      count < 0 ||
+      count > maximumSelectedVrFiles ||
+      !unsignedU64Pattern.test(totalBytes) ||
+      !unsignedU64Pattern.test(downloadedBytes) ||
+      !unsignedU64Pattern.test(speedBytesPerSecond) ||
+      BigInt(totalBytes) > maximumU64 ||
+      BigInt(downloadedBytes) > maximumU64 ||
+      BigInt(speedBytesPerSecond) > maximumU64 ||
+      BigInt(downloadedBytes) > BigInt(totalBytes) ||
+      !vrDownloadStates.has(state as VrDownloadState)
+    ) {
+      throw new Error("The native VR download store returned invalid data.");
+    }
+    transferIds.add(transferId);
+    downloads.push({
+      transferId,
+      code,
+      releaseName,
+      selectedFileCount: count,
+      totalBytes,
+      downloadedBytes,
+      speedBytesPerSecond,
+      state: state as VrDownloadState,
+    });
+  }
+  return downloads;
+}
+
+export async function loadVrDownloads() {
+  return parseVrDownloads(
+    await window.__TAURI__.core.invoke<unknown>("load_vr_downloads"),
+  );
+}
+
+export async function listVrDownloads() {
+  return parseVrDownloads(
+    await window.__TAURI__.core.invoke<unknown>("list_vr_downloads"),
+  );
+}
+
+export async function startVerifiedVrDownload(
+  inspectionId: string,
+  selectedFileIds: number[],
+) {
+  const uniqueIds = new Set(selectedFileIds);
+  if (
+    inspectionId.trim() === "" ||
+    selectedFileIds.length === 0 ||
+    uniqueIds.size !== selectedFileIds.length ||
+    selectedFileIds.some(
+      (fileId) => !Number.isSafeInteger(fileId) || fileId < 0,
+    )
+  ) {
+    throw new Error("A current inspection and valid file selection are required.");
+  }
+  const transferId = await window.__TAURI__.core.invoke<unknown>(
+    "start_verified_vr_download",
+    { inspectionId, selectedFileIds },
+  );
+  if (typeof transferId !== "string" || transferId === "") {
+    throw new Error("The native VR download response was invalid.");
+  }
+  return transferId;
+}
+
+async function runVrDownloadCommand(command: string, transferId: string) {
+  if (transferId === "") {
+    throw new Error("A transfer identity is required.");
+  }
+  await window.__TAURI__.core.invoke<void>(command, { transferId });
+}
+
+export function pauseVrDownload(transferId: string) {
+  return runVrDownloadCommand("pause_vr_download", transferId);
+}
+
+export function resumeVrDownload(transferId: string) {
+  return runVrDownloadCommand("resume_vr_download", transferId);
+}
+
+export function cancelVrDownload(transferId: string) {
+  return runVrDownloadCommand("cancel_vr_download", transferId);
+}
+
+export function dismissVrDownload(transferId: string) {
+  return runVrDownloadCommand("dismiss_vr_download", transferId);
 }

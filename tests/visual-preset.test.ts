@@ -77,7 +77,7 @@ describe("Mira preset contract", () => {
     expect(applicationStyles).toContain("width: min(42rem, 100%);");
     expect(applicationStyles).toContain("max-height: 100%;");
     expect(applicationStyles).toContain(
-      ".vr-torrent__content > ol li span:first-child {",
+      ".vr-torrent__file-selection li span:nth-child(2) {",
     );
     expect(applicationStyles).toContain("overflow-wrap: anywhere;");
     expect(applicationStyles).toContain("white-space: pre-wrap;");

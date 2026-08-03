@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod vr_download;
 mod vr_torrent;
 
 use std::{
@@ -14,12 +15,21 @@ use std::process::{Command, Stdio};
 
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
+use vr_download::{
+    cancel_download, clear_vr_folder as clear_trusted_vr_folder, dismiss_download, list_downloads,
+    load_downloads, load_vr_folder_with, pause_download, resume_download, set_vr_folder,
+    start_download, VrDownloadState, VR_DOWNLOAD_FAILED, VR_DOWNLOAD_PERSISTENCE_FAILED,
+    VR_FOLDER_STORAGE_FAILED, VR_FOLDER_UNAVAILABLE,
+};
 use vr_torrent::{
     fetch_artifact_response, inspect_sukebei_torrent_with, save_verified_torrent_with,
     TorrentInspectionRequest, VrTorrentState, VR_TORRENT_PROVIDER_ERROR, VR_TORRENT_SAVE_FAILED,
 };
 
 const MOVIES_FOLDER_FILE_NAME: &str = ".movies-folder";
+const VR_FOLDER_FILE_NAME: &str = ".vr-folder";
+const VR_DOWNLOADS_FILE_NAME: &str = ".vr-downloads";
+const VR_SESSION_FOLDER_NAME: &str = "vr-session";
 const MOVIES_FOLDER_UNAVAILABLE: &str = "movies_folder_unavailable";
 const MOVIES_FOLDER_STORAGE_FAILED: &str = "movies_folder_storage_failed";
 const MOVIES_STORAGE_FAILED: &str = "movies_storage_failed";
@@ -675,6 +685,27 @@ fn movies_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|_| MOVIES_FOLDER_STORAGE_FAILED.to_owned())
 }
 
+fn vr_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(VR_FOLDER_FILE_NAME))
+        .map_err(|_| VR_FOLDER_STORAGE_FAILED.to_owned())
+}
+
+fn vr_downloads_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(VR_DOWNLOADS_FILE_NAME))
+        .map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED.to_owned())
+}
+
+fn vr_session_folder(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(VR_SESSION_FOLDER_NAME))
+        .map_err(|_| VR_DOWNLOAD_FAILED.to_owned())
+}
+
 #[tauri::command]
 fn load_movies_folder(
     app: tauri::AppHandle,
@@ -851,6 +882,132 @@ fn clear_tmdb_token(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn load_vr_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<Vec<String>, String> {
+    load_vr_folder_with(state.inner(), &vr_folder_path(&app)?).map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn choose_vr_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<Option<String>, String> {
+    let dialog_app = app.clone();
+    let selected_folder = tauri::async_runtime::spawn_blocking(move || {
+        dialog_app
+            .dialog()
+            .file()
+            .set_title("Choose VR folder")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|_| VR_FOLDER_UNAVAILABLE.to_owned())?;
+    let Some(selected_folder) = selected_folder else {
+        return Ok(None);
+    };
+    let folder = selected_folder
+        .into_path()
+        .map_err(|_| VR_FOLDER_UNAVAILABLE.to_owned())?;
+    set_vr_folder(state.inner(), &vr_folder_path(&app)?, folder)
+        .map(Some)
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn clear_vr_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<(), String> {
+    clear_trusted_vr_folder(state.inner(), &vr_folder_path(&app)?).map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn load_vr_downloads(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<Vec<String>, String> {
+    load_downloads(
+        state.inner(),
+        &vr_downloads_path(&app)?,
+        &vr_session_folder(&app)?,
+    )
+    .await
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn list_vr_downloads(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<Vec<String>, String> {
+    list_downloads(state.inner(), &vr_downloads_path(&app)?).map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn start_verified_vr_download(
+    app: tauri::AppHandle,
+    inspection_id: String,
+    selected_file_ids: Vec<usize>,
+    download_state: tauri::State<'_, VrDownloadState>,
+    torrent_state: tauri::State<'_, VrTorrentState>,
+) -> Result<String, String> {
+    start_download(
+        download_state.inner(),
+        torrent_state.inner(),
+        &vr_downloads_path(&app)?,
+        &vr_session_folder(&app)?,
+        &inspection_id,
+        &selected_file_ids,
+    )
+    .await
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn pause_vr_download(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<(), String> {
+    pause_download(state.inner(), &vr_downloads_path(&app)?, &transfer_id)
+        .await
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn resume_vr_download(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<(), String> {
+    resume_download(state.inner(), &vr_downloads_path(&app)?, &transfer_id)
+        .await
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn cancel_vr_download(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<(), String> {
+    cancel_download(state.inner(), &vr_downloads_path(&app)?, &transfer_id)
+        .await
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn dismiss_vr_download(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<(), String> {
+    dismiss_download(state.inner(), &vr_downloads_path(&app)?, &transfer_id).map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn fetch_javdb_vr_catalog(code: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         fetch_javdb_vr_catalog_with(&code, fetch_provider_document).map_err(str::to_owned)
@@ -944,6 +1101,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(MoviesLibraryState::default())
         .manage(VrTorrentState::default())
+        .manage(VrDownloadState::default())
         .invoke_handler(tauri::generate_handler![
             load_movies_folder,
             choose_movies_folder,
@@ -956,6 +1114,16 @@ fn main() {
             load_tmdb_token,
             save_tmdb_token,
             clear_tmdb_token,
+            load_vr_folder,
+            choose_vr_folder,
+            clear_vr_folder,
+            load_vr_downloads,
+            list_vr_downloads,
+            start_verified_vr_download,
+            pause_vr_download,
+            resume_vr_download,
+            cancel_vr_download,
+            dismiss_vr_download,
             fetch_javdb_vr_catalog,
             fetch_sukebei_vr_releases,
             inspect_sukebei_vr_torrent,

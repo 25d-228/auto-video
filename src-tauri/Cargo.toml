@@ -9,6 +9,8 @@ rust-version = "1.96"
 tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
+anyhow = "=1.0.102"
+librqbit = { version = "=8.1.1", default-features = false, features = ["disable-upload", "rust-tls"] }
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-dialog = "=2.7.2"
 tauri-plugin-opener = "=2.5.4"
