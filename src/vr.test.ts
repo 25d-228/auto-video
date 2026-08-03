@@ -4,6 +4,7 @@ import {
   canonicalizeProductCode,
   fetchExactJavdbVrItem,
   fetchVerifiedSukebeiReleases,
+  inspectVerifiedSukebeiTorrent,
 } from "./vr";
 
 const catalogFixture = `
@@ -42,6 +43,16 @@ function releaseFeed(items: string) {
   return `<rss xmlns:nyaa="https://sukebei.nyaa.si/xmlns/nyaa" version="2.0">
     <channel><title>Sukebei results</title>${items}</channel>
   </rss>`;
+}
+
+function releaseArtifactElements(
+  itemId: string,
+  infohash = "0123456789abcdef0123456789abcdef01234567",
+  torrentUrl = `https://sukebei.nyaa.si/download/${itemId}.torrent`,
+) {
+  return `<guid>https://sukebei.nyaa.si/view/${itemId}</guid>
+    <link>${torrentUrl}</link>
+    <nyaa:infoHash>${infohash}</nyaa:infoHash>`;
 }
 
 let invokeMock: ReturnType<typeof vi.fn>;
@@ -245,6 +256,60 @@ describe("Sukebei identity-verified release request", () => {
     });
   });
 
+  it("retains a complete same-item artifact identity only on its verified release", async () => {
+    invokeMock.mockResolvedValue(
+      releaseFeed(
+        `<item><title>MDVR-419 complete artifact</title>
+          ${releaseArtifactElements("123", "ABCDEF0123456789ABCDEF0123456789ABCDEF01")}
+        </item>
+        <item><title>MDVR-419 mismatched artifact</title>
+          ${releaseArtifactElements("124", undefined, "https://sukebei.nyaa.si/download/125.torrent")}
+        </item>
+        <item><title>MDVR-419 unsafe artifact</title>
+          ${releaseArtifactElements("126", undefined, "https://user@sukebei.nyaa.si/download/126.torrent")}
+        </item>
+        <item><title>MDVR-419 missing artifact</title></item>`,
+      ),
+    );
+
+    await expect(
+      fetchVerifiedSukebeiReleases("MDVR-419"),
+    ).resolves.toEqual({
+      status: "ready",
+      releases: [
+        {
+          artifact: {
+            expectedInfohash: "abcdef0123456789abcdef0123456789abcdef01",
+            providerItemId: "123",
+            torrentUrl: "https://sukebei.nyaa.si/download/123.torrent",
+          },
+          name: "MDVR-419 complete artifact",
+          source: "Sukebei",
+          size: null,
+          seeders: null,
+        },
+        {
+          name: "MDVR-419 mismatched artifact",
+          source: "Sukebei",
+          size: null,
+          seeders: null,
+        },
+        {
+          name: "MDVR-419 unsafe artifact",
+          source: "Sukebei",
+          size: null,
+          seeders: null,
+        },
+        {
+          name: "MDVR-419 missing artifact",
+          source: "Sukebei",
+          size: null,
+          seeders: null,
+        },
+      ],
+    });
+  });
+
   it("distinguishes malformed and native provider failures", async () => {
     invokeMock.mockResolvedValueOnce("<rss>");
     await expect(
@@ -261,5 +326,107 @@ describe("Sukebei identity-verified release request", () => {
         fetchVerifiedSukebeiReleases("MDVR-419"),
       ).resolves.toEqual({ status });
     }
+  });
+});
+
+describe("verified Sukebei torrent inspection", () => {
+  const release = {
+    artifact: {
+      expectedInfohash: "0123456789abcdef0123456789abcdef01234567",
+      providerItemId: "123",
+      torrentUrl: "https://sukebei.nyaa.si/download/123.torrent",
+    },
+    name: "【VR】 MDVR-419  Exact — 特別版",
+    seeders: 4,
+    size: "8.0 GiB",
+    source: "Sukebei" as const,
+  };
+
+  it("accepts exact verified metadata and the complete file list", async () => {
+    invokeMock.mockResolvedValue([
+      "inspection-123",
+      "VR  — 作品",
+      release.artifact.expectedInfohash,
+      "12",
+      "Folder/Part  1 — 映画.mkv",
+      "5",
+      "Folder/特別版  B.mp4",
+      "7",
+    ]);
+
+    await expect(
+      inspectVerifiedSukebeiTorrent("MDVR-419", release),
+    ).resolves.toEqual({
+      status: "ready",
+      inspection: {
+        displayName: "VR  — 作品",
+        files: [
+          { path: "Folder/Part  1 — 映画.mkv", sizeBytes: "5" },
+          { path: "Folder/特別版  B.mp4", sizeBytes: "7" },
+        ],
+        infohash: release.artifact.expectedInfohash,
+        inspectionId: "inspection-123",
+        totalBytes: "12",
+      },
+    });
+    expect(invokeMock).toHaveBeenCalledWith("inspect_sukebei_vr_torrent", {
+      code: "MDVR-419",
+      expectedInfohash: release.artifact.expectedInfohash,
+      providerItemId: "123",
+      releaseName: release.name,
+      torrentUrl: release.artifact.torrentUrl,
+    });
+  });
+
+  it("distinguishes every native inspection failure", async () => {
+    for (const [error, status] of [
+      ["vr_torrent_source_unavailable", "source-unavailable"],
+      ["vr_torrent_network_error", "network-error"],
+      ["vr_torrent_provider_error", "provider-error"],
+      ["vr_torrent_malformed", "malformed-torrent"],
+      ["vr_torrent_unsupported", "unsupported-torrent"],
+      ["vr_torrent_infohash_mismatch", "infohash-mismatch"],
+    ]) {
+      invokeMock.mockRejectedValueOnce(error);
+      await expect(
+        inspectVerifiedSukebeiTorrent("MDVR-419", release),
+      ).resolves.toEqual({ status });
+    }
+  });
+
+  it("rejects malformed native metadata and an unavailable release before use", async () => {
+    invokeMock.mockResolvedValue([
+      "inspection-123",
+      "Torrent",
+      release.artifact.expectedInfohash,
+      "12",
+      "Only file",
+      "7",
+    ]);
+    await expect(
+      inspectVerifiedSukebeiTorrent("MDVR-419", release),
+    ).resolves.toEqual({ status: "malformed-torrent" });
+
+    invokeMock.mockResolvedValue([
+      "inspection-123",
+      "Torrent",
+      "0000000000000000000000000000000000000001",
+      "7",
+      "Only file",
+      "7",
+    ]);
+    await expect(
+      inspectVerifiedSukebeiTorrent("MDVR-419", release),
+    ).resolves.toEqual({ status: "infohash-mismatch" });
+
+    await expect(
+      inspectVerifiedSukebeiTorrent("MDVR-419", {
+        name: "MDVR-419 unavailable",
+        seeders: null,
+        size: null,
+        source: "Sukebei",
+      }),
+    ).resolves.toEqual({ status: "malformed-torrent" });
+    expect(invokeMock).toHaveBeenCalledTimes(2);
   });
 });

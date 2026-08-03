@@ -62,6 +62,13 @@ let fetchJavdbVrCatalogMock: Mock<
 let fetchSukebeiVrReleasesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string>
 >;
+let inspectSukebeiVrTorrentMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let invalidateVerifiedVrTorrentMock: Mock<() => Promise<void>>;
+let saveVerifiedVrTorrentMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<boolean>
+>;
 let fetchMock: Mock<typeof fetch>;
 let clipboardWriteMock: Mock<(text: string) => Promise<void>>;
 let resizeObserverRecords: ResizeObserverRecord[] = [];
@@ -193,6 +200,24 @@ function selectSettings() {
   fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 }
 
+async function openVrReleaseComparison(code = "MDVR-419") {
+  render(<App />);
+  selectDiscover();
+  selectVrDiscover();
+  fireEvent.change(
+    screen.getByRole("textbox", { name: "Search product code" }),
+    { target: { value: code } },
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Search" }));
+  const trigger = await screen.findByRole("button", {
+    name: `Find releases: ${code}`,
+  });
+  fireEvent.click(trigger);
+  return screen.findByRole("list", {
+    name: `Verified releases for ${code}`,
+  });
+}
+
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     headers: { "Content-Type": "application/json" },
@@ -214,14 +239,24 @@ function javdbCatalogFixture(
 }
 
 function sukebeiReleaseFixture(
-  releases: Array<{ name: string; seeders?: number; size?: string }>,
+  releases: Array<{
+    infohash?: string;
+    itemId?: string;
+    name: string;
+    seeders?: number;
+    size?: string;
+    torrentUrl?: string;
+  }>,
 ) {
   return `<rss xmlns:nyaa="https://sukebei.nyaa.si/xmlns/nyaa" version="2.0">
     <channel><title>Sukebei results</title>${releases
       .map(
-        ({ name, seeders, size }) => `<item><title>${name}</title>
+        ({ infohash, itemId, name, seeders, size, torrentUrl }) => `<item><title>${name}</title>
           ${size === undefined ? "" : `<nyaa:size>${size}</nyaa:size>`}
           ${seeders === undefined ? "" : `<nyaa:seeders>${seeders}</nyaa:seeders>`}
+          ${itemId === undefined ? "" : `<guid>https://sukebei.nyaa.si/view/${itemId}</guid>`}
+          ${torrentUrl === undefined && itemId === undefined ? "" : `<link>${torrentUrl ?? `https://sukebei.nyaa.si/download/${itemId}.torrent`}</link>`}
+          ${infohash === undefined ? "" : `<nyaa:infoHash>${infohash}</nyaa:infoHash>`}
         </item>`,
       )
       .join("")}</channel>
@@ -331,6 +366,16 @@ beforeEach(() => {
   fetchSukebeiVrReleasesMock = vi
     .fn()
     .mockResolvedValue(sukebeiReleaseFixture([]));
+  inspectSukebeiVrTorrentMock = vi.fn().mockResolvedValue([
+    "inspection-123",
+    "Verified torrent",
+    "0123456789abcdef0123456789abcdef01234567",
+    "5",
+    "Verified file.mp4",
+    "5",
+  ]);
+  invalidateVerifiedVrTorrentMock = vi.fn().mockResolvedValue(undefined);
+  saveVerifiedVrTorrentMock = vi.fn().mockResolvedValue(true);
   invokeMock = vi.fn(
     (command: string, parameters?: Record<string, unknown>) => {
       switch (command) {
@@ -367,6 +412,12 @@ beforeEach(() => {
           return fetchJavdbVrCatalogMock(parameters);
         case "fetch_sukebei_vr_releases":
           return fetchSukebeiVrReleasesMock(parameters);
+        case "inspect_sukebei_vr_torrent":
+          return inspectSukebeiVrTorrentMock(parameters);
+        case "invalidate_verified_vr_torrent":
+          return invalidateVerifiedVrTorrentMock();
+        case "save_verified_vr_torrent":
+          return saveVerifiedVrTorrentMock(parameters);
         default:
           return Promise.reject(new Error("Unexpected native command."));
       }
@@ -2443,6 +2494,308 @@ describe("VR Discover and verified release comparison", () => {
         false,
       );
     }
+  });
+
+  it("inspects and saves only a complete explicitly selected provider artifact", async () => {
+    const exactReleaseName = "【VR】 MDVR-419  Exact — 特別版";
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    fetchJavdbVrCatalogMock.mockResolvedValue(
+      javdbCatalogFixture("MDVR-419", "Inspectable title"),
+    );
+    fetchSukebeiVrReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        { name: "MDVR-419 artifact unavailable" },
+        {
+          infohash: expectedInfohash,
+          itemId: "123",
+          name: exactReleaseName,
+          seeders: 4,
+          size: "8.0 GiB",
+        },
+      ]),
+    );
+    const inspectionResult = createDeferred<string[]>();
+    inspectSukebeiVrTorrentMock.mockReturnValue(inspectionResult.promise);
+    const verifiedInspection = [
+      "inspection-123",
+      "VR  — 作品",
+      expectedInfohash,
+      "12",
+      "Folder/Part  1 — 映画.mkv",
+      "5",
+      "Folder/特別版  B.mp4",
+      "7",
+    ];
+    const releaseList = await openVrReleaseComparison();
+
+    fireEvent.click(
+      within(releaseList).getByRole("button", {
+        name: /MDVR-419 artifact unavailable/,
+      }),
+    );
+    expect(
+      screen.getByText(/no complete safe provider artifact identity/),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Inspect torrent" })).toBeNull();
+
+    fireEvent.click(
+      within(releaseList).getByRole("button", { name: /Exact — 特別版/ }),
+    );
+    const inspectButton = screen.getByRole("button", {
+      name: "Inspect torrent",
+    });
+    expect(inspectSukebeiVrTorrentMock).not.toHaveBeenCalled();
+    fireEvent.click(inspectButton);
+
+    expect(
+      await screen.findByRole("heading", { name: "Inspecting verified torrent" }),
+    ).toBeTruthy();
+    const loadingReleaseName = document.querySelector(
+      ".vr-torrent__release-name",
+    );
+    expect(loadingReleaseName?.textContent).toBe(exactReleaseName);
+    expect(screen.queryByRole("button", { name: "Save `.torrent`" })).toBeNull();
+
+    await act(async () => {
+      inspectionResult.resolve(verifiedInspection);
+      await inspectionResult.promise;
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Complete file list" }),
+    ).toBeTruthy();
+    expect(inspectSukebeiVrTorrentMock).toHaveBeenCalledWith({
+      code: "MDVR-419",
+      expectedInfohash,
+      providerItemId: "123",
+      releaseName: exactReleaseName,
+      torrentUrl: "https://sukebei.nyaa.si/download/123.torrent",
+    });
+    const torrentNameTerm = screen.getByText("Torrent name");
+    expect(torrentNameTerm.parentElement?.querySelector("dd")?.textContent).toBe(
+      "VR  — 作品",
+    );
+    expect(screen.getByText(expectedInfohash)).toBeTruthy();
+    const totalSizeTerm = screen.getByText("Total size");
+    expect(totalSizeTerm.parentElement?.querySelector("dd")?.textContent).toBe(
+      "12 B (12 bytes)",
+    );
+    const fileList = screen.getByRole("list", {
+      name: "Files in verified torrent for MDVR-419",
+    });
+    const fileRows = within(fileList).getAllByRole("listitem");
+    expect(fileRows).toHaveLength(2);
+    expect(fileRows[0].querySelector("span")?.textContent).toBe(
+      "Folder/Part  1 — 映画.mkv",
+    );
+    expect(fileRows[0].querySelector("span:last-child")?.textContent).toBe(
+      "5 B (5 bytes)",
+    );
+    expect(fileRows[1].querySelector("span")?.textContent).toBe(
+      "Folder/特別版  B.mp4",
+    );
+
+    saveVerifiedVrTorrentMock.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const saveButton = screen.getByRole("button", { name: "Save `.torrent`" });
+    fireEvent.click(saveButton);
+    await waitFor(() =>
+      expect(saveVerifiedVrTorrentMock).toHaveBeenLastCalledWith({
+        inspectionId: "inspection-123",
+      }),
+    );
+    expect(screen.queryByText("Verified torrent file saved.")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    fireEvent.click(saveButton);
+    expect(await screen.findByText("Verified torrent file saved.")).toBeTruthy();
+    saveVerifiedVrTorrentMock.mockRejectedValueOnce("vr_torrent_save_failed");
+    fireEvent.click(saveButton);
+    expect(
+      (
+        await screen.findByRole("alert", {
+          name: "",
+        })
+      ).textContent,
+    ).toBe("The verified torrent file could not be saved.");
+    const torrentDialog = screen
+      .getByText("Exact selected release")
+      .closest('[role="dialog"]');
+    expect(torrentDialog).not.toBeNull();
+    fireEvent.click(
+      within(torrentDialog as HTMLElement).getByRole("button", { name: "Close" }),
+    );
+    await waitFor(() => expect(document.activeElement).toBe(inspectButton));
+
+    expect(fetchSukebeiVrReleasesMock).toHaveBeenCalledTimes(1);
+    expect(
+      invokeMock.mock.calls.some(([command]) =>
+        ["scan_movies", "query_movies_storage", "open_movie", "reveal_movie", "trash_movie"].includes(
+          command,
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps every torrent inspection failure local and retryable", async () => {
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    fetchJavdbVrCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
+    fetchSukebeiVrReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        {
+          infohash: expectedInfohash,
+          itemId: "123",
+          name: "MDVR-419 exact artifact",
+        },
+      ]),
+    );
+    for (const error of [
+      "vr_torrent_source_unavailable",
+      "vr_torrent_network_error",
+      "vr_torrent_provider_error",
+      "vr_torrent_malformed",
+      "vr_torrent_unsupported",
+      "vr_torrent_infohash_mismatch",
+    ]) {
+      inspectSukebeiVrTorrentMock.mockRejectedValueOnce(error);
+    }
+    const releaseList = await openVrReleaseComparison();
+    fireEvent.click(within(releaseList).getByRole("button"));
+    fireEvent.click(screen.getByRole("button", { name: "Inspect torrent" }));
+
+    for (const heading of [
+      "Torrent artifact is unavailable",
+      "Torrent artifact could not be reached",
+      "Torrent provider rejected the request",
+      "Torrent artifact is malformed",
+      "Torrent artifact is unsupported",
+      "Torrent identity did not match",
+    ]) {
+      expect(await screen.findByRole("heading", { name: heading })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Save `.torrent`" })).toBeNull();
+      if (heading !== "Torrent identity did not match") {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Retry inspection" }),
+        );
+      }
+    }
+    expect(document.querySelector(".vr-releases__selection")).not.toBeNull();
+  });
+
+  it("invalidates late inspection and save responses across selection and dismissal", async () => {
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    fetchJavdbVrCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
+    fetchSukebeiVrReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        {
+          infohash: expectedInfohash,
+          itemId: "123",
+          name: "MDVR-419 release A",
+        },
+        {
+          infohash: expectedInfohash,
+          itemId: "124",
+          name: "MDVR-419 release B",
+        },
+      ]),
+    );
+    const inspectionA = createDeferred<string[]>();
+    inspectSukebeiVrTorrentMock
+      .mockReturnValueOnce(inspectionA.promise)
+      .mockResolvedValueOnce([
+        "inspection-124",
+        "Release B torrent",
+        expectedInfohash,
+        "7",
+        "B/Exact file.mp4",
+        "7",
+      ]);
+    const releaseList = await openVrReleaseComparison();
+    const releaseA = within(releaseList).getByRole("button", {
+      name: /release A/,
+    });
+    const releaseB = within(releaseList).getByRole("button", {
+      name: /release B/,
+    });
+    fireEvent.click(releaseA);
+    fireEvent.click(screen.getByRole("button", { name: "Inspect torrent" }));
+    await screen.findByRole("heading", { name: "Inspecting verified torrent" });
+
+    fireEvent.click(releaseB);
+    expect(screen.queryByText("Exact selected release")).toBeNull();
+    await act(async () => {
+      inspectionA.resolve([
+        "inspection-123",
+        "Late release A torrent",
+        expectedInfohash,
+        "5",
+        "A/Late file.mp4",
+        "5",
+      ]);
+      await inspectionA.promise;
+    });
+    expect(screen.queryByText("Late release A torrent")).toBeNull();
+
+    const inspectB = screen.getByRole("button", { name: "Inspect torrent" });
+    fireEvent.click(inspectB);
+    expect(await screen.findByText("Release B torrent")).toBeTruthy();
+    const saveResult = createDeferred<boolean>();
+    saveVerifiedVrTorrentMock.mockReturnValueOnce(saveResult.promise);
+    const saveButton = screen.getByRole("button", { name: "Save `.torrent`" });
+    fireEvent.click(saveButton);
+    fireEvent.click(saveButton);
+    expect(saveVerifiedVrTorrentMock).toHaveBeenCalledTimes(1);
+    const torrentDialog = screen
+      .getByText("Exact selected release")
+      .closest('[role="dialog"]');
+    fireEvent.click(
+      within(torrentDialog as HTMLElement).getByRole("button", { name: "Close" }),
+    );
+    await act(async () => {
+      saveResult.resolve(true);
+      await saveResult.promise;
+    });
+    expect(screen.queryByText("Verified torrent file saved.")).toBeNull();
+    expect(invalidateVerifiedVrTorrentMock).toHaveBeenCalled();
+    expect(document.activeElement).toBe(inspectB);
+  });
+
+  it("dismisses pending torrent inspection by keyboard and restores its trigger", async () => {
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    fetchJavdbVrCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
+    fetchSukebeiVrReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        {
+          infohash: expectedInfohash,
+          itemId: "123",
+          name: "MDVR-419 pending artifact",
+        },
+      ]),
+    );
+    const pendingInspection = createDeferred<string[]>();
+    inspectSukebeiVrTorrentMock.mockReturnValue(pendingInspection.promise);
+    const releaseList = await openVrReleaseComparison();
+    fireEvent.click(within(releaseList).getByRole("button"));
+    const inspectButton = screen.getByRole("button", {
+      name: "Inspect torrent",
+    });
+    fireEvent.click(inspectButton);
+    await screen.findByRole("heading", { name: "Inspecting verified torrent" });
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(inspectButton));
+    await act(async () => {
+      pendingInspection.resolve([
+        "inspection-123",
+        "Late closed torrent",
+        expectedInfohash,
+        "5",
+        "Late file.mp4",
+        "5",
+      ]);
+      await pendingInspection.promise;
+    });
+    expect(screen.queryByText("Late closed torrent")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save `.torrent`" })).toBeNull();
   });
 
   it("keeps only the newest catalog result and blocks a late result after a category change", async () => {

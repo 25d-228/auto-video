@@ -55,10 +55,14 @@ import {
   canonicalizeProductCode,
   fetchExactJavdbVrItem,
   fetchVerifiedSukebeiReleases,
+  inspectVerifiedSukebeiTorrent,
+  invalidateVerifiedVrTorrent,
+  saveVerifiedVrTorrent,
   type VrCatalogItem,
   type VrCatalogResult,
   type VrRelease,
   type VrReleasesResult,
+  type VrTorrentInspectionResult,
 } from "@/vr";
 
 import "./index.css";
@@ -180,6 +184,15 @@ type VrCatalogState =
   | { status: "loading" }
   | VrCatalogResult;
 type VrReleaseComparisonState = { status: "loading" } | VrReleasesResult;
+type VrTorrentInspectionState =
+  | { status: "loading" }
+  | VrTorrentInspectionResult;
+type VrTorrentSaveState = "idle" | "saving" | "success" | "error";
+type VrTorrentInspectionContext = {
+  item: VrCatalogItem;
+  release: VrRelease;
+  triggerId: string;
+};
 type GalleryVariant = "discover" | "library";
 type GalleryLayout = {
   capacity: number;
@@ -442,6 +455,44 @@ const vrReleaseMessages = {
   "provider-error": {
     heading: "Sukebei could not load releases",
     message: "The release provider returned an unexpected error. Try again later.",
+    role: "alert",
+  },
+} as const;
+
+const vrTorrentMessages = {
+  loading: {
+    heading: "Inspecting verified torrent",
+    message: "Fetching and verifying the exact selected Sukebei artifact.",
+    role: "status",
+  },
+  "source-unavailable": {
+    heading: "Torrent artifact is unavailable",
+    message: "The selected provider artifact is no longer available.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "Torrent artifact could not be reached",
+    message: "Check the network connection and try inspection again.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "Torrent provider rejected the request",
+    message: "The exact provider artifact could not be fetched safely.",
+    role: "alert",
+  },
+  "malformed-torrent": {
+    heading: "Torrent artifact is malformed",
+    message: "The selected artifact did not contain valid torrent metainfo.",
+    role: "alert",
+  },
+  "unsupported-torrent": {
+    heading: "Torrent artifact is unsupported",
+    message: "The selected artifact is not supported v1 torrent metainfo.",
+    role: "alert",
+  },
+  "infohash-mismatch": {
+    heading: "Torrent identity did not match",
+    message: "The fetched artifact did not match the selected provider item.",
     role: "alert",
   },
 } as const;
@@ -848,6 +899,7 @@ function DiscoverVrCard({
 
 function VrReleaseComparison({
   item,
+  onInspectRelease,
   onRetry,
   onSelectRelease,
   selectedRelease,
@@ -855,6 +907,7 @@ function VrReleaseComparison({
   triggerId,
 }: {
   item: VrCatalogItem;
+  onInspectRelease: (release: VrRelease, triggerId: string) => void;
   onRetry: () => void;
   onSelectRelease: (release: VrRelease) => void;
   selectedRelease: VrRelease | null;
@@ -993,8 +1046,144 @@ function VrReleaseComparison({
                       <dd>{selectedRelease.seeders ?? "Unavailable"}</dd>
                     </div>
                   </dl>
+                  {selectedRelease.artifact === undefined ? (
+                    <p className="vr-releases__artifact-unavailable">
+                      Torrent inspection is unavailable because this release
+                      has no complete safe provider artifact identity.
+                    </p>
+                  ) : (
+                    <Button
+                      id={`inspect-vr-torrent-${selectedRelease.artifact.providerItemId}`}
+                      onClick={(event) =>
+                        onInspectRelease(selectedRelease, event.currentTarget.id)
+                      }
+                      type="button"
+                    >
+                      <AppIcon name="details" />
+                      Inspect torrent
+                    </Button>
+                  )}
                 </section>
               )}
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
+  );
+}
+
+function VrTorrentInspectionDialog({
+  context,
+  onRetry,
+  onSave,
+  saveState,
+  state,
+}: {
+  context: VrTorrentInspectionContext;
+  onRetry: () => void;
+  onSave: () => void;
+  saveState: VrTorrentSaveState;
+  state: VrTorrentInspectionState;
+}) {
+  const currentMessage =
+    vrTorrentMessages[state.status === "ready" ? "loading" : state.status];
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="vr-torrent__backdrop" />
+      <Dialog.Viewport className="vr-torrent__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading" || saveState === "saving"}
+          className="vr-torrent__popup"
+          finalFocus={() => document.getElementById(context.triggerId)}
+        >
+          <div className="vr-torrent__heading">
+            <div>
+              <p className="card-eyebrow">Verified Sukebei torrent</p>
+              <Dialog.Title>{context.item.code}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="vr-torrent__description">
+            <span>Exact selected release</span>
+            <span className="vr-torrent__release-name">
+              {context.release.name}
+            </span>
+          </Dialog.Description>
+
+          {state.status === "ready" ? (
+            <div className="vr-torrent__content">
+              <dl className="vr-torrent__metadata">
+                <div>
+                  <dt>Torrent name</dt>
+                  <dd>{state.inspection.displayName}</dd>
+                </div>
+                <div>
+                  <dt>Verified infohash</dt>
+                  <dd>{state.inspection.infohash}</dd>
+                </div>
+                <div>
+                  <dt>Total size</dt>
+                  <dd>
+                    {formatStorageBytes(BigInt(state.inspection.totalBytes))} (
+                    {state.inspection.totalBytes} bytes)
+                  </dd>
+                </div>
+                <div>
+                  <dt>Files</dt>
+                  <dd>{state.inspection.files.length}</dd>
+                </div>
+              </dl>
+              <h3>Complete file list</h3>
+              <ol aria-label={`Files in verified torrent for ${context.item.code}`}>
+                {state.inspection.files.map((file) => (
+                  <li key={file.path}>
+                    <span>{file.path}</span>
+                    <span>
+                      {formatStorageBytes(BigInt(file.sizeBytes))} ({file.sizeBytes} bytes)
+                    </span>
+                  </li>
+                ))}
+              </ol>
+              <div className="vr-torrent__actions">
+                <Button
+                  disabled={saveState === "saving"}
+                  onClick={onSave}
+                  type="button"
+                >
+                  <AppIcon name="downloads" />
+                  {saveState === "saving" ? "Saving…" : "Save `.torrent`"}
+                </Button>
+                {saveState === "success" ? (
+                  <p role="status">Verified torrent file saved.</p>
+                ) : saveState === "error" ? (
+                  <p role="alert">The verified torrent file could not be saved.</p>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <div className="vr-torrent__state" role={currentMessage.role}>
+              <span className="empty-state__icon">
+                <AppIcon name="releases" />
+              </span>
+              <div>
+                <h3>{currentMessage.heading}</h3>
+                <p>{currentMessage.message}</p>
+                {state.status === "loading" ? null : (
+                  <Button onClick={onRetry} type="button" variant="outline">
+                    <AppIcon name="refresh" />
+                    Retry inspection
+                  </Button>
+                )}
+              </div>
             </div>
           )}
         </Dialog.Popup>
@@ -1545,6 +1734,14 @@ export default function App() {
   const [selectedVrRelease, setSelectedVrRelease] =
     useState<VrRelease | null>(null);
   const [releaseRequestVersion, setReleaseRequestVersion] = useState(0);
+  const [torrentInspectionContext, setTorrentInspectionContext] =
+    useState<VrTorrentInspectionContext | null>(null);
+  const [torrentInspectionState, setTorrentInspectionState] =
+    useState<VrTorrentInspectionState | null>(null);
+  const [torrentInspectionRequestVersion, setTorrentInspectionRequestVersion] =
+    useState(0);
+  const [torrentSaveState, setTorrentSaveState] =
+    useState<VrTorrentSaveState>("idle");
   const navigationItems = useRef<Array<HTMLButtonElement | null>>([]);
   const workspace = useRef<HTMLElement | null>(null);
   const scanRequestId = useRef(0);
@@ -1553,6 +1750,9 @@ export default function App() {
   const movieDetailsRequestId = useRef(0);
   const vrCatalogRequestId = useRef(0);
   const releaseRequestId = useRef(0);
+  const torrentInspectionRequestId = useRef(0);
+  const torrentSaveRequestId = useRef(0);
+  const torrentSavePending = useRef(false);
   const trendingDiscoverResult = useRef<{
     refreshVersion: number;
     result: TmdbMoviesResult;
@@ -1912,6 +2112,29 @@ export default function App() {
     };
   }, [releaseComparisonItem, releaseRequestVersion]);
 
+  useEffect(() => {
+    const requestId = ++torrentInspectionRequestId.current;
+    if (torrentInspectionContext === null) {
+      return;
+    }
+
+    setTorrentInspectionState({ status: "loading" });
+    setTorrentSaveState("idle");
+    void inspectVerifiedSukebeiTorrent(
+      torrentInspectionContext.item.code,
+      torrentInspectionContext.release,
+    ).then((result) => {
+      if (requestId === torrentInspectionRequestId.current) {
+        setTorrentInspectionState(result);
+      }
+    });
+
+    return () => {
+      torrentInspectionRequestId.current += 1;
+      void invalidateVerifiedVrTorrent().catch(() => undefined);
+    };
+  }, [torrentInspectionContext, torrentInspectionRequestVersion]);
+
   const moveNavigationFocus = (
     event: ReactKeyboardEvent<HTMLButtonElement>,
     currentIndex: number,
@@ -2067,7 +2290,17 @@ export default function App() {
     setMovieDetailsState(null);
   };
 
+  const closeVrTorrentInspection = () => {
+    torrentInspectionRequestId.current += 1;
+    torrentSaveRequestId.current += 1;
+    setTorrentInspectionContext(null);
+    setTorrentInspectionState(null);
+    setTorrentSaveState("idle");
+    void invalidateVerifiedVrTorrent().catch(() => undefined);
+  };
+
   const closeVrReleaseComparison = () => {
+    closeVrTorrentInspection();
     releaseRequestId.current += 1;
     setReleaseComparisonItem(null);
     setReleaseComparisonState(null);
@@ -2138,6 +2371,7 @@ export default function App() {
       return;
     }
 
+    closeVrTorrentInspection();
     releaseRequestId.current += 1;
     setReleaseComparisonState({ status: "loading" });
     setSelectedVrRelease(null);
@@ -2149,7 +2383,74 @@ export default function App() {
       releaseComparisonState?.status === "ready" &&
       releaseComparisonState.releases.includes(release)
     ) {
+      if (selectedVrRelease !== release) {
+        closeVrTorrentInspection();
+      }
       setSelectedVrRelease(release);
+    }
+  };
+
+  const openVrTorrentInspection = (
+    release: VrRelease,
+    triggerId: string,
+  ) => {
+    if (
+      release.artifact === undefined ||
+      releaseComparisonItem === null ||
+      selectedVrRelease !== release
+    ) {
+      return;
+    }
+
+    torrentInspectionRequestId.current += 1;
+    torrentSaveRequestId.current += 1;
+    setTorrentInspectionContext({
+      item: releaseComparisonItem,
+      release,
+      triggerId,
+    });
+    setTorrentInspectionState({ status: "loading" });
+    setTorrentSaveState("idle");
+    setTorrentInspectionRequestVersion((version) => version + 1);
+  };
+
+  const retryVrTorrentInspection = () => {
+    if (torrentInspectionContext === null) {
+      return;
+    }
+    torrentInspectionRequestId.current += 1;
+    torrentSaveRequestId.current += 1;
+    setTorrentInspectionState({ status: "loading" });
+    setTorrentSaveState("idle");
+    setTorrentInspectionRequestVersion((version) => version + 1);
+  };
+
+  const saveVrTorrent = async () => {
+    if (
+      torrentSavePending.current ||
+      torrentInspectionState?.status !== "ready"
+    ) {
+      return;
+    }
+
+    torrentSavePending.current = true;
+    const requestId = ++torrentSaveRequestId.current;
+    setTorrentSaveState("saving");
+    try {
+      const saved = await saveVerifiedVrTorrent(
+        torrentInspectionState.inspection.inspectionId,
+      );
+      if (requestId === torrentSaveRequestId.current && saved) {
+        setTorrentSaveState("success");
+      } else if (requestId === torrentSaveRequestId.current) {
+        setTorrentSaveState("idle");
+      }
+    } catch {
+      if (requestId === torrentSaveRequestId.current) {
+        setTorrentSaveState("error");
+      }
+    } finally {
+      torrentSavePending.current = false;
     }
   };
 
@@ -3228,7 +3529,7 @@ export default function App() {
       </Dialog.Root>
       <Dialog.Root
         onOpenChange={(open) => {
-          if (!open) {
+          if (!open && torrentInspectionContext === null) {
             closeVrReleaseComparison();
           }
         }}
@@ -3239,11 +3540,31 @@ export default function App() {
         releaseComparisonTriggerId === null ? null : (
           <VrReleaseComparison
             item={releaseComparisonItem}
+            onInspectRelease={openVrTorrentInspection}
             onRetry={retryVrReleaseComparison}
             onSelectRelease={selectVrRelease}
             selectedRelease={selectedVrRelease}
             state={releaseComparisonState}
             triggerId={releaseComparisonTriggerId}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeVrTorrentInspection();
+          }
+        }}
+        open={torrentInspectionContext !== null}
+      >
+        {torrentInspectionContext === null ||
+        torrentInspectionState === null ? null : (
+          <VrTorrentInspectionDialog
+            context={torrentInspectionContext}
+            onRetry={retryVrTorrentInspection}
+            onSave={() => void saveVrTorrent()}
+            saveState={torrentSaveState}
+            state={torrentInspectionState}
           />
         )}
       </Dialog.Root>

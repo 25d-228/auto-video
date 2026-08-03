@@ -71,4 +71,15 @@ describe("Mira preset contract", () => {
     );
     expect(applicationStyles).toContain("@media (hover: none)");
   });
+
+  it("keeps verified torrent names and paths usable in the minimum window", () => {
+    expect(applicationStyles).toContain(".vr-torrent__popup {");
+    expect(applicationStyles).toContain("width: min(42rem, 100%);");
+    expect(applicationStyles).toContain("max-height: 100%;");
+    expect(applicationStyles).toContain(
+      ".vr-torrent__content > ol li span:first-child {",
+    );
+    expect(applicationStyles).toContain("overflow-wrap: anywhere;");
+    expect(applicationStyles).toContain("white-space: pre-wrap;");
+  });
 });

@@ -1,6 +1,6 @@
 # Auto-Video
 
-Auto-Video is a Tauri 2 desktop application for macOS and Windows with a React and TypeScript interface built by Vite. It scans one local Movies folder, shows volume storage usage, discovers and searches TMDB Movies with exact-ID details, and finds JavDB VR titles by exact product code. Verified Sukebei releases can be compared as metadata and selected locally; torrent inspection, saving, and downloads remain unavailable.
+Auto-Video is a Tauri 2 desktop application for macOS and Windows with a React and TypeScript interface built by Vite. It scans one local Movies folder, shows volume storage usage, discovers and searches TMDB Movies with exact-ID details, and finds JavDB VR titles by exact product code. Verified Sukebei releases can be compared, selected, inspected as exact torrent metainfo, and saved as `.torrent` files; media downloading remains unavailable.
 
 ## Toolchain
 
