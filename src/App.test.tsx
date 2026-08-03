@@ -1608,6 +1608,599 @@ describe("TMDB Discover", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("loads exact ID-verified details from a trending card without prefetching or leaking the token", async () => {
+    const token = "details-fixture-token";
+    const summaryTitle = "映画  —  Selected Summary";
+    const providerTitle = "映画  —  Director's “DETAILS” Cut!";
+    const pendingDetails = createDeferred<Response>();
+    const parentActivation = vi.fn();
+    loadTmdbTokenMock.mockResolvedValue(token);
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          results: [
+            { id: 201, title: summaryTitle },
+            { id: 202, title: "Other trending Movie" },
+          ],
+        }),
+      )
+      .mockReturnValueOnce(pendingDetails.promise);
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectDiscover();
+    const summaryHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "映画 — Selected Summary",
+    });
+    const card = summaryHeading.closest("article") as HTMLElement;
+    const detailsButton = within(card).getByRole("button", {
+      name: "View details: 映画 — Selected Summary",
+    });
+    expect(detailsButton.getAttribute("aria-label")).toBe(
+      `View details: ${summaryTitle}`,
+    );
+    expect(
+      screen.getByRole("button", {
+        name: "View details: Other trending Movie",
+      }),
+    ).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    detailsButton.focus();
+    expect(document.activeElement).toBe(detailsButton);
+    parentActivation.mockClear();
+    fireEvent.pointerDown(detailsButton);
+    fireEvent.click(detailsButton);
+
+    const dialog = await screen.findByRole("dialog");
+    const loadingTitle = within(dialog).getByRole("heading", { level: 2 });
+    expect(loadingTitle.textContent).toBe(summaryTitle);
+    expect(
+      within(dialog).getByRole("heading", {
+        level: 3,
+        name: "Loading Movie details",
+      }),
+    ).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(parentActivation).not.toHaveBeenCalled();
+
+    const [detailsUrl, detailsOptions] = fetchMock.mock.calls[1];
+    expect(detailsUrl).toBe("https://api.themoviedb.org/3/movie/201");
+    expect(String(detailsUrl)).not.toContain(token);
+    expect(detailsOptions?.headers).toEqual({
+      Accept: "application/json",
+      Authorization: `Bearer ${token}`,
+    });
+    expect(document.body.textContent).not.toContain(token);
+    expect(clipboardWriteMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pendingDetails.resolve(
+        jsonResponse({
+          id: 201,
+          title: providerTitle,
+          poster_path: "/verified-details.jpg",
+          release_date: "2026-08-03",
+          runtime: 143,
+          genres: [{ name: "Drama" }, { name: "Science  Fiction" }],
+          overview: "Exact  provider overview — punctuation preserved!",
+        }),
+      );
+      await pendingDetails.promise;
+    });
+
+    const verifiedTitle = await within(dialog).findByRole("heading", {
+      level: 2,
+      name: "映画 — Director's “DETAILS” Cut!",
+    });
+    expect(verifiedTitle.textContent).toBe(providerTitle);
+    expect(within(dialog).getByText("2026-08-03")).toBeTruthy();
+    expect(within(dialog).getByText("143 minutes")).toBeTruthy();
+    expect(within(dialog).getByText("Drama, Science Fiction").textContent).toBe(
+      "Drama, Science  Fiction",
+    );
+    expect(
+      within(dialog).getByText(
+        "Exact provider overview — punctuation preserved!",
+      ).textContent,
+    ).toBe("Exact  provider overview — punctuation preserved!");
+    const poster = dialog.querySelector(".movie-details__poster img");
+    expect(poster).not.toBeNull();
+    expect((poster as HTMLImageElement).getAttribute("src")).toBe(
+      "https://image.tmdb.org/t/p/w500/verified-details.jpg",
+    );
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(detailsButton));
+    expect(document.body.contains(summaryHeading)).toBe(true);
+    expect(summaryHeading.textContent).toBe(summaryTitle);
+    parentActivation.mockClear();
+
+    const otherCard = screen
+      .getByRole("heading", { level: 3, name: "Other trending Movie" })
+      .closest("article") as HTMLElement;
+    fireEvent.click(
+      within(otherCard).getByRole("button", {
+        name: "Copy title: Other trending Movie",
+      }),
+    );
+    expect(clipboardWriteMock).toHaveBeenCalledWith("Other trending Movie");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(parentActivation).not.toHaveBeenCalled();
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(queryMoviesStorageMock).not.toHaveBeenCalled();
+    expect(openMovieMock).not.toHaveBeenCalled();
+    expect(revealMovieMock).not.toHaveBeenCalled();
+    expect(trashMovieMock).not.toHaveBeenCalled();
+  });
+
+  it("requests details by ID from a search card and preserves the submitted search after Close", async () => {
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 1, title: "Trending result" }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 302, title: "Search card result" }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 302,
+          title: "Search card result",
+          runtime: 98,
+          genres: [{ name: "Comedy" }],
+          overview: "Search-backed details.",
+        }),
+      );
+
+    render(<App />);
+    selectDiscover();
+    expect(await screen.findByText("Trending result")).toBeTruthy();
+    submitDiscoverSearch("Search query");
+    expect(await screen.findByText("Search card result")).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "View details: Search card result",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByText("Search-backed details.")).toBeTruthy();
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "https://api.themoviedb.org/3/movie/302",
+    );
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(
+      screen.getByRole("textbox", { name: "Search Movies" }),
+    ).toHaveProperty("value", "Search query");
+    expect(
+      screen.getByRole("list", { name: "TMDB Movies search results" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Search card result")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("shows honest optional-field and poster fallbacks in verified details", async () => {
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 401, title: "Fallback details" }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ id: 401, title: "Fallback details" }),
+      );
+
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View details: Fallback details",
+      }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByText("Poster unavailable")).toBeTruthy();
+    expect(within(dialog).getAllByText("Unavailable")).toHaveLength(4);
+  });
+
+  it.each([
+    {
+      caseName: "unauthorized token",
+      heading: "TMDB token was not accepted",
+      outcome: jsonResponse({}, 401),
+    },
+    {
+      caseName: "rate limit",
+      heading: "TMDB details rate limit reached",
+      outcome: jsonResponse({}, 429),
+    },
+    {
+      caseName: "malformed identity",
+      heading: "TMDB returned invalid Movie details",
+      outcome: jsonResponse({ id: 999, title: "Wrong Movie" }),
+    },
+    {
+      caseName: "general provider failure",
+      heading: "TMDB could not load Movie details",
+      outcome: jsonResponse({}, 500),
+    },
+  ])(
+    "keeps the Discover result set behind the local details $caseName state",
+    async ({ heading, outcome }) => {
+      loadTmdbTokenMock.mockResolvedValue("fixture-token");
+      fetchMock
+        .mockResolvedValueOnce(
+          jsonResponse({ results: [{ id: 501, title: "Stable result" }] }),
+        )
+        .mockResolvedValueOnce(outcome);
+
+      render(<App />);
+      selectDiscover();
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "View details: Stable result",
+        }),
+      );
+
+      const dialog = await screen.findByRole("dialog");
+      expect(
+        await within(dialog).findByRole("heading", {
+          level: 3,
+          name: heading,
+        }),
+      ).toBeTruthy();
+      expect(
+        document.querySelector('[aria-label="Weekly trending Movies"]'),
+      ).not.toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("shows a details network error without replacing Discover results", async () => {
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 502, title: "Network result" }] }),
+      )
+      .mockRejectedValueOnce(new TypeError("offline"));
+
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View details: Network result",
+      }),
+    );
+
+    expect(
+      await within(await screen.findByRole("dialog")).findByRole("heading", {
+        level: 3,
+        name: "TMDB Movie details could not be reached",
+      }),
+    ).toBeTruthy();
+    expect(document.querySelector('[aria-label="Weekly trending Movies"]'))
+      .not.toBeNull();
+  });
+
+  it("keeps Movie B details when Movie A resolves late", async () => {
+    const movieADetails = createDeferred<Response>();
+    const movieBDetails = createDeferred<Response>();
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          results: [
+            { id: 601, title: "Movie A" },
+            { id: 602, title: "Movie B" },
+          ],
+        }),
+      )
+      .mockReturnValueOnce(movieADetails.promise)
+      .mockReturnValueOnce(movieBDetails.promise);
+
+    render(<App />);
+    selectDiscover();
+    const movieAButton = await screen.findByRole("button", {
+      name: "View details: Movie A",
+    });
+    const movieBButton = screen.getByRole("button", {
+      name: "View details: Movie B",
+    });
+
+    fireEvent.click(movieAButton);
+    expect(
+      within(await screen.findByRole("dialog")).getByRole("heading", {
+        level: 2,
+        name: "Movie A",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(movieBButton);
+    const movieBDialog = await screen.findByRole("dialog");
+    expect(
+      within(movieBDialog).getByRole("heading", {
+        level: 2,
+        name: "Movie B",
+      }),
+    ).toBeTruthy();
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "https://api.themoviedb.org/3/movie/601",
+    );
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "https://api.themoviedb.org/3/movie/602",
+    );
+
+    await act(async () => {
+      movieBDetails.resolve(
+        jsonResponse({
+          id: 602,
+          title: "Movie B verified",
+          overview: "Newest selected details.",
+        }),
+      );
+      await movieBDetails.promise;
+    });
+    expect(await within(movieBDialog).findByText("Newest selected details."))
+      .toBeTruthy();
+
+    await act(async () => {
+      movieADetails.resolve(
+        jsonResponse({
+          id: 601,
+          title: "Movie A stale",
+          overview: "Stale Movie A details.",
+        }),
+      );
+      await movieADetails.promise;
+    });
+    expect(screen.queryByText("Stale Movie A details.")).toBeNull();
+    expect(within(movieBDialog).getByText("Newest selected details."))
+      .toBeTruthy();
+  });
+
+  it("invalidates pending details on explicit Close and Escape and restores trigger focus", async () => {
+    const explicitlyClosedDetails = createDeferred<Response>();
+    const escapedDetails = createDeferred<Response>();
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 701, title: "Dismiss details" }] }),
+      )
+      .mockReturnValueOnce(explicitlyClosedDetails.promise)
+      .mockReturnValueOnce(escapedDetails.promise);
+
+    render(<App />);
+    selectDiscover();
+    const detailsButton = await screen.findByRole("button", {
+      name: "View details: Dismiss details",
+    });
+
+    detailsButton.focus();
+    fireEvent.keyDown(detailsButton, { key: "Enter" });
+    fireEvent.click(detailsButton);
+    let dialog = await screen.findByRole("dialog");
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("button", { name: "Close" }),
+      ),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(detailsButton));
+
+    await act(async () => {
+      explicitlyClosedDetails.resolve(
+        jsonResponse({
+          id: 701,
+          title: "Late explicit close",
+          overview: "Should not reopen.",
+        }),
+      );
+      await explicitlyClosedDetails.promise;
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByText("Should not reopen.")).toBeNull();
+
+    fireEvent.click(detailsButton);
+    dialog = await screen.findByRole("dialog");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(detailsButton));
+
+    await act(async () => {
+      escapedDetails.resolve(
+        jsonResponse({
+          id: 701,
+          title: "Late Escape",
+          overview: "Should remain closed.",
+        }),
+      );
+      await escapedDetails.promise;
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByText("Should remain closed.")).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("invalidates pending details when the TMDB token is replaced or cleared", async () => {
+    const oldToken = "old-details-token";
+    const newToken = "new-details-token";
+    const oldTokenDetails = createDeferred<Response>();
+    const newTokenDetails = createDeferred<Response>();
+    loadTmdbTokenMock.mockResolvedValue(oldToken);
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 801, title: "Old token result" }] }),
+      )
+      .mockReturnValueOnce(oldTokenDetails.promise)
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 802, title: "New token result" }] }),
+      )
+      .mockReturnValueOnce(newTokenDetails.promise);
+
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View details: Old token result",
+      }),
+    );
+    await screen.findByRole("dialog");
+
+    const settingsButton = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".navigation-item"),
+    ).find((button) => button.textContent?.trim() === "Settings");
+    expect(settingsButton).not.toBeUndefined();
+    fireEvent.click(settingsButton as HTMLButtonElement);
+    const tokenInput = document.querySelector<HTMLInputElement>("#tmdb-token");
+    expect(tokenInput).not.toBeNull();
+    fireEvent.change(tokenInput as HTMLInputElement, {
+      target: { value: newToken },
+    });
+    fireEvent.submit((tokenInput as HTMLInputElement).form as HTMLFormElement);
+
+    expect(await screen.findByText("TMDB token replaced.")).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    selectDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View details: New token result",
+      }),
+    );
+    await screen.findByRole("dialog");
+
+    fireEvent.click(settingsButton as HTMLButtonElement);
+    const clearTokenButton = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((button) => button.textContent?.trim() === "Clear token");
+    expect(clearTokenButton).not.toBeUndefined();
+    fireEvent.click(clearTokenButton as HTMLButtonElement);
+    expect(await screen.findByText("TMDB token cleared.")).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    await act(async () => {
+      oldTokenDetails.resolve(
+        jsonResponse({
+          id: 801,
+          title: "Old token stale details",
+          overview: oldToken,
+        }),
+      );
+      newTokenDetails.resolve(
+        jsonResponse({
+          id: 802,
+          title: "New token stale details",
+          overview: newToken,
+        }),
+      );
+      await Promise.all([oldTokenDetails.promise, newTokenDetails.promise]);
+    });
+
+    expect(screen.queryByText("Old token stale details")).toBeNull();
+    expect(screen.queryByText("New token stale details")).toBeNull();
+    expect(document.body.textContent).not.toContain(oldToken);
+    expect(document.body.textContent).not.toContain(newToken);
+    expect(String(fetchMock.mock.calls[1][0])).not.toContain(oldToken);
+    expect(String(fetchMock.mock.calls[3][0])).not.toContain(newToken);
+    expect(fetchMock.mock.calls[1][1]?.headers).toEqual({
+      Accept: "application/json",
+      Authorization: `Bearer ${oldToken}`,
+    });
+    expect(fetchMock.mock.calls[3][1]?.headers).toEqual({
+      Accept: "application/json",
+      Authorization: `Bearer ${newToken}`,
+    });
+  });
+
+  it("preserves search results and responsive page through details, navigation, and appearance changes", async () => {
+    const detailsResponse = createDeferred<Response>();
+    const searchResults = Array.from({ length: 25 }, (_, index) => ({
+      id: index + 901,
+      title: `Details preservation ${index + 1}`,
+    }));
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 1, title: "Trending result" }] }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ results: searchResults }))
+      .mockReturnValueOnce(detailsResponse.promise);
+
+    render(<App />);
+    selectDiscover();
+    expect(await screen.findByText("Trending result")).toBeTruthy();
+    submitDiscoverSearch("Preserved details query");
+    expect(await screen.findByText("Details preservation 1")).toBeTruthy();
+    resizeGallery("discover", 1528, 472);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Next TMDB Movies search results page",
+      }),
+    );
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+
+    const searchResultsList = screen.getByRole("list", {
+      name: "TMDB Movies search results",
+    });
+    const detailsButton = within(searchResultsList).getAllByRole("button", {
+      name: /View details:/,
+    })[0];
+    const selectedTitle =
+      detailsButton
+        .getAttribute("aria-label")
+        ?.replace("View details: ", "") ?? "";
+    fireEvent.click(detailsButton);
+    const dialog = await screen.findByRole("dialog");
+    const detailsMovieId = Number(
+      String(fetchMock.mock.calls[2][0]).split("/").at(-1),
+    );
+
+    const settingsButton = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".navigation-item"),
+    ).find((button) => button.textContent?.trim() === "Settings");
+    fireEvent.click(settingsButton as HTMLButtonElement);
+    const darkAppearance = document.querySelector<HTMLInputElement>(
+      'input[name="appearance"][value="dark"]',
+    );
+    expect(darkAppearance).not.toBeNull();
+    fireEvent.click(darkAppearance as HTMLInputElement);
+
+    const discoverButton = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".navigation-item"),
+    ).find((button) => button.textContent?.trim() === "Discover");
+    fireEvent.click(discoverButton as HTMLButtonElement);
+    resizeGallery("discover", 1088, 956);
+
+    await act(async () => {
+      detailsResponse.resolve(
+        jsonResponse({
+          id: detailsMovieId,
+          title: selectedTitle,
+          overview: "Preserved verified details.",
+        }),
+      );
+      await detailsResponse.promise;
+    });
+    expect(await within(dialog).findByText("Preserved verified details."))
+      .toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+
+    expect(
+      screen.getByRole("textbox", { name: "Search Movies" }),
+    ).toHaveProperty("value", "Preserved details query");
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(screen.getByLabelText("TMDB credits")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(queryMoviesStorageMock).not.toHaveBeenCalled();
+  });
+
   it("prevents pending results from returning after the token changes or clears", async () => {
     const oldTokenRequest = createDeferred<Response>();
     const pendingClearRequest = createDeferred<Response>();
