@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
@@ -15,9 +15,10 @@ use librqbit::{
     TorrentStatsState,
 };
 
+use crate::vr_library::is_supported_media;
 use crate::vr_torrent::{
-    hex_sha1, revalidate_persisted_download_source, VerifiedDownloadFile, VerifiedDownloadSource,
-    VerifiedDownloadSourceError, VrTorrentState,
+    hex_sha1, media_name_matches_product_code, revalidate_persisted_download_source,
+    VerifiedDownloadFile, VerifiedDownloadSource, VerifiedDownloadSourceError, VrTorrentState,
 };
 
 pub const VR_DOWNLOAD_ACTION_INVALID: &str = "vr_download_action_invalid";
@@ -33,6 +34,10 @@ pub const VR_DOWNLOAD_PERSISTENCE_FAILED: &str = "vr_download_persistence_failed
 pub const VR_DOWNLOAD_STALE: &str = "vr_download_stale";
 pub const VR_FOLDER_STORAGE_FAILED: &str = "vr_folder_storage_failed";
 pub const VR_FOLDER_UNAVAILABLE: &str = "vr_folder_unavailable";
+pub const VR_ORGANIZATION_CONFLICT: &str = "vr_organization_conflict";
+pub const VR_ORGANIZATION_FAILED: &str = "vr_organization_failed";
+pub const VR_ORGANIZATION_INELIGIBLE: &str = "vr_organization_ineligible";
+pub const VR_ORGANIZATION_STALE: &str = "vr_organization_stale";
 
 const PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_VR_DOWNLOADS_V1\n";
 const MAX_PERSISTENCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -100,6 +105,33 @@ enum TransferAction {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum OrganizationState {
+    #[default]
+    None,
+    Organized,
+    Attention,
+}
+
+impl OrganizationState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Organized => "organized",
+            Self::Attention => "attention",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "organized" => Some(Self::Organized),
+            "attention" => Some(Self::Attention),
+            _ => None,
+        }
+    }
+}
+
 struct TransferRecord {
     transfer_id: String,
     code: String,
@@ -109,12 +141,48 @@ struct TransferRecord {
     selected_files: Vec<VerifiedDownloadFile>,
     destination: PathBuf,
     fingerprints: Vec<String>,
+    current_paths: Vec<String>,
+    organization_state: OrganizationState,
     state: TransferState,
     downloaded_bytes: u64,
     boundary_segments: Arc<Mutex<BTreeMap<usize, Vec<SparseSegment>>>>,
     handle: Option<ManagedTorrentHandle>,
     handle_generation: u64,
     pending_action: Option<TransferAction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OrganizationEntryKind {
+    Move,
+    MediaUnchanged,
+    NonMediaUnchanged,
+}
+
+impl OrganizationEntryKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Move => "move",
+            Self::MediaUnchanged => "media-unchanged",
+            Self::NonMediaUnchanged => "non-media-unchanged",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OrganizationEntry {
+    selected_index: usize,
+    kind: OrganizationEntryKind,
+    source_relative: String,
+    destination_relative: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OrganizationPlan {
+    plan_id: String,
+    generation: u64,
+    transfer_id: String,
+    code: String,
+    entries: Vec<OrganizationEntry>,
 }
 
 impl TransferRecord {
@@ -158,10 +226,17 @@ struct VrDownloadContext {
     transfers_loaded: bool,
     transfers_loading: bool,
     transfers: Vec<StoredTransfer>,
+    organization_generation: u64,
+    organization_plan: Option<OrganizationPlan>,
 }
 
 #[derive(Clone, Default)]
 pub struct VrDownloadState(Arc<Mutex<VrDownloadContext>>);
+
+fn invalidate_organization_plan(context: &mut VrDownloadContext) {
+    context.organization_generation = context.organization_generation.wrapping_add(1);
+    context.organization_plan = None;
+}
 
 pub(crate) fn configured_vr_folder(
     state: &VrDownloadState,
@@ -211,6 +286,7 @@ pub fn load_vr_folder_with(
 ) -> Result<Vec<String>, &'static str> {
     let configured = load_vr_folder_file(path)?;
     let mut context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
+    invalidate_organization_plan(&mut context);
     context.future_folder.clone_from(&configured);
     let Some(folder) = configured else {
         return Ok(vec!["unconfigured".to_owned()]);
@@ -247,21 +323,17 @@ pub fn set_vr_folder(
         .map(str::to_owned)
         .ok_or(VR_FOLDER_UNAVAILABLE)?;
     save_vr_folder_file(path, &canonical)?;
-    state
-        .0
-        .lock()
-        .map_err(|_| VR_FOLDER_STORAGE_FAILED)?
-        .future_folder = Some(canonical);
+    let mut context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
+    invalidate_organization_plan(&mut context);
+    context.future_folder = Some(canonical);
     Ok(response)
 }
 
 pub fn clear_vr_folder(state: &VrDownloadState, path: &Path) -> Result<(), &'static str> {
     clear_vr_folder_file(path)?;
-    state
-        .0
-        .lock()
-        .map_err(|_| VR_FOLDER_STORAGE_FAILED)?
-        .future_folder = None;
+    let mut context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
+    invalidate_organization_plan(&mut context);
+    context.future_folder = None;
     Ok(())
 }
 
@@ -472,6 +544,20 @@ fn selected_target(
     Ok(target)
 }
 
+fn current_target(record: &TransferRecord, selected_index: usize) -> Result<PathBuf, &'static str> {
+    let relative = record
+        .current_paths
+        .get(selected_index)
+        .ok_or(VR_DOWNLOAD_STALE)
+        .and_then(|path| relative_file_path(path))?;
+    validate_existing_parents(&record.destination, &relative)?;
+    let target = record.destination.join(relative);
+    if !target.starts_with(&record.destination) {
+        return Err(VR_DOWNLOAD_CONTEXT_INVALID);
+    }
+    Ok(target)
+}
+
 fn validate_new_targets(
     destination: &Path,
     selected_files: &[VerifiedDownloadFile],
@@ -512,6 +598,11 @@ fn transfer_from_source(
     destination: PathBuf,
     state: TransferState,
 ) -> TransferRecord {
+    let current_paths = source
+        .selected_files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect();
     TransferRecord {
         transfer_id: transfer_identity(&source, &destination),
         code: source.code,
@@ -521,6 +612,8 @@ fn transfer_from_source(
         selected_files: source.selected_files,
         destination,
         fingerprints: Vec::new(),
+        current_paths,
+        organization_state: OrganizationState::None,
         state,
         downloaded_bytes: 0,
         boundary_segments: Arc::new(Mutex::new(BTreeMap::new())),
@@ -588,6 +681,15 @@ fn encoded_fingerprints(record: &TransferRecord) -> String {
         .join(",")
 }
 
+fn encoded_current_paths(record: &TransferRecord) -> String {
+    record
+        .current_paths
+        .iter()
+        .map(|path| encode_hex(path.as_bytes()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn encoded_boundary_segments(record: &TransferRecord) -> Result<String, &'static str> {
     let segments = record
         .boundary_segments
@@ -621,6 +723,8 @@ fn encode_transfer(record: &TransferRecord) -> Result<Vec<u8>, &'static str> {
         encoded_fingerprints(record),
         record.downloaded_bytes.to_string(),
         encoded_boundary_segments(record)?,
+        record.organization_state.as_str().to_owned(),
+        encoded_current_paths(record),
     ]
     .join("\t")
     .into_bytes())
@@ -642,6 +746,13 @@ fn parse_selected_ids(value: &[u8]) -> Option<Vec<usize>> {
 fn parse_fingerprints(value: &[u8]) -> Option<Vec<String>> {
     if value.is_empty() {
         return Some(Vec::new());
+    }
+    value.split(|byte| *byte == b',').map(decode_text).collect()
+}
+
+fn parse_current_paths(value: &[u8]) -> Option<Vec<String>> {
+    if value.is_empty() {
+        return None;
     }
     value.split(|byte| *byte == b',').map(decode_text).collect()
 }
@@ -675,7 +786,7 @@ fn parse_boundary_segments(value: &[u8]) -> Option<BTreeMap<usize, Vec<SparseSeg
 
 fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
     let fields = line.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-    let (fields, boundary_segments) = match fields.as_slice() {
+    let (fields, boundary_segments, organization_state, current_paths) = match fields.as_slice() {
         [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes] => {
             (
                 [
@@ -691,6 +802,8 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
                     *downloaded_bytes,
                 ],
                 BTreeMap::new(),
+                OrganizationState::None,
+                None,
             )
         }
         [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments] => {
@@ -708,6 +821,27 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
                     *downloaded_bytes,
                 ],
                 parse_boundary_segments(boundary_segments)?,
+                OrganizationState::None,
+                None,
+            )
+        }
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths] => {
+            (
+                [
+                    *transfer_id,
+                    *code,
+                    *release_name,
+                    *infohash,
+                    *destination,
+                    *state,
+                    *metainfo,
+                    *selected_ids,
+                    *fingerprints,
+                    *downloaded_bytes,
+                ],
+                parse_boundary_segments(boundary_segments)?,
+                OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
+                Some(parse_current_paths(current_paths)?),
             )
         }
         _ => return None,
@@ -744,8 +878,32 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
         &selected_ids,
     )
     .ok()?;
+    let current_paths = current_paths.unwrap_or_else(|| {
+        source
+            .selected_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect()
+    });
     let selected_total = checked_selected_total(&source.selected_files).ok()?;
     if transfer_identity(&source, &destination) != transfer_id || downloaded_bytes > selected_total
+    {
+        return None;
+    }
+    if current_paths.len() != source.selected_files.len()
+        || current_paths
+            .iter()
+            .any(|path| relative_file_path(path).is_err())
+        || current_paths.iter().collect::<BTreeSet<_>>().len() != current_paths.len()
+        || (organization_state == OrganizationState::None
+            && current_paths
+                .iter()
+                .zip(source.selected_files.iter())
+                .any(|(current, selected)| current != &selected.path))
+        || (organization_state != OrganizationState::None
+            && (state != TransferState::Completed
+                || downloaded_bytes != selected_total
+                || fingerprints.len() != source.selected_files.len()))
     {
         return None;
     }
@@ -759,6 +917,8 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
         selected_files: source.selected_files,
         destination,
         fingerprints,
+        current_paths,
+        organization_state,
         state,
         downloaded_bytes,
         boundary_segments: Arc::new(Mutex::new(boundary_segments)),
@@ -1350,7 +1510,8 @@ fn capture_fingerprints(record: &TransferRecord) -> Result<Vec<String>, &'static
     record
         .selected_files
         .iter()
-        .map(|file| file_fingerprint(&selected_target(&record.destination, file)?))
+        .enumerate()
+        .map(|(index, _)| file_fingerprint(&current_target(record, index)?))
         .collect()
 }
 
@@ -1360,9 +1521,11 @@ fn validate_resume_context(record: &TransferRecord) -> Result<(), &'static str> 
     {
         return Err(VR_DOWNLOAD_STALE);
     }
-    for (file, expected_fingerprint) in record.selected_files.iter().zip(record.fingerprints.iter())
-    {
-        if file_fingerprint(&selected_target(&record.destination, file)?)? != *expected_fingerprint
+    for (index, expected_fingerprint) in record.fingerprints.iter().enumerate() {
+        let target = current_target(record, index)?;
+        let metadata = fs::metadata(&target).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
+        if metadata.len() != record.selected_files[index].size
+            || file_fingerprint(&target)? != *expected_fingerprint
         {
             return Err(VR_DOWNLOAD_STALE);
         }
@@ -1506,6 +1669,8 @@ async fn restore_record(
             selected_files: record.selected_files.clone(),
             destination: record.destination.clone(),
             fingerprints: record.fingerprints.clone(),
+            current_paths: record.current_paths.clone(),
+            organization_state: record.organization_state,
             state: record.state,
             downloaded_bytes: record.downloaded_bytes,
             boundary_segments: record.boundary_segments.clone(),
@@ -1615,7 +1780,11 @@ pub async fn load_downloads(
         for transfer in &mut context.transfers {
             if let StoredTransfer::Valid(record) = transfer {
                 if validate_resume_context(record).is_err() {
-                    record.state = TransferState::Offline;
+                    if record.organization_state == OrganizationState::None {
+                        record.state = TransferState::Offline;
+                    } else {
+                        record.organization_state = OrganizationState::Attention;
+                    }
                     record.handle = None;
                     record.pending_action = None;
                 }
@@ -1666,6 +1835,526 @@ fn selected_progress(record: &TransferRecord, handle: &ManagedTorrentHandle) -> 
     (downloaded.min(record.selected_total()), speed)
 }
 
+fn exact_part_label(file_name: &str) -> Option<String> {
+    let title = Path::new(file_name).file_stem()?.to_str()?;
+    let bytes = title.as_bytes();
+    let mut matches = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if index > 0 && bytes[index - 1].is_ascii_alphanumeric() {
+            index += 1;
+            continue;
+        }
+        let label_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+            index += 1;
+        }
+        let prefix = std::str::from_utf8(&bytes[label_start..index])
+            .ok()?
+            .to_ascii_uppercase();
+        if !matches!(prefix.as_str(), "PART" | "PT" | "CD" | "DISC" | "DISK") {
+            index = label_start + 1;
+            continue;
+        }
+        while index < bytes.len() && matches!(bytes[index], b' ' | b'_' | b'-') {
+            index += 1;
+        }
+        let number_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let number = std::str::from_utf8(&bytes[number_start..index]).ok()?;
+        let significant_number = number.trim_start_matches('0');
+        if significant_number.is_empty()
+            || significant_number.len() > 4
+            || (index < bytes.len() && bytes[index].is_ascii_alphanumeric())
+        {
+            index = label_start + 1;
+            continue;
+        }
+        matches.push((
+            significant_number.to_owned(),
+            title[label_start..index].to_owned(),
+        ));
+    }
+    let numbers = matches
+        .iter()
+        .map(|(number, _)| number.as_str())
+        .collect::<BTreeSet<_>>();
+    (numbers.len() == 1).then(|| matches[0].1.clone())
+}
+
+fn validate_current_organization_file(
+    record: &TransferRecord,
+    selected_index: usize,
+) -> Result<PathBuf, &'static str> {
+    let path = current_target(record, selected_index).map_err(|_| VR_ORGANIZATION_STALE)?;
+    let metadata = fs::symlink_metadata(&path).map_err(|_| VR_ORGANIZATION_STALE)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(VR_ORGANIZATION_STALE);
+    }
+    if metadata.len() != record.selected_files[selected_index].size
+        || file_fingerprint(&path).map_err(|_| VR_ORGANIZATION_STALE)?
+            != record.fingerprints[selected_index]
+    {
+        return Err(VR_ORGANIZATION_STALE);
+    }
+    let canonical = fs::canonicalize(&path).map_err(|_| VR_ORGANIZATION_STALE)?;
+    if canonical != path || !canonical.starts_with(&record.destination) {
+        return Err(VR_ORGANIZATION_STALE);
+    }
+    Ok(path)
+}
+
+fn validate_organization_directory(
+    destination: &Path,
+    code: &str,
+) -> Result<Option<PathBuf>, &'static str> {
+    for entry in fs::read_dir(destination).map_err(|_| VR_ORGANIZATION_INELIGIBLE)? {
+        let entry = entry.map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or(VR_ORGANIZATION_CONFLICT)?
+            .to_owned();
+        if name.to_lowercase() == code.to_lowercase() && name != code {
+            return Err(VR_ORGANIZATION_CONFLICT);
+        }
+    }
+    let directory = destination.join(code);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(VR_ORGANIZATION_CONFLICT)
+        }
+        Ok(_) => {
+            let canonical = fs::canonicalize(&directory).map_err(|_| VR_ORGANIZATION_CONFLICT)?;
+            if canonical != directory || !canonical.starts_with(destination) {
+                return Err(VR_ORGANIZATION_CONFLICT);
+            }
+            Ok(Some(directory))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(VR_ORGANIZATION_CONFLICT),
+    }
+}
+
+fn destination_has_case_collision(directory: &Path, file_name: &str) -> Result<bool, &'static str> {
+    let expected = file_name.to_lowercase();
+    for entry in fs::read_dir(directory).map_err(|_| VR_ORGANIZATION_CONFLICT)? {
+        let entry = entry.map_err(|_| VR_ORGANIZATION_CONFLICT)?;
+        let existing = entry
+            .file_name()
+            .to_str()
+            .ok_or(VR_ORGANIZATION_CONFLICT)?
+            .to_lowercase();
+        if existing == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn organization_entries(
+    record: &TransferRecord,
+    current_folder: Option<&Path>,
+) -> Result<Vec<OrganizationEntry>, &'static str> {
+    if record.state != TransferState::Completed
+        || record.handle.is_some()
+        || record.pending_action.is_some()
+        || record.organization_state == OrganizationState::Organized
+        || current_folder != Some(record.destination.as_path())
+        || canonical_destination(&record.destination).ok().as_deref()
+            != Some(record.destination.as_path())
+        || record.current_paths.len() != record.selected_files.len()
+        || record.fingerprints.len() != record.selected_files.len()
+    {
+        return Err(VR_ORGANIZATION_INELIGIBLE);
+    }
+
+    let eligible_media = record
+        .current_paths
+        .iter()
+        .filter(|path| is_supported_media(Path::new(path)))
+        .count();
+    if eligible_media == 0 {
+        return Err(VR_ORGANIZATION_INELIGIBLE);
+    }
+    let existing_directory = validate_organization_directory(&record.destination, &record.code)?;
+    let current_paths = record
+        .current_paths
+        .iter()
+        .map(|path| path.to_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut proposed_paths = BTreeSet::new();
+    let mut entries = Vec::with_capacity(record.selected_files.len());
+
+    for (selected_index, source_relative) in record.current_paths.iter().enumerate() {
+        validate_current_organization_file(record, selected_index)?;
+        if !is_supported_media(Path::new(source_relative)) {
+            entries.push(OrganizationEntry {
+                selected_index,
+                kind: OrganizationEntryKind::NonMediaUnchanged,
+                source_relative: source_relative.clone(),
+                destination_relative: None,
+            });
+            continue;
+        }
+
+        let source_name = Path::new(source_relative)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(VR_ORGANIZATION_STALE)?;
+        let source_title = Path::new(source_name)
+            .file_stem()
+            .and_then(|title| title.to_str())
+            .ok_or(VR_ORGANIZATION_STALE)?;
+        if !media_name_matches_product_code(source_title, &record.code) {
+            return Err(VR_ORGANIZATION_INELIGIBLE);
+        }
+        let extension = Path::new(source_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .ok_or(VR_ORGANIZATION_STALE)?;
+        let destination_name = if eligible_media == 1 {
+            format!("{}.{}", record.code, extension)
+        } else if let Some(part_label) = exact_part_label(source_name) {
+            format!("{} - {}.{}", record.code, part_label, extension)
+        } else {
+            source_name.to_owned()
+        };
+        let destination_relative = format!("{}/{}", record.code, destination_name);
+        relative_file_path(&destination_relative).map_err(|_| VR_ORGANIZATION_CONFLICT)?;
+        let destination_key = destination_relative.to_lowercase();
+        if !proposed_paths.insert(destination_key.clone()) {
+            return Err(VR_ORGANIZATION_CONFLICT);
+        }
+        let same_path = source_relative == &destination_relative;
+        if !same_path && current_paths.contains(&destination_key) {
+            return Err(VR_ORGANIZATION_CONFLICT);
+        }
+        if !same_path
+            && existing_directory.as_ref().is_some_and(|directory| {
+                destination_has_case_collision(directory, &destination_name).unwrap_or(true)
+            })
+        {
+            return Err(VR_ORGANIZATION_CONFLICT);
+        }
+        entries.push(OrganizationEntry {
+            selected_index,
+            kind: if same_path {
+                OrganizationEntryKind::MediaUnchanged
+            } else {
+                OrganizationEntryKind::Move
+            },
+            source_relative: source_relative.clone(),
+            destination_relative: Some(destination_relative),
+        });
+    }
+    Ok(entries)
+}
+
+fn organization_plan_id(
+    generation: u64,
+    record: &TransferRecord,
+    entries: &[OrganizationEntry],
+) -> String {
+    let mut identity = generation.to_be_bytes().to_vec();
+    identity_field(&mut identity, record.transfer_id.as_bytes());
+    for entry in entries {
+        identity.extend_from_slice(&(entry.selected_index as u64).to_be_bytes());
+        identity_field(&mut identity, entry.kind.as_str().as_bytes());
+        identity_field(&mut identity, entry.source_relative.as_bytes());
+        identity_field(
+            &mut identity,
+            entry
+                .destination_relative
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
+        identity_field(
+            &mut identity,
+            record.fingerprints[entry.selected_index].as_bytes(),
+        );
+    }
+    format!("{generation}-{}", hex_sha1(&identity))
+}
+
+fn organization_plan_response(plan: &OrganizationPlan) -> Vec<String> {
+    let move_count = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == OrganizationEntryKind::Move)
+        .count();
+    let mut response = vec![
+        plan.plan_id.clone(),
+        plan.transfer_id.clone(),
+        plan.code.clone(),
+        move_count.to_string(),
+        plan.entries.len().to_string(),
+    ];
+    for entry in &plan.entries {
+        response.extend([
+            entry.kind.as_str().to_owned(),
+            entry.source_relative.clone(),
+            entry.destination_relative.clone().unwrap_or_default(),
+        ]);
+    }
+    response
+}
+
+pub fn preview_organization(
+    state: &VrDownloadState,
+    transfer_id: &str,
+) -> Result<Vec<String>, &'static str> {
+    let mut context = state.0.lock().map_err(|_| VR_ORGANIZATION_FAILED)?;
+    invalidate_organization_plan(&mut context);
+    let generation = context.organization_generation;
+    let record = context
+        .transfers
+        .iter()
+        .find_map(|transfer| match transfer {
+            StoredTransfer::Valid(record) if record.transfer_id == transfer_id => Some(record),
+            _ => None,
+        })
+        .ok_or(VR_ORGANIZATION_STALE)?;
+    let entries = organization_entries(record, context.future_folder.as_deref())?;
+    let plan = OrganizationPlan {
+        plan_id: organization_plan_id(generation, record, &entries),
+        generation,
+        transfer_id: record.transfer_id.clone(),
+        code: record.code.clone(),
+        entries,
+    };
+    let response = organization_plan_response(&plan);
+    context.organization_plan = Some(plan);
+    Ok(response)
+}
+
+pub fn dismiss_organization(state: &VrDownloadState) -> Result<(), &'static str> {
+    let mut context = state.0.lock().map_err(|_| VR_ORGANIZATION_FAILED)?;
+    invalidate_organization_plan(&mut context);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const std::ffi::c_char,
+            to: *const std::ffi::c_char,
+            flags: u32,
+        ) -> std::ffi::c_int;
+    }
+
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    // RENAME_EXCL makes the final mutation fail instead of replacing a raced destination.
+    if unsafe { renamex_np(source.as_ptr(), destination.as_ptr(), 0x0000_0004) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileW(existing: *const u16, new: *const u16) -> i32;
+    }
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe { MoveFileW(source.as_ptr(), destination.as_ptr()) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "target exists",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(source, destination)
+}
+
+fn rollback_organization_moves(
+    moved: &[(usize, PathBuf, PathBuf)],
+    original_paths: &[String],
+    current_paths: &mut [String],
+    move_file: &mut impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> bool {
+    let mut restored = true;
+    for (selected_index, source, destination) in moved.iter().rev() {
+        if move_file(destination, source).is_ok() {
+            current_paths[*selected_index] = original_paths[*selected_index].clone();
+        } else {
+            restored = false;
+        }
+    }
+    restored
+}
+
+fn apply_organization_with(
+    state: &VrDownloadState,
+    persistence_path: &Path,
+    plan_id: &str,
+    mut move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<(), &'static str> {
+    let mut context = state.0.lock().map_err(|_| VR_ORGANIZATION_FAILED)?;
+    let plan = context
+        .organization_plan
+        .take()
+        .filter(|plan| plan.plan_id == plan_id)
+        .ok_or(VR_ORGANIZATION_STALE)?;
+    if plan.generation != context.organization_generation {
+        invalidate_organization_plan(&mut context);
+        return Err(VR_ORGANIZATION_STALE);
+    }
+    invalidate_organization_plan(&mut context);
+    let current_folder = context.future_folder.clone();
+    let record_index = context
+        .transfers
+        .iter()
+        .position(|transfer| {
+            matches!(transfer, StoredTransfer::Valid(record) if record.transfer_id == plan.transfer_id)
+        })
+        .ok_or(VR_ORGANIZATION_STALE)?;
+    let record = match &context.transfers[record_index] {
+        StoredTransfer::Valid(record) => record,
+        StoredTransfer::Corrupt(_) => return Err(VR_ORGANIZATION_STALE),
+    };
+    let entries = organization_entries(record, current_folder.as_deref())?;
+    if plan.code != record.code || plan.entries != entries {
+        return Err(VR_ORGANIZATION_STALE);
+    }
+    let previous_state = record.organization_state;
+    let original_paths = record.current_paths.clone();
+    let destination_root = record.destination.clone();
+    let organization_directory = destination_root.join(&record.code);
+    let move_entries = entries
+        .iter()
+        .filter(|entry| entry.kind == OrganizationEntryKind::Move)
+        .map(|entry| {
+            let destination_relative = entry
+                .destination_relative
+                .as_deref()
+                .ok_or(VR_ORGANIZATION_STALE)?;
+            Ok((
+                entry.selected_index,
+                destination_root.join(relative_file_path(&entry.source_relative)?),
+                destination_root.join(relative_file_path(destination_relative)?),
+                destination_relative.to_owned(),
+            ))
+        })
+        .collect::<Result<Vec<_>, &'static str>>()?;
+
+    let mut created_directory = false;
+    if !move_entries.is_empty()
+        && validate_organization_directory(&destination_root, &plan.code)?.is_none()
+    {
+        match fs::create_dir(&organization_directory) {
+            Ok(()) => created_directory = true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                validate_organization_directory(&destination_root, &plan.code)?;
+            }
+            Err(_) => return Err(VR_ORGANIZATION_FAILED),
+        }
+    }
+
+    let mut current_paths = original_paths.clone();
+    let mut moved = Vec::new();
+    for (selected_index, source, destination, destination_relative) in &move_entries {
+        if move_file(source, destination).is_err() {
+            let restored = rollback_organization_moves(
+                &moved,
+                &original_paths,
+                &mut current_paths,
+                &mut move_file,
+            );
+            if created_directory {
+                let _ = fs::remove_dir(&organization_directory);
+            }
+            if !restored {
+                let StoredTransfer::Valid(record) = &mut context.transfers[record_index] else {
+                    return Err(VR_ORGANIZATION_FAILED);
+                };
+                record.current_paths = current_paths;
+                record.organization_state = OrganizationState::Attention;
+                let _ = write_persisted_transfers(persistence_path, &context.transfers);
+            }
+            return Err(VR_ORGANIZATION_FAILED);
+        }
+        current_paths[*selected_index] = destination_relative.clone();
+        moved.push((*selected_index, source.clone(), destination.clone()));
+    }
+
+    {
+        let StoredTransfer::Valid(record) = &mut context.transfers[record_index] else {
+            return Err(VR_ORGANIZATION_FAILED);
+        };
+        record.current_paths.clone_from(&current_paths);
+        record.organization_state = OrganizationState::Organized;
+    }
+    if let Err(error) = write_persisted_transfers(persistence_path, &context.transfers) {
+        let restored = rollback_organization_moves(
+            &moved,
+            &original_paths,
+            &mut current_paths,
+            &mut move_file,
+        );
+        if created_directory {
+            let _ = fs::remove_dir(&organization_directory);
+        }
+        let StoredTransfer::Valid(record) = &mut context.transfers[record_index] else {
+            return Err(VR_ORGANIZATION_FAILED);
+        };
+        record.current_paths = if restored {
+            original_paths
+        } else {
+            current_paths
+        };
+        record.organization_state = if restored {
+            previous_state
+        } else {
+            OrganizationState::Attention
+        };
+        let _ = write_persisted_transfers(persistence_path, &context.transfers);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn apply_organization(
+    state: &VrDownloadState,
+    persistence_path: &Path,
+    plan_id: &str,
+) -> Result<(), &'static str> {
+    apply_organization_with(state, persistence_path, plan_id, rename_without_overwrite)
+}
+
 fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
     let mut rows = Vec::new();
     let current_folder = context.future_folder.clone();
@@ -1698,6 +2387,15 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                     speed.to_string(),
                     record.state.as_str().to_owned(),
                     (current_folder.as_ref() == Some(&record.destination)).to_string(),
+                    record.organization_state.as_str().to_owned(),
+                    if record.organization_state == OrganizationState::None {
+                        String::new()
+                    } else {
+                        format!("{}/", record.code)
+                    },
+                    organization_entries(record, current_folder.as_deref())
+                        .is_ok()
+                        .to_string(),
                 ]);
             }
             StoredTransfer::Corrupt(record) => rows.extend([
@@ -1709,6 +2407,9 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                 "0".to_owned(),
                 "0".to_owned(),
                 TransferState::Offline.as_str().to_owned(),
+                "false".to_owned(),
+                OrganizationState::None.as_str().to_owned(),
+                String::new(),
                 "false".to_owned(),
             ]),
         }
@@ -1801,6 +2502,8 @@ pub async fn start_download(
                         selected_files: record.selected_files.clone(),
                         destination: record.destination.clone(),
                         fingerprints: Vec::new(),
+                        current_paths: record.current_paths.clone(),
+                        organization_state: record.organization_state,
                         state: record.state,
                         downloaded_bytes: 0,
                         boundary_segments: record.boundary_segments.clone(),
@@ -2007,6 +2710,7 @@ pub fn dismiss_download(
             StoredTransfer::Corrupt(record) => record.transfer_id == transfer_id,
         })
         .ok_or(VR_DOWNLOAD_ACTION_INVALID)?;
+    invalidate_organization_plan(&mut context);
     context.transfers.remove(position);
     write_persisted_transfers(persistence_path, &context.transfers)
 }
@@ -2071,6 +2775,55 @@ mod tests {
         }
     }
 
+    fn organization_source(files: Vec<(&str, u64)>) -> VerifiedDownloadSource {
+        VerifiedDownloadSource {
+            bytes: b"organization fixture torrent".to_vec(),
+            code: "MDVR-419".to_owned(),
+            infohash: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            release_name: "【VR】 MDVR-419  Exact — 特別版".to_owned(),
+            selected_files: files
+                .into_iter()
+                .enumerate()
+                .map(|(file_id, (path, size))| VerifiedDownloadFile {
+                    file_id,
+                    path: path.to_owned(),
+                    size,
+                })
+                .collect(),
+        }
+    }
+
+    fn completed_organization_record(
+        destination: &Path,
+        source: VerifiedDownloadSource,
+    ) -> TransferRecord {
+        let mut record =
+            transfer_from_source(source, destination.to_owned(), TransferState::Completed);
+        for (index, file) in record.selected_files.iter().enumerate() {
+            let target = selected_target(destination, file).expect("selected target must resolve");
+            fs::create_dir_all(target.parent().expect("selected target must have a parent"))
+                .expect("selected parent must exist");
+            fs::write(&target, vec![b'a' + index as u8; file.size as usize])
+                .expect("selected contents must exist");
+        }
+        record.downloaded_bytes = record.selected_total();
+        record.fingerprints = capture_fingerprints(&record).expect("fingerprints must resolve");
+        record
+    }
+
+    fn organization_state(record: TransferRecord) -> (VrDownloadState, String) {
+        let transfer_id = record.transfer_id.clone();
+        let destination = record.destination.clone();
+        let state = VrDownloadState::default();
+        {
+            let mut context = state.0.lock().expect("state must lock");
+            context.future_folder = Some(destination);
+            context.transfers_loaded = true;
+            context.transfers.push(StoredTransfer::Valid(record));
+        }
+        (state, transfer_id)
+    }
+
     #[test]
     fn download_rows_mark_only_the_current_configured_destination() {
         let fixture = FilesystemFixture::new();
@@ -2089,6 +2842,540 @@ mod tests {
         assert_eq!(download_rows(&mut context)[8], "true");
         context.future_folder = Some(fixture.path.join("replacement"));
         assert_eq!(download_rows(&mut context)[8], "false");
+    }
+
+    #[test]
+    fn previews_applies_persists_and_dismisses_single_file_organization() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let record = completed_organization_record(&destination, persistable_fixture_source());
+        let expected_identity = (
+            record.transfer_id.clone(),
+            record.code.clone(),
+            record.release_name.clone(),
+            record.infohash.clone(),
+            record.metainfo.clone(),
+            record.selected_file_ids(),
+            record.destination.clone(),
+        );
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(&preview[1..5], &[&transfer_id, "MDVR-419", "1", "1"]);
+        assert_eq!(
+            &preview[5..],
+            &["move", "Movie  A.mp4", "MDVR-419/MDVR-419.mp4"]
+        );
+        apply_organization(&state, &persistence_path, &preview[0])
+            .expect("organization must succeed");
+        assert!(!destination.join("Movie  A.mp4").exists());
+        let organized_file = destination.join("MDVR-419/MDVR-419.mp4");
+        assert_eq!(
+            fs::read(&organized_file).expect("organized file must remain readable"),
+            vec![b'a'; 5]
+        );
+
+        let context = state.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("transfer must remain valid");
+        };
+        assert_eq!(
+            (
+                record.transfer_id.clone(),
+                record.code.clone(),
+                record.release_name.clone(),
+                record.infohash.clone(),
+                record.metainfo.clone(),
+                record.selected_file_ids(),
+                record.destination.clone(),
+            ),
+            expected_identity
+        );
+        assert_eq!(record.state, TransferState::Completed);
+        assert_eq!(record.organization_state, OrganizationState::Organized);
+        assert_eq!(record.current_paths, ["MDVR-419/MDVR-419.mp4"]);
+        assert!(record.handle.is_none());
+        drop(context);
+
+        let restarted = VrDownloadState::default();
+        restarted.0.lock().expect("state must lock").future_folder = Some(destination.clone());
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("organized transfer must reload");
+        assert_eq!(
+            &rows[7..12],
+            &["completed", "true", "organized", "MDVR-419/", "false"]
+        );
+        assert!(
+            restarted
+                .0
+                .lock()
+                .expect("state must lock")
+                .session
+                .is_none(),
+            "organized completion restarted a native session"
+        );
+        dismiss_download(&restarted, &persistence_path, &transfer_id)
+            .expect("organized row must dismiss");
+        assert!(organized_file.exists(), "dismiss removed organized content");
+    }
+
+    #[test]
+    fn preserves_exact_multipart_labels_ambiguous_basenames_and_non_media_files() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = organization_source(vec![
+            ("Source/MDVR-419 Part  000001 — 映画.MKV", 3),
+            ("Source/MDVR-419 Disc-2 — 特別.mp4", 4),
+            ("Source/MDVR-419 Part 3 Disc 4 — ambiguous.mkv", 5),
+            ("Source/MDVR-419  feature  —  Final.mp4", 6),
+            ("Source/notes  —  exact.txt", 7),
+        ]);
+        let record = completed_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(&preview[3..5], &["4", "5"]);
+        assert_eq!(
+            &preview[5..],
+            &[
+                "move",
+                "Source/MDVR-419 Part  000001 — 映画.MKV",
+                "MDVR-419/MDVR-419 - Part  000001.MKV",
+                "move",
+                "Source/MDVR-419 Disc-2 — 特別.mp4",
+                "MDVR-419/MDVR-419 - Disc-2.mp4",
+                "move",
+                "Source/MDVR-419 Part 3 Disc 4 — ambiguous.mkv",
+                "MDVR-419/MDVR-419 Part 3 Disc 4 — ambiguous.mkv",
+                "move",
+                "Source/MDVR-419  feature  —  Final.mp4",
+                "MDVR-419/MDVR-419  feature  —  Final.mp4",
+                "non-media-unchanged",
+                "Source/notes  —  exact.txt",
+                "",
+            ]
+        );
+        apply_organization(&state, &fixture.path.join("downloads"), &preview[0])
+            .expect("multipart organization must succeed");
+        for path in [
+            "MDVR-419/MDVR-419 - Part  000001.MKV",
+            "MDVR-419/MDVR-419 - Disc-2.mp4",
+            "MDVR-419/MDVR-419 Part 3 Disc 4 — ambiguous.mkv",
+            "MDVR-419/MDVR-419  feature  —  Final.mp4",
+            "Source/notes  —  exact.txt",
+        ] {
+            assert!(destination.join(path).exists(), "missing {path:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_media_identity_and_complete_destination_collisions() {
+        for file_name in [
+            "MDVR-4190 neighboring.mp4",
+            "XMDVR-419 embedded.mp4",
+            "MDVR-419B attached.mp4",
+            "MDVR-419 + ABC-123 mixed.mp4",
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let record = completed_organization_record(
+                &destination,
+                organization_source(vec![(file_name, 3)]),
+            );
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE),
+                "{file_name:?} was assigned to MDVR-419",
+            );
+        }
+
+        for files in [
+            vec![("A/MDVR-419 Part 1.mp4", 3), ("B/MDVR-419 part 1.mp4", 4)],
+            vec![("A/MDVR-419 feature.mp4", 3), ("B/MDVR-419 feature.mp4", 4)],
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let record = completed_organization_record(&destination, organization_source(files));
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_CONFLICT)
+            );
+        }
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let record = completed_organization_record(
+            &destination,
+            organization_source(vec![("Source/MDVR-419.mp4", 3)]),
+        );
+        fs::create_dir(destination.join("MDVR-419")).expect("canonical directory must exist");
+        fs::write(destination.join("MDVR-419/mdvr-419.MP4"), b"unrelated")
+            .expect("case-colliding target must exist");
+        let (state, transfer_id) = organization_state(record);
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_CONFLICT)
+        );
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let record = completed_organization_record(
+            &destination,
+            organization_source(vec![("Source/MDVR-419.mp4", 3)]),
+        );
+        fs::create_dir(destination.join("mdvr-419")).expect("case-colliding directory must exist");
+        let (state, transfer_id) = organization_state(record);
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_CONFLICT)
+        );
+    }
+
+    #[test]
+    fn stale_plans_and_changed_files_never_reach_the_move_dispatcher() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let record = completed_organization_record(
+            &destination,
+            organization_source(vec![("Source/MDVR-419.mp4", 3)]),
+        );
+        let (state, transfer_id) = organization_state(record);
+        let first = preview_organization(&state, &transfer_id).expect("first preview must succeed");
+        preview_organization(&state, &transfer_id).expect("second preview must succeed");
+        let mut dispatched = false;
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &first[0],
+                |_, _| {
+                    dispatched = true;
+                    Ok(())
+                },
+            ),
+            Err(VR_ORGANIZATION_STALE)
+        );
+        assert!(!dispatched, "obsolete preview reached mutation");
+
+        let current =
+            preview_organization(&state, &transfer_id).expect("current preview must succeed");
+        let source_path = destination.join("Source/MDVR-419.mp4");
+        fs::remove_file(&source_path).expect("old source must be removed");
+        fs::write(&source_path, b"new").expect("replacement source must exist");
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &current[0],
+                |_, _| {
+                    dispatched = true;
+                    Ok(())
+                },
+            ),
+            Err(VR_ORGANIZATION_STALE)
+        );
+        assert!(!dispatched, "changed source reached mutation");
+    }
+
+    #[test]
+    fn organization_plans_do_not_survive_application_state_restart() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let record = completed_organization_record(
+            &destination,
+            organization_source(vec![("Source/MDVR-419.mp4", 3)]),
+        );
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let restarted = VrDownloadState::default();
+        let mut dispatched = false;
+        assert_eq!(
+            apply_organization_with(
+                &restarted,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |_, _| {
+                    dispatched = true;
+                    Ok(())
+                },
+            ),
+            Err(VR_ORGANIZATION_STALE)
+        );
+        assert!(!dispatched, "restarted application state dispatched a plan");
+    }
+
+    #[test]
+    fn folder_change_and_dismissals_invalidate_native_owned_plans() {
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("current");
+        let replacement = fixture.path.join("replacement");
+        fs::create_dir(&destination).expect("current folder must exist");
+        fs::create_dir(&replacement).expect("replacement folder must exist");
+        let destination = fs::canonicalize(destination).expect("current folder must canonicalize");
+        let replacement = fs::canonicalize(replacement).expect("replacement must canonicalize");
+        let record = completed_organization_record(
+            &destination,
+            organization_source(vec![("Source/MDVR-419.mp4", 3)]),
+        );
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        set_vr_folder(&state, &fixture.path.join("folder"), replacement)
+            .expect("folder must change");
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |_, _| panic!("folder-stale plan dispatched"),
+            ),
+            Err(VR_ORGANIZATION_STALE)
+        );
+
+        set_vr_folder(&state, &fixture.path.join("folder"), destination)
+            .expect("folder must restore");
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        dismiss_organization(&state).expect("preview must dismiss");
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |_, _| panic!("dismissed preview dispatched"),
+            ),
+            Err(VR_ORGANIZATION_STALE)
+        );
+
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        dismiss_download(&state, &fixture.path.join("downloads"), &transfer_id)
+            .expect("completed transfer must dismiss");
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |_, _| panic!("dismissed plan dispatched"),
+            ),
+            Err(VR_ORGANIZATION_STALE)
+        );
+    }
+
+    #[test]
+    fn rejects_noncompleted_old_folder_traversal_and_symlink_contexts() {
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("current");
+        let old_destination = fixture.path.join("old");
+        fs::create_dir(&destination).expect("current folder must exist");
+        fs::create_dir(&old_destination).expect("old folder must exist");
+        let destination = fs::canonicalize(destination).expect("current folder must canonicalize");
+        let old_destination =
+            fs::canonicalize(old_destination).expect("old folder must canonicalize");
+
+        let mut paused = completed_organization_record(
+            &destination,
+            organization_source(vec![("Source/MDVR-419.mp4", 3)]),
+        );
+        paused.state = TransferState::Paused;
+        let (paused_state, paused_id) = organization_state(paused);
+        assert_eq!(
+            preview_organization(&paused_state, &paused_id),
+            Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+
+        let old = completed_organization_record(
+            &old_destination,
+            organization_source(vec![("Source/MDVR-419.mp4", 3)]),
+        );
+        let (old_state, old_id) = organization_state(old);
+        old_state.0.lock().expect("state must lock").future_folder = Some(destination);
+        assert_eq!(
+            preview_organization(&old_state, &old_id),
+            Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+
+        let mut traversal = completed_organization_record(
+            &old_destination,
+            organization_source(vec![("Source/MDVR-419.mp4", 3)]),
+        );
+        traversal.current_paths[0] = "../outside.mp4".to_owned();
+        let (traversal_state, traversal_id) = organization_state(traversal);
+        assert_eq!(
+            preview_organization(&traversal_state, &traversal_id),
+            Err(VR_ORGANIZATION_STALE)
+        );
+
+        #[cfg(unix)]
+        {
+            let symlink_fixture = FilesystemFixture::new();
+            let symlink_destination = symlink_fixture.path.join("current");
+            let outside = symlink_fixture.path.join("outside");
+            fs::create_dir(&symlink_destination).expect("current folder must exist");
+            fs::create_dir(&outside).expect("outside folder must exist");
+            let symlink_destination =
+                fs::canonicalize(symlink_destination).expect("current folder must canonicalize");
+            let record = completed_organization_record(
+                &symlink_destination,
+                organization_source(vec![("Source/MDVR-419.mp4", 3)]),
+            );
+            fs::remove_dir_all(symlink_destination.join("Source"))
+                .expect("source parent must be replaced");
+            std::os::unix::fs::symlink(&outside, symlink_destination.join("Source"))
+                .expect("source symlink must exist");
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_STALE)
+            );
+
+            let destination_symlink_fixture = FilesystemFixture::new();
+            let destination = destination_symlink_fixture.path.join("current");
+            let outside = destination_symlink_fixture.path.join("outside");
+            fs::create_dir(&destination).expect("current folder must exist");
+            fs::create_dir(&outside).expect("outside folder must exist");
+            let destination =
+                fs::canonicalize(destination).expect("current folder must canonicalize");
+            let record = completed_organization_record(
+                &destination,
+                organization_source(vec![("Source/MDVR-419.mp4", 3)]),
+            );
+            std::os::unix::fs::symlink(&outside, destination.join("MDVR-419"))
+                .expect("destination symlink must exist");
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_CONFLICT)
+            );
+        }
+    }
+
+    #[test]
+    fn injected_mid_operation_failure_restores_every_source_and_consumes_the_plan() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let record = completed_organization_record(
+            &destination,
+            organization_source(vec![
+                ("Source/MDVR-419 Part 1.mp4", 3),
+                ("Source/MDVR-419 Part 2.mkv", 4),
+            ]),
+        );
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let mut calls = 0;
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |source, target| {
+                    calls += 1;
+                    if calls == 2 {
+                        Err(io::Error::other("injected second move failure"))
+                    } else {
+                        fs::rename(source, target)
+                    }
+                },
+            ),
+            Err(VR_ORGANIZATION_FAILED)
+        );
+        assert_eq!(calls, 3, "the first move was not rolled back exactly once");
+        assert!(destination.join("Source/MDVR-419 Part 1.mp4").exists());
+        assert!(destination.join("Source/MDVR-419 Part 2.mkv").exists());
+        assert!(!destination.join("MDVR-419/MDVR-419 - Part 1.mp4").exists());
+        let context = state.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("transfer must remain valid");
+        };
+        assert_eq!(record.organization_state, OrganizationState::None);
+        assert_eq!(
+            record.current_paths,
+            ["Source/MDVR-419 Part 1.mp4", "Source/MDVR-419 Part 2.mkv"]
+        );
+        drop(context);
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |_, _| panic!("consumed plan dispatched twice"),
+            ),
+            Err(VR_ORGANIZATION_STALE)
+        );
+    }
+
+    #[test]
+    fn rollback_failure_persists_exact_moved_and_unmoved_paths_for_safe_relaunch() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let metainfo = selected_file_torrent();
+        let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+        let source = revalidate_persisted_download_source(
+            &metainfo,
+            "MDVR-419",
+            "【VR】 MDVR-419  Exact — 特別版",
+            &infohash,
+            &[0, 1],
+        )
+        .expect("multipart source must revalidate");
+        let record = completed_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let mut calls = 0;
+        assert_eq!(
+            apply_organization_with(&state, &persistence_path, &preview[0], |source, target| {
+                calls += 1;
+                if calls == 1 {
+                    fs::rename(source, target)
+                } else {
+                    Err(io::Error::other("injected move and rollback failure"))
+                }
+            },),
+            Err(VR_ORGANIZATION_FAILED)
+        );
+        assert_eq!(calls, 3);
+        let context = state.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("transfer must remain valid");
+        };
+        assert_eq!(record.organization_state, OrganizationState::Attention);
+        assert_eq!(
+            record.current_paths,
+            ["MDVR-419/MDVR-419 - Part  1.mkv", "Folder/特別版  B.mp4"]
+        );
+        drop(context);
+
+        let restarted = VrDownloadState::default();
+        restarted.0.lock().expect("state must lock").future_folder = Some(destination);
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("attention state must reload");
+        assert_eq!(
+            &rows[7..12],
+            &["completed", "true", "attention", "MDVR-419/", "true"]
+        );
+        assert!(
+            restarted
+                .0
+                .lock()
+                .expect("state must lock")
+                .session
+                .is_none(),
+            "attention completion restarted a native session"
+        );
     }
 
     #[test]

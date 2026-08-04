@@ -73,6 +73,23 @@ export type VrDownload = {
   speedBytesPerSecond: string;
   state: VrDownloadState;
   isCurrentFolder: boolean;
+  organizationStatus: "none" | "organized" | "attention";
+  organizationRelativeDirectory: string | null;
+  canOrganize: boolean;
+};
+
+export type VrOrganizationPreviewEntry = {
+  kind: "move" | "media-unchanged" | "non-media-unchanged";
+  sourceRelativePath: string;
+  destinationRelativePath: string | null;
+};
+
+export type VrOrganizationPreview = {
+  planId: string;
+  transferId: string;
+  code: string;
+  moveCount: number;
+  entries: VrOrganizationPreviewEntry[];
 };
 
 export type VrDownloadLimit = {
@@ -685,7 +702,7 @@ const vrDownloadStates = new Set<VrDownloadState>([
 function parseVrDownloads(value: unknown): VrDownload[] {
   if (
     !Array.isArray(value) ||
-    value.length % 9 !== 0 ||
+    value.length % 12 !== 0 ||
     !value.every((entry) => typeof entry === "string")
   ) {
     throw new Error("The native VR download store returned invalid data.");
@@ -693,7 +710,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
 
   const downloads: VrDownload[] = [];
   const transferIds = new Set<string>();
-  for (let index = 0; index < value.length; index += 9) {
+  for (let index = 0; index < value.length; index += 12) {
     const [
       transferId,
       code,
@@ -704,12 +721,18 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       speedBytesPerSecond,
       state,
       currentFolder,
-    ] = value.slice(index, index + 9) as string[];
+      organizationStatus,
+      organizationRelativeDirectory,
+      canOrganize,
+    ] = value.slice(index, index + 12) as string[];
     const count = Number(selectedFileCount);
+    const canonicalCode = canonicalizeProductCode(code);
     if (
       transferId === "" ||
       transferIds.has(transferId) ||
-      code === "" ||
+      code.trim() === "" ||
+      ((canOrganize === "true" || organizationStatus !== "none") &&
+        canonicalCode !== code) ||
       releaseName.trim() === "" ||
       !Number.isSafeInteger(count) ||
       count < 0 ||
@@ -722,7 +745,18 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       BigInt(speedBytesPerSecond) > maximumU64 ||
       BigInt(downloadedBytes) > BigInt(totalBytes) ||
       !vrDownloadStates.has(state as VrDownloadState) ||
-      (currentFolder !== "true" && currentFolder !== "false")
+      (currentFolder !== "true" && currentFolder !== "false") ||
+      !["none", "organized", "attention"].includes(organizationStatus) ||
+      (organizationStatus === "none") !==
+        (organizationRelativeDirectory === "") ||
+      (organizationStatus !== "none" &&
+        (state !== "completed" ||
+          organizationRelativeDirectory !== `${code}/`)) ||
+      (canOrganize !== "true" && canOrganize !== "false") ||
+      (canOrganize === "true" &&
+        (state !== "completed" ||
+          currentFolder !== "true" ||
+          organizationStatus === "organized"))
     ) {
       throw new Error("The native VR download store returned invalid data.");
     }
@@ -737,9 +771,84 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       speedBytesPerSecond,
       state: state as VrDownloadState,
       isCurrentFolder: currentFolder === "true",
+      organizationStatus: organizationStatus as VrDownload["organizationStatus"],
+      organizationRelativeDirectory:
+        organizationRelativeDirectory === ""
+          ? null
+          : organizationRelativeDirectory,
+      canOrganize: canOrganize === "true",
     });
   }
   return downloads;
+}
+
+function safeOrganizationRelativePath(value: string) {
+  return (
+    value !== "" &&
+    !value.startsWith("/") &&
+    !value.includes("\\") &&
+    value.split("/").every((component) => component !== "" && component !== "." && component !== "..")
+  );
+}
+
+function parseVrOrganizationPreview(value: unknown): VrOrganizationPreview {
+  if (
+    !Array.isArray(value) ||
+    value.length < 5 ||
+    !value.every((entry) => typeof entry === "string")
+  ) {
+    throw new Error("The native VR organization preview returned invalid data.");
+  }
+  const [planId, transferId, code, moveCountValue, entryCountValue] = value as string[];
+  const moveCount = Number(moveCountValue);
+  const entryCount = Number(entryCountValue);
+  if (
+    planId === "" ||
+    transferId === "" ||
+    canonicalizeProductCode(code) !== code ||
+    !Number.isSafeInteger(moveCount) ||
+    moveCount < 0 ||
+    !Number.isSafeInteger(entryCount) ||
+    entryCount < 1 ||
+    entryCount > maximumSelectedVrFiles ||
+    value.length !== 5 + entryCount * 3
+  ) {
+    throw new Error("The native VR organization preview returned invalid data.");
+  }
+  const entries: VrOrganizationPreviewEntry[] = [];
+  const sources = new Set<string>();
+  let observedMoveCount = 0;
+  for (let index = 5; index < value.length; index += 3) {
+    const [kind, sourceRelativePath, destinationRelativePath] = value.slice(
+      index,
+      index + 3,
+    ) as string[];
+    if (
+      !["move", "media-unchanged", "non-media-unchanged"].includes(kind) ||
+      !safeOrganizationRelativePath(sourceRelativePath) ||
+      sources.has(sourceRelativePath) ||
+      (kind === "non-media-unchanged"
+        ? destinationRelativePath !== ""
+        : !safeOrganizationRelativePath(destinationRelativePath) ||
+          !destinationRelativePath.startsWith(`${code}/`))
+    ) {
+      throw new Error("The native VR organization preview returned invalid data.");
+    }
+    sources.add(sourceRelativePath);
+    if (kind === "move") {
+      observedMoveCount += 1;
+    }
+    entries.push({
+      kind: kind as VrOrganizationPreviewEntry["kind"],
+      sourceRelativePath,
+      destinationRelativePath:
+        destinationRelativePath === "" ? null : destinationRelativePath,
+    });
+  }
+  if (observedMoveCount !== moveCount) {
+    throw new Error("The native VR organization preview returned invalid data.");
+  }
+  return { planId, transferId, code, moveCount, entries };
 }
 
 function parseVrDownloadLimit(value: unknown): VrDownloadLimit {
@@ -842,4 +951,28 @@ export function cancelVrDownload(transferId: string) {
 
 export function dismissVrDownload(transferId: string) {
   return runVrDownloadCommand("dismiss_vr_download", transferId);
+}
+
+export async function previewVrOrganization(transferId: string) {
+  if (transferId === "") {
+    throw new Error("A transfer identity is required.");
+  }
+  return parseVrOrganizationPreview(
+    await window.__TAURI__.core.invoke<unknown>("preview_vr_organization", {
+      transferId,
+    }),
+  );
+}
+
+export function applyVrOrganization(planId: string) {
+  if (planId === "") {
+    throw new Error("A current organization plan is required.");
+  }
+  return window.__TAURI__.core.invoke<void>("apply_vr_organization", {
+    planId,
+  });
+}
+
+export function dismissVrOrganization() {
+  return window.__TAURI__.core.invoke<void>("dismiss_vr_organization");
 }

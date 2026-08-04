@@ -784,13 +784,15 @@ button {
 }
 
 .vr-download-card__state.is-downloading,
-.vr-download-card__state.is-completed {
+.vr-download-card__state.is-completed,
+.vr-download-card__state.is-organized {
   border-color: color-mix(in oklch, var(--primary) 45%, var(--border));
   color: var(--foreground);
 }
 
 .vr-download-card__state.is-failed,
-.vr-download-card__state.is-offline {
+.vr-download-card__state.is-offline,
+.vr-download-card__state.is-attention {
   color: var(--destructive);
 }
 
@@ -816,6 +818,7 @@ button {
 
 .vr-download-card__metadata {
   display: flex;
+  flex-wrap: wrap;
   gap: 1.5rem;
   margin: 0.75rem 0 0;
 }
@@ -2151,6 +2154,32 @@ button {
 
 .trash-dialog__popup .trash-dialog__error {
   color: var(--destructive);
+}
+
+.vr-organization-dialog {
+  width: min(36rem, 100%);
+}
+
+.vr-organization-dialog__files {
+  display: grid;
+  gap: 0.5rem;
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vr-organization-dialog__files li {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.625rem;
+  border: 1px solid var(--border);
+  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-size: 0.6875rem;
+  overflow-wrap: anywhere;
+}
+
+.vr-organization-dialog__files li span:last-child {
+  color: var(--muted-foreground);
 }
 
 .trash-dialog__actions {

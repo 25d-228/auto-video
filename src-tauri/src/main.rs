@@ -17,11 +17,12 @@ use std::process::{Command, Stdio};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use vr_download::{
-    cancel_download, clear_vr_folder as clear_trusted_vr_folder, configured_vr_folder,
-    dismiss_download, list_downloads, load_download_limit, load_downloads, load_vr_folder_with,
-    pause_download, resume_download, save_download_limit, set_vr_folder, start_download,
-    VrDownloadState, VR_DOWNLOAD_FAILED, VR_DOWNLOAD_LIMIT_STORAGE_FAILED,
-    VR_DOWNLOAD_PERSISTENCE_FAILED, VR_FOLDER_STORAGE_FAILED, VR_FOLDER_UNAVAILABLE,
+    apply_organization, cancel_download, clear_vr_folder as clear_trusted_vr_folder,
+    configured_vr_folder, dismiss_download, dismiss_organization, list_downloads,
+    load_download_limit, load_downloads, load_vr_folder_with, pause_download, preview_organization,
+    resume_download, save_download_limit, set_vr_folder, start_download, VrDownloadState,
+    VR_DOWNLOAD_FAILED, VR_DOWNLOAD_LIMIT_STORAGE_FAILED, VR_DOWNLOAD_PERSISTENCE_FAILED,
+    VR_FOLDER_STORAGE_FAILED, VR_FOLDER_UNAVAILABLE,
 };
 use vr_library::{
     invalidate_vr_library, open_vr_file_with, reveal_vr_file_with, scan_vr_library_with,
@@ -1153,6 +1154,39 @@ fn dismiss_vr_download(
 }
 
 #[tauri::command]
+async fn preview_vr_organization(
+    transfer_id: String,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        preview_organization(&state, &transfer_id).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| vr_download::VR_ORGANIZATION_FAILED.to_owned())?
+}
+
+#[tauri::command]
+async fn apply_vr_organization(
+    app: tauri::AppHandle,
+    plan_id: String,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let persistence_path = vr_downloads_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        apply_organization(&state, &persistence_path, &plan_id).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| vr_download::VR_ORGANIZATION_FAILED.to_owned())?
+}
+
+#[tauri::command]
+fn dismiss_vr_organization(state: tauri::State<'_, VrDownloadState>) -> Result<(), String> {
+    dismiss_organization(state.inner()).map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn fetch_javdb_vr_catalog(code: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         fetch_javdb_vr_catalog_with(&code, fetch_provider_document).map_err(str::to_owned)
@@ -1276,6 +1310,9 @@ fn main() {
             resume_vr_download,
             cancel_vr_download,
             dismiss_vr_download,
+            preview_vr_organization,
+            apply_vr_organization,
+            dismiss_vr_organization,
             fetch_javdb_vr_catalog,
             fetch_sukebei_vr_releases,
             inspect_sukebei_vr_torrent,
