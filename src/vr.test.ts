@@ -1,13 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  applyVrOrganization,
   canonicalizeProductCode,
+  dismissVrOrganization,
   fetchExactJavdbVrItem,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedSukebeiTorrent,
   loadVrDownloadLimit,
   loadVrDownloads,
   loadVrFolder,
+  previewVrOrganization,
   scanVrLibrary,
   saveVrDownloadLimit,
   startVerifiedVrDownload,
@@ -592,6 +595,9 @@ describe("trusted VR download boundary", () => {
       "1024",
       "paused",
       "true",
+      "none",
+      "",
+      "false",
     ]);
 
     await expect(loadVrDownloads()).resolves.toEqual([
@@ -605,9 +611,148 @@ describe("trusted VR download boundary", () => {
         speedBytesPerSecond: "1024",
         state: "paused",
         isCurrentFolder: true,
+        organizationStatus: "none",
+        organizationRelativeDirectory: null,
+        canOrganize: false,
       },
     ]);
     expect(invokeMock).toHaveBeenCalledWith("load_vr_downloads");
+  });
+
+  it("keeps corrupt persisted transfers dismissible without making them organizable", async () => {
+    invokeMock.mockResolvedValue([
+      "corrupt-1",
+      "Unavailable",
+      "Persisted transfer data is corrupt.",
+      "0",
+      "0",
+      "0",
+      "0",
+      "offline",
+      "false",
+      "none",
+      "",
+      "false",
+    ]);
+
+    await expect(loadVrDownloads()).resolves.toEqual([
+      {
+        transferId: "corrupt-1",
+        code: "Unavailable",
+        releaseName: "Persisted transfer data is corrupt.",
+        selectedFileCount: 0,
+        totalBytes: "0",
+        downloadedBytes: "0",
+        speedBytesPerSecond: "0",
+        state: "offline",
+        isCurrentFolder: false,
+        organizationStatus: "none",
+        organizationRelativeDirectory: null,
+        canOrganize: false,
+      },
+    ]);
+  });
+
+  it("parses exact native organization previews and applies only the plan identity", async () => {
+    invokeMock
+      .mockResolvedValueOnce([
+        "plan-123",
+        "transfer-123",
+        "MDVR-419",
+        "1",
+        "2",
+        "move",
+        "Source/MDVR-419  —  映画.MKV",
+        "MDVR-419/MDVR-419.MKV",
+        "non-media-unchanged",
+        "Source/notes  —  exact.txt",
+        "",
+      ])
+      .mockResolvedValueOnce(undefined);
+
+    await expect(previewVrOrganization("transfer-123")).resolves.toEqual({
+      planId: "plan-123",
+      transferId: "transfer-123",
+      code: "MDVR-419",
+      moveCount: 1,
+      entries: [
+        {
+          kind: "move",
+          sourceRelativePath: "Source/MDVR-419  —  映画.MKV",
+          destinationRelativePath: "MDVR-419/MDVR-419.MKV",
+        },
+        {
+          kind: "non-media-unchanged",
+          sourceRelativePath: "Source/notes  —  exact.txt",
+          destinationRelativePath: null,
+        },
+      ],
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "preview_vr_organization", {
+      transferId: "transfer-123",
+    });
+    await expect(applyVrOrganization("plan-123")).resolves.toBeUndefined();
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "apply_vr_organization", {
+      planId: "plan-123",
+    });
+    invokeMock.mockResolvedValueOnce(undefined);
+    await expect(dismissVrOrganization()).resolves.toBeUndefined();
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "dismiss_vr_organization");
+  });
+
+  it("rejects malformed organization identities and paths at the interface boundary", async () => {
+    await expect(previewVrOrganization("")).rejects.toThrow("transfer identity");
+    expect(() => applyVrOrganization("")).toThrow("current organization plan");
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    for (const malformed of [
+      [],
+      [
+        "plan",
+        "transfer",
+        "MDVR-419",
+        "1",
+        "1",
+        "move",
+        "../source.mp4",
+        "MDVR-419/file.mp4",
+      ],
+      [
+        "plan",
+        "transfer",
+        "MDVR-419",
+        "2",
+        "1",
+        "move",
+        "source.mp4",
+        "MDVR-419/file.mp4",
+      ],
+      [
+        "plan",
+        "transfer",
+        "ABC-123",
+        "0",
+        "1",
+        "non-media-unchanged",
+        "notes.txt",
+        "ABC-123/notes.txt",
+      ],
+      [
+        "plan",
+        "transfer",
+        "MDVR-419",
+        "0",
+        "1",
+        "media-unchanged",
+        "source.mp4",
+        "outside/file.mp4",
+      ],
+    ]) {
+      invokeMock.mockResolvedValueOnce(malformed);
+      await expect(previewVrOrganization("transfer")).rejects.toThrow(
+        "invalid data",
+      );
+    }
   });
 
   it("starts with only the current inspection and selected file IDs", async () => {

@@ -691,9 +691,9 @@ fn decode_xml_text(value: &str) -> Option<String> {
     Some(decoded.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
-fn release_matches_product_code(name: &str, requested_code: &str) -> bool {
+fn product_code_candidates(name: &str) -> Vec<(String, String)> {
     let bytes = name.as_bytes();
-    let mut identities = BTreeSet::new();
+    let mut candidates = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
         if index > 0 && bytes[index - 1].is_ascii_alphanumeric() {
@@ -731,11 +731,51 @@ fn release_matches_product_code(name: &str, requested_code: &str) -> bool {
         if let Some(number) = number.filter(|number| *number > 0) {
             let prefix = std::str::from_utf8(&bytes[prefix_start..prefix_start + prefix_length])
                 .expect("ASCII product-code prefixes are valid UTF-8");
-            identities.insert(format!("{}-{number}", prefix.to_ascii_uppercase()));
+            let prefix = prefix.to_ascii_uppercase();
+            candidates.push((format!("{prefix}-{number}"), prefix));
         }
     }
 
+    candidates
+}
+
+fn release_matches_product_code(name: &str, requested_code: &str) -> bool {
+    let identities = product_code_candidates(name)
+        .into_iter()
+        .map(|(code, _)| code)
+        .collect::<BTreeSet<_>>();
+
     identities.len() == 1 && identities.contains(requested_code)
+}
+
+pub(crate) fn media_name_matches_product_code(name: &str, requested_code: &str) -> bool {
+    let identities = product_code_candidates(name)
+        .into_iter()
+        .filter(|(_, prefix)| !matches!(prefix.as_str(), "PART" | "PT" | "CD" | "DISC" | "DISK"))
+        .map(|(code, _)| code)
+        .collect::<BTreeSet<_>>();
+    if !identities.is_empty() {
+        return identities.len() == 1 && identities.contains(requested_code);
+    }
+
+    let Some((requested_prefix, requested_number)) = requested_code.split_once('-') else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    let prefix = requested_prefix.as_bytes();
+    let number = requested_number.as_bytes();
+    !(0..bytes.len()).any(|start| {
+        let prefix_end = start + prefix.len();
+        if prefix_end > bytes.len() || !bytes[start..prefix_end].eq_ignore_ascii_case(prefix) {
+            return false;
+        }
+        let mut number_start = prefix_end;
+        while number_start < bytes.len() && matches!(bytes[number_start], b' ' | b'_' | b'-') {
+            number_start += 1;
+        }
+        let number_end = number_start + number.len();
+        number_end <= bytes.len() && bytes[number_start..number_end].eq(number)
+    })
 }
 
 fn view_item_id(url: &str) -> Option<String> {

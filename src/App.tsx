@@ -53,11 +53,13 @@ import {
   tmdbPosterUrl,
 } from "@/tmdb";
 import {
+  applyVrOrganization,
   canonicalizeProductCode,
   cancelVrDownload,
   chooseVrFolder,
   clearVrFolder,
   dismissVrDownload,
+  dismissVrOrganization,
   fetchExactJavdbVrItem,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedSukebeiTorrent,
@@ -68,6 +70,7 @@ import {
   loadVrFolder,
   openVrFile,
   pauseVrDownload,
+  previewVrOrganization,
   revealVrFile,
   resumeVrDownload,
   saveVrDownloadLimit,
@@ -79,6 +82,7 @@ import {
   type VrFolderState,
   type VrLibraryFile,
   type VrLibraryItem,
+  type VrOrganizationPreview,
   type VrCatalogItem,
   type VrCatalogResult,
   type VrRelease,
@@ -1891,25 +1895,44 @@ function VrDownloadCard({
   download,
   error,
   isPending,
+  organizationPreview,
+  onApplyOrganization,
   onCancel,
+  onCloseOrganization,
   onDismiss,
   onPause,
+  onPreviewOrganization,
   onResume,
 }: {
   download: VrDownload;
   error: string | null;
   isPending: boolean;
+  organizationPreview: VrOrganizationPreview | null;
+  onApplyOrganization: () => void;
   onCancel: () => void;
+  onCloseOrganization: () => void;
   onDismiss: () => void;
   onPause: () => void;
+  onPreviewOrganization: () => void;
   onResume: () => void;
 }) {
+  const organizationCancelButton = useRef<HTMLButtonElement | null>(null);
   const totalBytes = BigInt(download.totalBytes);
   const downloadedBytes = BigInt(download.downloadedBytes);
   const percent =
     totalBytes === 0n ? 0 : Number((downloadedBytes * 100n) / totalBytes);
   const stateLabel =
-    download.state.charAt(0).toUpperCase() + download.state.slice(1);
+    download.organizationStatus === "organized"
+      ? "Organized"
+      : download.organizationStatus === "attention"
+        ? "Organization needs attention"
+        : download.state.charAt(0).toUpperCase() + download.state.slice(1);
+  const stateClass =
+    download.organizationStatus === "attention"
+      ? "attention"
+      : download.organizationStatus === "organized"
+        ? "organized"
+        : download.state;
   const isTerminal = !activeVrDownloadStates.has(download.state);
 
   return (
@@ -1924,7 +1947,10 @@ function VrDownloadCard({
             {download.releaseName}
           </h2>
         </div>
-        <span className={`vr-download-card__state is-${download.state}`}>
+        <span
+          className={`vr-download-card__state is-${stateClass}`}
+          role={download.organizationStatus === "none" ? undefined : "status"}
+        >
           {stateLabel}
         </span>
       </div>
@@ -1952,6 +1978,20 @@ function VrDownloadCard({
             {formatStorageBytes(BigInt(download.speedBytesPerSecond))}/s
           </dd>
         </div>
+        {download.organizationStatus === "none" ? null : (
+          <div>
+            <dt>
+              {download.organizationStatus === "organized"
+                ? "Organized location"
+                : "Organization"}
+            </dt>
+            <dd>
+              {download.organizationStatus === "organized"
+                ? download.organizationRelativeDirectory
+                : "Needs attention"}
+            </dd>
+          </div>
+        )}
       </dl>
       <div className="vr-download-card__actions">
         {download.state === "downloading" ? (
@@ -1976,6 +2016,123 @@ function VrDownloadCard({
             <AppIcon name="brand" />
             {isPending ? "Resuming…" : "Resume"}
           </Button>
+        ) : null}
+        {download.canOrganize ? (
+          <AlertDialog.Root
+            onOpenChange={(open) => {
+              if (open && organizationPreview === null) {
+                onPreviewOrganization();
+              } else if (!open && !isPending) {
+                onCloseOrganization();
+              }
+            }}
+            open={organizationPreview !== null}
+            triggerId={
+              organizationPreview === null
+                ? null
+                : `vr-download-organize-${download.transferId}`
+            }
+          >
+            <AlertDialog.Trigger
+              id={`vr-download-organize-${download.transferId}`}
+              render={
+                <Button disabled={isPending} type="button" variant="outline">
+                  <AppIcon name="folder" />
+                  {isPending && organizationPreview === null
+                    ? "Preparing…"
+                    : "Organize files"}
+                </Button>
+              }
+            />
+            {organizationPreview === null ? null : (
+              <AlertDialog.Portal>
+                <AlertDialog.Backdrop
+                  className="trash-dialog__backdrop"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onCloseOrganization();
+                  }}
+                  onPointerDown={(event) => event.stopPropagation()}
+                />
+                <AlertDialog.Viewport className="trash-dialog__viewport">
+                  <AlertDialog.Popup
+                    aria-busy={isPending}
+                    className="trash-dialog__popup vr-organization-dialog"
+                    initialFocus={() => organizationCancelButton.current}
+                  >
+                    <div className="trash-dialog__heading">
+                      <AlertDialog.Title>
+                        Organize {organizationPreview.code} files?
+                      </AlertDialog.Title>
+                      <AlertDialog.Close
+                        render={
+                          <Button
+                            aria-label="Close organization preview"
+                            disabled={isPending}
+                            size="icon-xs"
+                            type="button"
+                            variant="ghost"
+                          >
+                            <AppIcon name="close" />
+                          </Button>
+                        }
+                      />
+                    </div>
+                    <AlertDialog.Description>
+                      Confirm this exact plan. {organizationPreview.moveCount}{" "}
+                      {organizationPreview.moveCount === 1 ? "file" : "files"}
+                      {" "}will move within the current VR folder.
+                    </AlertDialog.Description>
+                    <ul
+                      aria-label={`Organization plan for ${organizationPreview.code}`}
+                      className="vr-organization-dialog__files"
+                    >
+                      {organizationPreview.entries.map((entry) => (
+                        <li key={entry.sourceRelativePath}>
+                          <span>{entry.sourceRelativePath}</span>
+                          <span>
+                            {entry.kind === "non-media-unchanged"
+                              ? "Unchanged non-media file"
+                              : entry.kind === "media-unchanged"
+                                ? `Already canonical: ${entry.destinationRelativePath}`
+                                : `Move to: ${entry.destinationRelativePath}`}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                    <div className="trash-dialog__actions">
+                      <AlertDialog.Close
+                        render={
+                          <Button
+                            disabled={isPending}
+                            ref={organizationCancelButton}
+                            type="button"
+                            variant="outline"
+                          >
+                            Cancel
+                          </Button>
+                        }
+                      />
+                      <Button
+                        disabled={isPending}
+                        onClick={onApplyOrganization}
+                        type="button"
+                      >
+                        <AppIcon name="folder" />
+                        {isPending
+                          ? "Organizing…"
+                          : `Organize ${organizationPreview.moveCount} ${
+                              organizationPreview.moveCount === 1
+                                ? "file"
+                                : "files"
+                            }`}
+                      </Button>
+                    </div>
+                  </AlertDialog.Popup>
+                </AlertDialog.Viewport>
+              </AlertDialog.Portal>
+            )}
+          </AlertDialog.Root>
         ) : null}
         {!isTerminal ? (
           <AlertDialog.Root>
@@ -2111,7 +2268,12 @@ function summarizeVrDownloads(downloads: VrDownload[]): VrDownloadSummary {
       pausedCount += 1;
     } else if (download.state === "completed") {
       completedCount += 1;
-    } else if (download.state === "offline" || download.state === "failed") {
+    }
+    if (
+      download.state === "offline" ||
+      download.state === "failed" ||
+      download.organizationStatus === "attention"
+    ) {
       attentionCount += 1;
     }
   }
@@ -2314,6 +2476,8 @@ export default function App() {
   const [vrDownloadErrors, setVrDownloadErrors] = useState<
     Record<string, string>
   >({});
+  const [vrOrganizationPreview, setVrOrganizationPreview] =
+    useState<VrOrganizationPreview | null>(null);
   const [vrDownloadFocusTarget, setVrDownloadFocusTarget] = useState<
     string | null
   >(null);
@@ -2330,6 +2494,8 @@ export default function App() {
   const torrentStartRequestId = useRef(0);
   const vrDownloadsRequestId = useRef(0);
   const vrDownloadLimitRequestId = useRef(0);
+  const vrOrganizationRequestId = useRef(0);
+  const vrOrganizationPreviewPending = useRef(false);
   const vrFolderRequestId = useRef(0);
   const vrLibraryScanRequestId = useRef(0);
   const vrStorageRequestId = useRef(0);
@@ -2819,6 +2985,16 @@ export default function App() {
   }, [activeDestination.id]);
 
   useEffect(() => {
+    if (activeDestination.id !== "downloads") {
+      vrOrganizationRequestId.current += 1;
+      if (vrOrganizationPreview !== null) {
+        void dismissVrOrganization();
+      }
+      setVrOrganizationPreview(null);
+    }
+  }, [activeDestination.id, vrOrganizationPreview]);
+
+  useEffect(() => {
     const requestId = ++discoverRequestId.current;
 
     if (!isDiscoverActivated) {
@@ -3074,6 +3250,8 @@ export default function App() {
         requestId === vrFolderRequestId.current &&
         selectedFolder !== null
       ) {
+        vrOrganizationRequestId.current += 1;
+        setVrOrganizationPreview(null);
         vrLibraryScanRequestId.current += 1;
         vrStorageRequestId.current += 1;
         setVrLibraryScanState({ status: "scanning" });
@@ -3091,6 +3269,8 @@ export default function App() {
 
   const clearConfiguredVrFolder = async () => {
     const requestId = ++vrFolderRequestId.current;
+    vrOrganizationRequestId.current += 1;
+    setVrOrganizationPreview(null);
     setIsRevalidatingVrFolder(false);
     vrLibraryScanRequestId.current += 1;
     vrStorageRequestId.current += 1;
@@ -3279,6 +3459,149 @@ export default function App() {
         vrDownloadLimitSavePending.current = false;
         setIsSavingVrDownloadLimit(false);
       }
+    }
+  };
+
+  const organizationErrorMessage = (error: unknown) => {
+    switch (nativeErrorCode(error)) {
+      case "vr_organization_conflict":
+        return "The complete organization plan conflicts with an existing or duplicate destination.";
+      case "vr_organization_ineligible":
+        return "This transfer is no longer eligible for organization in the current VR folder.";
+      case "vr_organization_stale":
+        return "The organization plan is stale because its transfer, folder, or files changed.";
+      default:
+        return "The organization operation could not be completed safely. Review the current Downloads state before retrying.";
+    }
+  };
+
+  const previewDownloadOrganization = async (download: VrDownload) => {
+    if (
+      vrOrganizationPreviewPending.current ||
+      vrOrganizationPreview !== null ||
+      vrDownloadActionsPending.current.has(download.transferId)
+    ) {
+      return;
+    }
+    const currentState = currentVrDownloadsState.current;
+    const currentDownload =
+      currentState.status === "ready"
+        ? currentState.downloads.find(
+            (candidate) => candidate.transferId === download.transferId,
+          )
+        : undefined;
+    if (currentDownload?.canOrganize !== true) {
+      return;
+    }
+
+    const requestId = ++vrOrganizationRequestId.current;
+    vrOrganizationPreviewPending.current = true;
+    vrDownloadActionsPending.current.add(download.transferId);
+    setPendingVrDownloadIds(new Set(vrDownloadActionsPending.current));
+    setVrDownloadErrors((errors) => {
+      const nextErrors = { ...errors };
+      delete nextErrors[download.transferId];
+      return nextErrors;
+    });
+    try {
+      const preview = await previewVrOrganization(download.transferId);
+      if (requestId !== vrOrganizationRequestId.current) {
+        await dismissVrOrganization();
+        return;
+      }
+      const latestState = currentVrDownloadsState.current;
+      const latestDownload =
+        latestState.status === "ready"
+          ? latestState.downloads.find(
+              (candidate) => candidate.transferId === download.transferId,
+            )
+          : undefined;
+      if (
+        latestDownload?.canOrganize !== true ||
+        preview.transferId !== download.transferId ||
+        preview.code !== download.code
+      ) {
+        await dismissVrOrganization();
+        throw new Error("vr_organization_stale");
+      }
+      setVrOrganizationPreview(preview);
+    } catch (error: unknown) {
+      if (requestId === vrOrganizationRequestId.current) {
+        setVrDownloadErrors((errors) => ({
+          ...errors,
+          [download.transferId]: organizationErrorMessage(error),
+        }));
+      }
+    } finally {
+      vrOrganizationPreviewPending.current = false;
+      vrDownloadActionsPending.current.delete(download.transferId);
+      setPendingVrDownloadIds(new Set(vrDownloadActionsPending.current));
+    }
+  };
+
+  const closeDownloadOrganization = () => {
+    if (
+      vrOrganizationPreview !== null &&
+      vrDownloadActionsPending.current.has(vrOrganizationPreview.transferId)
+    ) {
+      return;
+    }
+    vrOrganizationRequestId.current += 1;
+    void dismissVrOrganization();
+    setVrOrganizationPreview(null);
+  };
+
+  const applyDownloadOrganization = async () => {
+    const preview = vrOrganizationPreview;
+    if (
+      preview === null ||
+      vrDownloadActionsPending.current.has(preview.transferId)
+    ) {
+      return;
+    }
+    const currentState = currentVrDownloadsState.current;
+    const currentDownload =
+      currentState.status === "ready"
+        ? currentState.downloads.find(
+            (candidate) => candidate.transferId === preview.transferId,
+          )
+        : undefined;
+    if (currentDownload?.canOrganize !== true) {
+      return;
+    }
+
+    const requestId = ++vrOrganizationRequestId.current;
+    vrDownloadActionsPending.current.add(preview.transferId);
+    setPendingVrDownloadIds(new Set(vrDownloadActionsPending.current));
+    setVrDownloadErrors((errors) => {
+      const nextErrors = { ...errors };
+      delete nextErrors[preview.transferId];
+      return nextErrors;
+    });
+    try {
+      await applyVrOrganization(preview.planId);
+      if (requestId !== vrOrganizationRequestId.current) {
+        return;
+      }
+      setVrOrganizationPreview(null);
+      await refreshVrDownloads();
+      refreshVrLibrary();
+      setVrDownloadFocusTarget(`vr-download-dismiss-${preview.transferId}`);
+    } catch (error: unknown) {
+      if (requestId === vrOrganizationRequestId.current) {
+        setVrOrganizationPreview(null);
+        await refreshVrDownloads();
+        setVrDownloadErrors((errors) => ({
+          ...errors,
+          [preview.transferId]: organizationErrorMessage(error),
+        }));
+        setVrDownloadFocusTarget(
+          `vr-download-organize-${preview.transferId}`,
+        );
+      }
+    } finally {
+      vrDownloadActionsPending.current.delete(preview.transferId);
+      setPendingVrDownloadIds(new Set(vrDownloadActionsPending.current));
     }
   };
 
@@ -4999,17 +5322,29 @@ export default function App() {
                       error={vrDownloadErrors[download.transferId] ?? null}
                       isPending={pendingVrDownloadIds.has(download.transferId)}
                       key={download.transferId}
+                      onApplyOrganization={() =>
+                        void applyDownloadOrganization()
+                      }
                       onCancel={() =>
                         void runVrDownloadAction(download, "cancel")
                       }
+                      onCloseOrganization={closeDownloadOrganization}
                       onDismiss={() =>
                         void runVrDownloadAction(download, "dismiss")
                       }
                       onPause={() =>
                         void runVrDownloadAction(download, "pause")
                       }
+                      onPreviewOrganization={() =>
+                        void previewDownloadOrganization(download)
+                      }
                       onResume={() =>
                         void runVrDownloadAction(download, "resume")
+                      }
+                      organizationPreview={
+                        vrOrganizationPreview?.transferId === download.transferId
+                          ? vrOrganizationPreview
+                          : null
                       }
                     />
                   ))}

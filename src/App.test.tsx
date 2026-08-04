@@ -97,6 +97,13 @@ let cancelVrDownloadMock: Mock<
 let dismissVrDownloadMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
+let previewVrOrganizationMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let applyVrOrganizationMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let dismissVrOrganizationMock: Mock<() => Promise<void>>;
 let fetchMock: Mock<typeof fetch>;
 let clipboardWriteMock: Mock<(text: string) => Promise<void>>;
 let resizeObserverRecords: ResizeObserverRecord[] = [];
@@ -293,6 +300,7 @@ function sukebeiReleaseFixture(
 }
 
 function vrDownloadFixture({
+  canOrganize = "false",
   code = "MDVR-419",
   downloadedBytes = "5",
   releaseName,
@@ -302,7 +310,10 @@ function vrDownloadFixture({
   totalBytes = "10",
   transferId,
   isCurrentFolder = "true",
+  organizationRelativeDirectory = "",
+  organizationStatus = "none",
 }: {
+  canOrganize?: string;
   code?: string;
   downloadedBytes?: string;
   releaseName: string;
@@ -312,6 +323,8 @@ function vrDownloadFixture({
   totalBytes?: string;
   transferId: string;
   isCurrentFolder?: string;
+  organizationRelativeDirectory?: string;
+  organizationStatus?: string;
 }) {
   return [
     transferId,
@@ -323,6 +336,9 @@ function vrDownloadFixture({
     speedBytesPerSecond,
     state,
     isCurrentFolder,
+    organizationStatus,
+    organizationRelativeDirectory,
+    canOrganize,
   ];
 }
 
@@ -470,6 +486,20 @@ beforeEach(() => {
   resumeVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   cancelVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   dismissVrDownloadMock = vi.fn().mockResolvedValue(undefined);
+  previewVrOrganizationMock = vi.fn().mockImplementation((parameters) =>
+    Promise.resolve([
+      "plan-123",
+      parameters?.transferId as string,
+      "MDVR-419",
+      "1",
+      "1",
+      "move",
+      "Source/MDVR-419.mp4",
+      "MDVR-419/MDVR-419.mp4",
+    ]),
+  );
+  applyVrOrganizationMock = vi.fn().mockResolvedValue(undefined);
+  dismissVrOrganizationMock = vi.fn().mockResolvedValue(undefined);
   invokeMock = vi.fn(
     (command: string, parameters?: Record<string, unknown>) => {
       switch (command) {
@@ -551,6 +581,12 @@ beforeEach(() => {
           return cancelVrDownloadMock(parameters);
         case "dismiss_vr_download":
           return dismissVrDownloadMock(parameters);
+        case "preview_vr_organization":
+          return previewVrOrganizationMock(parameters);
+        case "apply_vr_organization":
+          return applyVrOrganizationMock(parameters);
+        case "dismiss_vr_organization":
+          return dismissVrOrganizationMock();
         default:
           return Promise.reject(new Error("Unexpected native command."));
       }
@@ -3778,7 +3814,7 @@ describe("VR Discover and verified release comparison", () => {
       downloadRows[6] = "0";
     });
     dismissVrDownloadMock.mockImplementation(async () => {
-      downloadRows = downloadRows.slice(9);
+      downloadRows = downloadRows.slice(12);
     });
     resumeVrDownloadMock.mockRejectedValueOnce("vr_download_failed");
     render(<App />);
@@ -4146,6 +4182,447 @@ describe("aggregate VR download limit and transfer summaries", () => {
     });
     expect(screen.getByText("Current limit: 4 MiB/s.")).toBeTruthy();
     expect(screen.queryByText("Current limit: 8 MiB/s.")).toBeNull();
+  });
+});
+
+describe("completed VR download organization", () => {
+  it("exposes only native-eligible rows and supports cancel, Escape, close, and focus return", async () => {
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 720,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 520,
+    });
+    loadVrDownloadsMock.mockResolvedValue([
+      ...vrDownloadFixture({
+        canOrganize: "true",
+        downloadedBytes: "10",
+        releaseName: "Eligible MDVR-419",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "eligible",
+      }),
+      ...vrDownloadFixture({
+        downloadedBytes: "10",
+        isCurrentFolder: "false",
+        releaseName: "Old-folder completion",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "old-folder",
+      }),
+      ...vrDownloadFixture({
+        downloadedBytes: "10",
+        organizationRelativeDirectory: "MDVR-419/",
+        organizationStatus: "organized",
+        releaseName: "Already organized",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "organized",
+      }),
+      ...vrDownloadFixture({
+        downloadedBytes: "3",
+        releaseName: "Paused transfer",
+        speedBytesPerSecond: "0",
+        state: "paused",
+        transferId: "paused",
+      }),
+    ]);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const eligibleCard = (
+      await screen.findByRole("heading", { name: "Eligible MDVR-419" })
+    ).closest("article") as HTMLElement;
+    expect(screen.getAllByRole("button", { name: "Organize files" })).toHaveLength(1);
+    const trigger = within(eligibleCard).getByRole("button", {
+      name: "Organize files",
+    });
+
+    fireEvent.click(trigger);
+    let confirmation = await screen.findByRole("alertdialog");
+    expect(
+      within(confirmation).getByRole("heading", {
+        name: "Organize MDVR-419 files?",
+      }),
+    ).toBeTruthy();
+    expect(within(confirmation).getByText("Source/MDVR-419.mp4")).toBeTruthy();
+    expect(
+      within(confirmation).getByText("Move to: MDVR-419/MDVR-419.mp4"),
+    ).toBeTruthy();
+    const cancel = within(confirmation).getByRole("button", { name: "Cancel" });
+    await waitFor(() => expect(document.activeElement).toBe(cancel));
+    fireEvent.click(cancel);
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+
+    fireEvent.click(trigger);
+    confirmation = await screen.findByRole("alertdialog");
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+
+    fireEvent.click(trigger);
+    confirmation = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(confirmation).getByRole("button", {
+        name: "Close organization preview",
+      }),
+    );
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+
+    fireEvent.click(trigger);
+    await screen.findByRole("alertdialog");
+    const backdrop = document.querySelector(".trash-dialog__backdrop");
+    if (backdrop === null) {
+      throw new Error("The organization confirmation backdrop was not rendered.");
+    }
+    fireEvent.pointerDown(backdrop);
+    fireEvent.click(backdrop);
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+
+    expect(previewVrOrganizationMock).toHaveBeenCalledTimes(4);
+    expect(previewVrOrganizationMock).toHaveBeenLastCalledWith({
+      transferId: "eligible",
+    });
+    expect(applyVrOrganizationMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(dismissVrOrganizationMock).toHaveBeenCalledTimes(4));
+    for (const call of dismissVrOrganizationMock.mock.calls) {
+      expect(call).toEqual([]);
+    }
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    fireEvent(window, new Event("resize"));
+    expect(previewVrOrganizationMock).toHaveBeenCalledTimes(4);
+    expect(listVrDownloadsMock).not.toHaveBeenCalled();
+  });
+
+  it("applies one exact plan, refreshes Library and storage once, and dismisses without organizing again", async () => {
+    savedVrFolder = "/VR";
+    const initialRows = vrDownloadFixture({
+      canOrganize: "true",
+      downloadedBytes: "10",
+      releaseName: "Exact completed release",
+      speedBytesPerSecond: "0",
+      state: "completed",
+      transferId: "transfer-419",
+    });
+    const organizedRows = vrDownloadFixture({
+      downloadedBytes: "10",
+      organizationRelativeDirectory: "MDVR-419/",
+      organizationStatus: "organized",
+      releaseName: "Exact completed release",
+      speedBytesPerSecond: "0",
+      state: "completed",
+      transferId: "transfer-419",
+    });
+    loadVrDownloadsMock.mockResolvedValue(initialRows);
+    listVrDownloadsMock.mockResolvedValueOnce(organizedRows);
+    previewVrOrganizationMock.mockResolvedValue([
+      "plan-419",
+      "transfer-419",
+      "MDVR-419",
+      "1",
+      "3",
+      "move",
+      "Source/MDVR-419  —  映画.MKV",
+      "MDVR-419/MDVR-419.MKV",
+      "media-unchanged",
+      "MDVR-419/MDVR-419 - Part 2.mp4",
+      "MDVR-419/MDVR-419 - Part 2.mp4",
+      "non-media-unchanged",
+      "Source/notes  —  exact.txt",
+      "",
+    ]);
+    const applyRequest = createDeferred<void>();
+    applyVrOrganizationMock.mockReturnValue(applyRequest.promise);
+    scanVrLibraryMock
+      .mockResolvedValueOnce(["/VR/Source/MDVR-419  —  映画.MKV", "10"])
+      .mockResolvedValueOnce(["/VR/MDVR-419/MDVR-419.MKV", "10"]);
+    render(<App />);
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+      expect(queryVrStorageMock).toHaveBeenCalledOnce();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Organize files" }));
+    const confirmation = await screen.findByRole("alertdialog");
+    expect(
+      within(confirmation).getByText("Unchanged non-media file"),
+    ).toBeTruthy();
+    const apply = within(confirmation).getByRole("button", {
+      name: "Organize 1 file",
+    });
+    fireEvent.click(apply);
+    fireEvent.click(apply);
+    expect(applyVrOrganizationMock).toHaveBeenCalledOnce();
+    expect(applyVrOrganizationMock).toHaveBeenCalledWith({ planId: "plan-419" });
+    expect(previewVrOrganizationMock).toHaveBeenCalledWith({
+      transferId: "transfer-419",
+    });
+    expect(
+      await within(confirmation).findByRole("button", { name: "Organizing…" }),
+    ).toBeTruthy();
+
+    await act(async () => {
+      applyRequest.resolve();
+      await applyRequest.promise;
+    });
+    const organizedCard = (
+      await screen.findByRole("heading", { name: "Exact completed release" })
+    ).closest("article") as HTMLElement;
+    expect(within(organizedCard).getByText("Organized")).toBeTruthy();
+    expect(within(organizedCard).getByText("MDVR-419/")).toBeTruthy();
+    expect(within(organizedCard).queryByRole("button", { name: "Organize files" }))
+      .toBeNull();
+    const dismiss = within(organizedCard).getByRole("button", { name: "Dismiss" });
+    await waitFor(() => expect(document.activeElement).toBe(dismiss));
+    await waitFor(() => {
+      expect(listVrDownloadsMock).toHaveBeenCalledOnce();
+      expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
+      expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
+    });
+
+    listVrDownloadsMock.mockResolvedValueOnce([]);
+    fireEvent.click(dismiss);
+    await waitFor(() => expect(screen.queryByText("Exact completed release")).toBeNull());
+    expect(dismissVrDownloadMock).toHaveBeenCalledWith({
+      transferId: "transfer-419",
+    });
+    expect(applyVrOrganizationMock).toHaveBeenCalledOnce();
+  });
+
+  it("reports preview and apply failures locally without a Library refresh", async () => {
+    savedVrFolder = "/VR";
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        canOrganize: "true",
+        downloadedBytes: "10",
+        releaseName: "Failure-isolated release",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "failure-row",
+      }),
+    );
+    previewVrOrganizationMock
+      .mockRejectedValueOnce("vr_organization_conflict")
+      .mockResolvedValueOnce([
+        "plan-failure",
+        "failure-row",
+        "MDVR-419",
+        "1",
+        "1",
+        "move",
+        "Source/MDVR-419.mp4",
+        "MDVR-419/MDVR-419.mp4",
+      ]);
+    applyVrOrganizationMock.mockRejectedValueOnce("vr_organization_failed");
+    listVrDownloadsMock.mockResolvedValueOnce(
+      vrDownloadFixture({
+        canOrganize: "true",
+        downloadedBytes: "10",
+        organizationRelativeDirectory: "MDVR-419/",
+        organizationStatus: "attention",
+        releaseName: "Failure-isolated release",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "failure-row",
+      }),
+    );
+    render(<App />);
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+      expect(queryVrStorageMock).toHaveBeenCalledOnce();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const card = (
+      await screen.findByRole("heading", { name: "Failure-isolated release" })
+    ).closest("article") as HTMLElement;
+    const trigger = within(card).getByRole("button", { name: "Organize files" });
+
+    fireEvent.click(trigger);
+    expect(
+      await within(card).findByText(
+        "The complete organization plan conflicts with an existing or duplicate destination.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(applyVrOrganizationMock).not.toHaveBeenCalled();
+
+    fireEvent.click(trigger);
+    const confirmation = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "Organize 1 file" }),
+    );
+    expect(
+      await within(card).findByText(
+        "The organization operation could not be completed safely. Review the current Downloads state before retrying.",
+      ),
+    ).toBeTruthy();
+    expect(within(card).getByText("Organization needs attention")).toBeTruthy();
+    expect(within(card).getByText("Needs attention")).toBeTruthy();
+    expect(within(card).getByRole("button", { name: "Organize files" })).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    expect(listVrDownloadsMock).toHaveBeenCalledOnce();
+    expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+    expect(queryVrStorageMock).toHaveBeenCalledOnce();
+    expect(dismissVrDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores a late preview after navigation without refreshing or applying", async () => {
+    const pendingPreview = createDeferred<string[]>();
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        canOrganize: "true",
+        downloadedBytes: "10",
+        releaseName: "Late preview release",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "late-preview",
+      }),
+    );
+    previewVrOrganizationMock.mockReturnValue(pendingPreview.promise);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Organize files" }));
+    selectDashboard();
+
+    await act(async () => {
+      pendingPreview.resolve([
+        "late-plan",
+        "late-preview",
+        "MDVR-419",
+        "1",
+        "1",
+        "move",
+        "Source/MDVR-419.mp4",
+        "MDVR-419/MDVR-419.mp4",
+      ]);
+      await pendingPreview.promise;
+    });
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(applyVrOrganizationMock).not.toHaveBeenCalled();
+    expect(listVrDownloadsMock).not.toHaveBeenCalled();
+    expect(dismissVrOrganizationMock).toHaveBeenCalledOnce();
+  });
+
+  it("ignores a late apply after navigation without refreshing Library or storage", async () => {
+    savedVrFolder = "/VR";
+    const pendingApply = createDeferred<void>();
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        canOrganize: "true",
+        downloadedBytes: "10",
+        releaseName: "Late apply release",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "late-apply",
+      }),
+    );
+    applyVrOrganizationMock.mockReturnValue(pendingApply.promise);
+    render(<App />);
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+      expect(queryVrStorageMock).toHaveBeenCalledOnce();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Organize files" }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Organize 1 file",
+      }),
+    );
+    const dashboard = document.querySelectorAll<HTMLButtonElement>(
+      ".navigation-item",
+    )[0];
+    fireEvent.click(dashboard);
+
+    await act(async () => {
+      pendingApply.resolve();
+      await pendingApply.promise;
+    });
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(listVrDownloadsMock).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+    expect(queryVrStorageMock).toHaveBeenCalledOnce();
+  });
+
+  it("counts recoverable organization attention without losing completed totals", async () => {
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        canOrganize: "true",
+        downloadedBytes: "10",
+        organizationRelativeDirectory: "MDVR-419/",
+        organizationStatus: "attention",
+        releaseName: "Recoverable partial organization",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "attention-row",
+      }),
+    );
+    render(<App />);
+    const downloads = await screen.findByRole("region", { name: "Downloads" });
+    const summary = within(downloads).getByLabelText("VR transfer summary");
+    const completed = within(summary).getByText("Completed").closest("div");
+    const attention = within(summary).getByText("Needs attention").closest("div");
+    expect(within(completed as HTMLElement).getByText("1")).toBeTruthy();
+    expect(within(attention as HTMLElement).getByText("1")).toBeTruthy();
+
+    fireEvent.click(
+      within(downloads).getByRole("button", { name: "Open Downloads" }),
+    );
+    const card = (
+      await screen.findByRole("heading", {
+        name: "Recoverable partial organization",
+      })
+    ).closest("article") as HTMLElement;
+    expect(within(card).getByText("Organization needs attention")).toBeTruthy();
+    expect(within(card).getByRole("button", { name: "Organize files" })).toBeTruthy();
+  });
+
+  it("retains a recovered row and local error when durable dismissal fails", async () => {
+    savedVrFolder = "/VR";
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        canOrganize: "true",
+        downloadedBytes: "10",
+        organizationRelativeDirectory: "MDVR-419/",
+        organizationStatus: "attention",
+        releaseName: "Dismissal recovery retained",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "failed-dismiss",
+      }),
+    );
+    dismissVrDownloadMock.mockRejectedValueOnce(
+      "vr_download_persistence_failed",
+    );
+    render(<App />);
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+      expect(queryVrStorageMock).toHaveBeenCalledOnce();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const card = (
+      await screen.findByRole("heading", {
+        name: "Dismissal recovery retained",
+      })
+    ).closest("article") as HTMLElement;
+    const dismiss = within(card).getByRole("button", { name: "Dismiss" });
+    fireEvent.click(dismiss);
+
+    expect(
+      await within(card).findByText(
+        "The dismiss action could not be completed for this transfer.",
+      ),
+    ).toBeTruthy();
+    expect(within(card).getByText("Organization needs attention")).toBeTruthy();
+    expect(within(card).getByRole("button", { name: "Organize files" })).toBeTruthy();
+    expect(listVrDownloadsMock).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+    expect(queryVrStorageMock).toHaveBeenCalledOnce();
   });
 });
 
