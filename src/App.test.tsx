@@ -4407,6 +4407,18 @@ describe("completed VR download organization", () => {
         "MDVR-419/MDVR-419.mp4",
       ]);
     applyVrOrganizationMock.mockRejectedValueOnce("vr_organization_failed");
+    listVrDownloadsMock.mockResolvedValueOnce(
+      vrDownloadFixture({
+        canOrganize: "true",
+        downloadedBytes: "10",
+        organizationRelativeDirectory: "MDVR-419/",
+        organizationStatus: "attention",
+        releaseName: "Failure-isolated release",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "failure-row",
+      }),
+    );
     render(<App />);
     await waitFor(() => {
       expect(scanVrLibraryMock).toHaveBeenCalledOnce();
@@ -4434,11 +4446,14 @@ describe("completed VR download organization", () => {
     );
     expect(
       await within(card).findByText(
-        "The organization operation could not be completed safely. No organized result was recorded.",
+        "The organization operation could not be completed safely. Review the current Downloads state before retrying.",
       ),
     ).toBeTruthy();
+    expect(within(card).getByText("Organization needs attention")).toBeTruthy();
+    expect(within(card).getByText("Needs attention")).toBeTruthy();
+    expect(within(card).getByRole("button", { name: "Organize files" })).toBeTruthy();
     await waitFor(() => expect(document.activeElement).toBe(trigger));
-    expect(listVrDownloadsMock).not.toHaveBeenCalled();
+    expect(listVrDownloadsMock).toHaveBeenCalledOnce();
     expect(scanVrLibraryMock).toHaveBeenCalledOnce();
     expect(queryVrStorageMock).toHaveBeenCalledOnce();
     expect(dismissVrDownloadMock).not.toHaveBeenCalled();

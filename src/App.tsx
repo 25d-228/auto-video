@@ -3464,7 +3464,7 @@ export default function App() {
       case "vr_organization_stale":
         return "The organization plan is stale because its transfer, folder, or files changed.";
       default:
-        return "The organization operation could not be completed safely. No organized result was recorded.";
+        return "The organization operation could not be completed safely. Review the current Downloads state before retrying.";
     }
   };
 
@@ -3583,6 +3583,7 @@ export default function App() {
     } catch (error: unknown) {
       if (requestId === vrOrganizationRequestId.current) {
         setVrOrganizationPreview(null);
+        await refreshVrDownloads();
         setVrDownloadErrors((errors) => ({
           ...errors,
           [preview.transferId]: organizationErrorMessage(error),
