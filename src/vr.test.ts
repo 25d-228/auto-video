@@ -18,6 +18,7 @@ import {
   scanVrLibrary,
   saveVrDownloadLimit,
   saveVerifiedAdultTorrent,
+  startVerifiedAdultDownload,
   startVerifiedVrDownload,
 } from "./vr";
 
@@ -820,7 +821,7 @@ describe("trusted VR download boundary", () => {
   it("rejects invalid aggregate limits and malformed native responses", async () => {
     for (const invalid of ["", "0", "01", "-1", "+1", "1.5", "4096"]) {
       await expect(saveVrDownloadLimit(invalid)).rejects.toThrow(
-        "whole-number VR download limit",
+        "whole-number download limit",
       );
     }
     expect(invokeMock).not.toHaveBeenCalled();
@@ -841,6 +842,7 @@ describe("trusted VR download boundary", () => {
     const exactReleaseName = "【VR】 MDVR-419  Exact\t—\n特別版";
     invokeMock.mockResolvedValue([
       "transfer-123",
+      "vr",
       "MDVR-419",
       exactReleaseName,
       "2",
@@ -852,11 +854,25 @@ describe("trusted VR download boundary", () => {
       "none",
       "",
       "false",
+      "adult-transfer-123",
+      "adult",
+      "ADLT-123",
+      "【Adult】 ADLT-123  Exact  —  特別版",
+      "1",
+      "7",
+      "7",
+      "0",
+      "completed",
+      "true",
+      "none",
+      "",
+      "false",
     ]);
 
     await expect(loadVrDownloads()).resolves.toEqual([
       {
         transferId: "transfer-123",
+        category: "vr",
         code: "MDVR-419",
         releaseName: exactReleaseName,
         selectedFileCount: 2,
@@ -869,13 +885,49 @@ describe("trusted VR download boundary", () => {
         organizationRelativeDirectory: null,
         canOrganize: false,
       },
+      {
+        transferId: "adult-transfer-123",
+        category: "adult",
+        code: "ADLT-123",
+        releaseName: "【Adult】 ADLT-123  Exact  —  特別版",
+        selectedFileCount: 1,
+        totalBytes: "7",
+        downloadedBytes: "7",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        isCurrentFolder: true,
+        organizationStatus: "none",
+        organizationRelativeDirectory: null,
+        canOrganize: false,
+      },
     ]);
     expect(invokeMock).toHaveBeenCalledWith("load_vr_downloads");
+  });
+
+  it("rejects organization state on Adult transfer rows", async () => {
+    invokeMock.mockResolvedValue([
+      "adult-transfer-123",
+      "adult",
+      "ADLT-123",
+      "ADLT-123 exact",
+      "1",
+      "7",
+      "7",
+      "0",
+      "completed",
+      "true",
+      "none",
+      "",
+      "true",
+    ]);
+
+    await expect(loadVrDownloads()).rejects.toThrow("invalid data");
   });
 
   it("keeps corrupt persisted transfers dismissible without making them organizable", async () => {
     invokeMock.mockResolvedValue([
       "corrupt-1",
+      "vr",
       "Unavailable",
       "Persisted transfer data is corrupt.",
       "0",
@@ -892,6 +944,7 @@ describe("trusted VR download boundary", () => {
     await expect(loadVrDownloads()).resolves.toEqual([
       {
         transferId: "corrupt-1",
+        category: "vr",
         code: "Unavailable",
         releaseName: "Persisted transfer data is corrupt.",
         selectedFileCount: 0,
@@ -1025,6 +1078,15 @@ describe("trusted VR download boundary", () => {
       startVerifiedVrDownload("inspection-123", [2, 2]),
     ).rejects.toThrow("valid file selection");
     expect(invokeMock).not.toHaveBeenCalled();
+
+    invokeMock.mockResolvedValue("adult-transfer-123");
+    await expect(
+      startVerifiedAdultDownload("adult-inspection-123", [1]),
+    ).resolves.toBe("adult-transfer-123");
+    expect(invokeMock).toHaveBeenCalledWith("start_verified_adult_download", {
+      inspectionId: "adult-inspection-123",
+      selectedFileIds: [1],
+    });
   });
 
   it("distinguishes configured, unavailable, and malformed VR folder state", async () => {
