@@ -59,10 +59,16 @@ import {
 import {
   fetchTmdbMovieDetails,
   fetchTmdbMoviesByTitle,
+  fetchTmdbTvByTitle,
+  fetchTmdbTvDetails,
   fetchWeeklyTrendingMovies,
+  fetchWeeklyTrendingTv,
   type TmdbMovie,
   type TmdbMovieDetailsResult,
   type TmdbMoviesResult,
+  type TmdbTvDetailsResult,
+  type TmdbTvShow,
+  type TmdbTvShowsResult,
   tmdbPosterUrl,
 } from "@/tmdb";
 import {
@@ -129,7 +135,7 @@ const destinations = [
   {
     id: "discover",
     label: "Discover",
-    description: "Browse TMDB Movies or find VR titles by exact product code.",
+    description: "Browse TMDB Movies and TV or find VR titles by exact product code.",
     emptyHeading: "Discovery is not configured",
     emptyMessage:
       "Add a TMDB API Read Access Token in Settings to load weekly trending Movies.",
@@ -234,12 +240,19 @@ type DiscoverState =
 type MovieDetailsState =
   | { status: "loading" }
   | TmdbMovieDetailsResult;
+type TvDiscoverState =
+  | { status: "loading-credential" }
+  | { status: "credential-error" }
+  | { status: "unconfigured" }
+  | { status: "loading" }
+  | TmdbTvShowsResult;
+type TvDetailsState = { status: "loading" } | TmdbTvDetailsResult;
 type CredentialMessage = {
   role: "alert" | "status";
   text: string;
 };
 type CopyTitleState = "idle" | "success" | "error";
-type DiscoverCategory = "movies" | "vr";
+type DiscoverCategory = "movies" | "tv" | "vr";
 type LibraryCategory = "movies" | "tv" | "adult" | "vr";
 type VrLibraryScanState =
   | { status: "loading" }
@@ -669,6 +682,101 @@ const movieDetailsMessages = {
   },
 } as const;
 
+const tvDiscoverMessages = {
+  "loading-credential": {
+    heading: "Loading TMDB configuration",
+    message: "Checking for a locally saved TMDB token.",
+    role: "status",
+  },
+  "credential-error": {
+    heading: "TMDB configuration could not be loaded",
+    message: "Open Settings to save the TMDB token again.",
+    role: "alert",
+  },
+  unconfigured: {
+    heading: "Configure TMDB to discover TV",
+    message: "Add a TMDB API Read Access Token in Settings before loading the feed.",
+    role: undefined,
+  },
+  loading: {
+    heading: "Loading weekly trending TV",
+    message: "Requesting this week's TV feed from TMDB.",
+    role: "status",
+  },
+  empty: {
+    heading: "No trending TV returned",
+    message: "TMDB returned an empty weekly TV feed. Try Refresh later.",
+    role: undefined,
+  },
+  unauthorized: discoverMessages.unauthorized,
+  "rate-limited": discoverMessages["rate-limited"],
+  "network-error": discoverMessages["network-error"],
+  "malformed-provider": {
+    heading: "TMDB returned invalid TV data",
+    message: "TMDB returned an unexpected response. Try Refresh later.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "TMDB could not load trending TV",
+    message: "TMDB returned an unexpected response. Try Refresh later.",
+    role: "alert",
+  },
+} as const;
+
+const tvDiscoverSearchMessages = {
+  ...tvDiscoverMessages,
+  loading: {
+    heading: "Searching TMDB TV",
+    message: "Requesting TV title matches from TMDB.",
+    role: "status",
+  },
+  empty: {
+    heading: "No TMDB TV matches this search",
+    message: "TMDB returned no TV shows for the submitted title search.",
+    role: undefined,
+  },
+  "network-error": {
+    heading: "TMDB search could not be reached",
+    message: "Check the network connection and try Refresh.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "TMDB returned invalid search data",
+    message: "TMDB returned a malformed TV search response.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "TMDB could not search TV",
+    message: "TMDB returned an unexpected error. Try Refresh later.",
+    role: "alert",
+  },
+} as const;
+
+const tvDetailsMessages = {
+  loading: {
+    heading: "Loading TV details",
+    message: "Requesting the selected TV details from TMDB.",
+    role: "status",
+  },
+  unauthorized: movieDetailsMessages.unauthorized,
+  "rate-limited": movieDetailsMessages["rate-limited"],
+  "network-error": {
+    heading: "TMDB TV details could not be reached",
+    message: "Check the network connection and try View details again.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "TMDB returned invalid TV details",
+    message: "The response did not verify the selected TMDB TV identity.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "TMDB could not load TV details",
+    message: "TMDB returned an unexpected error. Try again later.",
+    role: "alert",
+  },
+} as const;
+
 const vrCatalogMessages = {
   idle: {
     heading: "Search for a VR title by product code",
@@ -1093,6 +1201,75 @@ function DiscoverMovieCard({
           <div>
             <dt>Release</dt>
             <dd>{movie.releaseDate ?? "Unavailable"}</dd>
+          </div>
+          <div>
+            <dt>Source</dt>
+            <dd>TMDB</dd>
+          </div>
+        </dl>
+      </div>
+    </article>
+  );
+}
+
+function DiscoverTvCard({
+  onViewDetails,
+  resultIndex,
+  show,
+}: {
+  onViewDetails: (show: TmdbTvShow, triggerId: string) => void;
+  resultIndex: number;
+  show: TmdbTvShow;
+}) {
+  const [posterFailed, setPosterFailed] = useState(false);
+  const detailsTriggerId = useId();
+  const titleId = `tmdb-tv-${show.id}-${resultIndex}`;
+
+  return (
+    <article aria-labelledby={titleId} className="discover-card">
+      <div className="discover-card__poster">
+        {show.posterPath !== null && !posterFailed ? (
+          <img
+            alt=""
+            onError={() => setPosterFailed(true)}
+            src={tmdbPosterUrl(show.posterPath)}
+          />
+        ) : (
+          <div className="discover-card__poster-fallback">
+            <AppIcon name="poster" />
+            <span>Poster unavailable</span>
+          </div>
+        )}
+      </div>
+      <div className="discover-card__body">
+        <div className="media-title-row">
+          <h3 id={titleId}>{show.name}</h3>
+          <div className="discover-card__title-actions">
+            <CopyTitleAction title={show.name} />
+            <Button
+              aria-label={`View details: ${show.name}`}
+              className="discover-card__details-action"
+              id={detailsTriggerId}
+              onClick={(event) => {
+                event.stopPropagation();
+                onViewDetails(show, detailsTriggerId);
+              }}
+              onKeyDown={(event) => event.stopPropagation()}
+              onPointerDown={(event) => event.stopPropagation()}
+              size="xs"
+              title="View details"
+              type="button"
+              variant="outline"
+            >
+              <AppIcon name="details" />
+              Details
+            </Button>
+          </div>
+        </div>
+        <dl>
+          <div>
+            <dt>First air date</dt>
+            <dd>{show.firstAirDate ?? "Unavailable"}</dd>
           </div>
           <div>
             <dt>Source</dt>
@@ -1634,6 +1811,117 @@ function DiscoverMovieDetails({
                         ? "Unavailable"
                         : `${details.runtimeMinutes} minutes`}
                     </dd>
+                  </div>
+                  <div>
+                    <dt>Genres</dt>
+                    <dd>
+                      {details.genres.length === 0
+                        ? "Unavailable"
+                        : details.genres.join(", ")}
+                    </dd>
+                  </div>
+                </dl>
+                <div className="movie-details__overview">
+                  <h3>Overview</h3>
+                  <p>{details.overview ?? "Unavailable"}</p>
+                </div>
+              </div>
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
+  );
+}
+
+function DiscoverTvDetails({
+  show,
+  state,
+  triggerId,
+}: {
+  show: TmdbTvShow;
+  state: TvDetailsState;
+  triggerId: string;
+}) {
+  const [failedPosterPath, setFailedPosterPath] = useState<string | null>(null);
+  const details = state.status === "ready" ? state.details : null;
+  const displayedName = details?.name ?? show.name;
+  const currentMessage =
+    state.status === "ready" ? null : tvDetailsMessages[state.status];
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="movie-details__backdrop" />
+      <Dialog.Viewport className="movie-details__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading"}
+          className="movie-details__popup"
+          finalFocus={() => document.getElementById(triggerId)}
+          onClick={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <div className="movie-details__heading">
+            <div>
+              <p className="card-eyebrow">TMDB TV details</p>
+              <Dialog.Title>{displayedName}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="movie-details__description">
+            Provider details for the selected TMDB TV show.
+          </Dialog.Description>
+
+          {details === null ? (
+            <div className="movie-details__state" role={currentMessage?.role}>
+              <span className="empty-state__icon">
+                <AppIcon name="details" />
+              </span>
+              <div>
+                <h3>{currentMessage?.heading}</h3>
+                <p>{currentMessage?.message}</p>
+              </div>
+            </div>
+          ) : (
+            <div className="movie-details__content">
+              <div className="movie-details__poster">
+                {details.posterPath !== null &&
+                failedPosterPath !== details.posterPath ? (
+                  <img
+                    alt=""
+                    onError={() => setFailedPosterPath(details.posterPath)}
+                    src={tmdbPosterUrl(details.posterPath)}
+                  />
+                ) : (
+                  <div className="discover-card__poster-fallback">
+                    <AppIcon name="poster" />
+                    <span>Poster unavailable</span>
+                  </div>
+                )}
+              </div>
+              <div className="movie-details__information">
+                <dl>
+                  <div>
+                    <dt>First air date</dt>
+                    <dd>{details.firstAirDate ?? "Unavailable"}</dd>
+                  </div>
+                  <div>
+                    <dt>Status</dt>
+                    <dd>{details.providerStatus ?? "Unavailable"}</dd>
+                  </div>
+                  <div>
+                    <dt>Seasons</dt>
+                    <dd>{details.seasonCount ?? "Unavailable"}</dd>
+                  </div>
+                  <div>
+                    <dt>Episodes</dt>
+                    <dd>{details.episodeCount ?? "Unavailable"}</dd>
                   </div>
                   <div>
                     <dt>Genres</dt>
@@ -2867,6 +3155,27 @@ export default function App() {
   >(null);
   const [movieDetailsRequestVersion, setMovieDetailsRequestVersion] =
     useState(0);
+  const [tvDiscoverState, setTvDiscoverState] = useState<TvDiscoverState>({
+    status: "loading-credential",
+  });
+  const [isTvDiscoverActivated, setIsTvDiscoverActivated] = useState(false);
+  const [tvDiscoverSearchInput, setTvDiscoverSearchInput] = useState("");
+  const [submittedTvDiscoverSearchQuery, setSubmittedTvDiscoverSearchQuery] =
+    useState<string | null>(null);
+  const [tvDiscoverSearchInputError, setTvDiscoverSearchInputError] = useState<
+    string | null
+  >(null);
+  const [tvTrendingRefreshVersion, setTvTrendingRefreshVersion] = useState(0);
+  const [tvSearchRefreshVersion, setTvSearchRefreshVersion] = useState(0);
+  const [tvDiscoverSelectedPage, setTvDiscoverSelectedPage] = useState(1);
+  const [selectedDiscoverTvShow, setSelectedDiscoverTvShow] =
+    useState<TmdbTvShow | null>(null);
+  const [tvDetailsState, setTvDetailsState] =
+    useState<TvDetailsState | null>(null);
+  const [tvDetailsTriggerId, setTvDetailsTriggerId] = useState<string | null>(
+    null,
+  );
+  const [tvDetailsRequestVersion, setTvDetailsRequestVersion] = useState(0);
   const [vrSearchInput, setVrSearchInput] = useState("");
   const [vrSearchInputError, setVrSearchInputError] = useState<string | null>(
     null,
@@ -2934,6 +3243,8 @@ export default function App() {
   const storageRequestId = useRef(0);
   const discoverRequestId = useRef(0);
   const movieDetailsRequestId = useRef(0);
+  const tvDiscoverRequestId = useRef(0);
+  const tvDetailsRequestId = useRef(0);
   const vrCatalogRequestId = useRef(0);
   const releaseRequestId = useRef(0);
   const torrentInspectionRequestId = useRef(0);
@@ -2961,6 +3272,11 @@ export default function App() {
     refreshVersion: number;
     result: TmdbMoviesResult;
   } | null>(null);
+  const trendingTvDiscoverResult = useRef<{
+    refreshVersion: number;
+    result: TmdbTvShowsResult;
+  } | null>(null);
+  const currentTvDiscoverState = useRef(tvDiscoverState);
   const currentMoviesFolder = useRef(moviesFolder);
   const currentMovieScanState = useRef(movieScanState);
   const currentVrDownloadsState = useRef(vrDownloadsState);
@@ -2973,6 +3289,7 @@ export default function App() {
   currentMoviesFolder.current = moviesFolder;
   currentMovieScanState.current = movieScanState;
   currentVrDownloadsState.current = vrDownloadsState;
+  currentTvDiscoverState.current = tvDiscoverState;
 
   useLayoutEffect(() => {
     if (vrDownloadFocusTarget === null) {
@@ -3754,6 +4071,108 @@ export default function App() {
     selectedDiscoverMovie,
     tmdbToken,
   ]);
+
+  useEffect(() => {
+    const requestId = ++tvDiscoverRequestId.current;
+
+    if (!isTvDiscoverActivated || discoverCategory !== "tv") {
+      return;
+    }
+    if (!isTmdbTokenLoaded) {
+      setTvDiscoverState({ status: "loading-credential" });
+      return;
+    }
+    if (tmdbCredentialLoadFailed) {
+      setTvDiscoverState({ status: "credential-error" });
+      return;
+    }
+    if (tmdbToken === null) {
+      setTvDiscoverState({ status: "unconfigured" });
+      return;
+    }
+    if (
+      currentTvDiscoverState.current.status !== "loading" &&
+      currentTvDiscoverState.current.status !== "loading-credential" &&
+      currentTvDiscoverState.current.status !== "credential-error" &&
+      currentTvDiscoverState.current.status !== "unconfigured"
+    ) {
+      return;
+    }
+
+    if (submittedTvDiscoverSearchQuery === null) {
+      const cachedTrendingResult = trendingTvDiscoverResult.current;
+      if (cachedTrendingResult?.refreshVersion === tvTrendingRefreshVersion) {
+        setTvDiscoverState(cachedTrendingResult.result);
+        return;
+      }
+    }
+
+    const abortController = new AbortController();
+    setTvDiscoverState({ status: "loading" });
+    const request =
+      submittedTvDiscoverSearchQuery === null
+        ? fetchWeeklyTrendingTv(tmdbToken, abortController.signal)
+        : fetchTmdbTvByTitle(
+            tmdbToken,
+            submittedTvDiscoverSearchQuery,
+            abortController.signal,
+          );
+    void request.then((result) => {
+      if (requestId !== tvDiscoverRequestId.current) {
+        return;
+      }
+      if (submittedTvDiscoverSearchQuery === null) {
+        trendingTvDiscoverResult.current = {
+          refreshVersion: tvTrendingRefreshVersion,
+          result,
+        };
+      }
+      setTvDiscoverState(result);
+    });
+
+    return () => {
+      tvDiscoverRequestId.current += 1;
+      abortController.abort();
+    };
+  }, [
+    discoverCategory,
+    isTmdbTokenLoaded,
+    isTvDiscoverActivated,
+    submittedTvDiscoverSearchQuery,
+    tmdbCredentialLoadFailed,
+    tmdbToken,
+    tvSearchRefreshVersion,
+    tvTrendingRefreshVersion,
+  ]);
+
+  useEffect(() => {
+    const requestId = ++tvDetailsRequestId.current;
+
+    if (selectedDiscoverTvShow === null) {
+      return;
+    }
+    if (tmdbToken === null) {
+      setTvDetailsState({ status: "unauthorized" });
+      return;
+    }
+
+    const abortController = new AbortController();
+    setTvDetailsState({ status: "loading" });
+    void fetchTmdbTvDetails(
+      tmdbToken,
+      selectedDiscoverTvShow.id,
+      abortController.signal,
+    ).then((result) => {
+      if (requestId === tvDetailsRequestId.current) {
+        setTvDetailsState(result);
+      }
+    });
+
+    return () => {
+      tvDetailsRequestId.current += 1;
+      abortController.abort();
+    };
+  }, [selectedDiscoverTvShow, tmdbToken, tvDetailsRequestVersion]);
 
   useEffect(() => {
     const requestId = ++vrCatalogRequestId.current;
@@ -4602,6 +5021,20 @@ export default function App() {
     setMovieDetailsState(null);
   };
 
+  const openDiscoverTvDetails = (show: TmdbTvShow, triggerId: string) => {
+    tvDetailsRequestId.current += 1;
+    setSelectedDiscoverTvShow(show);
+    setTvDetailsState({ status: "loading" });
+    setTvDetailsTriggerId(triggerId);
+    setTvDetailsRequestVersion((version) => version + 1);
+  };
+
+  const closeDiscoverTvDetails = () => {
+    tvDetailsRequestId.current += 1;
+    setSelectedDiscoverTvShow(null);
+    setTvDetailsState(null);
+  };
+
   const closeVrTorrentInspection = () => {
     torrentInspectionRequestId.current += 1;
     torrentSaveRequestId.current += 1;
@@ -4628,6 +5061,7 @@ export default function App() {
     }
 
     closeDiscoverMovieDetails();
+    closeDiscoverTvDetails();
     closeVrReleaseComparison();
     if (discoverCategory === "vr") {
       vrCatalogRequestId.current += 1;
@@ -4636,6 +5070,9 @@ export default function App() {
           ? { status: "idle" }
           : currentState,
       );
+    }
+    if (category === "tv") {
+      setIsTvDiscoverActivated(true);
     }
     setDiscoverCategory(category);
   };
@@ -4851,6 +5288,16 @@ export default function App() {
     }
   };
 
+  const reloadTvDiscoverMode = () => {
+    tvDiscoverRequestId.current += 1;
+    setTvDiscoverState({ status: "loading" });
+    if (submittedTvDiscoverSearchQuery === null) {
+      setTvTrendingRefreshVersion((version) => version + 1);
+    } else {
+      setTvSearchRefreshVersion((version) => version + 1);
+    }
+  };
+
   const saveTmdbToken = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const token = tmdbTokenInput.trim();
@@ -4860,9 +5307,13 @@ export default function App() {
 
     const previousToken = tmdbToken;
     closeDiscoverMovieDetails();
+    closeDiscoverTvDetails();
     discoverRequestId.current += 1;
+    tvDiscoverRequestId.current += 1;
     trendingDiscoverResult.current = null;
+    trendingTvDiscoverResult.current = null;
     setDiscoverState({ status: "loading" });
+    setTvDiscoverState({ status: "loading" });
     setTmdbToken(null);
     setIsSavingTmdbToken(true);
     setTmdbCredentialMessage(null);
@@ -4881,6 +5332,7 @@ export default function App() {
     } catch {
       setTmdbToken(previousToken);
       reloadDiscoverMode();
+      reloadTvDiscoverMode();
       setTmdbCredentialMessage({
         role: "alert",
         text: "The TMDB token could not be saved on this device.",
@@ -4893,9 +5345,13 @@ export default function App() {
   const clearTmdbToken = async () => {
     const tokenToRestore = tmdbToken;
     closeDiscoverMovieDetails();
+    closeDiscoverTvDetails();
     discoverRequestId.current += 1;
+    tvDiscoverRequestId.current += 1;
     trendingDiscoverResult.current = null;
+    trendingTvDiscoverResult.current = null;
     setDiscoverState({ status: "unconfigured" });
+    setTvDiscoverState({ status: "unconfigured" });
     setTmdbToken(null);
     setIsSavingTmdbToken(true);
     setTmdbCredentialMessage(null);
@@ -4913,6 +5369,7 @@ export default function App() {
     } catch {
       setTmdbToken(tokenToRestore);
       reloadDiscoverMode();
+      reloadTvDiscoverMode();
       setTmdbCredentialMessage({
         role: "alert",
         text: "The TMDB token could not be cleared from this device.",
@@ -4922,7 +5379,7 @@ export default function App() {
     }
   };
 
-  const refreshDiscover = () => {
+  const refreshMovieDiscover = () => {
     if (tmdbToken === null) {
       return;
     }
@@ -4964,6 +5421,47 @@ export default function App() {
     );
   };
 
+  const refreshTvDiscover = () => {
+    if (tmdbToken === null) {
+      return;
+    }
+
+    reloadTvDiscoverMode();
+  };
+
+  const searchDiscoverTv = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (tmdbToken === null) {
+      return;
+    }
+    if (tvDiscoverSearchInput.trim() === "") {
+      setTvDiscoverSearchInputError("Enter a TV title to search TMDB.");
+      return;
+    }
+
+    tvDiscoverRequestId.current += 1;
+    setTvDiscoverState({ status: "loading" });
+    setTvDiscoverSearchInputError(null);
+    setSubmittedTvDiscoverSearchQuery(tvDiscoverSearchInput);
+    setTvDiscoverSelectedPage(1);
+    setTvSearchRefreshVersion((version) => version + 1);
+  };
+
+  const clearTvDiscoverSearch = () => {
+    tvDiscoverRequestId.current += 1;
+    setTvDiscoverSearchInput("");
+    setTvDiscoverSearchInputError(null);
+    setSubmittedTvDiscoverSearchQuery(null);
+    setTvDiscoverSelectedPage(1);
+
+    const cachedTrendingResult = trendingTvDiscoverResult.current;
+    setTvDiscoverState(
+      cachedTrendingResult?.refreshVersion === tvTrendingRefreshVersion
+        ? cachedTrendingResult.result
+        : { status: "loading" },
+    );
+  };
+
   const currentMovieScanMessage =
     movieScanState.status === "ready"
       ? null
@@ -4978,6 +5476,16 @@ export default function App() {
   const discoverGalleryLabel = isDiscoverSearchActive
     ? "TMDB Movies search results"
     : "Weekly trending Movies";
+  const isTvDiscoverSearchActive = submittedTvDiscoverSearchQuery !== null;
+  const currentTvDiscoverMessage =
+    tvDiscoverState.status === "ready"
+      ? null
+      : (isTvDiscoverSearchActive
+          ? tvDiscoverSearchMessages
+          : tvDiscoverMessages)[tvDiscoverState.status];
+  const tvDiscoverGalleryLabel = isTvDiscoverSearchActive
+    ? "TMDB TV search results"
+    : "Weekly trending TV";
   const currentVrCatalogMessage =
     vrCatalogState.status === "ready"
       ? null
@@ -5883,28 +6391,36 @@ export default function App() {
               aria-busy={
                 discoverCategory === "movies"
                   ? discoverState.status === "loading"
-                  : vrCatalogState.status === "loading"
+                  : discoverCategory === "tv"
+                    ? tvDiscoverState.status === "loading"
+                    : vrCatalogState.status === "loading"
               }
-              aria-labelledby="discover-movies-heading"
+              aria-labelledby="discover-heading"
               className="discover-content"
             >
               <div className="library-toolbar library-toolbar--discover">
                 <div className="library-toolbar__heading">
                   <span className="empty-state__icon">
                     <AppIcon
-                      name={discoverCategory === "movies" ? "discover" : "vr"}
+                      name={
+                        discoverCategory === "movies"
+                          ? "discover"
+                          : discoverCategory
+                      }
                     />
                   </span>
                   <div>
                     <p className="card-eyebrow">
-                      {discoverCategory === "movies"
-                        ? "TMDB Discover"
-                        : "JavDB VR Discover"}
+                      {discoverCategory === "vr"
+                        ? "JavDB VR Discover"
+                        : "TMDB Discover"}
                     </p>
-                    <h2 id="discover-movies-heading">
+                    <h2 id="discover-heading">
                       {discoverCategory === "movies"
                         ? discoverGalleryLabel
-                        : vrGalleryLabel}
+                        : discoverCategory === "tv"
+                          ? tvDiscoverGalleryLabel
+                          : vrGalleryLabel}
                     </h2>
                     <p className="library-folder">
                       {discoverCategory === "vr" ? (
@@ -5912,6 +6428,18 @@ export default function App() {
                           "Exact product-code lookup"
                         ) : (
                           <>Requested code {submittedVrCode}</>
+                        )
+                      ) : discoverCategory === "tv" ? (
+                        isTvDiscoverSearchActive ? (
+                          <>
+                            Results for “
+                            <span className="discover-search-query">
+                              {submittedTvDiscoverSearchQuery}
+                            </span>
+                            ”
+                          </>
+                        ) : (
+                          "Weekly TV feed"
                         )
                       ) : isDiscoverSearchActive ? (
                         <>
@@ -5933,6 +6461,7 @@ export default function App() {
                     <div>
                       {([
                         ["movies", "Movies"],
+                        ["tv", "TV"],
                         ["vr", "VR"],
                       ] as const).map(([category, label]) => (
                         <label key={category}>
@@ -6000,13 +6529,81 @@ export default function App() {
                   ) : isTmdbTokenLoaded &&
                     !tmdbCredentialLoadFailed &&
                     tmdbToken !== null ? (
-                    <>
-                      <form
-                        aria-label="Search TMDB Movies"
-                        className="discover-search"
-                        onSubmit={searchDiscoverMovies}
-                        role="search"
-                      >
+                    discoverCategory === "tv" ? (
+                      <>
+                        <form
+                          aria-label="Search TMDB TV"
+                          className="discover-search"
+                          onSubmit={searchDiscoverTv}
+                          role="search"
+                        >
+                          <label htmlFor="discover-tv-search">Search TV</label>
+                          <div className="discover-search__field">
+                            <input
+                              aria-describedby={
+                                tvDiscoverSearchInputError === null
+                                  ? undefined
+                                  : "discover-tv-search-error"
+                              }
+                              aria-invalid={
+                                tvDiscoverSearchInputError === null
+                                  ? undefined
+                                  : true
+                              }
+                              className="discover-search__input"
+                              id="discover-tv-search"
+                              onChange={(event) => {
+                                setTvDiscoverSearchInput(event.target.value);
+                                if (tvDiscoverSearchInputError !== null) {
+                                  setTvDiscoverSearchInputError(null);
+                                }
+                              }}
+                              placeholder="Find a TV show"
+                              type="text"
+                              value={tvDiscoverSearchInput}
+                            />
+                            <Button type="submit">
+                              <AppIcon name="search" />
+                              Search
+                            </Button>
+                          </div>
+                          {tvDiscoverSearchInputError === null ? null : (
+                            <p
+                              className="discover-search__error"
+                              id="discover-tv-search-error"
+                              role="alert"
+                            >
+                              {tvDiscoverSearchInputError}
+                            </p>
+                          )}
+                        </form>
+                        {isTvDiscoverSearchActive ? (
+                          <Button
+                            onClick={clearTvDiscoverSearch}
+                            type="button"
+                            variant="outline"
+                          >
+                            <AppIcon name="close" />
+                            Clear
+                          </Button>
+                        ) : null}
+                        <Button
+                          onClick={refreshTvDiscover}
+                          type="button"
+                          variant="outline"
+                        >
+                          <AppIcon name="refresh" />
+                          Refresh
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <form
+                          aria-label="Search TMDB Movies"
+                          className="discover-search"
+                          onSubmit={searchDiscoverMovies}
+                          role="search"
+                        >
                         <label htmlFor="discover-movies-search">
                           Search Movies
                         </label>
@@ -6048,26 +6645,27 @@ export default function App() {
                             {discoverSearchInputError}
                           </p>
                         )}
-                      </form>
-                      {isDiscoverSearchActive ? (
+                        </form>
+                        {isDiscoverSearchActive ? (
+                          <Button
+                            onClick={clearDiscoverSearch}
+                            type="button"
+                            variant="outline"
+                          >
+                            <AppIcon name="close" />
+                            Clear
+                          </Button>
+                        ) : null}
                         <Button
-                          onClick={clearDiscoverSearch}
+                          onClick={refreshMovieDiscover}
                           type="button"
                           variant="outline"
                         >
-                          <AppIcon name="close" />
-                          Clear
+                          <AppIcon name="refresh" />
+                          Refresh
                         </Button>
-                      ) : null}
-                      <Button
-                        onClick={refreshDiscover}
-                        type="button"
-                        variant="outline"
-                      >
-                        <AppIcon name="refresh" />
-                        Refresh
-                      </Button>
-                    </>
+                      </>
+                    )
                   ) : null}
                 </div>
               </div>
@@ -6111,6 +6709,53 @@ export default function App() {
                       >
                         <AppIcon name="refresh" />
                         Retry search
+                      </Button>
+                    ) : null}
+                  </div>
+                )
+              ) : discoverCategory === "tv" ? (
+                tvDiscoverState.status === "ready" ? (
+                  <ResizeAwareGallery
+                    ariaLabel={tvDiscoverGalleryLabel}
+                    getItemKey={(show, resultIndex) =>
+                      `${show.id}-${resultIndex}-${show.posterPath ?? "posterless"}`
+                    }
+                    items={tvDiscoverState.shows}
+                    key={
+                      isTvDiscoverSearchActive
+                        ? "tv-discover-search-gallery"
+                        : "tv-discover-trending-gallery"
+                    }
+                    onSelectedPageChange={setTvDiscoverSelectedPage}
+                    renderItem={(show, resultIndex) => (
+                      <DiscoverTvCard
+                        onViewDetails={openDiscoverTvDetails}
+                        resultIndex={resultIndex}
+                        show={show}
+                      />
+                    )}
+                    selectedPage={tvDiscoverSelectedPage}
+                    variant="discover"
+                  />
+                ) : (
+                  <div
+                    className="empty-state discover-state"
+                    role={currentTvDiscoverMessage?.role}
+                  >
+                    <span className="empty-state__icon">
+                      <AppIcon name="tv" />
+                    </span>
+                    <h2>{currentTvDiscoverMessage?.heading}</h2>
+                    <p>{currentTvDiscoverMessage?.message}</p>
+                    {tvDiscoverState.status === "unconfigured" ||
+                    tvDiscoverState.status === "credential-error" ||
+                    tvDiscoverState.status === "unauthorized" ? (
+                      <Button
+                        className="empty-state__action"
+                        onClick={() => navigateTo(settingsDestination)}
+                        type="button"
+                      >
+                        Open Settings
                       </Button>
                     ) : null}
                   </div>
@@ -6162,7 +6807,7 @@ export default function App() {
                   </div>
                 )}
 
-              {discoverCategory === "movies" ? (
+              {discoverCategory !== "vr" ? (
                 <footer aria-label="TMDB credits" className="tmdb-attribution">
                   <img alt="TMDB" src={tmdbLogo} />
                   <p>
@@ -7501,6 +8146,25 @@ export default function App() {
             movie={selectedDiscoverMovie}
             state={movieDetailsState}
             triggerId={movieDetailsTriggerId}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeDiscoverTvDetails();
+          }
+        }}
+        open={selectedDiscoverTvShow !== null}
+      >
+        {selectedDiscoverTvShow === null ||
+        tvDetailsState === null ||
+        tvDetailsTriggerId === null ? null : (
+          <DiscoverTvDetails
+            key={selectedDiscoverTvShow.id}
+            show={selectedDiscoverTvShow}
+            state={tvDetailsState}
+            triggerId={tvDetailsTriggerId}
           />
         )}
       </Dialog.Root>

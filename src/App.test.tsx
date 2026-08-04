@@ -252,6 +252,10 @@ function selectVrDiscover() {
   fireEvent.click(screen.getByRole("radio", { name: "VR" }));
 }
 
+function selectTvDiscover() {
+  fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+}
+
 function selectSettings() {
   fireEvent.click(screen.getByRole("button", { name: "Settings" }));
 }
@@ -424,6 +428,13 @@ function searchMovies(query: string) {
 
 function submitDiscoverSearch(query: string) {
   fireEvent.change(screen.getByRole("textbox", { name: "Search Movies" }), {
+    target: { value: query },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Search" }));
+}
+
+function submitTvDiscoverSearch(query: string) {
+  fireEvent.change(screen.getByRole("textbox", { name: "Search TV" }), {
     target: { value: query },
   });
   fireEvent.click(screen.getByRole("button", { name: "Search" }));
@@ -3934,6 +3945,519 @@ describe("TMDB Discover", () => {
       }),
     ).toBeTruthy();
     expect(screen.queryByText("Cleared token result")).toBeNull();
+  });
+});
+
+describe("TMDB TV Discover", () => {
+  it("loads TV trends only after activation and renders exact accessible cards without native side effects", async () => {
+    const token = "tv-fixture-token";
+    const exactName = "番組  —  Director's “Cut”!";
+    loadTmdbTokenMock.mockResolvedValue(token);
+    fetchMock.mockImplementation((request) => {
+      const url = String(request);
+      if (url.endsWith("/trending/movie/week")) {
+        return Promise.resolve(
+          jsonResponse({ results: [{ id: 1, title: "Movie result" }] }),
+        );
+      }
+      return Promise.resolve(
+        jsonResponse({
+          results: [
+            {
+              id: 51,
+              name: exactName,
+              poster_path: "/tv-poster.jpg",
+              first_air_date: "2026-08-05",
+            },
+            { id: 52, name: "Posterless TV" },
+            { id: "invalid", name: "Invalid TV" },
+          ],
+        }),
+      );
+    });
+
+    render(<App />);
+    await waitFor(() => expect(loadTmdbTokenMock).toHaveBeenCalledTimes(1));
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    selectDiscover();
+    expect(await screen.findByText("Movie result")).toBeTruthy();
+    expect(
+      fetchMock.mock.calls.some(([request]) =>
+        String(request).includes("/trending/tv/week"),
+      ),
+    ).toBe(false);
+
+    selectTvDiscover();
+    const exactHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "番組 — Director's “Cut”!",
+    });
+    expect(exactHeading.textContent).toBe(exactName);
+    expect(screen.getAllByRole("article")).toHaveLength(2);
+    expect(screen.getByText("2026-08-05")).toBeTruthy();
+    expect(screen.getByText("Poster unavailable")).toBeTruthy();
+    expect(screen.getByRole("list", { name: "Weekly trending TV" })).toBeTruthy();
+    expect(screen.getByLabelText("TMDB credits")).toBeTruthy();
+
+    const exactCard = exactHeading.closest("article") as HTMLElement;
+    const copyButton = within(exactCard).getByRole("button", {
+      name: /Copy title:/,
+    });
+    expect(copyButton.getAttribute("aria-label")).toBe(`Copy title: ${exactName}`);
+    fireEvent.click(copyButton);
+    expect(clipboardWriteMock).toHaveBeenCalledWith(exactName);
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(queryMoviesStorageMock).not.toHaveBeenCalled();
+    expect(openTvFileMock).not.toHaveBeenCalled();
+    expect(revealTvFileMock).not.toHaveBeenCalled();
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+
+    const tvRequest = fetchMock.mock.calls.find(([request]) =>
+      String(request).includes("/trending/tv/week"),
+    );
+    expect(tvRequest?.[1]?.headers).toEqual({
+      Accept: "application/json",
+      Authorization: `Bearer ${token}`,
+    });
+    expect(String(tvRequest?.[0])).not.toContain(token);
+    expect(document.body.textContent).not.toContain(token);
+  });
+
+  it("submits exact TV queries explicitly, keeps edits separate, and clears a pending search to cached trends", async () => {
+    const query = "  番組 — Director's “Cut”! & CAPS  ";
+    const pendingSearch = createDeferred<Response>();
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 1, title: "Movie result" }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 2, name: "Cached TV trend" }] }),
+      )
+      .mockReturnValueOnce(pendingSearch.promise);
+
+    render(<App />);
+    selectDiscover();
+    expect(await screen.findByText("Movie result")).toBeTruthy();
+    selectTvDiscover();
+    expect(await screen.findByText("Cached TV trend")).toBeTruthy();
+
+    const input = screen.getByRole("textbox", { name: "Search TV" });
+    fireEvent.change(input, { target: { value: query } });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "Searching TMDB TV",
+      }),
+    ).toBeTruthy();
+    const searchUrl = new URL(String(fetchMock.mock.calls[2][0]));
+    expect(searchUrl.pathname).toBe("/3/search/tv");
+    expect(searchUrl.searchParams.get("query")).toBe(query);
+
+    fireEvent.change(input, { target: { value: "Unsubmitted edit" } });
+    expect(screen.getByText(/Results for/).textContent).toContain(query);
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    expect(screen.getByText("Cached TV trend")).toBeTruthy();
+    expect(input).toHaveProperty("value", "");
+
+    await act(async () => {
+      pendingSearch.resolve(
+        jsonResponse({ results: [{ id: 3, name: "Late search result" }] }),
+      );
+      await pendingSearch.promise;
+    });
+    expect(screen.queryByText("Late search result")).toBeNull();
+    expect(screen.getByText("Cached TV trend")).toBeTruthy();
+
+    submitTvDiscoverSearch(" \t ");
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Enter a TV title to search TMDB.",
+    );
+    expect(screen.getByText("Cached TV trend")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    {
+      heading: "No trending TV returned",
+      response: jsonResponse({ results: [] }),
+    },
+    {
+      heading: "TMDB token was not accepted",
+      response: jsonResponse({}, 401),
+    },
+    {
+      heading: "TMDB rate limit reached",
+      response: jsonResponse({}, 429),
+    },
+    {
+      heading: "TMDB could not load trending TV",
+      response: jsonResponse({}, 500),
+    },
+    {
+      heading: "TMDB returned invalid TV data",
+      response: jsonResponse({ page: 1 }),
+    },
+  ])("shows the local TV provider state $heading", async ({ heading, response }) => {
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(response);
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+
+    expect(
+      await screen.findByRole("heading", { level: 2, name: heading }),
+    ).toBeTruthy();
+  });
+
+  it("shows TV network and search provider errors without changing Movies state", async () => {
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 1, title: "Stable Movie" }] }),
+      )
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 2, name: "TV after retry" }] }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ page: 1 }));
+
+    render(<App />);
+    selectDiscover();
+    expect(await screen.findByText("Stable Movie")).toBeTruthy();
+    selectTvDiscover();
+    expect(
+      await screen.findByRole("heading", { name: "TMDB could not be reached" }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText("TV after retry")).toBeTruthy();
+    submitTvDiscoverSearch("Fixture query");
+    expect(
+      await screen.findByRole("heading", {
+        name: "TMDB returned invalid search data",
+      }),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+    expect(screen.getByText("Stable Movie")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps only the newest TV refresh result", async () => {
+    const earlierRefresh = createDeferred<Response>();
+    const latestRefresh = createDeferred<Response>();
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 1, name: "Initial TV" }] }),
+      )
+      .mockReturnValueOnce(earlierRefresh.promise)
+      .mockReturnValueOnce(latestRefresh.promise);
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    expect(await screen.findByText("Initial TV")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await act(async () => {
+      latestRefresh.resolve(
+        jsonResponse({ results: [{ id: 3, name: "Latest TV" }] }),
+      );
+      await latestRefresh.promise;
+    });
+    expect(await screen.findByText("Latest TV")).toBeTruthy();
+
+    await act(async () => {
+      earlierRefresh.resolve(
+        jsonResponse({ results: [{ id: 2, name: "Stale TV" }] }),
+      );
+      await earlierRefresh.promise;
+    });
+    expect(screen.queryByText("Stale TV")).toBeNull();
+    expect(screen.getByText("Latest TV")).toBeTruthy();
+  });
+
+  it("invalidates pending TV data when the token is replaced or cleared", async () => {
+    const oldToken = "old-tv-token";
+    const newToken = "new-tv-token";
+    const oldTokenRefresh = createDeferred<Response>();
+    let oldTvRequestCount = 0;
+    loadTmdbTokenMock.mockResolvedValue(oldToken);
+    fetchMock.mockImplementation((request, options) => {
+      const url = String(request);
+      const authorization =
+        options === undefined
+          ? undefined
+          : (options.headers as Record<string, string>).Authorization;
+      if (url.includes("/trending/movie/week")) {
+        return Promise.resolve(jsonResponse({ results: [] }));
+      }
+      if (authorization === `Bearer ${oldToken}`) {
+        oldTvRequestCount += 1;
+        return oldTvRequestCount === 1
+          ? Promise.resolve(
+              jsonResponse({ results: [{ id: 1, name: "Old token TV" }] }),
+            )
+          : oldTokenRefresh.promise;
+      }
+      return Promise.resolve(
+        jsonResponse({ results: [{ id: 2, name: "New token TV" }] }),
+      );
+    });
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    expect(await screen.findByText("Old token TV")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    selectSettings();
+    fireEvent.change(screen.getByLabelText("New token"), {
+      target: { value: newToken },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Replace token" }));
+    expect(await screen.findByText("TMDB token replaced.")).toBeTruthy();
+    selectDiscover();
+    expect(await screen.findByText("New token TV")).toBeTruthy();
+
+    await act(async () => {
+      oldTokenRefresh.resolve(
+        jsonResponse({ results: [{ id: 3, name: "Stale old-token TV" }] }),
+      );
+      await oldTokenRefresh.promise;
+    });
+    expect(screen.queryByText("Stale old-token TV")).toBeNull();
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Clear token" }));
+    expect(await screen.findByText("TMDB token cleared.")).toBeTruthy();
+    selectDiscover();
+    expect(
+      await screen.findByRole("heading", {
+        name: "Configure TMDB to discover TV",
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByText("New token TV")).toBeNull();
+    expect(document.body.textContent).not.toContain(oldToken);
+    expect(document.body.textContent).not.toContain(newToken);
+    for (const [request] of fetchMock.mock.calls) {
+      expect(String(request)).not.toContain(oldToken);
+      expect(String(request)).not.toContain(newToken);
+    }
+  });
+
+  it("loads exact ID-verified TV details with truthful metadata and restores focus on Close", async () => {
+    const summaryName = "番組  —  Summary";
+    const detailsName = "番組  —  Exact “DETAILS”!";
+    const pendingDetails = createDeferred<Response>();
+    loadTmdbTokenMock.mockResolvedValue("details-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          results: [{ id: 601, name: summaryName, poster_path: null }],
+        }),
+      )
+      .mockReturnValueOnce(pendingDetails.promise);
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    const summaryHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "番組 — Summary",
+    });
+    const detailsButton = within(
+      summaryHeading.closest("article") as HTMLElement,
+    ).getByRole("button", { name: /View details:/ });
+    expect(detailsButton.getAttribute("aria-label")).toBe(
+      `View details: ${summaryName}`,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    detailsButton.focus();
+    fireEvent.click(detailsButton);
+    const dialog = await screen.findByRole("dialog");
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "https://api.themoviedb.org/3/tv/601",
+    );
+
+    await act(async () => {
+      pendingDetails.resolve(
+        jsonResponse({
+          id: 601,
+          name: detailsName,
+          poster_path: "/details-tv.jpg",
+          first_air_date: "2026-08-05",
+          status: "Returning  Series",
+          number_of_seasons: 3,
+          number_of_episodes: 28,
+          genres: [{ name: "ドラマ" }, { name: "Science  Fiction" }],
+          overview: "Exact  overview — punctuation preserved!",
+        }),
+      );
+      await pendingDetails.promise;
+    });
+
+    expect(
+      within(dialog).getByRole("heading", { level: 2 }).textContent,
+    ).toBe(detailsName);
+    expect(within(dialog).getByText("2026-08-05")).toBeTruthy();
+    expect(within(dialog).getByText("Returning Series").textContent).toBe(
+      "Returning  Series",
+    );
+    expect(within(dialog).getByText("3")).toBeTruthy();
+    expect(within(dialog).getByText("28")).toBeTruthy();
+    expect(within(dialog).getByText("ドラマ, Science Fiction").textContent).toBe(
+      "ドラマ, Science  Fiction",
+    );
+    expect(
+      within(dialog).getByText("Exact overview — punctuation preserved!")
+        .textContent,
+    ).toBe("Exact  overview — punctuation preserved!");
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(detailsButton));
+    expect(document.body.contains(summaryHeading)).toBe(true);
+    expect(summaryHeading.textContent).toBe(summaryName);
+  });
+
+  it("keeps details errors local and blocks late details across selection, category, and dismissal", async () => {
+    const showADetails = createDeferred<Response>();
+    const showBDetails = createDeferred<Response>();
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          results: [
+            { id: 701, name: "TV A" },
+            { id: 702, name: "TV B" },
+          ],
+        }),
+      )
+      .mockReturnValueOnce(showADetails.promise)
+      .mockReturnValueOnce(showBDetails.promise);
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    const showAButton = await screen.findByRole("button", {
+      name: "View details: TV A",
+    });
+    const showBButton = screen.getByRole("button", {
+      name: "View details: TV B",
+    });
+    fireEvent.click(showAButton);
+    fireEvent.click(showBButton);
+    const dialog = await screen.findByRole("dialog");
+
+    await act(async () => {
+      showBDetails.resolve(jsonResponse({ id: 999, name: "Wrong TV" }));
+      await showBDetails.promise;
+    });
+    expect(
+      await within(dialog).findByRole("heading", {
+        level: 3,
+        name: "TMDB returned invalid TV details",
+      }),
+    ).toBeTruthy();
+    expect(document.querySelector('[aria-label="Weekly trending TV"]')).not.toBeNull();
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+    await act(async () => {
+      showADetails.resolve(
+        jsonResponse({
+          id: 701,
+          name: "Late TV A",
+          overview: "Must stay absent",
+        }),
+      );
+      await showADetails.promise;
+    });
+    expect(screen.queryByText("Must stay absent")).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("preserves independent TV search state and responsive pagination without extra requests", async () => {
+    const query = "Persistent TV query";
+    const results = Array.from({ length: 25 }, (_, index) => ({
+      id: index + 801,
+      name: `Persistent TV ${index + 1}`,
+    }));
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 1, title: "Movie result" }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 2, name: "TV trend" }] }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ results }));
+    gallerySizes.discover = { width: 1088, height: 2408 };
+
+    render(<App />);
+    selectDiscover();
+    expect(await screen.findByText("Movie result")).toBeTruthy();
+    selectTvDiscover();
+    expect(await screen.findByText("TV trend")).toBeTruthy();
+    submitTvDiscoverSearch(query);
+    expect(await screen.findByText("Persistent TV 1")).toBeTruthy();
+
+    expect(
+      document.querySelector('[data-gallery="discover"]')?.getAttribute(
+        "data-page-capacity",
+      ),
+    ).toBe("25");
+    resizeGallery("discover", 1528, 472);
+    expect(
+      document.querySelector('[data-gallery="discover"]')?.getAttribute(
+        "data-page-capacity",
+      ),
+    ).toBe("7");
+    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Next TMDB TV search results page",
+      }),
+    );
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectDashboard();
+    selectDiscover();
+    selectTvDiscover();
+    expect(screen.getByRole("textbox", { name: "Search TV" })).toHaveProperty(
+      "value",
+      query,
+    );
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+    resizeGallery("discover", 1088, 956);
+    expect(
+      document.querySelector('[data-gallery="discover"]')?.getAttribute(
+        "data-page-capacity",
+      ),
+    ).toBe("10");
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });
 
