@@ -1080,6 +1080,72 @@ fn remove_organization_recovery(record: &TransferRecord) -> Result<(), &'static 
     }
 }
 
+fn recovery_file_matches(
+    record: &TransferRecord,
+    selected_index: usize,
+    relative_path: &str,
+) -> bool {
+    let Ok(relative_path) = relative_file_path(relative_path) else {
+        return false;
+    };
+    let path = record.destination.join(relative_path);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    !metadata.file_type().is_symlink()
+        && metadata.is_file()
+        && metadata.len() == record.selected_files[selected_index].size
+        && fs::canonicalize(&path).ok().as_deref() == Some(path.as_path())
+        && path.starts_with(&record.destination)
+        && file_fingerprint(&path).ok().as_ref() == record.fingerprints.get(selected_index)
+}
+
+fn reconcile_interrupted_organization(mut record: TransferRecord) -> Option<TransferRecord> {
+    if validate_resume_context(&record).is_ok() {
+        return Some(record);
+    }
+    let eligible_media = record
+        .current_paths
+        .iter()
+        .filter(|path| is_supported_media(Path::new(path)))
+        .count();
+    if eligible_media == 0 {
+        return None;
+    }
+    let mut current_paths = Vec::with_capacity(record.current_paths.len());
+    for selected_index in 0..record.current_paths.len() {
+        let source_relative = &record.current_paths[selected_index];
+        let destination_relative =
+            organization_destination_relative(&record, selected_index, eligible_media).ok()?;
+        let Some(destination_relative) = destination_relative else {
+            if !recovery_file_matches(&record, selected_index, source_relative) {
+                return None;
+            }
+            current_paths.push(source_relative.clone());
+            continue;
+        };
+        if destination_relative == *source_relative {
+            if !recovery_file_matches(&record, selected_index, source_relative) {
+                return None;
+            }
+            current_paths.push(source_relative.clone());
+            continue;
+        }
+        let source_matches = recovery_file_matches(&record, selected_index, source_relative);
+        let destination_matches =
+            recovery_file_matches(&record, selected_index, &destination_relative);
+        current_paths.push(match (source_matches, destination_matches) {
+            (true, false) => source_relative.clone(),
+            (false, true) => destination_relative,
+            _ => return None,
+        });
+    }
+    record.current_paths = current_paths;
+    record.organization_state = OrganizationState::Attention;
+    validate_resume_context(&record).ok()?;
+    Some(record)
+}
+
 fn read_organization_recoveries(destination: &Path) -> Vec<TransferRecord> {
     let Ok(entries) = fs::read_dir(destination) else {
         return Vec::new();
@@ -1112,12 +1178,11 @@ fn read_organization_recoveries(destination: &Path) -> Vec<TransferRecord> {
             let line = bytes
                 .strip_prefix(ORGANIZATION_RECOVERY_HEADER)?
                 .strip_suffix(b"\n")?;
-            let record = parse_transfer_line(line)?;
+            let record = reconcile_interrupted_organization(parse_transfer_line(line)?)?;
             if record.organization_state != OrganizationState::Attention
                 || record.state != TransferState::Completed
                 || record.destination != destination
                 || organization_recovery_path(&record) != path
-                || validate_resume_context(&record).is_err()
             {
                 return None;
             }
@@ -2104,6 +2169,45 @@ fn destination_has_case_collision(directory: &Path, file_name: &str) -> Result<b
     Ok(false)
 }
 
+fn organization_destination_relative(
+    record: &TransferRecord,
+    selected_index: usize,
+    eligible_media: usize,
+) -> Result<Option<String>, &'static str> {
+    let source_relative = record
+        .current_paths
+        .get(selected_index)
+        .ok_or(VR_ORGANIZATION_STALE)?;
+    if !is_supported_media(Path::new(source_relative)) {
+        return Ok(None);
+    }
+    let source_name = Path::new(source_relative)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(VR_ORGANIZATION_STALE)?;
+    let source_title = Path::new(source_name)
+        .file_stem()
+        .and_then(|title| title.to_str())
+        .ok_or(VR_ORGANIZATION_STALE)?;
+    if !media_name_matches_product_code(source_title, &record.code) {
+        return Err(VR_ORGANIZATION_INELIGIBLE);
+    }
+    let extension = Path::new(source_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or(VR_ORGANIZATION_STALE)?;
+    let destination_name = if eligible_media == 1 {
+        format!("{}.{}", record.code, extension)
+    } else if let Some(part_label) = exact_part_label(source_name) {
+        format!("{} - {}.{}", record.code, part_label, extension)
+    } else {
+        source_name.to_owned()
+    };
+    let destination_relative = format!("{}/{}", record.code, destination_name);
+    relative_file_path(&destination_relative).map_err(|_| VR_ORGANIZATION_CONFLICT)?;
+    Ok(Some(destination_relative))
+}
+
 fn organization_entries(
     record: &TransferRecord,
     current_folder: Option<&Path>,
@@ -2140,7 +2244,9 @@ fn organization_entries(
 
     for (selected_index, source_relative) in record.current_paths.iter().enumerate() {
         validate_current_organization_file(record, selected_index)?;
-        if !is_supported_media(Path::new(source_relative)) {
+        let Some(destination_relative) =
+            organization_destination_relative(record, selected_index, eligible_media)?
+        else {
             entries.push(OrganizationEntry {
                 selected_index,
                 kind: OrganizationEntryKind::NonMediaUnchanged,
@@ -2148,32 +2254,11 @@ fn organization_entries(
                 destination_relative: None,
             });
             continue;
-        }
-
-        let source_name = Path::new(source_relative)
+        };
+        let destination_name = Path::new(&destination_relative)
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or(VR_ORGANIZATION_STALE)?;
-        let source_title = Path::new(source_name)
-            .file_stem()
-            .and_then(|title| title.to_str())
-            .ok_or(VR_ORGANIZATION_STALE)?;
-        if !media_name_matches_product_code(source_title, &record.code) {
-            return Err(VR_ORGANIZATION_INELIGIBLE);
-        }
-        let extension = Path::new(source_name)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .ok_or(VR_ORGANIZATION_STALE)?;
-        let destination_name = if eligible_media == 1 {
-            format!("{}.{}", record.code, extension)
-        } else if let Some(part_label) = exact_part_label(source_name) {
-            format!("{} - {}.{}", record.code, part_label, extension)
-        } else {
-            source_name.to_owned()
-        };
-        let destination_relative = format!("{}/{}", record.code, destination_name);
-        relative_file_path(&destination_relative).map_err(|_| VR_ORGANIZATION_CONFLICT)?;
+            .ok_or(VR_ORGANIZATION_CONFLICT)?;
         let destination_key = destination_relative.to_lowercase();
         if !proposed_paths.insert(destination_key.clone()) {
             return Err(VR_ORGANIZATION_CONFLICT);
@@ -2184,7 +2269,7 @@ fn organization_entries(
         }
         if !same_path
             && existing_directory.as_ref().is_some_and(|directory| {
-                destination_has_case_collision(directory, &destination_name).unwrap_or(true)
+                destination_has_case_collision(directory, destination_name).unwrap_or(true)
             })
         {
             return Err(VR_ORGANIZATION_CONFLICT);
@@ -3773,6 +3858,98 @@ mod tests {
         assert_eq!(
             &rows[7..12],
             &["completed", "true", "attention", "MDVR-419/", "true"]
+        );
+    }
+
+    #[test]
+    fn interruption_after_one_move_recovers_exact_moved_and_unmoved_paths() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let metainfo = selected_file_torrent();
+        let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+        let source = revalidate_persisted_download_source(
+            &metainfo,
+            "MDVR-419",
+            "【VR】 MDVR-419  Exact — 特別版",
+            &infohash,
+            &[0, 1],
+        )
+        .expect("multipart source must revalidate");
+        let record = completed_organization_record(&destination, source);
+        let media_contents = record
+            .current_paths
+            .iter()
+            .map(|relative_path| {
+                fs::read(destination.join(relative_path)).expect("media must remain readable")
+            })
+            .collect::<Vec<_>>();
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(preview[3], "2");
+        let persistence_path = fixture.path.join("downloads");
+        fs::create_dir(destination.join("MDVR-419")).expect("organization directory must exist");
+        let recovery_path = {
+            let context = state.0.lock().expect("state must lock");
+            write_persisted_transfers(&persistence_path, &context.transfers)
+                .expect("original transfer must persist");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("transfer must remain valid");
+            };
+            write_organization_recovery(record, &record.current_paths, false)
+                .expect("pre-mutation recovery must persist");
+            organization_recovery_path(record)
+        };
+        let original_persistence =
+            fs::read(&persistence_path).expect("main persistence must remain readable");
+        let original_recovery =
+            fs::read(&recovery_path).expect("recovery state must remain readable");
+
+        let moved_path = destination.join("MDVR-419/MDVR-419 - Part  1.mkv");
+        let unmoved_path = destination.join("Folder/特別版  B.mp4");
+        fs::rename(destination.join("Folder/Part  1 — 映画.mkv"), &moved_path)
+            .expect("first move must complete before the simulated interruption");
+        assert_eq!(
+            fs::read(&persistence_path).expect("main store must remain unchanged"),
+            original_persistence
+        );
+        assert_eq!(
+            fs::read(&recovery_path).expect("recovery store must remain unchanged"),
+            original_recovery
+        );
+
+        let restarted = VrDownloadState::default();
+        restarted.0.lock().expect("state must lock").future_folder = Some(destination);
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("interrupted-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("interrupted paths must recover on restart");
+        assert_eq!(
+            &rows[7..12],
+            &["completed", "true", "attention", "MDVR-419/", "true"]
+        );
+        let context = restarted.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("recovered transfer must remain valid");
+        };
+        assert_eq!(
+            record.current_paths,
+            ["MDVR-419/MDVR-419 - Part  1.mkv", "Folder/特別版  B.mp4"]
+        );
+        assert!(
+            context.session.is_none(),
+            "recovery started a transfer session"
+        );
+        drop(context);
+        assert_eq!(
+            fs::read(moved_path).expect("moved media must remain at its exact path"),
+            media_contents[0]
+        );
+        assert_eq!(
+            fs::read(unmoved_path).expect("unmoved media must remain at its exact path"),
+            media_contents[1]
         );
     }
 
