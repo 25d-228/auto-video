@@ -28,6 +28,8 @@ const unsignedU64Pattern = /^\d{1,20}$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const episodeTokenPattern =
   /(^|[^A-Za-z0-9])(?:S([0-9]{1,2})E([0-9]{1,2})|([0-9]{1,2})x([0-9]{1,2}))(?=$|[^A-Za-z0-9])/gi;
+const compactEpisodeContinuationPattern =
+  /^[\s._+,&\p{Pd}]+E?[0-9]{1,2}(?=$|[^A-Za-z0-9])/iu;
 
 function parseTvFolderState(value: unknown): TvFolderState {
   if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
@@ -76,6 +78,10 @@ function parsedEpisodeIdentity(stem: string, relativePath: string) {
     return null;
   }
   const match = matches[0];
+  const tokenEnd = (match.index ?? 0) + match[0].length;
+  if (compactEpisodeContinuationPattern.test(stem.slice(tokenEnd))) {
+    return null;
+  }
   const seasonText = match[2] ?? match[4];
   const episodeText = match[3] ?? match[5];
   const season = Number(seasonText);

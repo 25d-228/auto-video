@@ -4626,6 +4626,10 @@ export default function App() {
         tvLibraryTitleSortDirection,
       ),
   );
+  const completeTvLibraryFileCount = completeTvLibraryItems.reduce(
+    (count, item) => count + item.files.length,
+    0,
+  );
   const completeTvLibraryEpisodeCount = completeTvLibraryItems.reduce(
     (count, item) =>
       count +
@@ -4760,18 +4764,18 @@ export default function App() {
     dashboardTvHeading = "Scanning TV Library";
     dashboardTvMessage = "Looking recursively for supported .mp4 and .mkv files.";
   } else if (tvLibraryScanState.status === "empty") {
-    dashboardTvHeading = "0 shows · 0 episodes";
+    dashboardTvHeading = "0 supported TV files";
     dashboardTvMessage = "The configured folder contains no supported video files.";
     dashboardTvRole = undefined;
   } else if (tvLibraryScanState.status === "ready") {
-    dashboardTvHeading = `${completeTvLibraryShowCount} ${completeTvLibraryShowCount === 1 ? "show" : "shows"} · ${completeTvLibraryEpisodeCount} ${completeTvLibraryEpisodeCount === 1 ? "episode" : "episodes"}`;
+    dashboardTvHeading = `${completeTvLibraryFileCount} supported TV ${completeTvLibraryFileCount === 1 ? "file" : "files"}`;
     const unassociatedCount = completeTvLibraryItems.filter(
       (item) => item.showTitle === null,
     ).length;
-    dashboardTvMessage =
-      unassociatedCount === 0
-        ? "These totals come from the latest complete TV folder scan."
-        : `${unassociatedCount} ${unassociatedCount === 1 ? "file remains" : "files remain"} unassociated.`;
+    const associatedSummary = `${completeTvLibraryShowCount} ${completeTvLibraryShowCount === 1 ? "show" : "shows"} · ${completeTvLibraryEpisodeCount} associated ${completeTvLibraryEpisodeCount === 1 ? "episode" : "episodes"}`;
+    dashboardTvMessage = unassociatedCount === 0
+      ? `${associatedSummary}. These totals come from the latest complete TV folder scan.`
+      : `${associatedSummary} · ${unassociatedCount} ${unassociatedCount === 1 ? "file remains" : "files remain"} unassociated.`;
     dashboardTvRole = undefined;
   } else if (tvLibraryScanState.status === "unavailable") {
     dashboardTvHeading = "TV folder is unavailable";
@@ -5934,7 +5938,7 @@ export default function App() {
                     >
                       {isTvLibrarySearchActive
                         ? `${matchingTvLibraryItems.length} TV items match the current search.`
-                        : `${completeTvLibraryShowCount} shows, ${completeTvLibraryEpisodeCount} episodes, and ${completeTvLibraryItems.length - completeTvLibraryShowCount} unassociated files in the complete current result.`}
+                        : `${completeTvLibraryFileCount} supported files, ${completeTvLibraryShowCount} shows, ${completeTvLibraryEpisodeCount} associated episodes, and ${completeTvLibraryItems.length - completeTvLibraryShowCount} unassociated files in the complete current result.`}
                     </p>
                     {matchingTvLibraryItems.length === 0 &&
                     isTvLibrarySearchActive ? (

@@ -749,6 +749,15 @@ describe("parsed TV Library and Dashboard", () => {
       "/TV/番組  Library/Unknown release.mp4",
       "Unknown release.mp4",
       "5",
+      "/TV/番組  Library/星  Show.S01E02-E03.mp4",
+      "星  Show.S01E02-E03.mp4",
+      "6",
+      "/TV/番組  Library/星  Show.S01E02-03.mkv",
+      "星  Show.S01E02-03.mkv",
+      "7",
+      "/TV/番組  Library/星  Show.1x02-03.mp4",
+      "星  Show.1x02-03.mp4",
+      "8",
     ]);
 
     render(<App />);
@@ -756,10 +765,14 @@ describe("parsed TV Library and Dashboard", () => {
     expect(
       await screen.findByRole("heading", {
         level: 3,
-        name: "1 show · 2 episodes",
+        name: "6 supported TV files",
       }),
     ).toBeTruthy();
-    expect(screen.getByText("1 file remains unassociated.")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "1 show · 2 associated episodes · 4 files remain unassociated.",
+      ),
+    ).toBeTruthy();
     expect(
       await screen.findByText("3.0 TiB", { selector: "dd" }),
     ).toBeTruthy();
@@ -776,19 +789,38 @@ describe("parsed TV Library and Dashboard", () => {
       name: "星 Show",
     });
     expect(showHeading.textContent).toBe("星  Show");
+    const showCard = showHeading.closest("article");
+    if (showCard === null) {
+      throw new Error("The grouped TV show card was not rendered.");
+    }
+    expect(showCard.querySelectorAll("[data-tv-file-path]")).toHaveLength(2);
     expect(screen.getByText("Season 1 · Episode 2 · 1.0 GiB")).toBeTruthy();
     expect(screen.getByText("Unknown release.mp4")).toBeTruthy();
+    const visibleFilePaths = Array.from(
+      document.querySelectorAll("[data-tv-file-path]"),
+      (row) => row.getAttribute("data-tv-file-path"),
+    );
+    expect(visibleFilePaths).toEqual(
+      expect.arrayContaining([
+        "/TV/番組  Library/星  Show.S01E02-E03.mp4",
+        "/TV/番組  Library/星  Show.S01E02-03.mkv",
+        "/TV/番組  Library/星  Show.1x02-03.mp4",
+      ]),
+    );
   });
 
   it("searches then sorts then paginates immediately across 25, 7, and 10 item capacities", async () => {
     savedTvFolder = "/TV";
-    scanTvLibraryMock.mockResolvedValue(
-      Array.from({ length: 30 }, (_, index) => {
+    scanTvLibraryMock.mockResolvedValue([
+      ...Array.from({ length: 30 }, (_, index) => {
         const title = `Show ${String(index + 1).padStart(2, "0")}`;
         const filename = `${title}.S01E01.mp4`;
         return [`/TV/${filename}`, filename, "1"];
       }).flat(),
-    );
+      "/TV/Unassociated special.mp4",
+      "Unassociated special.mp4",
+      "1",
+    ]);
     gallerySizes.library = { width: 1088, height: 728 };
 
     render(<App />);
@@ -832,6 +864,24 @@ describe("parsed TV Library and Dashboard", () => {
       "value",
       "Show 2",
     );
+    selectDashboard();
+    const tvSummary = screen
+      .getByRole("heading", { level: 2, name: "TV Library" })
+      .closest("section");
+    if (tvSummary === null) {
+      throw new Error("The TV Dashboard summary was not rendered.");
+    }
+    expect(
+      within(tvSummary).getByRole("heading", {
+        level: 3,
+        name: "31 supported TV files",
+      }),
+    ).toBeTruthy();
+    expect(
+      within(tvSummary).getByText(
+        "30 shows · 30 associated episodes · 1 file remains unassociated.",
+      ),
+    ).toBeTruthy();
     expect(scanTvLibraryMock).toHaveBeenCalledTimes(1);
     expect(queryTvStorageMock).toHaveBeenCalledTimes(1);
   });
@@ -917,7 +967,10 @@ describe("parsed TV Library and Dashboard", () => {
     openTvFileMock.mockRejectedValue("tv_file_open_stale");
 
     render(<App />);
-    await screen.findByRole("heading", { level: 3, name: "1 show · 1 episode" });
+    await screen.findByRole("heading", {
+      level: 3,
+      name: "1 supported TV file",
+    });
     fireEvent.click(screen.getByRole("button", { name: "Open TV Library" }));
     expect(screen.getByRole("radio", { name: "TV" })).toHaveProperty(
       "checked",
