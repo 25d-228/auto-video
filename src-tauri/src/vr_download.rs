@@ -2,12 +2,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    num::NonZeroU32,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use anyhow::{anyhow, Context};
 use librqbit::{
+    limits::LimitsConfig,
     storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage},
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, SessionOptions,
     TorrentStatsState,
@@ -23,6 +25,10 @@ pub const VR_DOWNLOAD_CONTEXT_INVALID: &str = "vr_download_context_invalid";
 pub const VR_DOWNLOAD_DESTINATION_CONFLICT: &str = "vr_download_destination_conflict";
 pub const VR_DOWNLOAD_DUPLICATE: &str = "vr_download_duplicate";
 pub const VR_DOWNLOAD_FAILED: &str = "vr_download_failed";
+pub const VR_DOWNLOAD_LIMIT_APPLY_FAILED: &str = "vr_download_limit_apply_failed";
+pub const VR_DOWNLOAD_LIMIT_INVALID: &str = "vr_download_limit_invalid";
+pub const VR_DOWNLOAD_LIMIT_STORAGE_FAILED: &str = "vr_download_limit_storage_failed";
+pub const VR_DOWNLOAD_LIMIT_UNAVAILABLE: &str = "vr_download_limit_unavailable";
 pub const VR_DOWNLOAD_PERSISTENCE_FAILED: &str = "vr_download_persistence_failed";
 pub const VR_DOWNLOAD_STALE: &str = "vr_download_stale";
 pub const VR_FOLDER_STORAGE_FAILED: &str = "vr_folder_storage_failed";
@@ -32,6 +38,9 @@ const PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_VR_DOWNLOADS_V1\n";
 const MAX_PERSISTENCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PERSISTED_TRANSFERS: usize = 100;
 const MAX_SELECTED_FILES: usize = 100_000;
+const BYTES_PER_MIB: u32 = 1024 * 1024;
+const MAX_DOWNLOAD_LIMIT_MIB_PER_SECOND: u32 = u32::MAX / BYTES_PER_MIB;
+const DOWNLOAD_LIMIT_UNLIMITED: &str = "unlimited\n";
 
 type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
@@ -133,11 +142,19 @@ enum StoredTransfer {
     Corrupt(CorruptTransferRecord),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DownloadLimitState {
+    #[default]
+    Unloaded,
+    Loaded(Option<NonZeroU32>),
+}
+
 #[derive(Default)]
 struct VrDownloadContext {
     future_folder: Option<PathBuf>,
     session: Option<Arc<Session>>,
     session_starting: bool,
+    download_limit: DownloadLimitState,
     transfers_loaded: bool,
     transfers_loading: bool,
     transfers: Vec<StoredTransfer>,
@@ -246,6 +263,143 @@ pub fn clear_vr_folder(state: &VrDownloadState, path: &Path) -> Result<(), &'sta
         .map_err(|_| VR_FOLDER_STORAGE_FAILED)?
         .future_folder = None;
     Ok(())
+}
+
+fn parse_download_limit(mib_per_second: Option<&str>) -> Result<Option<NonZeroU32>, &'static str> {
+    let Some(value) = mib_per_second else {
+        return Ok(None);
+    };
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(VR_DOWNLOAD_LIMIT_INVALID);
+    }
+    let value = value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value <= MAX_DOWNLOAD_LIMIT_MIB_PER_SECOND)
+        .and_then(NonZeroU32::new)
+        .ok_or(VR_DOWNLOAD_LIMIT_INVALID)?;
+    Ok(Some(value))
+}
+
+fn read_download_limit(path: &Path) -> Result<Option<NonZeroU32>, &'static str> {
+    match fs::read_to_string(path) {
+        Ok(value) if value == DOWNLOAD_LIMIT_UNLIMITED => Ok(None),
+        Ok(value) => parse_download_limit(Some(
+            value.strip_suffix('\n').ok_or(VR_DOWNLOAD_LIMIT_INVALID)?,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(VR_DOWNLOAD_LIMIT_STORAGE_FAILED),
+    }
+}
+
+fn write_download_limit(
+    path: &Path,
+    mib_per_second: Option<NonZeroU32>,
+) -> Result<(), &'static str> {
+    let parent = path.parent().ok_or(VR_DOWNLOAD_LIMIT_STORAGE_FAILED)?;
+    fs::create_dir_all(parent).map_err(|_| VR_DOWNLOAD_LIMIT_STORAGE_FAILED)?;
+    let value = mib_per_second
+        .map(|value| format!("{}\n", value.get()))
+        .unwrap_or_else(|| DOWNLOAD_LIMIT_UNLIMITED.to_owned());
+    fs::write(path, value).map_err(|_| VR_DOWNLOAD_LIMIT_STORAGE_FAILED)
+}
+
+fn download_limit_response(mib_per_second: Option<NonZeroU32>) -> Vec<String> {
+    match mib_per_second {
+        Some(value) => vec!["limited".to_owned(), value.get().to_string()],
+        None => vec!["unlimited".to_owned()],
+    }
+}
+
+fn download_limit_bytes_per_second(mib_per_second: Option<NonZeroU32>) -> Option<NonZeroU32> {
+    mib_per_second.and_then(|value| NonZeroU32::new(value.get() * BYTES_PER_MIB))
+}
+
+fn apply_download_limit(
+    session: Option<&Arc<Session>>,
+    bytes_per_second: Option<NonZeroU32>,
+) -> Result<(), ()> {
+    if let Some(session) = session {
+        session.ratelimits.set_download_bps(bytes_per_second);
+    }
+    Ok(())
+}
+
+fn load_download_limit_with(
+    state: &VrDownloadState,
+    path: &Path,
+    apply: impl FnOnce(Option<&Arc<Session>>, Option<NonZeroU32>) -> Result<(), ()>,
+) -> Result<Vec<String>, &'static str> {
+    let mut context = state
+        .0
+        .lock()
+        .map_err(|_| VR_DOWNLOAD_LIMIT_STORAGE_FAILED)?;
+    if let DownloadLimitState::Loaded(mib_per_second) = context.download_limit {
+        return Ok(download_limit_response(mib_per_second));
+    }
+    if context.session_starting {
+        return Err(VR_DOWNLOAD_LIMIT_APPLY_FAILED);
+    }
+    let mib_per_second = read_download_limit(path)?;
+    apply(
+        context.session.as_ref(),
+        download_limit_bytes_per_second(mib_per_second),
+    )
+    .map_err(|_| VR_DOWNLOAD_LIMIT_APPLY_FAILED)?;
+    context.download_limit = DownloadLimitState::Loaded(mib_per_second);
+    Ok(download_limit_response(mib_per_second))
+}
+
+pub fn load_download_limit(
+    state: &VrDownloadState,
+    path: &Path,
+) -> Result<Vec<String>, &'static str> {
+    load_download_limit_with(state, path, apply_download_limit)
+}
+
+fn save_download_limit_with(
+    state: &VrDownloadState,
+    path: &Path,
+    mib_per_second: Option<&str>,
+    mut apply: impl FnMut(Option<&Arc<Session>>, Option<NonZeroU32>) -> Result<(), ()>,
+) -> Result<Vec<String>, &'static str> {
+    let mib_per_second = parse_download_limit(mib_per_second)?;
+    let mut context = state
+        .0
+        .lock()
+        .map_err(|_| VR_DOWNLOAD_LIMIT_STORAGE_FAILED)?;
+    let DownloadLimitState::Loaded(previous_limit) = context.download_limit else {
+        return Err(VR_DOWNLOAD_LIMIT_UNAVAILABLE);
+    };
+    if context.session_starting {
+        return Err(VR_DOWNLOAD_LIMIT_APPLY_FAILED);
+    }
+    apply(
+        context.session.as_ref(),
+        download_limit_bytes_per_second(mib_per_second),
+    )
+    .map_err(|_| VR_DOWNLOAD_LIMIT_APPLY_FAILED)?;
+    if let Err(error) = write_download_limit(path, mib_per_second) {
+        apply(
+            context.session.as_ref(),
+            download_limit_bytes_per_second(previous_limit),
+        )
+        .map_err(|_| VR_DOWNLOAD_LIMIT_APPLY_FAILED)?;
+        return Err(error);
+    }
+    context.download_limit = DownloadLimitState::Loaded(mib_per_second);
+    Ok(download_limit_response(mib_per_second))
+}
+
+pub fn save_download_limit(
+    state: &VrDownloadState,
+    path: &Path,
+    mib_per_second: Option<&str>,
+) -> Result<Vec<String>, &'static str> {
+    save_download_limit_with(state, path, mib_per_second, apply_download_limit)
 }
 
 fn map_source_error(error: VerifiedDownloadSourceError) -> &'static str {
@@ -703,7 +857,7 @@ async fn session_for(
     state: &VrDownloadState,
     session_folder: &Path,
 ) -> Result<Arc<Session>, &'static str> {
-    {
+    let download_limit = {
         let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_FAILED)?;
         if let Some(session) = &context.session {
             return Ok(session.clone());
@@ -711,8 +865,12 @@ async fn session_for(
         if context.session_starting {
             return Err(VR_DOWNLOAD_ACTION_INVALID);
         }
+        let DownloadLimitState::Loaded(download_limit) = context.download_limit else {
+            return Err(VR_DOWNLOAD_LIMIT_UNAVAILABLE);
+        };
         context.session_starting = true;
-    }
+        download_limit
+    };
 
     if fs::create_dir_all(session_folder).is_err() {
         if let Ok(mut context) = state.0.lock() {
@@ -721,19 +879,9 @@ async fn session_for(
         return Err(VR_DOWNLOAD_FAILED);
     }
 
-    let result = Session::new_with_opts(
-        session_folder.to_owned(),
-        SessionOptions {
-            disable_upload: true,
-            disable_dht: true,
-            disable_dht_persistence: true,
-            fastresume: false,
-            enable_upnp_port_forwarding: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .map_err(|_| VR_DOWNLOAD_FAILED);
+    let result = Session::new_with_opts(session_folder.to_owned(), session_options(download_limit))
+        .await
+        .map_err(|_| VR_DOWNLOAD_FAILED);
 
     let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_FAILED)?;
     context.session_starting = false;
@@ -743,6 +891,21 @@ async fn session_for(
             Ok(session)
         }
         Err(error) => Err(error),
+    }
+}
+
+fn session_options(download_limit: Option<NonZeroU32>) -> SessionOptions {
+    SessionOptions {
+        disable_upload: true,
+        disable_dht: true,
+        disable_dht_persistence: true,
+        fastresume: false,
+        enable_upnp_port_forwarding: false,
+        ratelimits: LimitsConfig {
+            download_bps: download_limit_bytes_per_second(download_limit),
+            upload_bps: None,
+        },
+        ..Default::default()
     }
 }
 
@@ -1430,7 +1593,9 @@ pub async fn load_downloads(
     state: &VrDownloadState,
     persistence_path: &Path,
     session_folder: &Path,
+    download_limit_path: &Path,
 ) -> Result<Vec<String>, &'static str> {
+    load_download_limit(state, download_limit_path)?;
     {
         let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
         if context.transfers_loaded {
@@ -1580,6 +1745,9 @@ pub async fn start_download(
         let context = state.0.lock().map_err(|_| VR_DOWNLOAD_FAILED)?;
         if !context.transfers_loaded {
             return Err(VR_DOWNLOAD_ACTION_INVALID);
+        }
+        if matches!(context.download_limit, DownloadLimitState::Unloaded) {
+            return Err(VR_DOWNLOAD_LIMIT_UNAVAILABLE);
         }
         let destination = canonical_destination(
             context
@@ -1923,6 +2091,210 @@ mod tests {
         assert_eq!(download_rows(&mut context)[8], "false");
     }
 
+    #[test]
+    fn persists_replaces_and_clears_the_aggregate_download_limit() {
+        let fixture = FilesystemFixture::new();
+        let limit_path = fixture.path.join("download-limit");
+        let state = VrDownloadState::default();
+        let mut applied = Vec::new();
+
+        assert_eq!(
+            load_download_limit_with(&state, &limit_path, |_, bytes_per_second| {
+                applied.push(bytes_per_second.map(NonZeroU32::get));
+                Ok(())
+            }),
+            Ok(vec!["unlimited".to_owned()])
+        );
+        assert_eq!(
+            save_download_limit_with(&state, &limit_path, Some("8"), |_, bytes_per_second| {
+                applied.push(bytes_per_second.map(NonZeroU32::get));
+                Ok(())
+            },),
+            Ok(vec!["limited".to_owned(), "8".to_owned()])
+        );
+        assert_eq!(
+            fs::read_to_string(&limit_path).expect("finite limit must persist"),
+            "8\n"
+        );
+        let restarted = VrDownloadState::default();
+        assert_eq!(
+            load_download_limit(&restarted, &limit_path),
+            Ok(vec!["limited".to_owned(), "8".to_owned()])
+        );
+        assert_eq!(
+            save_download_limit_with(&state, &limit_path, None, |_, bytes_per_second| {
+                applied.push(bytes_per_second.map(NonZeroU32::get));
+                Ok(())
+            }),
+            Ok(vec!["unlimited".to_owned()])
+        );
+        assert_eq!(applied, vec![None, Some(8 * BYTES_PER_MIB), None]);
+        assert_eq!(
+            fs::read_to_string(&limit_path).expect("unlimited state must persist"),
+            DOWNLOAD_LIMIT_UNLIMITED
+        );
+        assert_eq!(
+            load_download_limit(&VrDownloadState::default(), &limit_path),
+            Ok(vec!["unlimited".to_owned()])
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_download_limits_before_engine_application() {
+        for invalid in ["", "0", "01", "-1", "+1", "1.5", "4096", "4294967296"] {
+            let fixture = FilesystemFixture::new();
+            let limit_path = fixture.path.join("download-limit");
+            let state = VrDownloadState::default();
+            load_download_limit(&state, &limit_path).expect("unlimited state must load");
+            let mut applied = false;
+
+            assert_eq!(
+                save_download_limit_with(&state, &limit_path, Some(invalid), |_, _| {
+                    applied = true;
+                    Ok(())
+                },),
+                Err(VR_DOWNLOAD_LIMIT_INVALID),
+                "{invalid:?} was accepted",
+            );
+            assert!(!applied, "{invalid:?} reached the engine");
+            assert!(!limit_path.exists(), "{invalid:?} reached persistence");
+        }
+    }
+
+    #[test]
+    fn live_limit_replacement_preserves_transfer_identity_and_lifecycle() {
+        let fixture = FilesystemFixture::new();
+        let limit_path = fixture.path.join("download-limit");
+        let state = VrDownloadState::default();
+        load_download_limit(&state, &limit_path).expect("unlimited state must load");
+        tauri::async_runtime::block_on(session_for(&state, &fixture.path.join("session")))
+            .expect("local session must start");
+        let destination = fixture.path.join("destination");
+        let record =
+            transfer_from_source(fixture_source(), destination.clone(), TransferState::Paused);
+        let expected_identity = (
+            record.transfer_id.clone(),
+            record.infohash.clone(),
+            record.selected_file_ids(),
+            record.destination.clone(),
+            record.downloaded_bytes,
+            record.state,
+        );
+        state
+            .0
+            .lock()
+            .expect("state must lock")
+            .transfers
+            .push(StoredTransfer::Valid(record));
+        let mut applied = None;
+
+        assert_eq!(
+            save_download_limit_with(
+                &state,
+                &limit_path,
+                Some("4"),
+                |session, bytes_per_second| {
+                    assert!(session.is_some());
+                    applied = bytes_per_second.map(NonZeroU32::get);
+                    Ok(())
+                },
+            ),
+            Ok(vec!["limited".to_owned(), "4".to_owned()])
+        );
+        assert_eq!(applied, Some(4 * BYTES_PER_MIB));
+        let context = state.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("transfer must remain valid");
+        };
+        assert_eq!(
+            (
+                record.transfer_id.clone(),
+                record.infohash.clone(),
+                record.selected_file_ids(),
+                record.destination.clone(),
+                record.downloaded_bytes,
+                record.state,
+            ),
+            expected_identity
+        );
+    }
+
+    #[test]
+    fn limit_failures_preserve_the_previous_setting_and_block_unsafe_restart() {
+        let fixture = FilesystemFixture::new();
+        let limit_path = fixture.path.join("download-limit");
+        let state = VrDownloadState::default();
+        load_download_limit(&state, &limit_path).expect("unlimited state must load");
+        assert_eq!(
+            save_download_limit_with(&state, &limit_path, Some("2"), |_, _| Err(())),
+            Err(VR_DOWNLOAD_LIMIT_APPLY_FAILED)
+        );
+        assert!(!limit_path.exists());
+        assert_eq!(
+            state.0.lock().expect("state must lock").download_limit,
+            DownloadLimitState::Loaded(None)
+        );
+
+        let blocking_file = fixture.path.join("blocking-file");
+        fs::write(&blocking_file, b"not a directory").expect("blocking file must exist");
+        let mut applied = Vec::new();
+        assert_eq!(
+            save_download_limit_with(
+                &state,
+                &blocking_file.join("download-limit"),
+                Some("2"),
+                |_, bytes_per_second| {
+                    applied.push(bytes_per_second.map(NonZeroU32::get));
+                    Ok(())
+                },
+            ),
+            Err(VR_DOWNLOAD_LIMIT_STORAGE_FAILED)
+        );
+        assert_eq!(applied, vec![Some(2 * BYTES_PER_MIB), None]);
+        assert_eq!(
+            state.0.lock().expect("state must lock").download_limit,
+            DownloadLimitState::Loaded(None)
+        );
+
+        fs::write(&limit_path, b"2\n").expect("finite restart limit must persist");
+        let apply_failure_state = VrDownloadState::default();
+        assert_eq!(
+            load_download_limit_with(&apply_failure_state, &limit_path, |_, _| Err(())),
+            Err(VR_DOWNLOAD_LIMIT_APPLY_FAILED)
+        );
+        let context = apply_failure_state.0.lock().expect("state must lock");
+        assert_eq!(context.download_limit, DownloadLimitState::Unloaded);
+        assert!(context.session.is_none());
+        drop(context);
+
+        fs::write(&limit_path, b"1.5\n").expect("invalid limit must persist for the fixture");
+        let restart_state = VrDownloadState::default();
+        assert_eq!(
+            tauri::async_runtime::block_on(load_downloads(
+                &restart_state,
+                &fixture.path.join("downloads"),
+                &fixture.path.join("restart-session"),
+                &limit_path,
+            )),
+            Err(VR_DOWNLOAD_LIMIT_INVALID)
+        );
+        let context = restart_state.0.lock().expect("state must lock");
+        assert_eq!(context.download_limit, DownloadLimitState::Unloaded);
+        assert!(!context.transfers_loaded);
+        assert!(context.session.is_none());
+    }
+
+    #[test]
+    fn finite_limit_is_present_in_session_options_before_session_creation() {
+        let limit = NonZeroU32::new(3).expect("finite limit must be nonzero");
+        let options = session_options(Some(limit));
+        assert_eq!(
+            options.ratelimits.download_bps.map(NonZeroU32::get),
+            Some(3 * BYTES_PER_MIB)
+        );
+        assert_eq!(options.ratelimits.upload_bps, None);
+    }
+
     fn push_bencoded_text(encoded: &mut Vec<u8>, value: &str) {
         encoded.extend_from_slice(value.len().to_string().as_bytes());
         encoded.push(b':');
@@ -2208,6 +2580,7 @@ mod tests {
             &available_state,
             &persistence_path,
             &session_folder,
+            &fixture.path.join("download-limit"),
         ))
         .expect("valid terminal row must load");
         assert_eq!(available_rows[7], "cancelled");
@@ -2225,6 +2598,7 @@ mod tests {
             &missing_state,
             &persistence_path,
             &session_folder,
+            &fixture.path.join("download-limit"),
         ))
         .expect("missing terminal row must remain visible");
         assert_eq!(missing_rows[7], "offline");
@@ -2270,6 +2644,7 @@ mod tests {
                 &state,
                 &persistence_path,
                 &fixture.path.join("completion-session"),
+                &fixture.path.join("download-limit"),
             )
             .await
             .expect("verified complete content must restore");
@@ -2323,6 +2698,7 @@ mod tests {
                 &state,
                 &persistence_path,
                 &fixture.path.join("boundary-session"),
+                &fixture.path.join("download-limit"),
             )
             .await
             .expect("retained boundary state must restore without a peer");
@@ -2373,6 +2749,7 @@ mod tests {
                 &state,
                 &persistence_path,
                 &fixture.path.join(format!("{case}-boundary-session")),
+                &fixture.path.join("download-limit"),
             ))
             .expect("invalid retained state must remain dismissable");
             assert_eq!(rows[5], "0", "{case} boundary state reported progress");
@@ -2397,6 +2774,7 @@ mod tests {
         let destination = fs::canonicalize(destination).expect("destination must canonicalize");
         let persistence_path = fixture.path.join("downloads");
         let session_folder = fixture.path.join("session");
+        let download_limit_path = fixture.path.join("download-limit");
         let folder_path = fixture.path.join("vr-folder");
         let bytes = selected_file_torrent();
         let infohash = hex_sha1(&bytes[b"d4:info".len()..bytes.len() - 1]);
@@ -2435,9 +2813,14 @@ mod tests {
         let state = VrDownloadState::default();
 
         tauri::async_runtime::block_on(async {
-            load_downloads(&state, &persistence_path, &session_folder)
-                .await
-                .expect("empty transfer state must load");
+            load_downloads(
+                &state,
+                &persistence_path,
+                &session_folder,
+                &download_limit_path,
+            )
+            .await
+            .expect("empty transfer state must load");
             set_vr_folder(&state, &folder_path, destination.clone())
                 .expect("trusted destination must configure");
             let transfer_id = start_download(
@@ -2489,6 +2872,7 @@ mod tests {
                 &resumed_state,
                 &persistence_path,
                 &fixture.path.join("resumed-session"),
+                &download_limit_path,
             )
             .await
             .expect("valid paused transfer must restore");

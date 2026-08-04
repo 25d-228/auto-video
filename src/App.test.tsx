@@ -76,6 +76,10 @@ let scanVrLibraryMock: Mock<() => Promise<string[]>>;
 let queryVrStorageMock: Mock<() => Promise<[string, string]>>;
 let openVrFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
 let revealVrFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
+let loadVrDownloadLimitMock: Mock<() => Promise<string[]>>;
+let saveVrDownloadLimitMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
 let loadVrDownloadsMock: Mock<() => Promise<string[]>>;
 let listVrDownloadsMock: Mock<() => Promise<string[]>>;
 let startVerifiedVrDownloadMock: Mock<
@@ -449,6 +453,16 @@ beforeEach(() => {
     .mockResolvedValue(["2199023255552", "549755813888"]);
   openVrFileMock = vi.fn().mockResolvedValue(undefined);
   revealVrFileMock = vi.fn().mockResolvedValue(undefined);
+  loadVrDownloadLimitMock = vi.fn().mockResolvedValue(["unlimited"]);
+  saveVrDownloadLimitMock = vi
+    .fn()
+    .mockImplementation((parameters) =>
+      Promise.resolve(
+        parameters?.mibPerSecond === null
+          ? ["unlimited"]
+          : ["limited", parameters?.mibPerSecond as string],
+      ),
+    );
   loadVrDownloadsMock = vi.fn().mockResolvedValue([]);
   listVrDownloadsMock = vi.fn().mockResolvedValue([]);
   startVerifiedVrDownloadMock = vi.fn().mockResolvedValue("transfer-123");
@@ -519,6 +533,10 @@ beforeEach(() => {
           return openVrFileMock(parameters);
         case "reveal_vr_file":
           return revealVrFileMock(parameters);
+        case "load_vr_download_limit":
+          return loadVrDownloadLimitMock();
+        case "save_vr_download_limit":
+          return saveVrDownloadLimitMock(parameters);
         case "load_vr_downloads":
           return loadVrDownloadsMock();
         case "list_vr_downloads":
@@ -3814,6 +3832,320 @@ describe("VR Discover and verified release comparison", () => {
     );
     expect(screen.getByRole("heading", { name: releaseB })).toBeTruthy();
     expect(dismissVrDownloadMock).toHaveBeenCalledWith({ transferId: "transfer-a" });
+  });
+});
+
+describe("aggregate VR download limit and transfer summaries", () => {
+  it("loads before transfers and applies finite replacement and Unlimited modes", async () => {
+    const pendingLimit = createDeferred<string[]>();
+    loadVrDownloadLimitMock.mockReturnValue(pendingLimit.promise);
+    render(<App />);
+    selectSettings();
+
+    expect(
+      screen.getByText("Loading the native-owned aggregate limit…"),
+    ).toBeTruthy();
+    expect(loadVrDownloadsMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pendingLimit.resolve(["limited", "8"]);
+      await pendingLimit.promise;
+    });
+    expect(await screen.findByText("Current limit: 8 MiB/s.")).toBeTruthy();
+    expect(loadVrDownloadsMock).toHaveBeenCalledOnce();
+    expect(
+      (screen.getByRole("radio", { name: "Finite" }) as HTMLInputElement)
+        .checked,
+    ).toBe(true);
+
+    const limitInput = screen.getByRole("spinbutton", {
+      name: "Finite limit (MiB/s)",
+    });
+    fireEvent.change(limitInput, { target: { value: "12" } });
+    const applyLimit = screen.getByRole("button", { name: "Apply limit" });
+    fireEvent.click(applyLimit);
+    fireEvent.click(applyLimit);
+    expect(saveVrDownloadLimitMock).toHaveBeenCalledOnce();
+    expect(saveVrDownloadLimitMock).toHaveBeenLastCalledWith({
+      mibPerSecond: "12",
+    });
+    expect(
+      await screen.findByText("VR download limit applied at 12 MiB/s."),
+    ).toBeTruthy();
+    expect(screen.getByText("Current limit: 12 MiB/s.")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Unlimited" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply limit" }));
+    expect(
+      await screen.findByText("VR downloads are now Unlimited."),
+    ).toBeTruthy();
+    expect(saveVrDownloadLimitMock).toHaveBeenLastCalledWith({
+      mibPerSecond: null,
+    });
+    expect(screen.getByText("Current limit: Unlimited.")).toBeTruthy();
+  });
+
+  it("rejects invalid finite values before native dispatch", async () => {
+    loadVrDownloadLimitMock.mockResolvedValue(["limited", "8"]);
+    render(<App />);
+    selectSettings();
+    const input = await screen.findByRole("spinbutton", {
+      name: "Finite limit (MiB/s)",
+    });
+
+    for (const value of ["", "0", "-1", "1.5", "4096"]) {
+      fireEvent.change(input, { target: { value } });
+      fireEvent.click(screen.getByRole("button", { name: "Apply limit" }));
+      expect(
+        screen.getByText("Enter a whole-number limit from 1 to 4095 MiB/s."),
+      ).toBeTruthy();
+    }
+    expect(saveVrDownloadLimitMock).not.toHaveBeenCalled();
+    expect(screen.getByText("Current limit: 8 MiB/s.")).toBeTruthy();
+  });
+
+  it("keeps the previous limit on save and apply failures and routes attention to Settings", async () => {
+    loadVrDownloadLimitMock.mockResolvedValue(["limited", "8"]);
+    saveVrDownloadLimitMock
+      .mockRejectedValueOnce("vr_download_limit_storage_failed")
+      .mockRejectedValueOnce("vr_download_limit_apply_failed");
+    render(<App />);
+    selectSettings();
+    const input = await screen.findByRole("spinbutton", {
+      name: "Finite limit (MiB/s)",
+    });
+
+    fireEvent.change(input, { target: { value: "12" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply limit" }));
+    expect(
+      await screen.findByText(
+        "The VR download limit could not be saved. The previous limit remains active.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText("Current limit: 8 MiB/s.")).toBeTruthy();
+
+    fireEvent.change(input, { target: { value: "16" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply limit" }));
+    expect(
+      await screen.findByText(
+        "The VR download limit could not be applied. The previous limit remains active.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText("Current limit: 8 MiB/s.")).toBeTruthy();
+
+    selectDashboard();
+    const downloads = screen.getByRole("region", { name: "Downloads" });
+    fireEvent.click(
+      within(downloads).getByRole("button", {
+        name: "Open Download Settings",
+      }),
+    );
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Settings" }),
+    ).toBeTruthy();
+  });
+
+  it("blocks transfer restoration after a limit load failure and recovers in order", async () => {
+    loadVrDownloadLimitMock
+      .mockRejectedValueOnce("vr_download_limit_storage_failed")
+      .mockResolvedValueOnce(["limited", "4"]);
+    render(<App />);
+
+    const downloads = await screen.findByRole("region", { name: "Downloads" });
+    expect(
+      within(downloads).getByRole("heading", {
+        level: 3,
+        name: "VR transfers need attention",
+      }),
+    ).toBeTruthy();
+    expect(loadVrDownloadsMock).not.toHaveBeenCalled();
+    fireEvent.click(
+      within(downloads).getByRole("button", {
+        name: "Open Download Settings",
+      }),
+    );
+    expect(
+      screen.getByText(
+        "The aggregate limit could not be loaded or applied. Eligible saved transfers remain non-running.",
+      ),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry limit" }));
+    expect(await screen.findByText("Current limit: 4 MiB/s.")).toBeTruthy();
+    expect(loadVrDownloadLimitMock).toHaveBeenCalledTimes(2);
+    expect(loadVrDownloadsMock).toHaveBeenCalledOnce();
+  });
+
+  it("summarizes only the current native snapshot without extra view work", async () => {
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 720,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 520,
+    });
+    loadVrDownloadLimitMock.mockResolvedValue(["limited", "8"]);
+    const initialRows = [
+      ...vrDownloadFixture({
+        releaseName: "Active A",
+        speedBytesPerSecond: "1024",
+        state: "downloading",
+        transferId: "active-a",
+      }),
+      ...vrDownloadFixture({
+        releaseName: "Active B",
+        speedBytesPerSecond: "2048",
+        state: "downloading",
+        transferId: "active-b",
+      }),
+      ...vrDownloadFixture({
+        releaseName: "Queued",
+        speedBytesPerSecond: "8192",
+        state: "queued",
+        transferId: "queued",
+      }),
+      ...vrDownloadFixture({
+        releaseName: "Paused",
+        speedBytesPerSecond: "4096",
+        state: "paused",
+        transferId: "paused",
+      }),
+      ...vrDownloadFixture({
+        releaseName: "Completed",
+        speedBytesPerSecond: "4096",
+        state: "completed",
+        transferId: "completed",
+      }),
+      ...vrDownloadFixture({
+        releaseName: "Offline",
+        speedBytesPerSecond: "4096",
+        state: "offline",
+        transferId: "offline",
+      }),
+      ...vrDownloadFixture({
+        releaseName: "Failed",
+        speedBytesPerSecond: "4096",
+        state: "failed",
+        transferId: "failed",
+      }),
+      ...vrDownloadFixture({
+        releaseName: "Cancelled",
+        speedBytesPerSecond: "4096",
+        state: "cancelled",
+        transferId: "cancelled",
+      }),
+    ];
+    loadVrDownloadsMock.mockResolvedValue(initialRows);
+    render(<App />);
+
+    const dashboard = await screen.findByRole("region", { name: "Downloads" });
+    const dashboardSummary = within(dashboard).getByLabelText(
+      "VR transfer summary",
+    );
+    const expectedDashboardValues = [
+      ["Active", "2"],
+      ["Paused", "1"],
+      ["Completed", "1"],
+      ["Needs attention", "2"],
+      ["Download speed", "3.0 KiB/s"],
+      ["Limit", "8 MiB/s"],
+    ];
+    for (const [label, value] of expectedDashboardValues) {
+      const item = within(dashboardSummary).getByText(label).closest("div");
+      expect(item).not.toBeNull();
+      expect(within(item as HTMLElement).getByText(value)).toBeTruthy();
+    }
+
+    fireEvent.click(
+      within(dashboard).getByRole("button", { name: "Open Downloads" }),
+    );
+    const aggregate = screen.getByLabelText("VR downloads aggregate status");
+    expect(within(aggregate).getByText("2", { selector: "dd" })).toBeTruthy();
+    expect(within(aggregate).getByText("3.0 KiB/s")).toBeTruthy();
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectDashboard();
+    fireEvent(window, new Event("resize"));
+    expect(loadVrDownloadLimitMock).toHaveBeenCalledOnce();
+    expect(loadVrDownloadsMock).toHaveBeenCalledOnce();
+    expect(listVrDownloadsMock).not.toHaveBeenCalled();
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryMoviesStorageMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
+  });
+
+  it("uses one poll for both summaries and reports zero without downloading transfers", async () => {
+    vi.useFakeTimers();
+    const activeRows = vrDownloadFixture({
+      releaseName: "Active",
+      speedBytesPerSecond: "1024",
+      state: "downloading",
+      transferId: "active",
+    });
+    const pausedRows = vrDownloadFixture({
+      releaseName: "Paused",
+      speedBytesPerSecond: "9999",
+      state: "paused",
+      transferId: "active",
+    });
+    loadVrDownloadsMock.mockResolvedValue(activeRows);
+    listVrDownloadsMock.mockResolvedValue(pausedRows);
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    let aggregate = screen.getByLabelText("VR downloads aggregate status");
+    expect(within(aggregate).getByText("1.0 KiB/s")).toBeTruthy();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(listVrDownloadsMock).toHaveBeenCalledOnce();
+    aggregate = screen.getByLabelText("VR downloads aggregate status");
+    expect(within(aggregate).getByText("0 B/s")).toBeTruthy();
+    selectDashboard();
+    expect(
+      within(screen.getByLabelText("VR transfer summary")).getByText("0 B/s"),
+    ).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(listVrDownloadsMock).toHaveBeenCalledOnce();
+  });
+
+  it("ignores a late save result after relaunch", async () => {
+    const staleSave = createDeferred<string[]>();
+    loadVrDownloadLimitMock
+      .mockResolvedValueOnce(["unlimited"])
+      .mockResolvedValueOnce(["limited", "4"]);
+    saveVrDownloadLimitMock.mockReturnValueOnce(staleSave.promise);
+    render(<App />);
+    selectSettings();
+    await screen.findByText("Current limit: Unlimited.");
+    fireEvent.click(screen.getByRole("radio", { name: "Finite" }));
+    fireEvent.change(
+      screen.getByRole("spinbutton", { name: "Finite limit (MiB/s)" }),
+      { target: { value: "8" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply limit" }));
+    expect(await screen.findByRole("button", { name: "Applying…" })).toBeTruthy();
+
+    cleanup();
+    render(<App />);
+    selectSettings();
+    expect(await screen.findByText("Current limit: 4 MiB/s.")).toBeTruthy();
+    await act(async () => {
+      staleSave.resolve(["limited", "8"]);
+      await staleSave.promise;
+    });
+    expect(screen.getByText("Current limit: 4 MiB/s.")).toBeTruthy();
+    expect(screen.queryByText("Current limit: 8 MiB/s.")).toBeNull();
   });
 });
 
