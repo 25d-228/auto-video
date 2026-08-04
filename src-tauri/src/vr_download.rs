@@ -1069,7 +1069,15 @@ fn write_organization_recovery(
 }
 
 fn clear_organization_recovery(record: &TransferRecord) {
-    let _ = fs::remove_file(organization_recovery_path(record));
+    let _ = remove_organization_recovery(record);
+}
+
+fn remove_organization_recovery(record: &TransferRecord) -> Result<(), &'static str> {
+    match fs::remove_file(organization_recovery_path(record)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+    }
 }
 
 fn read_organization_recoveries(destination: &Path) -> Vec<TransferRecord> {
@@ -2939,8 +2947,19 @@ pub fn dismiss_download(
         })
         .ok_or(VR_DOWNLOAD_ACTION_INVALID)?;
     invalidate_organization_plan(&mut context);
-    context.transfers.remove(position);
-    write_persisted_transfers(persistence_path, &context.transfers)
+    let dismissed = context.transfers.remove(position);
+    if let Err(error) = write_persisted_transfers(persistence_path, &context.transfers) {
+        context.transfers.insert(position, dismissed);
+        return Err(error);
+    }
+    if let StoredTransfer::Valid(record) = &dismissed {
+        if let Err(error) = remove_organization_recovery(record) {
+            context.transfers.insert(position, dismissed);
+            let _ = write_persisted_transfers(persistence_path, &context.transfers);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3734,6 +3753,80 @@ mod tests {
             &rows[7..12],
             &["completed", "true", "attention", "MDVR-419/", "true"]
         );
+    }
+
+    #[test]
+    fn dismissing_recovered_terminal_transfer_survives_restart_without_moving_media() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let metainfo = selected_file_torrent();
+        let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+        let source = revalidate_persisted_download_source(
+            &metainfo,
+            "MDVR-419",
+            "【VR】 MDVR-419  Exact — 特別版",
+            &infohash,
+            &[0, 1],
+        )
+        .expect("multipart source must revalidate");
+        let mut record = completed_organization_record(&destination, source);
+        let original_first_path = destination.join(&record.current_paths[0]);
+        let moved_first_path = destination.join("MDVR-419/MDVR-419 - Part  1.mkv");
+        fs::create_dir(destination.join("MDVR-419")).expect("organization directory must exist");
+        fs::rename(&original_first_path, &moved_first_path)
+            .expect("first media file must be partially organized");
+        record.current_paths[0] = "MDVR-419/MDVR-419 - Part  1.mkv".to_owned();
+        record.organization_state = OrganizationState::Attention;
+        let media = record
+            .current_paths
+            .iter()
+            .map(|relative_path| {
+                let path = destination.join(relative_path);
+                let contents = fs::read(&path).expect("media must remain readable");
+                (path, contents)
+            })
+            .collect::<Vec<_>>();
+        let recovery_path = organization_recovery_path(&record);
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+        {
+            let context = state.0.lock().expect("state must lock");
+            write_persisted_transfers(&persistence_path, &context.transfers)
+                .expect("attention transfer must persist");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("transfer must remain valid");
+            };
+            write_organization_recovery(record, &record.current_paths, false)
+                .expect("durable recovery must be created");
+        }
+        assert!(recovery_path.exists());
+
+        dismiss_download(&state, &persistence_path, &transfer_id)
+            .expect("recovered terminal row must dismiss");
+        assert!(!recovery_path.exists());
+        for (path, contents) in &media {
+            assert_eq!(
+                fs::read(path).expect("dismissed media must remain at its exact path"),
+                *contents
+            );
+        }
+
+        let restarted = VrDownloadState::default();
+        restarted.0.lock().expect("state must lock").future_folder = Some(destination);
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("downloads must reload after dismissal");
+        assert!(rows.is_empty(), "dismissed recovery recreated its row");
+        for (path, contents) in media {
+            assert_eq!(
+                fs::read(path).expect("reloaded media must remain at its exact path"),
+                contents
+            );
+        }
     }
 
     #[test]
