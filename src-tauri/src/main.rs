@@ -86,6 +86,9 @@ const MOVIE_TRASH_UNSUPPORTED: &str = "movie_trash_unsupported";
 const TMDB_TOKEN_FILE_NAME: &str = ".tmdb-api-read-access-token";
 const TMDB_TOKEN_INVALID: &str = "tmdb_token_invalid";
 const TMDB_TOKEN_STORAGE_FAILED: &str = "tmdb_token_storage_failed";
+const ADULT_NETWORK_ERROR: &str = "adult_network_error";
+const ADULT_PROVIDER_ERROR: &str = "adult_provider_error";
+const ADULT_SOURCE_UNAVAILABLE: &str = "adult_source_unavailable";
 const VR_NETWORK_ERROR: &str = "vr_network_error";
 const VR_PROVIDER_ERROR: &str = "vr_provider_error";
 const VR_SOURCE_UNAVAILABLE: &str = "vr_source_unavailable";
@@ -612,6 +615,14 @@ fn provider_error_code(error: ProviderRequestError) -> &'static str {
     }
 }
 
+fn adult_provider_error_code(error: ProviderRequestError) -> &'static str {
+    match error {
+        ProviderRequestError::SourceUnavailable => ADULT_SOURCE_UNAVAILABLE,
+        ProviderRequestError::Network => ADULT_NETWORK_ERROR,
+        ProviderRequestError::Provider => ADULT_PROVIDER_ERROR,
+    }
+}
+
 fn parse_provider_response(output: &[u8]) -> Result<String, ProviderRequestError> {
     let output = std::str::from_utf8(output).map_err(|_| ProviderRequestError::Provider)?;
     let (document, status) = output
@@ -713,6 +724,29 @@ fn fetch_sukebei_vr_releases_with(
     }
 
     request(&format!("{SUKEBEI_RELEASES_URL}{code}%22&c=0_0&f=0")).map_err(provider_error_code)
+}
+
+fn fetch_javdb_adult_catalog_with(
+    code: &str,
+    request: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+) -> Result<String, &'static str> {
+    if !is_canonical_product_code(code) {
+        return Err(ADULT_PROVIDER_ERROR);
+    }
+
+    request(&format!("{JAVDB_CATALOG_URL}{code}&f=all")).map_err(adult_provider_error_code)
+}
+
+fn fetch_sukebei_adult_releases_with(
+    code: &str,
+    request: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+) -> Result<String, &'static str> {
+    if !is_canonical_product_code(code) {
+        return Err(ADULT_PROVIDER_ERROR);
+    }
+
+    request(&format!("{SUKEBEI_RELEASES_URL}{code}%22&c=0_0&f=0"))
+        .map_err(adult_provider_error_code)
 }
 
 fn tmdb_token_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -1455,6 +1489,24 @@ async fn fetch_javdb_vr_catalog(code: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn fetch_javdb_adult_catalog(code: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_javdb_adult_catalog_with(&code, fetch_provider_document).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| ADULT_PROVIDER_ERROR.to_owned())?
+}
+
+#[tauri::command]
+async fn fetch_sukebei_adult_releases(code: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_sukebei_adult_releases_with(&code, fetch_provider_document).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| ADULT_PROVIDER_ERROR.to_owned())?
+}
+
+#[tauri::command]
 async fn fetch_sukebei_vr_releases(
     code: String,
     state: tauri::State<'_, VrTorrentState>,
@@ -1589,6 +1641,8 @@ fn main() {
             apply_vr_organization,
             dismiss_vr_organization,
             fetch_javdb_vr_catalog,
+            fetch_javdb_adult_catalog,
+            fetch_sukebei_adult_releases,
             fetch_sukebei_vr_releases,
             inspect_sukebei_vr_torrent,
             invalidate_verified_vr_torrent,
@@ -1612,18 +1666,19 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::parse_windows_volume_storage;
     use super::{
-        clear_movies_folder_file, clear_tmdb_token_file, fetch_javdb_vr_catalog_with,
+        clear_movies_folder_file, clear_tmdb_token_file, fetch_javdb_adult_catalog_with,
+        fetch_javdb_vr_catalog_with, fetch_sukebei_adult_releases_with,
         fetch_sukebei_vr_releases_with, load_movies_folder_file, load_tmdb_token_file,
         movie_metadata_error, open_movie_path_with, parse_provider_response,
         query_movies_volume_storage_with, reveal_movie_path_with, save_movies_folder_file,
         save_tmdb_token_file, scan_movie_paths, trash_movie_path_with, trash_movie_request_with,
         MoviePathValidationError, MoviesLibraryContext, MoviesVolumeStorageQueryError,
-        ProviderRequestError, TrashMovieRequest, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
-        MOVIES_STORAGE_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND,
-        MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE,
-        MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED,
-        MOVIE_TRASH_FAILED, MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE,
-        MOVIE_TRASH_NOT_FOUND, MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE,
+        ProviderRequestError, TrashMovieRequest, ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE,
+        MOVIES_STORAGE_FAILED, MOVIES_STORAGE_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE,
+        MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED,
+        MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE,
+        MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED, MOVIE_TRASH_FOLDER_UNAVAILABLE,
+        MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND, MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE,
         MOVIE_TRASH_UNAVAILABLE, MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID, VR_PROVIDER_ERROR,
     };
 
@@ -1696,6 +1751,35 @@ mod tests {
     }
 
     #[test]
+    fn constructs_literal_adult_exact_code_provider_requests() {
+        let javdb_url = RefCell::new(None);
+        let sukebei_url = RefCell::new(None);
+
+        assert_eq!(
+            fetch_javdb_adult_catalog_with("ADLT-123", |url| {
+                javdb_url.replace(Some(url.to_owned()));
+                Ok("catalog".to_owned())
+            }),
+            Ok("catalog".to_owned())
+        );
+        assert_eq!(
+            fetch_sukebei_adult_releases_with("ADLT-123", |url| {
+                sukebei_url.replace(Some(url.to_owned()));
+                Ok("releases".to_owned())
+            }),
+            Ok("releases".to_owned())
+        );
+        assert_eq!(
+            javdb_url.into_inner().as_deref(),
+            Some("https://javdb.com/search?q=ADLT-123&f=all")
+        );
+        assert_eq!(
+            sukebei_url.into_inner().as_deref(),
+            Some("https://sukebei.nyaa.si/?page=rss&q=%22ADLT-123%22&c=0_0&f=0")
+        );
+    }
+
+    #[test]
     fn rejects_noncanonical_provider_codes_before_dispatch() {
         for code in ["", "mdvr-419", "MDVR_419", "MDVR-0419", "MDVR-4190 extra"] {
             let dispatched = RefCell::new(false);
@@ -1706,6 +1790,38 @@ mod tests {
 
             assert_eq!(result, Err(VR_PROVIDER_ERROR));
             assert!(!dispatched.into_inner());
+        }
+    }
+
+    #[test]
+    fn rejects_noncanonical_adult_provider_codes_before_either_dispatch() {
+        for code in [
+            "",
+            "adlt-123",
+            "ADLT_123",
+            "ADLT-0123",
+            "ADLT-0",
+            "XADLT-123 extra",
+        ] {
+            let javdb_dispatched = RefCell::new(false);
+            let sukebei_dispatched = RefCell::new(false);
+
+            assert_eq!(
+                fetch_javdb_adult_catalog_with(code, |_| {
+                    javdb_dispatched.replace(true);
+                    Err(ProviderRequestError::Network)
+                }),
+                Err(ADULT_PROVIDER_ERROR)
+            );
+            assert_eq!(
+                fetch_sukebei_adult_releases_with(code, |_| {
+                    sukebei_dispatched.replace(true);
+                    Err(ProviderRequestError::Network)
+                }),
+                Err(ADULT_PROVIDER_ERROR)
+            );
+            assert!(!javdb_dispatched.into_inner());
+            assert!(!sukebei_dispatched.into_inner());
         }
     }
 
