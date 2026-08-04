@@ -43,6 +43,7 @@ const PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_VR_DOWNLOADS_V1\n";
 const ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_VR_ORGANIZATION_V1\n";
 const ORGANIZATION_RECOVERY_PREFIX: &str = ".auto-video-organization-";
 const ORGANIZATION_RECOVERY_SUFFIX: &str = ".recovery";
+const ORGANIZATION_RECOVERY_SUCCESSOR_SUFFIX: &str = ".recovery.next";
 const MAX_PERSISTENCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PERSISTED_TRANSFERS: usize = 100;
 const MAX_SELECTED_FILES: usize = 100_000;
@@ -1030,11 +1031,17 @@ fn organization_recovery_path(record: &TransferRecord) -> PathBuf {
     ))
 }
 
-fn write_organization_recovery(
+fn organization_recovery_successor_path(record: &TransferRecord) -> PathBuf {
+    record.destination.join(format!(
+        "{ORGANIZATION_RECOVERY_PREFIX}{}{ORGANIZATION_RECOVERY_SUCCESSOR_SUFFIX}",
+        record.transfer_id
+    ))
+}
+
+fn encoded_organization_recovery(
     record: &TransferRecord,
     current_paths: &[String],
-    replace_existing: bool,
-) -> Result<(), &'static str> {
+) -> Result<Vec<u8>, &'static str> {
     let mut bytes = ORGANIZATION_RECOVERY_HEADER.to_vec();
     bytes.extend_from_slice(&encode_transfer_state(
         record,
@@ -1045,18 +1052,49 @@ fn write_organization_recovery(
     if bytes.len() as u64 > MAX_PERSISTENCE_BYTES {
         return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
     }
-    let path = organization_recovery_path(record);
-    let mut options = OpenOptions::new();
-    options.write(true);
-    if replace_existing {
-        let metadata = fs::symlink_metadata(&path).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    Ok(bytes)
+}
+
+fn write_organization_recovery(
+    record: &TransferRecord,
+    current_paths: &[String],
+    preserved_paths: Option<&[String]>,
+) -> Result<(), &'static str> {
+    let bytes = encoded_organization_recovery(record, current_paths)?;
+    let path = if let Some(preserved_paths) = preserved_paths {
+        let preserved_path = organization_recovery_path(record);
+        let metadata =
+            fs::symlink_metadata(&preserved_path).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
-            || fs::canonicalize(&path).ok().as_deref() != Some(path.as_path())
+            || fs::canonicalize(&preserved_path).ok().as_deref() != Some(preserved_path.as_path())
+            || fs::read(&preserved_path).ok().as_deref()
+                != Some(encoded_organization_recovery(record, preserved_paths)?.as_slice())
         {
             return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
         }
-        options.truncate(true);
+        organization_recovery_successor_path(record)
+    } else {
+        organization_recovery_path(record)
+    };
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if preserved_paths.is_some() {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_file()
+                    || fs::canonicalize(&path).ok().as_deref() != Some(path.as_path())
+                {
+                    return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+                }
+                options.truncate(true);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                options.create_new(true);
+            }
+            Err(_) => return Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+        }
     } else {
         options.create_new(true);
     }
@@ -1073,10 +1111,21 @@ fn clear_organization_recovery(record: &TransferRecord) {
 }
 
 fn remove_organization_recovery(record: &TransferRecord) -> Result<(), &'static str> {
-    match fs::remove_file(organization_recovery_path(record)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+    let mut failed = false;
+    for path in [
+        organization_recovery_path(record),
+        organization_recovery_successor_path(record),
+    ] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => failed = true,
+        }
+    }
+    if failed {
+        Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+    } else {
+        Ok(())
     }
 }
 
@@ -1146,6 +1195,33 @@ fn reconcile_interrupted_organization(mut record: TransferRecord) -> Option<Tran
     Some(record)
 }
 
+fn parse_organization_recovery_file(path: &Path) -> Option<TransferRecord> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PERSISTENCE_BYTES
+    {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let line = bytes
+        .strip_prefix(ORGANIZATION_RECOVERY_HEADER)?
+        .strip_suffix(b"\n")?;
+    let record = parse_transfer_line(line)?;
+    if record.organization_state != OrganizationState::Attention
+        || record.state != TransferState::Completed
+        || (organization_recovery_path(&record) != path
+            && organization_recovery_successor_path(&record) != path)
+    {
+        return None;
+    }
+    Some(record)
+}
+
+fn read_organization_recovery_file(path: &Path) -> Option<TransferRecord> {
+    reconcile_interrupted_organization(parse_organization_recovery_file(path)?)
+}
+
 fn read_organization_recoveries(destination: &Path) -> Vec<TransferRecord> {
     let Ok(entries) = fs::read_dir(destination) else {
         return Vec::new();
@@ -1155,39 +1231,24 @@ fn read_organization_recoveries(destination: &Path) -> Vec<TransferRecord> {
         .filter_map(|entry| {
             let name = entry.file_name();
             let name = name.to_str()?;
+            let name = name.strip_prefix(ORGANIZATION_RECOVERY_PREFIX)?;
             let transfer_id = name
-                .strip_prefix(ORGANIZATION_RECOVERY_PREFIX)?
-                .strip_suffix(ORGANIZATION_RECOVERY_SUFFIX)?;
+                .strip_suffix(ORGANIZATION_RECOVERY_SUCCESSOR_SUFFIX)
+                .or_else(|| name.strip_suffix(ORGANIZATION_RECOVERY_SUFFIX))?;
             (transfer_id.len() == 40 && transfer_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
                 .then_some(entry.path())
         })
         .collect::<Vec<_>>();
     paths.sort();
-    paths.truncate(MAX_PERSISTED_TRANSFERS);
+    paths.truncate(MAX_PERSISTED_TRANSFERS * 2);
+    let mut transfer_ids = BTreeSet::new();
     paths
         .into_iter()
-        .filter_map(|path| {
-            let metadata = fs::symlink_metadata(&path).ok()?;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.len() > MAX_PERSISTENCE_BYTES
-            {
-                return None;
-            }
-            let bytes = fs::read(&path).ok()?;
-            let line = bytes
-                .strip_prefix(ORGANIZATION_RECOVERY_HEADER)?
-                .strip_suffix(b"\n")?;
-            let record = reconcile_interrupted_organization(parse_transfer_line(line)?)?;
-            if record.organization_state != OrganizationState::Attention
-                || record.state != TransferState::Completed
-                || record.destination != destination
-                || organization_recovery_path(&record) != path
-            {
-                return None;
-            }
-            Some(record)
+        .filter_map(|path| read_organization_recovery_file(&path))
+        .filter(|record| {
+            record.destination == destination && transfer_ids.insert(record.transfer_id.clone())
         })
+        .take(MAX_PERSISTED_TRANSFERS)
         .collect()
 }
 
@@ -2521,9 +2582,7 @@ fn apply_organization_with_persistence(
     }
 
     let recovery_result = match &context.transfers[record_index] {
-        StoredTransfer::Valid(record) => {
-            write_organization_recovery(record, &original_paths, false)
-        }
+        StoredTransfer::Valid(record) => write_organization_recovery(record, &original_paths, None),
         StoredTransfer::Corrupt(_) => Err(VR_ORGANIZATION_STALE),
     };
     if let Err(error) = recovery_result {
@@ -2556,7 +2615,7 @@ fn apply_organization_with_persistence(
                 } else {
                     OrganizationState::Attention
                 };
-                write_organization_recovery(record, &current_paths, true).is_ok()
+                write_organization_recovery(record, &current_paths, Some(&original_paths)).is_ok()
             };
             if persist_transfers(persistence_path, &context.transfers).is_ok() {
                 let StoredTransfer::Valid(record) = &context.transfers[record_index] else {
@@ -2580,7 +2639,9 @@ fn apply_organization_with_persistence(
         record.organization_state = OrganizationState::Organized;
     }
     let recovery_result = match &context.transfers[record_index] {
-        StoredTransfer::Valid(record) => write_organization_recovery(record, &current_paths, true),
+        StoredTransfer::Valid(record) => {
+            write_organization_recovery(record, &current_paths, Some(&original_paths))
+        }
         StoredTransfer::Corrupt(_) => Err(VR_ORGANIZATION_STALE),
     };
     let persistence_result =
@@ -2600,7 +2661,7 @@ fn apply_organization_with_persistence(
                 return Err(VR_ORGANIZATION_FAILED);
             };
             record.current_paths = if restored {
-                original_paths
+                original_paths.clone()
             } else {
                 current_paths
             };
@@ -2609,7 +2670,8 @@ fn apply_organization_with_persistence(
             } else {
                 OrganizationState::Attention
             };
-            write_organization_recovery(record, &record.current_paths, true).is_ok()
+            write_organization_recovery(record, &record.current_paths, Some(&original_paths))
+                .is_ok()
         };
         if persist_transfers(persistence_path, &context.transfers).is_ok() {
             let StoredTransfer::Valid(record) = &context.transfers[record_index] else {
@@ -3895,7 +3957,7 @@ mod tests {
             let StoredTransfer::Valid(record) = &context.transfers[0] else {
                 panic!("transfer must remain valid");
             };
-            write_organization_recovery(record, &record.current_paths, false)
+            write_organization_recovery(record, &record.current_paths, None)
                 .expect("pre-mutation recovery must persist");
             organization_recovery_path(record)
         };
@@ -3954,6 +4016,126 @@ mod tests {
     }
 
     #[test]
+    fn partial_recovery_successor_preserves_exact_paths_after_restart() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let metainfo = selected_file_torrent();
+        let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+        let source = revalidate_persisted_download_source(
+            &metainfo,
+            "MDVR-419",
+            "【VR】 MDVR-419  Exact — 特別版",
+            &infohash,
+            &[0, 1],
+        )
+        .expect("multipart source must revalidate");
+        let record = completed_organization_record(&destination, source);
+        let media_contents = record
+            .current_paths
+            .iter()
+            .map(|relative_path| {
+                fs::read(destination.join(relative_path)).expect("media must remain readable")
+            })
+            .collect::<Vec<_>>();
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(preview[3], "2");
+        let persistence_path = fixture.path.join("downloads");
+        fs::create_dir(destination.join("MDVR-419")).expect("organization directory must exist");
+        let (recovery_path, successor_path) = {
+            let context = state.0.lock().expect("state must lock");
+            write_persisted_transfers(&persistence_path, &context.transfers)
+                .expect("original transfer must persist");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("transfer must remain valid");
+            };
+            write_organization_recovery(record, &record.current_paths, None)
+                .expect("pre-mutation recovery must persist");
+            (
+                organization_recovery_path(record),
+                organization_recovery_successor_path(record),
+            )
+        };
+        let original_persistence =
+            fs::read(&persistence_path).expect("main persistence must remain readable");
+        let original_recovery =
+            fs::read(&recovery_path).expect("recovery state must remain readable");
+
+        let moved_path = destination.join("MDVR-419/MDVR-419 - Part  1.mkv");
+        let unmoved_path = destination.join("Folder/特別版  B.mp4");
+        fs::rename(destination.join("Folder/Part  1 — 映画.mkv"), &moved_path)
+            .expect("first move must complete before the simulated interruption");
+        let current_paths = vec![
+            "MDVR-419/MDVR-419 - Part  1.mkv".to_owned(),
+            "Folder/特別版  B.mp4".to_owned(),
+        ];
+        {
+            let context = state.0.lock().expect("state must lock");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("transfer must remain valid");
+            };
+            write_organization_recovery(record, &current_paths, Some(&record.current_paths))
+                .expect("successor recovery must persist separately");
+        }
+        assert_eq!(
+            fs::read(&recovery_path).expect("original recovery must remain readable"),
+            original_recovery
+        );
+        let mut interrupted_successor = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&successor_path)
+            .expect("successor must open for interrupted replacement");
+        interrupted_successor
+            .write_all(b"AUTO_VIDEO_VR_ORGANIZATION")
+            .and_then(|()| interrupted_successor.sync_all())
+            .expect("partial successor state must be deterministic");
+        drop(interrupted_successor);
+        assert_eq!(
+            fs::read(&persistence_path).expect("main store must remain unchanged"),
+            original_persistence
+        );
+        assert_eq!(
+            fs::read(&recovery_path).expect("complete recovery must remain unchanged"),
+            original_recovery
+        );
+
+        let restarted = VrDownloadState::default();
+        restarted.0.lock().expect("state must lock").future_folder = Some(destination);
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("partial-successor-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("complete recovery must survive a partial successor");
+        assert_eq!(
+            &rows[7..12],
+            &["completed", "true", "attention", "MDVR-419/", "true"]
+        );
+        let context = restarted.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("recovered transfer must remain valid");
+        };
+        assert_eq!(record.current_paths, current_paths);
+        assert!(
+            context.session.is_none(),
+            "recovery started a transfer session"
+        );
+        drop(context);
+        assert!(!recovery_path.exists());
+        assert!(!successor_path.exists());
+        assert_eq!(
+            fs::read(moved_path).expect("moved media must remain at its exact path"),
+            media_contents[0]
+        );
+        assert_eq!(
+            fs::read(unmoved_path).expect("unmoved media must remain at its exact path"),
+            media_contents[1]
+        );
+    }
+
+    #[test]
     fn dismissing_recovered_terminal_transfer_survives_restart_without_moving_media() {
         let fixture = FilesystemFixture::new();
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
@@ -3985,6 +4167,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let recovery_path = organization_recovery_path(&record);
+        let successor_path = organization_recovery_successor_path(&record);
         let (state, transfer_id) = organization_state(record);
         let persistence_path = fixture.path.join("downloads");
         {
@@ -3994,14 +4177,18 @@ mod tests {
             let StoredTransfer::Valid(record) = &context.transfers[0] else {
                 panic!("transfer must remain valid");
             };
-            write_organization_recovery(record, &record.current_paths, false)
+            write_organization_recovery(record, &record.current_paths, None)
                 .expect("durable recovery must be created");
+            write_organization_recovery(record, &record.current_paths, Some(&record.current_paths))
+                .expect("durable successor must be created");
         }
         assert!(recovery_path.exists());
+        assert!(successor_path.exists());
 
         dismiss_download(&state, &persistence_path, &transfer_id)
             .expect("recovered terminal row must dismiss");
         assert!(!recovery_path.exists());
+        assert!(!successor_path.exists());
         for (path, contents) in &media {
             assert_eq!(
                 fs::read(path).expect("dismissed media must remain at its exact path"),
@@ -4049,7 +4236,7 @@ mod tests {
             let StoredTransfer::Valid(record) = &context.transfers[0] else {
                 panic!("transfer must remain valid");
             };
-            write_organization_recovery(record, &record.current_paths, false)
+            write_organization_recovery(record, &record.current_paths, None)
                 .expect("durable recovery must be created");
         }
         fs::remove_file(&recovery_path).expect("recovery file must be replaceable");
