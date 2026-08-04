@@ -596,7 +596,7 @@ function vrPartLabel(title: string) {
   return partNumbers.size === 1 && !partNumbers.has("0") ? matches[0][2] : null;
 }
 
-function vrLibraryCode(title: string) {
+export function canonicalLibraryProductCode(title: string) {
   const candidates = productCodeCandidates(title)
     .filter((candidate) => !vrLibraryPartPrefixes.has(candidate.prefix))
     .map((candidate) => candidate.code);
@@ -643,7 +643,7 @@ function parseVrLibrary(value: unknown): VrLibraryItem[] {
   const groupedItems = new Map<string, VrLibraryItem>();
   const unassociatedItems: VrLibraryItem[] = [];
   for (const file of files) {
-    const code = vrLibraryCode(file.title);
+    const code = canonicalLibraryProductCode(file.title);
     if (code === null) {
       unassociatedItems.push({
         id: `file:${file.path}`,

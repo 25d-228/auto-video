@@ -58,6 +58,17 @@ let scanTvLibraryMock: Mock<() => Promise<string[]>>;
 let queryTvStorageMock: Mock<() => Promise<[string, string]>>;
 let openTvFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
 let revealTvFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
+let loadAdultFolderMock: Mock<() => Promise<string[]>>;
+let chooseAdultFolderMock: Mock<() => Promise<string | null>>;
+let clearAdultFolderMock: Mock<() => Promise<void>>;
+let scanAdultLibraryMock: Mock<() => Promise<string[]>>;
+let queryAdultStorageMock: Mock<() => Promise<[string, string]>>;
+let openAdultFileMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let revealAdultFileMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
 let loadTmdbTokenMock: Mock<() => Promise<string | null>>;
 let saveTmdbTokenMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
@@ -120,6 +131,7 @@ let gallerySizes: Record<
 >;
 let savedMoviesFolder: string | null;
 let savedTvFolder: string | null;
+let savedAdultFolder: string | null;
 let savedVrFolder: string | null;
 
 function createResizeEntry(
@@ -433,6 +445,7 @@ beforeEach(() => {
   };
   savedMoviesFolder = null;
   savedTvFolder = null;
+  savedAdultFolder = null;
   savedVrFolder = null;
   scanMoviesMock = vi.fn().mockResolvedValue([]);
   queryMoviesStorageMock = vi
@@ -459,6 +472,21 @@ beforeEach(() => {
     .mockResolvedValue(["3298534883328", "1099511627776"]);
   openTvFileMock = vi.fn().mockResolvedValue(undefined);
   revealTvFileMock = vi.fn().mockResolvedValue(undefined);
+  loadAdultFolderMock = vi.fn().mockImplementation(() =>
+    Promise.resolve(
+      savedAdultFolder === null
+        ? ["unconfigured"]
+        : ["ready", savedAdultFolder],
+    ),
+  );
+  chooseAdultFolderMock = vi.fn().mockResolvedValue(null);
+  clearAdultFolderMock = vi.fn().mockResolvedValue(undefined);
+  scanAdultLibraryMock = vi.fn().mockResolvedValue([]);
+  queryAdultStorageMock = vi
+    .fn()
+    .mockResolvedValue(["4398046511104", "1099511627776"]);
+  openAdultFileMock = vi.fn().mockResolvedValue(undefined);
+  revealAdultFileMock = vi.fn().mockResolvedValue(undefined);
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
@@ -569,6 +597,27 @@ beforeEach(() => {
           return openTvFileMock(parameters);
         case "reveal_tv_file":
           return revealTvFileMock(parameters);
+        case "load_adult_folder":
+          return loadAdultFolderMock();
+        case "choose_adult_folder":
+          return chooseAdultFolderMock().then((selectedFolder) => {
+            if (selectedFolder !== null) {
+              savedAdultFolder = selectedFolder;
+            }
+            return selectedFolder;
+          });
+        case "clear_adult_folder":
+          return clearAdultFolderMock().then(() => {
+            savedAdultFolder = null;
+          });
+        case "scan_adult_library":
+          return scanAdultLibraryMock();
+        case "query_adult_storage":
+          return queryAdultStorageMock();
+        case "open_adult_file":
+          return openAdultFileMock(parameters);
+        case "reveal_adult_file":
+          return revealAdultFileMock(parameters);
         case "load_tmdb_token":
           return loadTmdbTokenMock();
         case "save_tmdb_token":
@@ -1003,6 +1052,458 @@ describe("parsed TV Library and Dashboard", () => {
     expect(revealTvFileMock).toHaveBeenCalledWith({ path });
     expect(scanMoviesMock).not.toHaveBeenCalled();
     expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("parsed Adult Library and Dashboard", () => {
+  it("distinguishes an unconfigured Adult Library without scanning or querying storage", async () => {
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "Choose an Adult folder to begin",
+      }),
+    ).toBeTruthy();
+    expect(scanAdultLibraryMock).not.toHaveBeenCalled();
+    expect(queryAdultStorageMock).not.toHaveBeenCalled();
+  });
+
+  it("renders loading, scanning, empty, error, ready, and no-match states deterministically", async () => {
+    const folderLoad = createDeferred<string[]>();
+    const firstScan = createDeferred<string[]>();
+    loadAdultFolderMock.mockReturnValue(folderLoad.promise);
+    scanAdultLibraryMock
+      .mockReturnValueOnce(firstScan.promise)
+      .mockRejectedValueOnce("adult_library_scan_failed")
+      .mockResolvedValueOnce([
+        "/Adult/ADLT-123.mp4",
+        "ADLT-123.mp4",
+        "1",
+      ]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Loading Adult folder" }),
+    ).toBeTruthy();
+    await act(async () => {
+      folderLoad.resolve(["ready", "/Adult"]);
+      await folderLoad.promise;
+    });
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Scanning Adult folder" }),
+    ).toBeTruthy();
+    await act(async () => {
+      firstScan.resolve([]);
+      await firstScan.promise;
+    });
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "No supported Adult videos found",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "Adult folder could not be scanned",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await screen.findByRole("heading", { level: 3, name: "ADLT-123" });
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "missing title" },
+    });
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: "No Adult titles match this search",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("chooses, changes, and clears only the native Adult folder configuration", async () => {
+    chooseAdultFolderMock
+      .mockResolvedValueOnce("/Adult/First")
+      .mockResolvedValueOnce("/Adult/Second");
+
+    render(<App />);
+    selectSettings();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Choose Adult folder" }),
+    );
+    expect(await screen.findByText("/Adult/First")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Change Adult folder" }));
+    expect(await screen.findByText("/Adult/Second")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Clear Adult folder" }));
+    expect(await screen.findByText("No Adult folder configured.")).toBeTruthy();
+    expect(chooseAdultFolderMock).toHaveBeenCalledTimes(2);
+    expect(clearAdultFolderMock).toHaveBeenCalledTimes(1);
+    expect(openFolderMock).not.toHaveBeenCalled();
+    expect(chooseTvFolderMock).not.toHaveBeenCalled();
+    expect(chooseVrFolderMock).not.toHaveBeenCalled();
+  });
+
+  it("shows exact grouped membership, multipart labels, complete totals, storage, and routing", async () => {
+    savedAdultFolder = "/Adult/作品  Library";
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/作品  Library/ADLT-123 Part 01 — 前編.mp4",
+      "ADLT-123 Part 01 — 前編.mp4",
+      "1073741824",
+      "/Adult/作品  Library/adlt_00123_CD2  特別版.MKV",
+      "adlt_00123_CD2  特別版.MKV",
+      "2147483648",
+      "/Adult/作品  Library/ADLT-123 Part 01 Disc 02.mp4",
+      "ADLT-123 Part 01 Disc 02.mp4",
+      "3221225472",
+      "/Adult/作品  Library/ADLT-123 + XYZ-7  pack.mp4",
+      "ADLT-123 + XYZ-7  pack.mp4",
+      "4",
+      "/Adult/作品  Library/作品  without code.mkv",
+      "作品  without code.mkv",
+      "5",
+    ]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "1 grouped title · 5 supported files",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByText("2 files remain unassociated.")).toBeTruthy();
+    expect(screen.getByText("4.0 TiB", { selector: "dd" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open Adult Library" }));
+    expect(screen.getByRole("radio", { name: "Adult" })).toHaveProperty(
+      "checked",
+      true,
+    );
+    const gallery = screen.getByRole("list", {
+      name: "Adult titles and unassociated files",
+    });
+    const groupedHeading = within(gallery).getByRole("heading", {
+      level: 3,
+      name: "ADLT-123",
+    });
+    const groupedCard = groupedHeading.closest("article");
+    if (groupedCard === null) {
+      throw new Error("The grouped Adult card was not rendered.");
+    }
+    expect(groupedCard.querySelectorAll("[data-adult-file-path]")).toHaveLength(3);
+    expect(within(groupedCard).getByText("Part 01 · 1.0 GiB")).toBeTruthy();
+    expect(within(groupedCard).getByText("CD2 · 2.0 GiB")).toBeTruthy();
+    const ambiguousRow = groupedCard.querySelector(
+      '[data-adult-file-path="/Adult/作品  Library/ADLT-123 Part 01 Disc 02.mp4"]',
+    );
+    expect(ambiguousRow?.textContent).toContain("3.0 GiB");
+    expect(ambiguousRow?.textContent).not.toContain("Part 01 ·");
+    const unassociatedHeading = within(gallery).getByRole("heading", {
+      level: 3,
+      name: "作品 without code",
+    });
+    expect(unassociatedHeading.textContent).toBe("作品  without code");
+  });
+
+  it("searches then sorts then paginates across 25, 7, and 10 without changing Dashboard totals", async () => {
+    savedAdultFolder = "/Adult";
+    scanAdultLibraryMock.mockResolvedValue([
+      ...Array.from({ length: 30 }, (_, index) => {
+        const code = `ADLT-${String(index + 101)}`;
+        const filename = `${code}.mp4`;
+        return [`/Adult/${filename}`, filename, "1"];
+      }).flat(),
+      "/Adult/Unassociated 作品.mp4",
+      "Unassociated 作品.mp4",
+      "1",
+    ]);
+    gallerySizes.library = { width: 1088, height: 728 };
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { level: 3, name: "ADLT-101" });
+    let gallery = document.querySelector('[data-gallery="library"]');
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("25");
+    expect(visibleCardCount("Adult titles and unassociated files")).toBe(25);
+    fireEvent.click(screen.getByRole("button", { name: /Next Adult titles/ }));
+    expect(gallery?.getAttribute("data-current-page")).toBe("2");
+
+    resizeGallery("library", 1528, 136);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
+    expect(gallery?.getAttribute("data-current-page")).toBe("2");
+    resizeGallery("library", 1088, 284);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
+    expect(gallery?.getAttribute("data-current-page")).toBe("2");
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "/Adult/" },
+    });
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: "No Adult titles match this search",
+      }),
+    ).toBeTruthy();
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "ADLT-1" },
+    });
+    gallery = document.querySelector('[data-gallery="library"]');
+    expect(gallery?.getAttribute("data-current-page")).toBe("1");
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort titles" }), {
+      target: { value: "descending" },
+    });
+    expect(
+      within(
+        screen.getByRole("list", {
+          name: "Adult titles and unassociated files",
+        }),
+      ).getAllByRole("heading", { level: 3 })[0].textContent,
+    ).toBe("ADLT-130");
+    fireEvent.click(screen.getByRole("button", { name: /Next Adult titles/ }));
+    expect(gallery?.getAttribute("data-current-page")).toBe("2");
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectLibrary();
+    gallery = document.querySelector('[data-gallery="library"]');
+    expect(screen.getByRole("radio", { name: "Adult" })).toHaveProperty(
+      "checked",
+      true,
+    );
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "ADLT-1",
+    );
+    expect(gallery?.getAttribute("data-current-page")).toBe("2");
+    selectDashboard();
+    const adultSummary = screen
+      .getByRole("heading", { level: 2, name: "Adult Library" })
+      .closest("section");
+    if (adultSummary === null) {
+      throw new Error("The Adult Dashboard summary was not rendered.");
+    }
+    expect(
+      within(adultSummary).getByRole("heading", {
+        level: 3,
+        name: "30 grouped titles · 31 supported files",
+      }),
+    ).toBeTruthy();
+    expect(within(adultSummary).getByText("1 file remains unassociated.")).toBeTruthy();
+    expect(scanAdultLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryAdultStorageMock).toHaveBeenCalledTimes(1);
+    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    expect(inspectSukebeiVrTorrentMock).not.toHaveBeenCalled();
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects stale scan and storage responses after the configured folder changes", async () => {
+    savedAdultFolder = "/Adult/Old";
+    const staleRefreshScan = createDeferred<string[]>();
+    const staleRefreshStorage = createDeferred<[string, string]>();
+    scanAdultLibraryMock
+      .mockResolvedValueOnce([
+        "/Adult/Old/ADLT-100.mp4",
+        "ADLT-100.mp4",
+        "1",
+      ])
+      .mockReturnValueOnce(staleRefreshScan.promise)
+      .mockResolvedValueOnce([
+        "/Adult/New/ADLT-200.mp4",
+        "ADLT-200.mp4",
+        "2",
+      ]);
+    queryAdultStorageMock
+      .mockResolvedValueOnce(["100", "25"])
+      .mockReturnValueOnce(staleRefreshStorage.promise)
+      .mockResolvedValueOnce(["200", "50"]);
+    chooseAdultFolderMock.mockResolvedValue("/Adult/New");
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { level: 3, name: "ADLT-100" });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Scanning Adult folder" }),
+    ).toBeTruthy();
+    selectSettings();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Change Adult folder" }),
+    );
+    await screen.findByText("/Adult/New");
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "ADLT-200" }),
+    ).toBeTruthy();
+
+    await act(async () => {
+      staleRefreshScan.resolve([
+        "/Adult/Old/ADLT-100.mp4",
+        "ADLT-100.mp4",
+        "1",
+      ]);
+      staleRefreshStorage.resolve(["1000", "999"]);
+      await Promise.all([
+        staleRefreshScan.promise,
+        staleRefreshStorage.promise,
+      ]);
+    });
+    expect(screen.queryByText("ADLT-100")).toBeNull();
+    selectDashboard();
+    const adultSummary = screen
+      .getByRole("heading", { level: 2, name: "Adult Library" })
+      .closest("section");
+    if (adultSummary === null) {
+      throw new Error("The Adult Dashboard summary was not rendered.");
+    }
+    expect(within(adultSummary).getByText("150 B")).toBeTruthy();
+    expect(scanAdultLibraryMock).toHaveBeenCalledTimes(3);
+    expect(queryAdultStorageMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("recovers an unavailable folder without accepting a stale revalidation response", async () => {
+    loadAdultFolderMock.mockResolvedValueOnce(["unavailable", "/Adult/Old"]);
+    const staleRefresh = createDeferred<string[]>();
+    loadAdultFolderMock.mockReturnValueOnce(staleRefresh.promise);
+    chooseAdultFolderMock.mockResolvedValue("/Adult/New");
+
+    render(<App />);
+    selectSettings();
+    await screen.findByText(
+      "This folder has moved or is unavailable. Restore it, choose another folder, or clear the configuration.",
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh Adult folder" }),
+    );
+    expect(
+      screen.getByRole("button", { name: "Refreshing Adult folder" }),
+    ).toHaveProperty("disabled", true);
+    fireEvent.click(screen.getByRole("button", { name: "Change Adult folder" }));
+    await screen.findByText("/Adult/New");
+    await act(async () => {
+      staleRefresh.resolve(["ready", "/Adult/Old"]);
+      await staleRefresh.promise;
+    });
+    expect(screen.getByText("/Adult/New")).toBeTruthy();
+    expect(screen.queryByText("/Adult/Old")).toBeNull();
+  });
+
+  it("keeps exact copy, Open, Reveal, errors, and unrelated actions isolated per file", async () => {
+    savedAdultFolder = "/Adult";
+    const groupedPath = "/Adult/ADLT-123 Part 01.mp4";
+    const unassociatedPath = "/Adult/作品  Special — Edition.mkv";
+    scanAdultLibraryMock.mockResolvedValue([
+      groupedPath,
+      "ADLT-123 Part 01.mp4",
+      "1024",
+      unassociatedPath,
+      "作品  Special — Edition.mkv",
+      "2048",
+    ]);
+    openAdultFileMock.mockRejectedValue("adult_file_open_stale");
+    clipboardWriteMock
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("denied"));
+
+    render(<App />);
+    await screen.findByRole("heading", {
+      level: 3,
+      name: "1 grouped title · 2 supported files",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open Adult Library" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy title: ADLT-123" }));
+    expect(clipboardWriteMock).toHaveBeenCalledWith("ADLT-123");
+    const unassociatedHeading = screen.getByRole("heading", {
+      level: 3,
+      name: "作品 Special — Edition",
+    });
+    expect(unassociatedHeading.textContent).toBe("作品  Special — Edition");
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Copy title: 作品 Special — Edition",
+      }),
+    );
+    expect(clipboardWriteMock).toHaveBeenCalledWith("作品  Special — Edition");
+    expect(
+      await screen.findByRole("button", {
+        name: "Copy failed for title: 作品 Special — Edition",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Open Adult file: ADLT-123 Part 01.mp4",
+      }),
+    );
+    expect(
+      await screen.findByText(
+        "This file is no longer part of the current Adult Library.",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Reveal Adult file: 作品 Special — Edition.mkv",
+      }),
+    );
+    expect(openAdultFileMock).toHaveBeenCalledWith({ path: groupedPath });
+    expect(revealAdultFileMock).toHaveBeenCalledWith({ path: unassociatedPath });
+    expect(scanAdultLibraryMock).toHaveBeenCalledTimes(1);
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(scanTvLibraryMock).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a complete Adult scan visible when its storage query fails", async () => {
+    savedAdultFolder = "/Adult";
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/ADLT-123.mp4",
+      "ADLT-123.mp4",
+      "1",
+    ]);
+    queryAdultStorageMock.mockRejectedValue("adult_storage_failed");
+
+    render(<App />);
+    const adultSummary = await screen.findByRole("region", {
+      name: "Adult Library",
+    });
+    expect(
+      await within(adultSummary).findByRole("heading", {
+        level: 3,
+        name: "1 grouped title · 1 supported file",
+      }),
+    ).toBeTruthy();
+    expect(
+      within(adultSummary).getByRole("heading", {
+        level: 3,
+        name: "Storage could not be loaded",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("keeps Adult storage visible when its scan fails", async () => {
+    savedAdultFolder = "/Adult";
+    scanAdultLibraryMock.mockRejectedValue("adult_library_scan_failed");
+
+    render(<App />);
+    const adultSummary = await screen.findByRole("region", {
+      name: "Adult Library",
+    });
+    expect(
+      await within(adultSummary).findByRole("heading", {
+        level: 3,
+        name: "Adult Library scan failed",
+      }),
+    ).toBeTruthy();
+    expect(
+      await within(adultSummary).findByText("4.0 TiB", { selector: "dd" }),
+    ).toBeTruthy();
   });
 });
 

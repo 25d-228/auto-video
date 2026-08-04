@@ -45,6 +45,18 @@ import {
 import tmdbLogo from "@/assets/tmdb-logo.svg";
 import { Button } from "@/components/ui/button";
 import {
+  chooseAdultFolder,
+  clearAdultFolder,
+  loadAdultFolder,
+  openAdultFile,
+  queryAdultStorage,
+  revealAdultFile,
+  scanAdultLibrary,
+  type AdultFolderState,
+  type AdultLibraryFile,
+  type AdultLibraryItem,
+} from "@/adult";
+import {
   fetchTmdbMovieDetails,
   fetchTmdbMoviesByTitle,
   fetchWeeklyTrendingMovies,
@@ -125,7 +137,7 @@ const destinations = [
   {
     id: "library",
     label: "Library",
-    description: "Browse supported video files from your local Movies, TV, and VR folders.",
+    description: "Browse supported video files from your local Movies, TV, Adult, and VR folders.",
     emptyHeading: "Choose a Movies folder to begin",
     emptyMessage:
       "Configure one local Movies folder in Settings before scanning your library.",
@@ -182,6 +194,7 @@ const appIcons = {
   details: InfoIcon,
   vr: GogglesIcon,
   tv: TelevisionSimpleIcon,
+  adult: FilmStripIcon,
   releases: ListMagnifyingGlassIcon,
   pause: PauseIcon,
 } satisfies Record<string, Icon>;
@@ -227,7 +240,7 @@ type CredentialMessage = {
 };
 type CopyTitleState = "idle" | "success" | "error";
 type DiscoverCategory = "movies" | "vr";
-type LibraryCategory = "movies" | "tv" | "vr";
+type LibraryCategory = "movies" | "tv" | "adult" | "vr";
 type VrLibraryScanState =
   | { status: "loading" }
   | { status: "unconfigured" }
@@ -257,6 +270,18 @@ type VrFolderUiState =
 type TvFolderUiState =
   | { status: "loading" }
   | TvFolderState
+  | { status: "error" };
+type AdultLibraryScanState =
+  | { status: "loading" }
+  | { status: "unconfigured" }
+  | { status: "scanning" }
+  | { status: "empty" }
+  | { status: "unavailable" }
+  | { status: "error" }
+  | { status: "ready"; items: AdultLibraryItem[] };
+type AdultFolderUiState =
+  | { status: "loading" }
+  | AdultFolderState
   | { status: "error" };
 type VrDownloadsUiState =
   | { status: "loading" }
@@ -420,6 +445,59 @@ const tvFileRevealErrorMessages: Record<string, string> = {
   tv_file_reveal_outside_folder: "This file is outside the configured TV folder.",
   tv_file_reveal_stale: "This file is no longer part of the current TV Library.",
   tv_file_reveal_failed: "The operating system could not reveal this file.",
+};
+
+const adultLibraryScanMessages = {
+  loading: {
+    heading: "Loading Adult folder",
+    message: "Checking the configured Adult folder.",
+    role: "status",
+  },
+  unconfigured: {
+    heading: "Choose an Adult folder to begin",
+    message: "Configure one local Adult folder in Settings before scanning your library.",
+    role: undefined,
+  },
+  scanning: {
+    heading: "Scanning Adult folder",
+    message: "Looking recursively for .mp4 and .mkv files.",
+    role: "status",
+  },
+  empty: {
+    heading: "No supported Adult videos found",
+    message: "This folder does not contain any .mp4 or .mkv files.",
+    role: undefined,
+  },
+  unavailable: {
+    heading: "Adult folder is unavailable",
+    message: "The configured folder may have moved or become inaccessible. Check it in Settings or try Refresh.",
+    role: "alert",
+  },
+  error: {
+    heading: "Adult folder could not be scanned",
+    message: "Auto-Video could not read every item in this folder. Check its access and try Refresh.",
+    role: "alert",
+  },
+} as const;
+
+const adultFileOpenErrorMessages: Record<string, string> = {
+  adult_file_open_not_found: "This file is no longer available.",
+  adult_file_open_unavailable: "Auto-Video could not access this file.",
+  adult_file_open_not_file: "This item is not an eligible video file.",
+  adult_file_open_unsupported: "This item is not a supported .mp4 or .mkv file.",
+  adult_file_open_outside_folder: "This file is outside the configured Adult folder.",
+  adult_file_open_stale: "This file is no longer part of the current Adult Library.",
+  adult_file_open_failed: "The operating system could not open this file.",
+};
+
+const adultFileRevealErrorMessages: Record<string, string> = {
+  adult_file_reveal_not_found: "This file is no longer available.",
+  adult_file_reveal_unavailable: "Auto-Video could not access this file.",
+  adult_file_reveal_not_file: "This item is not an eligible video file.",
+  adult_file_reveal_unsupported: "This item is not a supported .mp4 or .mkv file.",
+  adult_file_reveal_outside_folder: "This file is outside the configured Adult folder.",
+  adult_file_reveal_stale: "This file is no longer part of the current Adult Library.",
+  adult_file_reveal_failed: "The operating system could not reveal this file.",
 };
 
 const vrFileOpenErrorMessages: Record<string, string> = {
@@ -2080,6 +2158,113 @@ function TvLibraryCard({ item }: { item: TvLibraryItem }) {
   );
 }
 
+function AdultLibraryFileRow({ file }: { file: AdultLibraryFile }) {
+  const [pendingAction, setPendingAction] = useState<"open" | "reveal" | null>(
+    null,
+  );
+  const [actionError, setActionError] = useState<string | null>(null);
+  const actionPending = useRef(false);
+
+  const runAction = async (action: "open" | "reveal") => {
+    if (actionPending.current) {
+      return;
+    }
+    actionPending.current = true;
+    setPendingAction(action);
+    setActionError(null);
+    try {
+      if (action === "open") {
+        await openAdultFile(file.path);
+      } else {
+        await revealAdultFile(file.path);
+      }
+    } catch (error: unknown) {
+      const errorCode = nativeErrorCode(error);
+      setActionError(
+        action === "open"
+          ? (adultFileOpenErrorMessages[errorCode] ??
+              "Auto-Video could not open this Adult file.")
+          : (adultFileRevealErrorMessages[errorCode] ??
+              "Auto-Video could not reveal this Adult file."),
+      );
+    } finally {
+      actionPending.current = false;
+      setPendingAction(null);
+    }
+  };
+
+  return (
+    <li className="vr-library-file" data-adult-file-path={file.path}>
+      <div className="vr-library-file__identity">
+        <span title={file.path}>{file.filename}</span>
+        <small>
+          {file.partLabel === null ? null : `${file.partLabel} · `}
+          {formatStorageBytes(BigInt(file.sizeBytes))}
+        </small>
+      </div>
+      <div className="vr-library-file__actions">
+        <Button
+          aria-label={`${pendingAction === "open" ? "Opening" : "Open"} Adult file: ${file.filename}`}
+          disabled={pendingAction !== null}
+          onClick={() => void runAction("open")}
+          size="icon-xs"
+          title="Open file"
+          type="button"
+          variant="outline"
+        >
+          <AppIcon name="open" />
+        </Button>
+        <Button
+          aria-label={`${pendingAction === "reveal" ? "Revealing" : "Reveal"} Adult file: ${file.filename}`}
+          disabled={pendingAction !== null}
+          onClick={() => void runAction("reveal")}
+          size="icon-xs"
+          title="Reveal file"
+          type="button"
+          variant="outline"
+        >
+          <AppIcon name="reveal" />
+        </Button>
+      </div>
+      {actionError === null ? null : (
+        <p aria-atomic="true" role="alert">
+          {actionError}
+        </p>
+      )}
+    </li>
+  );
+}
+
+function AdultLibraryCard({ item }: { item: AdultLibraryItem }) {
+  return (
+    <article className="movie-card vr-library-card adult-library-card">
+      <div className="media-title-row">
+        <div>
+          <p className="card-eyebrow">
+            {item.code === null
+              ? "Unassociated file"
+              : `${item.files.length} ${item.files.length === 1 ? "file" : "files"}`}
+          </p>
+          <h3>{item.title}</h3>
+        </div>
+        <CopyTitleAction title={item.title} />
+      </div>
+      <ul
+        aria-label={
+          item.code === null
+            ? `File details for ${item.title}`
+            : `Files for ${item.title}`
+        }
+        className="vr-library-card__files"
+      >
+        {item.files.map((file) => (
+          <AdultLibraryFileRow file={file} key={file.path} />
+        ))}
+      </ul>
+    </article>
+  );
+}
+
 function VrDownloadCard({
   download,
   error,
@@ -2460,6 +2645,23 @@ function compareTvLibraryItemsByTitle(
   return leftItem.id < rightItem.id ? -1 : leftItem.id > rightItem.id ? 1 : 0;
 }
 
+function compareAdultLibraryItemsByTitle(
+  leftItem: AdultLibraryItem,
+  rightItem: AdultLibraryItem,
+  direction: LibraryTitleSortDirection,
+) {
+  const leftTitle = leftItem.title.toLowerCase();
+  const rightTitle = rightItem.title.toLowerCase();
+  const titleOrder = leftTitle < rightTitle ? -1 : leftTitle > rightTitle ? 1 : 0;
+  if (titleOrder !== 0) {
+    return direction === "ascending" ? titleOrder : -titleOrder;
+  }
+  if (leftItem.title !== rightItem.title) {
+    return leftItem.title < rightItem.title ? -1 : 1;
+  }
+  return leftItem.id < rightItem.id ? -1 : leftItem.id > rightItem.id ? 1 : 0;
+}
+
 function summarizeVrDownloads(downloads: VrDownload[]): VrDownloadSummary {
   let activeCount = 0;
   let pausedCount = 0;
@@ -2593,6 +2795,26 @@ export default function App() {
   const [tvFolderActionError, setTvFolderActionError] = useState<string | null>(
     null,
   );
+  const [adultFolderState, setAdultFolderState] = useState<AdultFolderUiState>({
+    status: "loading",
+  });
+  const [adultLibraryScanState, setAdultLibraryScanState] =
+    useState<AdultLibraryScanState>({ status: "loading" });
+  const [adultLibraryRefreshVersion, setAdultLibraryRefreshVersion] = useState(0);
+  const [adultStorageRefreshVersion, setAdultStorageRefreshVersion] = useState(0);
+  const [adultStorageState, setAdultStorageState] = useState<VolumeStorageState>({
+    status: "unconfigured",
+  });
+  const [adultLibrarySelectedPage, setAdultLibrarySelectedPage] = useState(1);
+  const [adultLibrarySearchQuery, setAdultLibrarySearchQuery] = useState("");
+  const [adultLibraryTitleSortDirection, setAdultLibraryTitleSortDirection] =
+    useState<LibraryTitleSortDirection>("ascending");
+  const [isChoosingAdultFolder, setIsChoosingAdultFolder] = useState(false);
+  const [isRevalidatingAdultFolder, setIsRevalidatingAdultFolder] =
+    useState(false);
+  const [adultFolderActionError, setAdultFolderActionError] = useState<
+    string | null
+  >(null);
   const [vrLibraryScanState, setVrLibraryScanState] =
     useState<VrLibraryScanState>({ status: "loading" });
   const [vrLibraryRefreshVersion, setVrLibraryRefreshVersion] = useState(0);
@@ -2727,6 +2949,9 @@ export default function App() {
   const tvFolderRequestId = useRef(0);
   const tvLibraryScanRequestId = useRef(0);
   const tvStorageRequestId = useRef(0);
+  const adultFolderRequestId = useRef(0);
+  const adultLibraryScanRequestId = useRef(0);
+  const adultStorageRequestId = useRef(0);
   const torrentSavePending = useRef(false);
   const torrentStartPending = useRef(false);
   const vrDownloadsRefreshPending = useRef(false);
@@ -2803,6 +3028,24 @@ export default function App() {
       });
     return () => {
       tvFolderRequestId.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    const requestId = ++adultFolderRequestId.current;
+    void loadAdultFolder()
+      .then((folderState) => {
+        if (requestId === adultFolderRequestId.current) {
+          setAdultFolderState(folderState);
+        }
+      })
+      .catch(() => {
+        if (requestId === adultFolderRequestId.current) {
+          setAdultFolderState({ status: "error" });
+        }
+      });
+    return () => {
+      adultFolderRequestId.current += 1;
     };
   }, []);
 
@@ -3125,6 +3368,92 @@ export default function App() {
       tvStorageRequestId.current += 1;
     };
   }, [tvFolderState, tvStorageRefreshVersion]);
+
+  useEffect(() => {
+    const requestId = ++adultLibraryScanRequestId.current;
+    if (adultFolderState.status === "loading") {
+      setAdultLibraryScanState({ status: "loading" });
+      return;
+    }
+    if (adultFolderState.status === "unconfigured") {
+      setAdultLibraryScanState({ status: "unconfigured" });
+      return;
+    }
+    if (adultFolderState.status === "unavailable") {
+      setAdultLibraryScanState({ status: "unavailable" });
+      return;
+    }
+    if (adultFolderState.status === "error") {
+      setAdultLibraryScanState({ status: "error" });
+      return;
+    }
+
+    setAdultLibraryScanState({ status: "scanning" });
+    void scanAdultLibrary()
+      .then((items) => {
+        if (requestId === adultLibraryScanRequestId.current) {
+          setAdultLibraryScanState(
+            items.length === 0
+              ? { status: "empty" }
+              : { status: "ready", items },
+          );
+        }
+      })
+      .catch((error: unknown) => {
+        if (requestId === adultLibraryScanRequestId.current) {
+          setAdultLibraryScanState({
+            status:
+              nativeErrorCode(error) === "adult_folder_unavailable"
+                ? "unavailable"
+                : "error",
+          });
+        }
+      });
+    return () => {
+      adultLibraryScanRequestId.current += 1;
+    };
+  }, [adultFolderState, adultLibraryRefreshVersion]);
+
+  useEffect(() => {
+    const requestId = ++adultStorageRequestId.current;
+    if (adultFolderState.status === "loading") {
+      setAdultStorageState({ status: "loading" });
+      return;
+    }
+    if (adultFolderState.status === "unconfigured") {
+      setAdultStorageState({ status: "unconfigured" });
+      return;
+    }
+    if (adultFolderState.status === "unavailable") {
+      setAdultStorageState({ status: "unavailable" });
+      return;
+    }
+    if (adultFolderState.status === "error") {
+      setAdultStorageState({ status: "error" });
+      return;
+    }
+
+    setAdultStorageState({ status: "loading" });
+    void queryAdultStorage()
+      .then(({ totalBytes, freeBytes }) => {
+        if (requestId === adultStorageRequestId.current) {
+          setAdultStorageState({ status: "ready", totalBytes, freeBytes });
+        }
+      })
+      .catch((error: unknown) => {
+        if (requestId === adultStorageRequestId.current) {
+          setAdultStorageState({
+            status:
+              nativeErrorCode(error) === "adult_storage_unavailable"
+                ? "unavailable"
+                : "error",
+          });
+        }
+      });
+    return () => {
+      adultStorageRequestId.current += 1;
+    };
+  }, [adultFolderState, adultStorageRefreshVersion]);
 
   useEffect(() => {
     let isCurrent = true;
@@ -3662,6 +3991,105 @@ export default function App() {
   ) => {
     setTvLibraryTitleSortDirection(direction);
     setTvLibrarySelectedPage(1);
+  };
+
+  const chooseConfiguredAdultFolder = async () => {
+    if (isChoosingAdultFolder) {
+      return;
+    }
+    const requestId = ++adultFolderRequestId.current;
+    setIsRevalidatingAdultFolder(false);
+    setAdultFolderActionError(null);
+    setIsChoosingAdultFolder(true);
+    try {
+      const selectedFolder = await chooseAdultFolder();
+      if (
+        requestId === adultFolderRequestId.current &&
+        selectedFolder !== null
+      ) {
+        adultLibraryScanRequestId.current += 1;
+        adultStorageRequestId.current += 1;
+        setAdultLibraryScanState({ status: "scanning" });
+        setAdultStorageState({ status: "loading" });
+        setAdultFolderState({ status: "ready", path: selectedFolder });
+      }
+    } catch {
+      if (requestId === adultFolderRequestId.current) {
+        setAdultFolderActionError("The Adult folder picker could not be opened.");
+      }
+    } finally {
+      setIsChoosingAdultFolder(false);
+    }
+  };
+
+  const clearConfiguredAdultFolder = async () => {
+    const requestId = ++adultFolderRequestId.current;
+    setIsRevalidatingAdultFolder(false);
+    adultLibraryScanRequestId.current += 1;
+    adultStorageRequestId.current += 1;
+    setAdultFolderActionError(null);
+    try {
+      await clearAdultFolder();
+      if (requestId === adultFolderRequestId.current) {
+        setAdultFolderState({ status: "unconfigured" });
+      }
+    } catch {
+      if (requestId === adultFolderRequestId.current) {
+        setAdultFolderActionError(
+          "The Adult folder configuration could not be cleared.",
+        );
+      }
+    }
+  };
+
+  const refreshAdultLibrary = () => {
+    if (adultFolderState.status === "unavailable") {
+      if (isRevalidatingAdultFolder) {
+        return;
+      }
+      const requestId = ++adultFolderRequestId.current;
+      adultLibraryScanRequestId.current += 1;
+      adultStorageRequestId.current += 1;
+      setIsRevalidatingAdultFolder(true);
+      void loadAdultFolder()
+        .then((folderState) => {
+          if (requestId === adultFolderRequestId.current) {
+            setAdultFolderState(folderState);
+          }
+        })
+        .catch(() => {
+          if (requestId === adultFolderRequestId.current) {
+            setAdultFolderState({ status: "error" });
+          }
+        })
+        .finally(() => {
+          if (requestId === adultFolderRequestId.current) {
+            setIsRevalidatingAdultFolder(false);
+          }
+        });
+      return;
+    }
+    if (adultFolderState.status !== "ready") {
+      return;
+    }
+    adultLibraryScanRequestId.current += 1;
+    adultStorageRequestId.current += 1;
+    setAdultLibraryScanState({ status: "scanning" });
+    setAdultStorageState({ status: "loading" });
+    setAdultLibraryRefreshVersion((version) => version + 1);
+    setAdultStorageRefreshVersion((version) => version + 1);
+  };
+
+  const updateAdultLibrarySearchQuery = (query: string) => {
+    setAdultLibrarySearchQuery(query);
+    setAdultLibrarySelectedPage(1);
+  };
+
+  const updateAdultLibraryTitleSortDirection = (
+    direction: LibraryTitleSortDirection,
+  ) => {
+    setAdultLibraryTitleSortDirection(direction);
+    setAdultLibrarySelectedPage(1);
   };
 
   const chooseConfiguredVrFolder = async () => {
@@ -4641,6 +5069,38 @@ export default function App() {
   const completeTvLibraryShowCount = completeTvLibraryItems.filter(
     (item) => item.showTitle !== null,
   ).length;
+  const currentAdultLibraryScanMessage =
+    adultLibraryScanState.status === "ready"
+      ? null
+      : adultLibraryScanMessages[adultLibraryScanState.status];
+  const completeAdultLibraryItems =
+    adultLibraryScanState.status === "ready"
+      ? adultLibraryScanState.items
+      : [];
+  const adultLibrarySearch = adultLibrarySearchQuery.toLowerCase();
+  const isAdultLibrarySearchActive = adultLibrarySearchQuery.trim() !== "";
+  const matchingAdultLibraryItems = isAdultLibrarySearchActive
+    ? completeAdultLibraryItems.filter((item) =>
+        item.title.toLowerCase().includes(adultLibrarySearch),
+      )
+    : completeAdultLibraryItems;
+  const orderedAdultLibraryItems = [...matchingAdultLibraryItems].sort(
+    (leftItem, rightItem) =>
+      compareAdultLibraryItemsByTitle(
+        leftItem,
+        rightItem,
+        adultLibraryTitleSortDirection,
+      ),
+  );
+  const completeAdultLibraryFileCount = completeAdultLibraryItems.reduce(
+    (count, item) => count + item.files.length,
+    0,
+  );
+  const completeAdultLibraryGroupedCount = completeAdultLibraryItems.filter(
+    (item) => item.code !== null,
+  ).length;
+  const completeAdultLibraryUnassociatedCount =
+    completeAdultLibraryItems.length - completeAdultLibraryGroupedCount;
   const currentVrDownloads =
     vrDownloadsState.status === "ready" ? vrDownloadsState.downloads : [];
   const vrDownloadSummary = summarizeVrDownloads(currentVrDownloads);
@@ -4804,6 +5264,67 @@ export default function App() {
     dashboardTvStorageHeading = "Storage could not be loaded";
     dashboardTvStorageMessage = "Auto-Video could not read the containing volume capacity.";
     dashboardTvStorageRole = "alert";
+  }
+  let dashboardAdultHeading = "Loading Adult Library";
+  let dashboardAdultMessage = "Loading the configured Adult folder.";
+  let dashboardAdultRole: "alert" | "status" | undefined = "status";
+  let dashboardAdultDestination: (typeof destinations)[number] = libraryDestination;
+
+  if (adultFolderState.status === "unconfigured") {
+    dashboardAdultHeading = "Adult Library is not configured";
+    dashboardAdultMessage = "Choose one local Adult folder in Settings.";
+    dashboardAdultRole = undefined;
+    dashboardAdultDestination = settingsDestination;
+  } else if (adultFolderState.status === "unavailable") {
+    dashboardAdultHeading = "Adult folder is unavailable";
+    dashboardAdultMessage = "The configured folder may have moved or become inaccessible.";
+    dashboardAdultRole = "alert";
+    dashboardAdultDestination = settingsDestination;
+  } else if (adultFolderState.status === "error") {
+    dashboardAdultHeading = "Adult Library needs attention";
+    dashboardAdultMessage = "The Adult folder configuration could not be loaded.";
+    dashboardAdultRole = "alert";
+    dashboardAdultDestination = settingsDestination;
+  } else if (adultLibraryScanState.status === "scanning") {
+    dashboardAdultHeading = "Scanning Adult Library";
+    dashboardAdultMessage = "Looking recursively for supported .mp4 and .mkv files.";
+  } else if (adultLibraryScanState.status === "empty") {
+    dashboardAdultHeading = "0 grouped titles · 0 supported files";
+    dashboardAdultMessage = "The configured folder contains no supported video files.";
+    dashboardAdultRole = undefined;
+  } else if (adultLibraryScanState.status === "ready") {
+    dashboardAdultHeading = `${completeAdultLibraryGroupedCount} grouped ${completeAdultLibraryGroupedCount === 1 ? "title" : "titles"} · ${completeAdultLibraryFileCount} supported ${completeAdultLibraryFileCount === 1 ? "file" : "files"}`;
+    dashboardAdultMessage = completeAdultLibraryUnassociatedCount === 0
+      ? "These totals come from the latest complete Adult folder scan."
+      : `${completeAdultLibraryUnassociatedCount} ${completeAdultLibraryUnassociatedCount === 1 ? "file remains" : "files remain"} unassociated.`;
+    dashboardAdultRole = undefined;
+  } else if (adultLibraryScanState.status === "unavailable") {
+    dashboardAdultHeading = "Adult folder is unavailable";
+    dashboardAdultMessage = "The configured folder may have moved or become inaccessible.";
+    dashboardAdultRole = "alert";
+    dashboardAdultDestination = settingsDestination;
+  } else if (adultLibraryScanState.status === "error") {
+    dashboardAdultHeading = "Adult Library scan failed";
+    dashboardAdultMessage = "Auto-Video could not read every item in the configured folder.";
+    dashboardAdultRole = "alert";
+  }
+
+  let dashboardAdultStorageHeading = "Waiting for Adult folder configuration";
+  let dashboardAdultStorageMessage =
+    "Storage will load after the configured Adult folder is known.";
+  let dashboardAdultStorageRole: "alert" | "status" | undefined;
+  if (adultStorageState.status === "loading") {
+    dashboardAdultStorageHeading = "Loading storage";
+    dashboardAdultStorageMessage = "Reading the volume capacity for the configured Adult folder.";
+    dashboardAdultStorageRole = "status";
+  } else if (adultStorageState.status === "unavailable") {
+    dashboardAdultStorageHeading = "Adult volume is unavailable";
+    dashboardAdultStorageMessage = "The configured folder or its containing volume is not accessible.";
+    dashboardAdultStorageRole = "alert";
+  } else if (adultStorageState.status === "error") {
+    dashboardAdultStorageHeading = "Storage could not be loaded";
+    dashboardAdultStorageMessage = "Auto-Video could not read the containing volume capacity.";
+    dashboardAdultStorageRole = "alert";
   }
   let dashboardVrHeading = "Loading VR Library";
   let dashboardVrMessage = "Loading the configured VR folder.";
@@ -5092,6 +5613,92 @@ export default function App() {
                   {dashboardTvDestination.id === "library"
                     ? "Open TV Library"
                     : "Open TV Settings"}
+                </Button>
+              )}
+            </section>
+            <section
+              aria-busy={
+                adultFolderState.status === "loading" ||
+                adultLibraryScanState.status === "scanning"
+              }
+              aria-labelledby="dashboard-adult-heading"
+              className="dashboard-library-summary"
+            >
+              <div className="dashboard-library-summary__heading">
+                <span className="empty-state__icon">
+                  <AppIcon name="adult" />
+                </span>
+                <div>
+                  <p className="card-eyebrow">Local library</p>
+                  <h2 id="dashboard-adult-heading">Adult Library</h2>
+                  <p className="dashboard-library-summary__folder">
+                    {adultFolderState.status === "loading"
+                      ? "Loading configured Adult folder…"
+                      : adultFolderState.status === "ready" ||
+                          adultFolderState.status === "unavailable"
+                        ? adultFolderState.path
+                        : "No Adult folder configured"}
+                  </p>
+                </div>
+              </div>
+
+              <div
+                className="dashboard-library-summary__status"
+                role={dashboardAdultRole}
+              >
+                <p className="card-eyebrow">Current status</p>
+                <h3>{dashboardAdultHeading}</h3>
+                <p>{dashboardAdultMessage}</p>
+              </div>
+
+              <div
+                aria-busy={adultStorageState.status === "loading"}
+                className="dashboard-library-summary__storage"
+              >
+                <p className="card-eyebrow">Storage</p>
+                {adultStorageState.status === "ready" ? (
+                  <dl aria-label="Adult volume storage">
+                    <div>
+                      <dt>Total</dt>
+                      <dd>{formatStorageBytes(adultStorageState.totalBytes)}</dd>
+                    </div>
+                    <div>
+                      <dt>Used</dt>
+                      <dd>
+                        {formatStorageBytes(
+                          adultStorageState.totalBytes -
+                            adultStorageState.freeBytes,
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Free</dt>
+                      <dd>{formatStorageBytes(adultStorageState.freeBytes)}</dd>
+                    </div>
+                  </dl>
+                ) : (
+                  <div role={dashboardAdultStorageRole}>
+                    <h3>{dashboardAdultStorageHeading}</h3>
+                    <p>{dashboardAdultStorageMessage}</p>
+                  </div>
+                )}
+              </div>
+
+              {adultFolderState.status === "loading" ? null : (
+                <Button
+                  className="dashboard-library-summary__action"
+                  onClick={() => {
+                    if (dashboardAdultDestination.id === "library") {
+                      setLibraryCategory("adult");
+                    }
+                    navigateTo(dashboardAdultDestination);
+                  }}
+                  type="button"
+                >
+                  <AppIcon name={dashboardAdultDestination.id} />
+                  {dashboardAdultDestination.id === "library"
+                    ? "Open Adult Library"
+                    : "Open Adult Settings"}
                 </Button>
               )}
             </section>
@@ -5572,7 +6179,9 @@ export default function App() {
                   ? movieScanState.status === "scanning"
                   : libraryCategory === "tv"
                     ? tvLibraryScanState.status === "scanning"
-                    : vrLibraryScanState.status === "scanning"
+                    : libraryCategory === "adult"
+                      ? adultLibraryScanState.status === "scanning"
+                      : vrLibraryScanState.status === "scanning"
               }
               aria-labelledby="library-heading"
               className="library-content"
@@ -5595,7 +6204,9 @@ export default function App() {
                         ? "Movies"
                         : libraryCategory === "tv"
                           ? "TV"
-                          : "VR"}
+                          : libraryCategory === "adult"
+                            ? "Adult"
+                            : "VR"}
                     </h2>
                     <p className="library-folder">
                       {libraryCategory === "movies"
@@ -5607,12 +6218,19 @@ export default function App() {
                             : tvFolderState.status === "loading"
                               ? "Loading configured TV folder…"
                               : "No TV folder configured"
-                          : vrFolderState.status === "ready" ||
-                            vrFolderState.status === "unavailable"
-                          ? vrFolderState.path
-                          : vrFolderState.status === "loading"
-                            ? "Loading configured VR folder…"
-                            : "No VR folder configured"}
+                          : libraryCategory === "adult"
+                            ? adultFolderState.status === "ready" ||
+                              adultFolderState.status === "unavailable"
+                              ? adultFolderState.path
+                              : adultFolderState.status === "loading"
+                                ? "Loading configured Adult folder…"
+                                : "No Adult folder configured"
+                            : vrFolderState.status === "ready" ||
+                                vrFolderState.status === "unavailable"
+                              ? vrFolderState.path
+                              : vrFolderState.status === "loading"
+                                ? "Loading configured VR folder…"
+                                : "No VR folder configured"}
                     </p>
                   </div>
                 </div>
@@ -5623,6 +6241,7 @@ export default function App() {
                       {([
                         ["movies", "Movies"],
                         ["tv", "TV"],
+                        ["adult", "Adult"],
                         ["vr", "VR"],
                       ] as const).map(([category, label]) => (
                         <label key={category}>
@@ -5786,6 +6405,82 @@ export default function App() {
                     >
                       <AppIcon name="refresh" />
                       {isRevalidatingTvFolder ? "Refreshing…" : "Refresh"}
+                    </Button>
+                  </div>
+                ) : libraryCategory === "adult" &&
+                  (adultFolderState.status === "ready" ||
+                    adultFolderState.status === "unavailable") ? (
+                  <div className="library-toolbar__controls">
+                    <div
+                      aria-label="Adult title search"
+                      className="movie-search"
+                      role="search"
+                    >
+                      <label htmlFor="adult-library-title-search">Search titles</label>
+                      <div className="movie-search__field">
+                        <span className="movie-search__icon">
+                          <AppIcon name="search" />
+                        </span>
+                        <input
+                          aria-describedby={
+                            adultLibraryScanState.status === "ready"
+                              ? "adult-library-search-results"
+                              : undefined
+                          }
+                          className="movie-search__input"
+                          id="adult-library-title-search"
+                          onChange={(event) =>
+                            updateAdultLibrarySearchQuery(event.target.value)
+                          }
+                          placeholder="Find an Adult title or code"
+                          type="text"
+                          value={adultLibrarySearchQuery}
+                        />
+                        {adultLibrarySearchQuery === "" ? null : (
+                          <Button
+                            aria-label="Clear Adult search"
+                            className="movie-search__clear"
+                            onClick={() => updateAdultLibrarySearchQuery("")}
+                            size="icon-sm"
+                            type="button"
+                            variant="ghost"
+                          >
+                            <AppIcon name="close" />
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="movie-sort">
+                      <label htmlFor="adult-library-title-sort">Sort titles</label>
+                      <select
+                        className="movie-sort__select"
+                        id="adult-library-title-sort"
+                        onChange={(event) => {
+                          const direction = event.target.value;
+                          if (direction !== "ascending" && direction !== "descending") {
+                            throw new Error(
+                              "The Adult title sort returned an invalid direction.",
+                            );
+                          }
+                          updateAdultLibraryTitleSortDirection(direction);
+                        }}
+                        value={adultLibraryTitleSortDirection}
+                      >
+                        <option value="ascending">Title A–Z</option>
+                        <option value="descending">Title Z–A</option>
+                      </select>
+                    </div>
+                    <Button
+                      disabled={
+                        adultLibraryScanState.status === "scanning" ||
+                        isRevalidatingAdultFolder
+                      }
+                      onClick={refreshAdultLibrary}
+                      type="button"
+                      variant="outline"
+                    >
+                      <AppIcon name="refresh" />
+                      {isRevalidatingAdultFolder ? "Refreshing…" : "Refresh"}
                     </Button>
                   </div>
                 ) : libraryCategory === "vr" &&
@@ -5978,6 +6673,59 @@ export default function App() {
                     </span>
                     <h2>{currentTvLibraryScanMessage?.heading}</h2>
                     <p>{currentTvLibraryScanMessage?.message}</p>
+                  </div>
+                )
+              ) : libraryCategory === "adult" ? (
+                adultLibraryScanState.status === "ready" ? (
+                  <>
+                    <p
+                      aria-atomic="true"
+                      aria-live="polite"
+                      className="sr-only"
+                      id="adult-library-search-results"
+                    >
+                      {isAdultLibrarySearchActive
+                        ? `${matchingAdultLibraryItems.length} Adult titles match the current search.`
+                        : `${completeAdultLibraryGroupedCount} grouped titles, ${completeAdultLibraryFileCount} supported files, and ${completeAdultLibraryUnassociatedCount} unassociated files in the complete current result.`}
+                    </p>
+                    {matchingAdultLibraryItems.length === 0 &&
+                    isAdultLibrarySearchActive ? (
+                      <div className="empty-state library-state library-search-empty">
+                        <span className="empty-state__icon">
+                          <AppIcon name="search" />
+                        </span>
+                        <h2>No Adult titles match this search</h2>
+                        <p>
+                          No canonical codes or unassociated titles match “
+                          <span className="library-search-empty__query">
+                            {adultLibrarySearchQuery}
+                          </span>
+                          ”. Clear the search to restore the complete Library.
+                        </p>
+                      </div>
+                    ) : (
+                      <ResizeAwareGallery
+                        ariaLabel="Adult titles and unassociated files"
+                        getItemKey={(item) => item.id}
+                        items={orderedAdultLibraryItems}
+                        key="adult-library-gallery"
+                        onSelectedPageChange={setAdultLibrarySelectedPage}
+                        renderItem={(item) => <AdultLibraryCard item={item} />}
+                        selectedPage={adultLibrarySelectedPage}
+                        variant="library"
+                      />
+                    )}
+                  </>
+                ) : (
+                  <div
+                    className="empty-state library-state"
+                    role={currentAdultLibraryScanMessage?.role}
+                  >
+                    <span className="empty-state__icon">
+                      <AppIcon name="adult" />
+                    </span>
+                    <h2>{currentAdultLibraryScanMessage?.heading}</h2>
+                    <p>{currentAdultLibraryScanMessage?.message}</p>
                   </div>
                 )
               ) : vrLibraryScanState.status === "ready" ? (
@@ -6371,6 +7119,113 @@ export default function App() {
                   {tvFolderActionError === null ? null : (
                     <p className="field-error" role="alert">
                       {tvFolderActionError}
+                    </p>
+                  )}
+                </div>
+              </section>
+
+              <section
+                aria-labelledby="adult-folder-heading"
+                className="settings-card"
+              >
+                <div className="settings-card__heading">
+                  <span className="empty-state__icon">
+                    <AppIcon name="adult" />
+                  </span>
+                  <div>
+                    <h2 id="adult-folder-heading">Adult folder</h2>
+                    <p>
+                      Choose one local folder to scan recursively for supported
+                      Adult files. Auto-Video never renames, moves, or deletes them.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="folder-setting">
+                  {adultFolderState.status === "ready" ||
+                  adultFolderState.status === "unavailable" ? (
+                    <div>
+                      <p className="field-label">Configured folder</p>
+                      <p className="folder-path">{adultFolderState.path}</p>
+                      {adultFolderState.status === "unavailable" ? (
+                        <p className="field-error" role="alert">
+                          This folder has moved or is unavailable. Restore it,
+                          choose another folder, or clear the configuration.
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <p
+                      className={
+                        adultFolderState.status === "error"
+                          ? "field-error folder-setting__empty"
+                          : "folder-setting__empty"
+                      }
+                      role={
+                        adultFolderState.status === "error" ? "alert" : undefined
+                      }
+                    >
+                      {adultFolderState.status === "loading"
+                        ? "Loading Adult folder configuration…"
+                        : adultFolderState.status === "error"
+                          ? "The Adult folder configuration could not be loaded."
+                          : "No Adult folder configured."}
+                    </p>
+                  )}
+                  <div className="folder-setting__actions">
+                    <Button
+                      disabled={
+                        isChoosingAdultFolder ||
+                        adultFolderState.status === "loading"
+                      }
+                      onClick={() => void chooseConfiguredAdultFolder()}
+                      type="button"
+                    >
+                      <AppIcon name="folder" />
+                      {isChoosingAdultFolder
+                        ? "Choosing…"
+                        : adultFolderState.status === "ready" ||
+                            adultFolderState.status === "unavailable"
+                          ? "Change Adult folder"
+                          : "Choose Adult folder"}
+                    </Button>
+                    {adultFolderState.status === "ready" ||
+                    adultFolderState.status === "unavailable" ? (
+                      <Button
+                        aria-label={
+                          isRevalidatingAdultFolder
+                            ? "Refreshing Adult folder"
+                            : "Refresh Adult folder"
+                        }
+                        disabled={
+                          isChoosingAdultFolder ||
+                          isRevalidatingAdultFolder ||
+                          adultLibraryScanState.status === "scanning"
+                        }
+                        onClick={refreshAdultLibrary}
+                        type="button"
+                        variant="outline"
+                      >
+                        <AppIcon name="refresh" />
+                        {isRevalidatingAdultFolder ? "Refreshing…" : "Refresh"}
+                      </Button>
+                    ) : null}
+                    {adultFolderState.status === "ready" ||
+                    adultFolderState.status === "unavailable" ? (
+                      <Button
+                        aria-label="Clear Adult folder"
+                        disabled={isChoosingAdultFolder}
+                        onClick={() => void clearConfiguredAdultFolder()}
+                        type="button"
+                        variant="outline"
+                      >
+                        Clear folder
+                      </Button>
+                    ) : null}
+                  </div>
+                  {adultFolderActionError === null ? null : (
+                    <p className="field-error" role="alert">
+                      {adultFolderActionError}
                     </p>
                   )}
                 </div>
