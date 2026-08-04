@@ -230,7 +230,7 @@ impl TransferRecord {
 
 struct CorruptTransferRecord {
     transfer_id: String,
-    category: TransferCategory,
+    category: Option<TransferCategory>,
     code: String,
     release_name: String,
     raw_line: Vec<u8>,
@@ -1035,7 +1035,11 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
     })
 }
 
-fn corrupt_transfer(line: &[u8], line_number: usize) -> CorruptTransferRecord {
+fn corrupt_transfer(
+    line: &[u8],
+    line_number: usize,
+    category: Option<TransferCategory>,
+) -> CorruptTransferRecord {
     let decoded_line = line
         .strip_prefix(b"!")
         .and_then(decode_hex)
@@ -1054,11 +1058,6 @@ fn corrupt_transfer(line: &[u8], line_number: usize) -> CorruptTransferRecord {
         .and_then(|value| decode_text(value))
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "Persisted transfer data is corrupt.".to_owned());
-    let category = fields
-        .get(13)
-        .and_then(|value| std::str::from_utf8(value).ok())
-        .and_then(TransferCategory::from_str)
-        .unwrap_or(TransferCategory::Vr);
     CorruptTransferRecord {
         transfer_id,
         category,
@@ -1078,6 +1077,7 @@ fn read_persisted_transfers(path: &Path) -> Result<Vec<StoredTransfer>, &'static
         return Ok(vec![StoredTransfer::Corrupt(corrupt_transfer(
             b"oversized persistence",
             0,
+            None,
         ))]);
     }
     let bytes = fs::read(path).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
@@ -1086,8 +1086,11 @@ fn read_persisted_transfers(path: &Path) -> Result<Vec<StoredTransfer>, &'static
     } else if let Some(body) = bytes.strip_prefix(LEGACY_PERSISTENCE_HEADER) {
         (body, true)
     } else {
-        return Ok(vec![StoredTransfer::Corrupt(corrupt_transfer(&bytes, 0))]);
+        return Ok(vec![StoredTransfer::Corrupt(corrupt_transfer(
+            &bytes, 0, None,
+        ))]);
     };
+    let corrupt_category = allow_legacy_vr.then_some(TransferCategory::Vr);
     let mut transfers = Vec::new();
     let mut transfer_ids = BTreeSet::new();
     for (line_number, line) in body
@@ -1098,13 +1101,15 @@ fn read_persisted_transfers(path: &Path) -> Result<Vec<StoredTransfer>, &'static
     {
         transfers.push(match parse_transfer_line(line, allow_legacy_vr) {
             Some(record) if allow_legacy_vr && record.category != TransferCategory::Vr => {
-                StoredTransfer::Corrupt(corrupt_transfer(line, line_number))
+                StoredTransfer::Corrupt(corrupt_transfer(line, line_number, corrupt_category))
             }
             Some(record) if transfer_ids.insert(record.transfer_id.clone()) => {
                 StoredTransfer::Valid(record)
             }
-            None => StoredTransfer::Corrupt(corrupt_transfer(line, line_number)),
-            Some(_) => StoredTransfer::Corrupt(corrupt_transfer(line, line_number)),
+            None => StoredTransfer::Corrupt(corrupt_transfer(line, line_number, corrupt_category)),
+            Some(_) => {
+                StoredTransfer::Corrupt(corrupt_transfer(line, line_number, corrupt_category))
+            }
         });
     }
     Ok(transfers)
@@ -2875,7 +2880,11 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
             }
             StoredTransfer::Corrupt(record) => rows.extend([
                 record.transfer_id.clone(),
-                record.category.as_str().to_owned(),
+                record
+                    .category
+                    .map(TransferCategory::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
                 record.code.clone(),
                 record.release_name.clone(),
                 "0".to_owned(),
@@ -4954,21 +4963,81 @@ mod tests {
     }
 
     #[test]
-    fn category_tampering_cannot_reinterpret_an_adult_record_as_vr() {
-        let fixture = FilesystemFixture::new();
-        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
-        let record = transfer_from_source(
-            TransferCategory::Adult,
-            persistable_adult_fixture_source(),
-            destination,
-            TransferState::Cancelled,
-        );
-        let mut encoded = encode_transfer(&record).expect("Adult record must encode");
-        assert!(encoded.ends_with(b"\tadult"));
-        encoded.truncate(encoded.len() - "adult".len());
-        encoded.extend_from_slice(b"vr");
+    fn damaged_v2_adult_categories_stay_unknown_and_dismiss_keeps_media() {
+        for category_case in ["missing", "invalid", "mismatched"] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let record = transfer_from_source(
+                TransferCategory::Adult,
+                persistable_adult_fixture_source(),
+                destination.clone(),
+                TransferState::Cancelled,
+            );
+            let media_path = destination.join("Movie  A.mp4");
+            fs::write(&media_path, b"media").expect("existing Adult media must be created");
+            let mut encoded = encode_transfer(&record).expect("Adult record must encode");
+            assert!(encoded.ends_with(b"\tadult"));
+            let category_start = encoded.len() - "adult".len();
+            match category_case {
+                "missing" => encoded.truncate(category_start - 1),
+                "invalid" => {
+                    encoded.truncate(category_start);
+                    encoded.extend_from_slice(b"invalid");
+                }
+                "mismatched" => {
+                    encoded.truncate(category_start);
+                    encoded.extend_from_slice(b"vr");
+                }
+                _ => unreachable!(),
+            }
+            assert!(parse_transfer_line(&encoded, false).is_none());
 
-        assert!(parse_transfer_line(&encoded, false).is_none());
+            let persistence_path = fixture.path.join("downloads");
+            let mut persisted = PERSISTENCE_HEADER.to_vec();
+            persisted.extend_from_slice(&encoded);
+            persisted.push(b'\n');
+            fs::write(&persistence_path, persisted).expect("damaged V2 row must persist");
+            let state = VrDownloadState::default();
+            let rows = tauri::async_runtime::block_on(load_downloads(
+                &state,
+                &persistence_path,
+                &fixture.path.join("session"),
+                &fixture.path.join("limit"),
+            ))
+            .expect("damaged V2 row must load as a terminal corrupt row");
+            assert_eq!(rows[1], "unknown", "{category_case} category fell back");
+            assert_eq!(rows[2], "ADLT-123");
+            assert_eq!(rows[8], "offline");
+            assert_eq!(rows[9], "false");
+            assert_eq!(rows[10], "none");
+            assert_eq!(rows[12], "false");
+            assert_eq!(
+                preview_organization(&state, &rows[0]),
+                Err(VR_ORGANIZATION_STALE)
+            );
+            assert!(state.0.lock().expect("state must lock").session.is_none());
+
+            dismiss_download(&state, &persistence_path, &rows[0])
+                .expect("corrupt terminal row must dismiss");
+            assert_eq!(
+                fs::read(&media_path).expect("dismissed media must remain at its exact path"),
+                b"media"
+            );
+            let restarted = VrDownloadState::default();
+            assert!(tauri::async_runtime::block_on(load_downloads(
+                &restarted,
+                &persistence_path,
+                &fixture.path.join("restart-session"),
+                &fixture.path.join("limit"),
+            ))
+            .expect("dismissed row state must reload")
+            .is_empty());
+            assert_eq!(
+                fs::read(&media_path).expect("relaunch must not alter dismissed media"),
+                b"media"
+            );
+        }
     }
 
     #[test]

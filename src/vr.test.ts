@@ -924,12 +924,12 @@ describe("trusted VR download boundary", () => {
     await expect(loadVrDownloads()).rejects.toThrow("invalid data");
   });
 
-  it("keeps corrupt persisted transfers dismissible without making them organizable", async () => {
+  it("accepts category-unknown persisted transfers only as inert offline rows", async () => {
     invokeMock.mockResolvedValue([
       "corrupt-1",
-      "vr",
-      "Unavailable",
-      "Persisted transfer data is corrupt.",
+      "unknown",
+      "ADLT-123",
+      "【Adult】 ADLT-123 damaged V2 record",
       "0",
       "0",
       "0",
@@ -944,9 +944,9 @@ describe("trusted VR download boundary", () => {
     await expect(loadVrDownloads()).resolves.toEqual([
       {
         transferId: "corrupt-1",
-        category: "vr",
-        code: "Unavailable",
-        releaseName: "Persisted transfer data is corrupt.",
+        category: "unknown",
+        code: "ADLT-123",
+        releaseName: "【Adult】 ADLT-123 damaged V2 record",
         selectedFileCount: 0,
         totalBytes: "0",
         downloadedBytes: "0",
@@ -958,6 +958,31 @@ describe("trusted VR download boundary", () => {
         canOrganize: false,
       },
     ]);
+
+    for (const [fieldIndex, invalidValue] of [
+      [8, "paused"],
+      [10, "attention"],
+      [12, "true"],
+    ] as const) {
+      const invalidRow = [
+        "corrupt-1",
+        "unknown",
+        "ADLT-123",
+        "【Adult】 ADLT-123 damaged V2 record",
+        "0",
+        "0",
+        "0",
+        "0",
+        "offline",
+        "false",
+        "none",
+        "",
+        "false",
+      ];
+      invalidRow[fieldIndex] = invalidValue;
+      invokeMock.mockResolvedValueOnce(invalidRow);
+      await expect(loadVrDownloads()).rejects.toThrow("invalid data");
+    }
   });
 
   it("parses exact native organization previews and applies only the plan identity", async () => {

@@ -72,7 +72,7 @@ export type VrDownloadState =
 
 export type VrDownload = {
   transferId: string;
-  category: "adult" | "vr";
+  category: "adult" | "unknown" | "vr";
   code: string;
   releaseName: string;
   selectedFileCount: number;
@@ -849,10 +849,20 @@ function parseVrDownloads(value: unknown): VrDownload[] {
     if (
       transferId === "" ||
       transferIds.has(transferId) ||
-      (category !== "adult" && category !== "vr") ||
+      (category !== "adult" && category !== "unknown" && category !== "vr") ||
       code.trim() === "" ||
       (category === "adult" &&
         (canOrganize !== "false" || organizationStatus !== "none")) ||
+      (category === "unknown" &&
+        (count !== 0 ||
+          totalBytes !== "0" ||
+          downloadedBytes !== "0" ||
+          speedBytesPerSecond !== "0" ||
+          state !== "offline" ||
+          currentFolder !== "false" ||
+          organizationStatus !== "none" ||
+          organizationRelativeDirectory !== "" ||
+          canOrganize !== "false")) ||
       ((canOrganize === "true" || organizationStatus !== "none") &&
         canonicalCode !== code) ||
       releaseName.trim() === "" ||

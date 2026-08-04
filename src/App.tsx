@@ -3034,6 +3034,18 @@ function VrDownloadCard({
         ? "organized"
         : download.state;
   const isTerminal = !activeVrDownloadStates.has(download.state);
+  const categoryLabel =
+    download.category === "adult"
+      ? "Adult"
+      : download.category === "vr"
+        ? "VR"
+        : "Category unavailable";
+  const acceptedFolderName =
+    download.category === "adult"
+      ? "accepted Adult folder"
+      : download.category === "vr"
+        ? "accepted VR folder"
+        : "accepted download folder";
 
   return (
     <article
@@ -3043,7 +3055,7 @@ function VrDownloadCard({
       <div className="vr-download-card__heading">
         <div>
           <p className="card-eyebrow">
-            {download.category === "adult" ? "Adult" : "VR"} · {download.code}
+            {categoryLabel} · {download.code}
           </p>
           <h2 id={`vr-download-${download.transferId}`}>
             {download.releaseName}
@@ -3258,7 +3270,7 @@ function VrDownloadCard({
                   <AlertDialog.Title>Cancel this download?</AlertDialog.Title>
                   <AlertDialog.Description>
                     The transfer will stop. Downloaded files and partial data
-                    will remain in the accepted {download.category === "adult" ? "Adult" : "VR"} folder.
+                    will remain in the {acceptedFolderName}.
                   </AlertDialog.Description>
                   <div className="trash-dialog__actions">
                     <AlertDialog.Close

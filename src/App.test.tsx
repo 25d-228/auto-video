@@ -6524,6 +6524,51 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
     expect(loadVrDownloadsMock).toHaveBeenCalledOnce();
   });
 
+  it("keeps a damaged V2 Adult row category-unknown, inert, and dismissible", async () => {
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        category: "unknown",
+        code: "ADLT-123",
+        downloadedBytes: "0",
+        isCurrentFolder: "false",
+        releaseName: "【Adult】 ADLT-123 damaged V2 record",
+        selectedFileCount: "0",
+        speedBytesPerSecond: "0",
+        state: "offline",
+        totalBytes: "0",
+        transferId: "corrupt-adult-v2",
+      }),
+    );
+    listVrDownloadsMock.mockResolvedValue([]);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+
+    const heading = await screen.findByRole("heading", {
+      name: "【Adult】 ADLT-123 damaged V2 record",
+    });
+    const card = heading.closest("article") as HTMLElement;
+    expect(within(card).getByText("Category unavailable · ADLT-123")).toBeTruthy();
+    expect(within(card).getByText("Offline")).toBeTruthy();
+    expect(within(card).queryByText("Adult · ADLT-123")).toBeNull();
+    expect(within(card).queryByText("VR · ADLT-123")).toBeNull();
+    expect(within(card).queryByRole("button", { name: "Pause" })).toBeNull();
+    expect(within(card).queryByRole("button", { name: "Resume" })).toBeNull();
+    expect(within(card).queryByRole("button", { name: "Cancel" })).toBeNull();
+    expect(
+      within(card).queryByRole("button", { name: "Organize files" }),
+    ).toBeNull();
+
+    fireEvent.click(within(card).getByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(heading.isConnected).toBe(false));
+    expect(dismissVrDownloadMock).toHaveBeenCalledWith({
+      transferId: "corrupt-adult-v2",
+    });
+    expect(pauseVrDownloadMock).not.toHaveBeenCalled();
+    expect(resumeVrDownloadMock).not.toHaveBeenCalled();
+    expect(cancelVrDownloadMock).not.toHaveBeenCalled();
+    expect(previewVrOrganizationMock).not.toHaveBeenCalled();
+  });
+
   it("summarizes only the current native snapshot without extra view work", async () => {
     Object.defineProperty(window, "innerWidth", {
       configurable: true,
