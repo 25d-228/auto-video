@@ -4598,6 +4598,84 @@ describe("Adult Discover and verified release comparison", () => {
     expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
   });
 
+  it("restores completed Adult releases and the exact selection without another request", async () => {
+    const exactReleaseName = "ADLT-123  Exact\t—\n特別版!?";
+    fetchJavdbCatalogMock.mockResolvedValue(
+      javdbCatalogFixture("ADLT-123", "Persistent Adult title"),
+    );
+    fetchSukebeiAdultReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        { name: exactReleaseName, seeders: 7, size: "4.5 GiB" },
+        { name: "ADLT-123 alternate", seeders: 2, size: "6 GiB" },
+      ]),
+    );
+    gallerySizes.discover = { width: 1088, height: 2408 };
+    render(<App />);
+    selectDiscover();
+    selectAdultDiscover();
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Search product code" }),
+      { target: { value: "ADLT-123" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    let trigger = await screen.findByRole("button", {
+      name: "Find releases: ADLT-123",
+    });
+    fireEvent.click(trigger);
+    let releaseList = await screen.findByRole("list", {
+      name: "Verified Adult releases for ADLT-123",
+    });
+    const exactRelease = Array.from(
+      releaseList.querySelectorAll<HTMLElement>(".vr-releases__release-name"),
+    ).find((releaseName) => releaseName.textContent === exactReleaseName);
+    fireEvent.click(exactRelease?.closest("button") as HTMLButtonElement);
+
+    const expectRestoredComparison = async () => {
+      releaseList = await screen.findByRole("list", {
+        name: "Verified Adult releases for ADLT-123",
+      });
+      expect(within(releaseList).getAllByRole("button")).toHaveLength(2);
+      const selectedRow = Array.from(
+        releaseList.querySelectorAll<HTMLElement>(
+          ".vr-releases__release-name",
+        ),
+      )
+        .find((releaseName) => releaseName.textContent === exactReleaseName)
+        ?.closest("button");
+      expect(selectedRow?.getAttribute("aria-pressed")).toBe("true");
+      const selectedSummary = screen
+        .getByRole("heading", { name: "Selected release" })
+        .closest("section");
+      expect(
+        Array.from(selectedSummary?.querySelectorAll("dd") ?? []).some(
+          (value) => value.textContent === exactReleaseName,
+        ),
+      ).toBe(true);
+      expect(fetchSukebeiAdultReleasesMock).toHaveBeenCalledTimes(1);
+    };
+
+    await expectRestoredComparison();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    fireEvent.click(trigger);
+    await expectRestoredComparison();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectDashboard();
+    selectDiscover();
+    resizeGallery("discover", 1528, 472);
+    fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+    selectAdultDiscover();
+    trigger = screen.getByRole("button", {
+      name: "Find releases: ADLT-123",
+    });
+    fireEvent.click(trigger);
+    await expectRestoredComparison();
+    expect(fetchJavdbCatalogMock).toHaveBeenCalledTimes(1);
+  });
+
   it("clears Adult release selection on retry and restores focus after close, Escape, and backdrop dismissal", async () => {
     fetchJavdbCatalogMock.mockResolvedValue(javdbCatalogFixture("ADLT-123"));
     fetchSukebeiAdultReleasesMock.mockResolvedValue(
@@ -4733,12 +4811,18 @@ describe("Adult Discover and verified release comparison", () => {
     ).toBeTruthy();
   });
 
-  it("preserves completed Adult state through categories, navigation, appearance, and 25-to-7-to-10 resize changes", async () => {
+  it("shows 25 then 7 then 10 Adult items with valid pages and no refetch", async () => {
+    const adultCatalogItemsFixture = Array.from({ length: 25 }, (_, index) => ({
+      code: "ADLT-123",
+      coverUrl: null,
+      source: "JavDB" as const,
+      title: `Adult fixture ${String(index + 1).padStart(2, "0")}`,
+    }));
     fetchJavdbCatalogMock.mockResolvedValue(
       javdbCatalogFixture("ADLT-123", "Preserved Adult title"),
     );
     gallerySizes.discover = { width: 1088, height: 2408 };
-    render(<App />);
+    render(<App adultCatalogItemsFixture={adultCatalogItemsFixture} />);
     selectDiscover();
     selectAdultDiscover();
     fireEvent.change(
@@ -4746,13 +4830,48 @@ describe("Adult Discover and verified release comparison", () => {
       { target: { value: "ADLT-123" } },
     );
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
-    expect(await screen.findByText("Preserved Adult title")).toBeTruthy();
+    expect(await screen.findByText("Adult fixture 01")).toBeTruthy();
     const gallery = document.querySelector('[data-gallery="discover"]');
     expect(gallery?.getAttribute("data-page-capacity")).toBe("25");
+    expect(gallery?.getAttribute("data-page-count")).toBe("1");
+    expect(gallery?.getAttribute("data-current-page")).toBe("1");
+    expect(visibleCardCount("Adult result for ADLT-123")).toBe(25);
+    expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+    expect(
+      screen.getByRole("button", {
+        name: "Previous Adult result for ADLT-123 page",
+      }),
+    ).toHaveProperty("disabled", true);
+    expect(
+      screen.getByRole("button", {
+        name: "Next Adult result for ADLT-123 page",
+      }),
+    ).toHaveProperty("disabled", true);
+
     resizeGallery("discover", 1528, 472);
     expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
+    expect(gallery?.getAttribute("data-page-count")).toBe("4");
+    expect(gallery?.getAttribute("data-current-page")).toBe("1");
+    expect(visibleCardCount("Adult result for ADLT-123")).toBe(7);
+    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    expect(
+      screen.getByRole("button", {
+        name: "Previous Adult result for ADLT-123 page",
+      }),
+    ).toHaveProperty("disabled", true);
+    expect(
+      screen.getByRole("button", {
+        name: "Next Adult result for ADLT-123 page",
+      }),
+    ).toHaveProperty("disabled", false);
+
     resizeGallery("discover", 1088, 956);
     expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
+    expect(gallery?.getAttribute("data-page-count")).toBe("3");
+    expect(gallery?.getAttribute("data-current-page")).toBe("1");
+    expect(visibleCardCount("Adult result for ADLT-123")).toBe(10);
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    expect(fetchJavdbCatalogMock).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
     selectAdultDiscover();
@@ -4767,10 +4886,13 @@ describe("Adult Discover and verified release comparison", () => {
       "value",
       "ADLT-123",
     );
-    expect(screen.getByText("Preserved Adult title")).toBeTruthy();
+    expect(screen.getByText("Adult fixture 01")).toBeTruthy();
     const restoredGallery = document.querySelector('[data-gallery="discover"]');
     expect(restoredGallery?.getAttribute("data-page-capacity")).toBe("10");
+    expect(restoredGallery?.getAttribute("data-page-count")).toBe("3");
     expect(restoredGallery?.getAttribute("data-current-page")).toBe("1");
+    expect(visibleCardCount("Adult result for ADLT-123")).toBe(10);
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
     expect(fetchJavdbCatalogMock).toHaveBeenCalledTimes(1);
   });
 

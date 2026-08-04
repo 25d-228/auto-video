@@ -280,6 +280,9 @@ type AdultCatalogState =
 type AdultReleaseComparisonState =
   | { status: "loading" }
   | SukebeiReleasesResult<SukebeiRelease>;
+type AppProps = {
+  adultCatalogItemsFixture?: JavdbCatalogItem[];
+};
 type VrTorrentInspectionState =
   | { status: "loading" }
   | VrTorrentInspectionResult;
@@ -3229,7 +3232,7 @@ function vrDownloadStartError(error: unknown) {
   }
 }
 
-export default function App() {
+export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [activeDestination, setActiveDestination] = useState<
     (typeof destinations)[number]
   >(destinations[0]);
@@ -3387,6 +3390,8 @@ export default function App() {
     useState<AdultReleaseComparisonState | null>(null);
   const [adultReleaseComparisonTriggerId, setAdultReleaseComparisonTriggerId] =
     useState<string | null>(null);
+  const [isAdultReleaseComparisonOpen, setIsAdultReleaseComparisonOpen] =
+    useState(false);
   const [selectedAdultRelease, setSelectedAdultRelease] =
     useState<SukebeiRelease | null>(null);
   const [adultReleaseRequestVersion, setAdultReleaseRequestVersion] =
@@ -4518,6 +4523,23 @@ export default function App() {
     navigationItems.current[nextIndex]?.focus();
   };
 
+  const closeAdultReleaseComparison = () => {
+    setIsAdultReleaseComparisonOpen(false);
+    adultReleaseRequestId.current += 1;
+    if (adultReleaseComparisonState?.status === "loading") {
+      setAdultReleaseComparisonState(null);
+      setSelectedAdultRelease(null);
+    }
+  };
+
+  const resetAdultReleaseComparison = () => {
+    setIsAdultReleaseComparisonOpen(false);
+    adultReleaseRequestId.current += 1;
+    setAdultReleaseComparisonItem(null);
+    setAdultReleaseComparisonState(null);
+    setSelectedAdultRelease(null);
+  };
+
   const navigateTo = (destination: (typeof destinations)[number]) => {
     if (
       activeDestination.id === "discover" &&
@@ -4529,10 +4551,7 @@ export default function App() {
           ? { status: "idle" }
           : currentState,
       );
-      adultReleaseRequestId.current += 1;
-      setAdultReleaseComparisonItem(null);
-      setAdultReleaseComparisonState(null);
-      setSelectedAdultRelease(null);
+      closeAdultReleaseComparison();
     }
     setActiveDestination(destination);
     if (workspace.current !== null) {
@@ -5325,13 +5344,6 @@ export default function App() {
     setSelectedVrRelease(null);
   };
 
-  const closeAdultReleaseComparison = () => {
-    adultReleaseRequestId.current += 1;
-    setAdultReleaseComparisonItem(null);
-    setAdultReleaseComparisonState(null);
-    setSelectedAdultRelease(null);
-  };
-
   const changeDiscoverCategory = (category: DiscoverCategory) => {
     if (category === discoverCategory) {
       return;
@@ -5373,7 +5385,7 @@ export default function App() {
       return;
     }
 
-    closeAdultReleaseComparison();
+    resetAdultReleaseComparison();
     adultCatalogRequestId.current += 1;
     setAdultSearchInput(canonicalCode);
     setAdultSearchInputError(null);
@@ -5388,7 +5400,7 @@ export default function App() {
       return;
     }
 
-    closeAdultReleaseComparison();
+    resetAdultReleaseComparison();
     adultCatalogRequestId.current += 1;
     setAdultCatalogState({ status: "loading" });
     setAdultCatalogRequestVersion((version) => version + 1);
@@ -5398,10 +5410,18 @@ export default function App() {
     item: JavdbCatalogItem,
     triggerId: string,
   ) => {
+    setAdultReleaseComparisonTriggerId(triggerId);
+    setIsAdultReleaseComparisonOpen(true);
+    if (
+      adultReleaseComparisonItem === item &&
+      adultReleaseComparisonState !== null
+    ) {
+      return;
+    }
+
     adultReleaseRequestId.current += 1;
     setAdultReleaseComparisonItem(item);
     setAdultReleaseComparisonState({ status: "loading" });
-    setAdultReleaseComparisonTriggerId(triggerId);
     setSelectedAdultRelease(null);
     setAdultReleaseRequestVersion((version) => version + 1);
   };
@@ -5843,6 +5863,11 @@ export default function App() {
     submittedAdultCode === null
       ? "Adult product-code search"
       : `Adult result for ${submittedAdultCode}`;
+  // Exact-code production results contain one item; the fixture exercises the real responsive pager.
+  const adultGalleryItems =
+    adultCatalogState.status === "ready"
+      ? (adultCatalogItemsFixture ?? [adultCatalogState.item])
+      : [];
   const currentVrCatalogMessage =
     vrCatalogState.status === "ready"
       ? null
@@ -7134,8 +7159,10 @@ export default function App() {
                 adultCatalogState.status === "ready" ? (
                   <ResizeAwareGallery
                     ariaLabel={adultGalleryLabel}
-                    getItemKey={(item) => item.code}
-                    items={[adultCatalogState.item]}
+                    getItemKey={(item, resultIndex) =>
+                      `${item.code}-${resultIndex}`
+                    }
+                    items={adultGalleryItems}
                     key={`adult-gallery-${adultCatalogState.item.code}`}
                     onSelectedPageChange={setAdultSelectedPage}
                     renderItem={(item) => (
@@ -8634,7 +8661,7 @@ export default function App() {
             closeAdultReleaseComparison();
           }
         }}
-        open={adultReleaseComparisonItem !== null}
+        open={isAdultReleaseComparisonOpen}
       >
         {adultReleaseComparisonItem === null ||
         adultReleaseComparisonState === null ||
