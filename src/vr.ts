@@ -17,43 +17,44 @@ export type VrCatalogItem = JavdbCatalogItem;
 export type VrCatalogResult = JavdbCatalogResult;
 
 export type SukebeiRelease = {
+  artifact?: SukebeiReleaseArtifact;
   name: string;
   source: "Sukebei";
   size: string | null;
   seeders: number | null;
 };
 
-export type VrRelease = SukebeiRelease & {
-  artifact?: VrReleaseArtifact;
-};
+export type VrRelease = SukebeiRelease;
 
-export type VrReleaseArtifact = {
+export type SukebeiReleaseArtifact = {
   expectedInfohash: string;
   providerItemId: string;
   torrentUrl: string;
 };
 
-export type VrTorrentFile = {
+export type TorrentFile = {
   path: string;
   sizeBytes: string;
 };
 
-export type VrTorrentInspection = {
+export type TorrentInspection = {
   displayName: string;
-  files: VrTorrentFile[];
+  files: TorrentFile[];
   infohash: string;
   inspectionId: string;
   totalBytes: string;
 };
 
-export type VrTorrentInspectionResult =
-  | { status: "ready"; inspection: VrTorrentInspection }
+export type TorrentInspectionResult =
+  | { status: "ready"; inspection: TorrentInspection }
   | { status: "source-unavailable" }
   | { status: "network-error" }
   | { status: "provider-error" }
   | { status: "malformed-torrent" }
   | { status: "unsupported-torrent" }
-  | { status: "infohash-mismatch" };
+  | { status: "infohash-mismatch" }
+  | { status: "stale-context" }
+  | { status: "inspection-error" };
 
 export type VrFolderState =
   | { status: "unconfigured" }
@@ -278,7 +279,7 @@ function sukebeiItemId(value: string, artifact: boolean) {
   }
 }
 
-function releaseArtifact(item: Element): VrReleaseArtifact | null {
+function releaseArtifact(item: Element): SukebeiReleaseArtifact | null {
   const providerIdentity = directChildTrimmedText(item, "guid");
   const torrentUrl = directChildTrimmedText(item, "link");
   const providerInfohash = directChildTrimmedText(item, "infoHash");
@@ -329,7 +330,6 @@ function releaseMatchesProductCode(name: string, requestedCode: string) {
 function parseSukebeiReleases(
   documentText: string,
   requestedCode: string,
-  includeArtifact: boolean,
 ): VrReleasesResult {
   const document = new DOMParser().parseFromString(
     documentText,
@@ -355,7 +355,7 @@ function parseSukebeiReleases(
       seedersText !== null && /^\d+$/.test(seedersText)
         ? Number(seedersText)
         : null;
-    const artifact = includeArtifact ? releaseArtifact(item) : null;
+    const artifact = releaseArtifact(item);
     releases.push({
       ...(artifact === null ? {} : { artifact }),
       name,
@@ -443,7 +443,7 @@ export async function fetchVerifiedSukebeiReleases(
     if (typeof documentText !== "string") {
       return { status: "malformed-provider" };
     }
-    return parseSukebeiReleases(documentText, requestedCode, true);
+    return parseSukebeiReleases(documentText, requestedCode);
   } catch (error: unknown) {
     return { status: invokeErrorStatus(error) };
   }
@@ -465,7 +465,7 @@ export async function fetchVerifiedAdultSukebeiReleases(
     if (typeof documentText !== "string") {
       return { status: "malformed-provider" };
     }
-    return parseSukebeiReleases(documentText, requestedCode, false);
+    return parseSukebeiReleases(documentText, requestedCode);
   } catch (error: unknown) {
     return { status: invokeErrorStatus(error) };
   }
@@ -473,7 +473,8 @@ export async function fetchVerifiedAdultSukebeiReleases(
 
 function torrentInspectionErrorStatus(
   error: unknown,
-): Exclude<VrTorrentInspectionResult["status"], "ready"> {
+  category: "adult" | "vr",
+): Exclude<TorrentInspectionResult["status"], "ready"> {
   const errorCode =
     typeof error === "string"
       ? error
@@ -482,22 +483,27 @@ function torrentInspectionErrorStatus(
         : "";
 
   switch (errorCode) {
-    case "vr_torrent_source_unavailable":
+    case `${category}_torrent_source_unavailable`:
       return "source-unavailable";
-    case "vr_torrent_network_error":
+    case `${category}_torrent_network_error`:
       return "network-error";
-    case "vr_torrent_provider_error":
+    case `${category}_torrent_provider_error`:
       return "provider-error";
-    case "vr_torrent_unsupported":
-      return "unsupported-torrent";
-    case "vr_torrent_infohash_mismatch":
-      return "infohash-mismatch";
-    default:
+    case `${category}_torrent_malformed`:
       return "malformed-torrent";
+    case `${category}_torrent_unsupported`:
+      return "unsupported-torrent";
+    case `${category}_torrent_infohash_mismatch`:
+      return "infohash-mismatch";
+    case `${category}_torrent_context_invalid`:
+    case `${category}_torrent_stale`:
+      return "stale-context";
+    default:
+      return "inspection-error";
   }
 }
 
-function parseTorrentInspection(value: unknown): VrTorrentInspection | null {
+function parseTorrentInspection(value: unknown): TorrentInspection | null {
   if (
     !Array.isArray(value) ||
     value.length < 6 ||
@@ -517,7 +523,7 @@ function parseTorrentInspection(value: unknown): VrTorrentInspection | null {
     return null;
   }
 
-  const files: VrTorrentFile[] = [];
+  const files: TorrentFile[] = [];
   const paths = new Set<string>();
   let summedBytes = 0n;
   for (let index = 0; index < fileValues.length; index += 2) {
@@ -544,7 +550,7 @@ function parseTorrentInspection(value: unknown): VrTorrentInspection | null {
 export async function inspectVerifiedSukebeiTorrent(
   code: string,
   release: VrRelease,
-): Promise<VrTorrentInspectionResult> {
+): Promise<TorrentInspectionResult> {
   const requestedCode = canonicalizeProductCode(code);
   if (requestedCode === null || requestedCode !== code) {
     throw new Error("A canonical VR product code is required.");
@@ -572,7 +578,42 @@ export async function inspectVerifiedSukebeiTorrent(
       ? { status: "ready", inspection }
       : { status: "infohash-mismatch" };
   } catch (error: unknown) {
-    return { status: torrentInspectionErrorStatus(error) };
+    return { status: torrentInspectionErrorStatus(error, "vr") };
+  }
+}
+
+export async function inspectVerifiedAdultSukebeiTorrent(
+  code: string,
+  release: SukebeiRelease,
+): Promise<TorrentInspectionResult> {
+  const requestedCode = canonicalizeProductCode(code);
+  if (requestedCode === null || requestedCode !== code) {
+    throw new Error("A canonical Adult product code is required.");
+  }
+  if (release.artifact === undefined) {
+    return { status: "malformed-torrent" };
+  }
+
+  try {
+    const value = await window.__TAURI__.core.invoke<unknown>(
+      "inspect_sukebei_adult_torrent",
+      {
+        code,
+        releaseName: release.name,
+        providerItemId: release.artifact.providerItemId,
+        torrentUrl: release.artifact.torrentUrl,
+        expectedInfohash: release.artifact.expectedInfohash,
+      },
+    );
+    const inspection = parseTorrentInspection(value);
+    if (inspection === null) {
+      return { status: "malformed-torrent" };
+    }
+    return inspection.infohash === release.artifact.expectedInfohash
+      ? { status: "ready", inspection }
+      : { status: "infohash-mismatch" };
+  } catch (error: unknown) {
+    return { status: torrentInspectionErrorStatus(error, "adult") };
   }
 }
 
@@ -590,8 +631,28 @@ export async function saveVerifiedVrTorrent(inspectionId: string) {
   return saved;
 }
 
+export async function saveVerifiedAdultTorrent(inspectionId: string) {
+  if (inspectionId.trim() === "") {
+    throw new Error("A current Adult torrent inspection is required.");
+  }
+  const saved = await window.__TAURI__.core.invoke<unknown>(
+    "save_verified_adult_torrent",
+    { inspectionId },
+  );
+  if (typeof saved !== "boolean") {
+    throw new Error("The native Adult save response was invalid.");
+  }
+  return saved;
+}
+
 export function invalidateVerifiedVrTorrent() {
   return window.__TAURI__.core.invoke<void>("invalidate_verified_vr_torrent");
+}
+
+export function invalidateVerifiedAdultTorrent() {
+  return window.__TAURI__.core.invoke<void>(
+    "invalidate_verified_adult_torrent",
+  );
 }
 
 function parseVrFolder(value: unknown): VrFolderState {

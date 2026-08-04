@@ -8,13 +8,16 @@ import {
   fetchExactJavdbVrItem,
   fetchVerifiedAdultSukebeiReleases,
   fetchVerifiedSukebeiReleases,
+  inspectVerifiedAdultSukebeiTorrent,
   inspectVerifiedSukebeiTorrent,
+  invalidateVerifiedAdultTorrent,
   loadVrDownloadLimit,
   loadVrDownloads,
   loadVrFolder,
   previewVrOrganization,
   scanVrLibrary,
   saveVrDownloadLimit,
+  saveVerifiedAdultTorrent,
   startVerifiedVrDownload,
 } from "./vr";
 
@@ -485,7 +488,7 @@ describe("Adult exact-code provider boundaries", () => {
     });
   });
 
-  it("keeps only unambiguous ADLT-123 releases and never returns torrent artifacts", async () => {
+  it("keeps only unambiguous ADLT-123 releases and retains a complete same-item artifact", async () => {
     const exactName = "【作品】 adlt_00123  Director’s Cut\t—\n特別版!?";
     invokeMock.mockResolvedValue(
       releaseFeed(
@@ -510,6 +513,11 @@ describe("Adult exact-code provider boundaries", () => {
       status: "ready",
       releases: [
         {
+          artifact: {
+            expectedInfohash: "0123456789abcdef0123456789abcdef01234567",
+            providerItemId: "321",
+            torrentUrl: "https://sukebei.nyaa.si/download/321.torrent",
+          },
           name: exactName,
           source: "Sukebei",
           size: "7.5 GiB",
@@ -520,6 +528,35 @@ describe("Adult exact-code provider boundaries", () => {
     expect(invokeMock).toHaveBeenCalledWith("fetch_sukebei_adult_releases", {
       code: "ADLT-123",
     });
+  });
+
+  it("keeps incomplete exact Adult releases metadata-only", async () => {
+    const validHash = "0123456789abcdef0123456789abcdef01234567";
+    invokeMock.mockResolvedValue(
+      releaseFeed(
+        [
+          `<item><title>ADLT-123 complete</title>${releaseArtifactElements("321", validHash)}</item>`,
+          releaseItem("ADLT-123 missing artifact"),
+          `<item><title>ADLT-123 mismatched item</title>${releaseArtifactElements("322", validHash, "https://sukebei.nyaa.si/download/323.torrent")}</item>`,
+          `<item><title>ADLT-123 credentials</title>${releaseArtifactElements("324", validHash, "https://user@sukebei.nyaa.si/download/324.torrent")}</item>`,
+          `<item><title>ADLT-123 query</title>${releaseArtifactElements("325", validHash, "https://sukebei.nyaa.si/download/325.torrent?alternate=1")}</item>`,
+          `<item><title>ADLT-123 invalid hash</title>${releaseArtifactElements("326", "invalid")}</item>`,
+        ].join(""),
+      ),
+    );
+
+    const result = await fetchVerifiedAdultSukebeiReleases("ADLT-123");
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") return;
+    expect(result.releases).toHaveLength(6);
+    expect(result.releases[0].artifact).toEqual({
+      expectedInfohash: validHash,
+      providerItemId: "321",
+      torrentUrl: "https://sukebei.nyaa.si/download/321.torrent",
+    });
+    for (const release of result.releases.slice(1)) {
+      expect(release.artifact).toBeUndefined();
+    }
   });
 
   it("returns a safe empty Adult result for unverified candidates", async () => {
@@ -556,6 +593,101 @@ describe("Adult exact-code provider boundaries", () => {
     await expect(
       fetchVerifiedAdultSukebeiReleases("adlt-123"),
     ).rejects.toThrow("A canonical Adult product code is required.");
+  });
+});
+
+describe("verified Adult Sukebei torrent inspection", () => {
+  const release = {
+    artifact: {
+      expectedInfohash: "0123456789abcdef0123456789abcdef01234567",
+      providerItemId: "321",
+      torrentUrl: "https://sukebei.nyaa.si/download/321.torrent",
+    },
+    name: "【Adult】 ADLT-123  Exact\t—\n特別版!?",
+    seeders: 4,
+    size: "8.0 GiB",
+    source: "Sukebei" as const,
+  };
+
+  it("uses only the Adult inspection and save commands with exact identity", async () => {
+    invokeMock.mockResolvedValueOnce([
+      "adult-1-1-321",
+      "作品  —  Exact",
+      release.artifact.expectedInfohash,
+      "12",
+      "Folder/Part  1 — 映画.mkv",
+      "5",
+      "Folder/特別版  B.mp4",
+      "7",
+    ]);
+
+    await expect(
+      inspectVerifiedAdultSukebeiTorrent("ADLT-123", release),
+    ).resolves.toMatchObject({
+      status: "ready",
+      inspection: {
+        displayName: "作品  —  Exact",
+        inspectionId: "adult-1-1-321",
+        totalBytes: "12",
+      },
+    });
+    expect(invokeMock).toHaveBeenCalledWith("inspect_sukebei_adult_torrent", {
+      code: "ADLT-123",
+      expectedInfohash: release.artifact.expectedInfohash,
+      providerItemId: "321",
+      releaseName: release.name,
+      torrentUrl: release.artifact.torrentUrl,
+    });
+
+    invokeMock.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    await expect(saveVerifiedAdultTorrent("adult-1-1-321")).resolves.toBe(false);
+    await expect(saveVerifiedAdultTorrent("adult-1-1-321")).resolves.toBe(true);
+    expect(invokeMock).toHaveBeenLastCalledWith("save_verified_adult_torrent", {
+      inspectionId: "adult-1-1-321",
+    });
+    invokeMock.mockResolvedValueOnce(undefined);
+    await expect(invalidateVerifiedAdultTorrent()).resolves.toBeUndefined();
+    expect(invokeMock).toHaveBeenLastCalledWith(
+      "invalidate_verified_adult_torrent",
+    );
+    expect(
+      invokeMock.mock.calls.some(([command]) =>
+        [
+          "inspect_sukebei_vr_torrent",
+          "save_verified_vr_torrent",
+          "start_verified_vr_download",
+        ].includes(command),
+      ),
+    ).toBe(false);
+  });
+
+  it("distinguishes Adult failures and rejects metadata-only releases", async () => {
+    for (const [error, status] of [
+      ["adult_torrent_source_unavailable", "source-unavailable"],
+      ["adult_torrent_network_error", "network-error"],
+      ["adult_torrent_provider_error", "provider-error"],
+      ["adult_torrent_malformed", "malformed-torrent"],
+      ["adult_torrent_unsupported", "unsupported-torrent"],
+      ["adult_torrent_infohash_mismatch", "infohash-mismatch"],
+      ["adult_torrent_context_invalid", "stale-context"],
+      ["adult_torrent_stale", "stale-context"],
+      ["unexpected", "inspection-error"],
+    ]) {
+      invokeMock.mockRejectedValueOnce(error);
+      await expect(
+        inspectVerifiedAdultSukebeiTorrent("ADLT-123", release),
+      ).resolves.toEqual({ status });
+    }
+
+    await expect(
+      inspectVerifiedAdultSukebeiTorrent("ADLT-123", {
+        name: "ADLT-123 metadata only",
+        seeders: null,
+        size: null,
+        source: "Sukebei",
+      }),
+    ).resolves.toEqual({ status: "malformed-torrent" });
+    expect(invokeMock).toHaveBeenCalledTimes(9);
   });
 });
 

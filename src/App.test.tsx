@@ -83,6 +83,13 @@ let fetchSukebeiAdultReleasesMock: Mock<
 let fetchSukebeiVrReleasesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string>
 >;
+let inspectSukebeiAdultTorrentMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let invalidateVerifiedAdultTorrentMock: Mock<() => Promise<void>>;
+let saveVerifiedAdultTorrentMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<boolean>
+>;
 let inspectSukebeiVrTorrentMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
@@ -282,6 +289,24 @@ async function openVrReleaseComparison(code = "MDVR-419") {
   fireEvent.click(trigger);
   return screen.findByRole("list", {
     name: `Verified releases for ${code}`,
+  });
+}
+
+async function openAdultReleaseComparison(code = "ADLT-123") {
+  render(<App />);
+  selectDiscover();
+  selectAdultDiscover();
+  fireEvent.change(
+    screen.getByRole("textbox", { name: "Search product code" }),
+    { target: { value: code } },
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Search" }));
+  const trigger = await screen.findByRole("button", {
+    name: `Find releases: ${code}`,
+  });
+  fireEvent.click(trigger);
+  return screen.findByRole("list", {
+    name: `Verified Adult releases for ${code}`,
   });
 }
 
@@ -517,6 +542,16 @@ beforeEach(() => {
   fetchSukebeiVrReleasesMock = vi
     .fn()
     .mockResolvedValue(sukebeiReleaseFixture([]));
+  inspectSukebeiAdultTorrentMock = vi.fn().mockResolvedValue([
+    "adult-1-1-321",
+    "Verified Adult torrent",
+    "0123456789abcdef0123456789abcdef01234567",
+    "5",
+    "Verified Adult file.mp4",
+    "5",
+  ]);
+  invalidateVerifiedAdultTorrentMock = vi.fn().mockResolvedValue(undefined);
+  saveVerifiedAdultTorrentMock = vi.fn().mockResolvedValue(true);
   inspectSukebeiVrTorrentMock = vi.fn().mockResolvedValue([
     "inspection-123",
     "Verified torrent",
@@ -652,6 +687,12 @@ beforeEach(() => {
           return fetchSukebeiAdultReleasesMock(parameters);
         case "fetch_sukebei_vr_releases":
           return fetchSukebeiVrReleasesMock(parameters);
+        case "inspect_sukebei_adult_torrent":
+          return inspectSukebeiAdultTorrentMock(parameters);
+        case "invalidate_verified_adult_torrent":
+          return invalidateVerifiedAdultTorrentMock();
+        case "save_verified_adult_torrent":
+          return saveVerifiedAdultTorrentMock(parameters);
         case "inspect_sukebei_vr_torrent":
           return inspectSukebeiVrTorrentMock(parameters);
         case "invalidate_verified_vr_torrent":
@@ -4596,6 +4637,336 @@ describe("Adult Discover and verified release comparison", () => {
     expect(inspectSukebeiVrTorrentMock).not.toHaveBeenCalled();
     expect(saveVerifiedVrTorrentMock).not.toHaveBeenCalled();
     expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("inspects and saves only the complete selected Adult artifact without downloading", async () => {
+    const exactReleaseName = "【Adult】 ADLT-123  Exact\t—\n特別版!?";
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    fetchJavdbCatalogMock.mockResolvedValue(
+      javdbCatalogFixture("ADLT-123", "Inspectable Adult title"),
+    );
+    fetchSukebeiAdultReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        { name: "ADLT-123 metadata only" },
+        {
+          infohash: expectedInfohash,
+          itemId: "321",
+          name: exactReleaseName,
+          seeders: 7,
+          size: "6.5 GiB",
+        },
+      ]),
+    );
+    const inspectionResult = createDeferred<string[]>();
+    inspectSukebeiAdultTorrentMock.mockReturnValue(inspectionResult.promise);
+    const releaseList = await openAdultReleaseComparison();
+
+    fireEvent.click(
+      within(releaseList).getByRole("button", { name: /metadata only/ }),
+    );
+    expect(
+      screen.getByText(/no complete safe provider artifact identity/),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Inspect torrent" })).toBeNull();
+
+    fireEvent.click(
+      within(releaseList).getByRole("button", { name: /Exact/ }),
+    );
+    const inspectButton = screen.getByRole("button", {
+      name: "Inspect torrent",
+    });
+    fireEvent.click(inspectButton);
+    expect(
+      await screen.findByRole("heading", { name: "Inspecting verified torrent" }),
+    ).toBeTruthy();
+    expect(document.querySelector(".vr-torrent__release-name")?.textContent).toBe(
+      exactReleaseName,
+    );
+    expect(screen.queryByRole("button", { name: "Save `.torrent`" })).toBeNull();
+
+    await act(async () => {
+      inspectionResult.resolve([
+        "adult-1-1-321",
+        "作品  —  Exact  Torrent",
+        expectedInfohash,
+        "12",
+        "Folder/Part  1 — 映画.mkv",
+        "5",
+        "Folder/特別版  B.mp4",
+        "7",
+      ]);
+      await inspectionResult.promise;
+    });
+
+    expect(inspectSukebeiAdultTorrentMock).toHaveBeenCalledWith({
+      code: "ADLT-123",
+      expectedInfohash,
+      providerItemId: "321",
+      releaseName: exactReleaseName,
+      torrentUrl: "https://sukebei.nyaa.si/download/321.torrent",
+    });
+    const torrentNameTerm = screen.getByText("Torrent name");
+    expect(torrentNameTerm.parentElement?.querySelector("dd")?.textContent).toBe(
+      "作品  —  Exact  Torrent",
+    );
+    expect(screen.getByText(expectedInfohash)).toBeTruthy();
+    expect(
+      screen.getByText("Total size").parentElement?.querySelector("dd")?.textContent,
+    ).toBe("12 B (12 bytes)");
+    const files = screen.getByRole("list", {
+      name: "Files in verified Adult torrent for ADLT-123",
+    });
+    const fileRows = within(files).getAllByRole("listitem");
+    expect(fileRows).toHaveLength(2);
+    expect(fileRows[0].querySelector("span")?.textContent).toBe(
+      "Folder/Part  1 — 映画.mkv",
+    );
+    expect(fileRows[1].querySelector("span")?.textContent).toBe(
+      "Folder/特別版  B.mp4",
+    );
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByRole("button", { name: /start download/i })).toBeNull();
+    expect(screen.getByText(/does not download media/)).toBeTruthy();
+
+    saveVerifiedAdultTorrentMock
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+      .mockRejectedValueOnce("adult_torrent_save_failed");
+    const saveButton = screen.getByRole("button", { name: "Save `.torrent`" });
+    fireEvent.click(saveButton);
+    await waitFor(() =>
+      expect(saveVerifiedAdultTorrentMock).toHaveBeenCalledWith({
+        inspectionId: "adult-1-1-321",
+      }),
+    );
+    expect(screen.queryByText("Verified Adult torrent file saved.")).toBeNull();
+    fireEvent.click(saveButton);
+    expect(
+      await screen.findByText("Verified Adult torrent file saved."),
+    ).toBeTruthy();
+    fireEvent.click(saveButton);
+    expect(
+      await screen.findByText(
+        "The verified Adult torrent file could not be saved.",
+      ),
+    ).toBeTruthy();
+
+    const torrentDialog = screen
+      .getByText("Exact selected release")
+      .closest('[role="dialog"]');
+    fireEvent.click(
+      within(torrentDialog as HTMLElement).getByRole("button", { name: "Close" }),
+    );
+    await waitFor(() => expect(document.activeElement).toBe(inspectButton));
+    expect(
+      screen.getByRole("heading", { name: "Selected release" }),
+    ).toBeTruthy();
+    expect(fetchSukebeiAdultReleasesMock).toHaveBeenCalledTimes(1);
+    expect(inspectSukebeiVrTorrentMock).not.toHaveBeenCalled();
+    expect(saveVerifiedVrTorrentMock).not.toHaveBeenCalled();
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps Adult inspection failures local, distinct, and retryable", async () => {
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    fetchJavdbCatalogMock.mockResolvedValue(javdbCatalogFixture("ADLT-123"));
+    fetchSukebeiAdultReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        {
+          infohash: expectedInfohash,
+          itemId: "321",
+          name: "ADLT-123 exact artifact",
+        },
+      ]),
+    );
+    for (const error of [
+      "adult_torrent_source_unavailable",
+      "adult_torrent_network_error",
+      "adult_torrent_provider_error",
+      "adult_torrent_malformed",
+      "adult_torrent_unsupported",
+      "adult_torrent_infohash_mismatch",
+      "adult_torrent_context_invalid",
+      "unexpected_error",
+    ]) {
+      inspectSukebeiAdultTorrentMock.mockRejectedValueOnce(error);
+    }
+    const releaseList = await openAdultReleaseComparison();
+    fireEvent.click(within(releaseList).getByRole("button"));
+    fireEvent.click(screen.getByRole("button", { name: "Inspect torrent" }));
+
+    for (const heading of [
+      "Torrent artifact is unavailable",
+      "Torrent artifact could not be reached",
+      "Torrent provider rejected the request",
+      "Torrent artifact is malformed",
+      "Torrent artifact is unsupported",
+      "Torrent identity did not match",
+      "Torrent inspection is no longer current",
+      "Torrent inspection could not be completed",
+    ]) {
+      expect(await screen.findByRole("heading", { name: heading })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Save `.torrent`" })).toBeNull();
+      if (heading !== "Torrent inspection could not be completed") {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Retry inspection" }),
+        );
+      }
+    }
+    expect(
+      within(releaseList).getByText("ADLT-123 exact artifact"),
+    ).toBeTruthy();
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("invalidates late Adult inspection and save work across selection and navigation", async () => {
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    fetchJavdbCatalogMock.mockResolvedValue(javdbCatalogFixture("ADLT-123"));
+    fetchSukebeiAdultReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        {
+          infohash: expectedInfohash,
+          itemId: "321",
+          name: "ADLT-123 release A",
+        },
+        {
+          infohash: expectedInfohash,
+          itemId: "322",
+          name: "ADLT-123 release B",
+        },
+      ]),
+    );
+    const inspectionA = createDeferred<string[]>();
+    inspectSukebeiAdultTorrentMock
+      .mockReturnValueOnce(inspectionA.promise)
+      .mockResolvedValueOnce([
+        "adult-1-2-322",
+        "Release B torrent",
+        expectedInfohash,
+        "7",
+        "B/Exact file.mp4",
+        "7",
+      ]);
+    const releaseList = await openAdultReleaseComparison();
+    const releaseA = within(releaseList).getByRole("button", {
+      name: /release A/,
+    });
+    const releaseB = within(releaseList).getByRole("button", {
+      name: /release B/,
+    });
+    fireEvent.click(releaseA);
+    fireEvent.click(screen.getByRole("button", { name: "Inspect torrent" }));
+    await screen.findByRole("heading", { name: "Inspecting verified torrent" });
+
+    fireEvent.click(releaseB);
+    expect(screen.queryByText("Exact selected release")).toBeNull();
+    await act(async () => {
+      inspectionA.resolve([
+        "adult-1-1-321",
+        "Late release A torrent",
+        expectedInfohash,
+        "5",
+        "A/Late file.mp4",
+        "5",
+      ]);
+      await inspectionA.promise;
+    });
+    expect(screen.queryByText("Late release A torrent")).toBeNull();
+
+    const inspectB = screen.getByRole("button", { name: "Inspect torrent" });
+    fireEvent.click(inspectB);
+    expect(await screen.findByText("Release B torrent")).toBeTruthy();
+    const saveResult = createDeferred<boolean>();
+    saveVerifiedAdultTorrentMock.mockReturnValueOnce(saveResult.promise);
+    const saveButton = screen.getByRole("button", { name: "Save `.torrent`" });
+    fireEvent.click(saveButton);
+    fireEvent.click(saveButton);
+    expect(saveVerifiedAdultTorrentMock).toHaveBeenCalledTimes(1);
+    const torrentDialog = screen
+      .getByText("Exact selected release")
+      .closest('[role="dialog"]');
+    fireEvent.click(
+      within(torrentDialog as HTMLElement).getByRole("button", { name: "Close" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    selectSettings();
+    await act(async () => {
+      saveResult.resolve(true);
+      await saveResult.promise;
+    });
+    expect(screen.queryByText("Verified Adult torrent file saved.")).toBeNull();
+    expect(invalidateVerifiedAdultTorrentMock).toHaveBeenCalled();
+
+    selectDiscover();
+    selectAdultDiscover();
+    const comparisonTrigger = screen.getByRole("button", {
+      name: "Find releases: ADLT-123",
+    });
+    fireEvent.click(comparisonTrigger);
+    const restoredReleaseB = screen.getByRole("button", { name: /release B/ });
+    expect(restoredReleaseB.getAttribute("aria-pressed")).toBe("true");
+    expect(fetchSukebeiAdultReleasesMock).toHaveBeenCalledTimes(1);
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("dismisses pending Adult inspection by keyboard and backdrop with focus return", async () => {
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    fetchJavdbCatalogMock.mockResolvedValue(javdbCatalogFixture("ADLT-123"));
+    fetchSukebeiAdultReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        {
+          infohash: expectedInfohash,
+          itemId: "321",
+          name: "ADLT-123 pending artifact",
+        },
+      ]),
+    );
+    const keyboardInspection = createDeferred<string[]>();
+    const backdropInspection = createDeferred<string[]>();
+    inspectSukebeiAdultTorrentMock
+      .mockReturnValueOnce(keyboardInspection.promise)
+      .mockReturnValueOnce(backdropInspection.promise);
+    const releaseList = await openAdultReleaseComparison();
+    fireEvent.click(within(releaseList).getByRole("button"));
+    const inspectButton = screen.getByRole("button", {
+      name: "Inspect torrent",
+    });
+
+    fireEvent.click(inspectButton);
+    await screen.findByRole("heading", { name: "Inspecting verified torrent" });
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(inspectButton));
+    await act(async () => {
+      keyboardInspection.resolve([
+        "adult-1-1-321",
+        "Late keyboard torrent",
+        expectedInfohash,
+        "5",
+        "Late keyboard.mp4",
+        "5",
+      ]);
+      await keyboardInspection.promise;
+    });
+    expect(screen.queryByText("Late keyboard torrent")).toBeNull();
+
+    fireEvent.click(inspectButton);
+    await screen.findByRole("heading", { name: "Inspecting verified torrent" });
+    fireEvent.click(document.querySelector(".vr-torrent__backdrop") as Element);
+    await waitFor(() => expect(document.activeElement).toBe(inspectButton));
+    await act(async () => {
+      backdropInspection.resolve([
+        "adult-1-2-321",
+        "Late backdrop torrent",
+        expectedInfohash,
+        "5",
+        "Late backdrop.mp4",
+        "5",
+      ]);
+      await backdropInspection.promise;
+    });
+    expect(screen.queryByText("Late backdrop torrent")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save `.torrent`" })).toBeNull();
+    expect(invalidateVerifiedAdultTorrentMock).toHaveBeenCalled();
   });
 
   it("restores completed Adult releases and the exact selection without another request", async () => {

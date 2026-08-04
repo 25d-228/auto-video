@@ -95,7 +95,9 @@ import {
   fetchExactJavdbVrItem,
   fetchVerifiedAdultSukebeiReleases,
   fetchVerifiedSukebeiReleases,
+  inspectVerifiedAdultSukebeiTorrent,
   inspectVerifiedSukebeiTorrent,
+  invalidateVerifiedAdultTorrent,
   invalidateVerifiedVrTorrent,
   listVrDownloads,
   loadVrDownloadLimit,
@@ -107,6 +109,7 @@ import {
   revealVrFile,
   resumeVrDownload,
   saveVrDownloadLimit,
+  saveVerifiedAdultTorrent,
   saveVerifiedVrTorrent,
   scanVrLibrary,
   startVerifiedVrDownload,
@@ -120,11 +123,11 @@ import {
   type JavdbCatalogResult,
   type SukebeiRelease,
   type SukebeiReleasesResult,
+  type TorrentInspectionResult,
   type VrCatalogItem,
   type VrCatalogResult,
   type VrRelease,
   type VrReleasesResult,
-  type VrTorrentInspectionResult,
 } from "@/vr";
 
 import "./index.css";
@@ -283,10 +286,10 @@ type AdultReleaseComparisonState =
 type AppProps = {
   adultCatalogItemsFixture?: JavdbCatalogItem[];
 };
-type VrTorrentInspectionState =
+type TorrentInspectionState =
   | { status: "loading" }
-  | VrTorrentInspectionResult;
-type VrTorrentSaveState = "idle" | "saving" | "success" | "error";
+  | TorrentInspectionResult;
+type TorrentSaveState = "idle" | "saving" | "success" | "error";
 type VrTorrentStartState =
   | { status: "idle" }
   | { status: "starting" }
@@ -331,6 +334,11 @@ type VrDownloadSummary = {
 type VrTorrentInspectionContext = {
   item: VrCatalogItem;
   release: VrRelease;
+  triggerId: string;
+};
+type AdultTorrentInspectionContext = {
+  item: JavdbCatalogItem;
+  release: SukebeiRelease;
   triggerId: string;
 };
 type GalleryVariant = "discover" | "library";
@@ -915,6 +923,16 @@ const vrTorrentMessages = {
   "infohash-mismatch": {
     heading: "Torrent identity did not match",
     message: "The fetched artifact did not match the selected provider item.",
+    role: "alert",
+  },
+  "stale-context": {
+    heading: "Torrent inspection is no longer current",
+    message: "Return to the current selected release and inspect it again.",
+    role: "alert",
+  },
+  "inspection-error": {
+    heading: "Torrent inspection could not be completed",
+    message: "The verified artifact could not be inspected. Try again.",
     role: "alert",
   },
 } as const;
@@ -1566,6 +1584,7 @@ function VrReleaseComparison({
 
 function AdultReleaseComparison({
   item,
+  onInspectRelease,
   onRetry,
   onSelectRelease,
   selectedRelease,
@@ -1573,6 +1592,7 @@ function AdultReleaseComparison({
   triggerId,
 }: {
   item: JavdbCatalogItem;
+  onInspectRelease: (release: SukebeiRelease, triggerId: string) => void;
   onRetry: () => void;
   onSelectRelease: (release: SukebeiRelease) => void;
   selectedRelease: SukebeiRelease | null;
@@ -1610,7 +1630,8 @@ function AdultReleaseComparison({
             />
           </div>
           <Dialog.Description className="vr-releases__description">
-            Metadata-only comparison of releases verified for this product code.
+            Compare releases verified for this product code and inspect complete
+            safe torrent artifacts explicitly.
           </Dialog.Description>
 
           {releases === null || noVerifiedReleases ? (
@@ -1711,6 +1732,23 @@ function AdultReleaseComparison({
                       <dd>{selectedRelease.seeders ?? "Unavailable"}</dd>
                     </div>
                   </dl>
+                  {selectedRelease.artifact === undefined ? (
+                    <p className="vr-releases__artifact-unavailable">
+                      Torrent inspection is unavailable because this release
+                      has no complete safe provider artifact identity.
+                    </p>
+                  ) : (
+                    <Button
+                      id={`inspect-adult-torrent-${selectedRelease.artifact.providerItemId}`}
+                      onClick={(event) =>
+                        onInspectRelease(selectedRelease, event.currentTarget.id)
+                      }
+                      type="button"
+                    >
+                      <AppIcon name="details" />
+                      Inspect torrent
+                    </Button>
+                  )}
                 </section>
               )}
             </div>
@@ -1745,10 +1783,10 @@ function VrTorrentInspectionDialog({
   onSave: () => void;
   onStart: () => void;
   onToggleFile: (fileId: number) => void;
-  saveState: VrTorrentSaveState;
+  saveState: TorrentSaveState;
   selectedFileIds: Set<number>;
   startState: VrTorrentStartState;
-  state: VrTorrentInspectionState;
+  state: TorrentInspectionState;
 }) {
   const currentMessage =
     vrTorrentMessages[state.status === "ready" ? "loading" : state.status];
@@ -1893,6 +1931,136 @@ function VrTorrentInspectionDialog({
                   </div>
                 ) : startState.status === "error" ? (
                   <p role="alert">{startState.message}</p>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <div className="vr-torrent__state" role={currentMessage.role}>
+              <span className="empty-state__icon">
+                <AppIcon name="releases" />
+              </span>
+              <div>
+                <h3>{currentMessage.heading}</h3>
+                <p>{currentMessage.message}</p>
+                {state.status === "loading" ? null : (
+                  <Button onClick={onRetry} type="button" variant="outline">
+                    <AppIcon name="refresh" />
+                    Retry inspection
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
+  );
+}
+
+function AdultTorrentInspectionDialog({
+  context,
+  onRetry,
+  onSave,
+  saveState,
+  state,
+}: {
+  context: AdultTorrentInspectionContext;
+  onRetry: () => void;
+  onSave: () => void;
+  saveState: TorrentSaveState;
+  state: TorrentInspectionState;
+}) {
+  const currentMessage =
+    vrTorrentMessages[state.status === "ready" ? "loading" : state.status];
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="vr-torrent__backdrop" />
+      <Dialog.Viewport className="vr-torrent__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading" || saveState === "saving"}
+          className="vr-torrent__popup"
+          finalFocus={() => document.getElementById(context.triggerId)}
+        >
+          <div className="vr-torrent__heading">
+            <div>
+              <p className="card-eyebrow">Verified Adult Sukebei torrent</p>
+              <Dialog.Title>{context.item.code}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="vr-torrent__description">
+            <span>Exact selected release</span>
+            <span className="vr-torrent__release-name">
+              {context.release.name}
+            </span>
+          </Dialog.Description>
+
+          {state.status === "ready" ? (
+            <div className="vr-torrent__content">
+              <dl className="vr-torrent__metadata">
+                <div>
+                  <dt>Torrent name</dt>
+                  <dd>{state.inspection.displayName}</dd>
+                </div>
+                <div>
+                  <dt>Verified infohash</dt>
+                  <dd>{state.inspection.infohash}</dd>
+                </div>
+                <div>
+                  <dt>Total size</dt>
+                  <dd>
+                    {formatStorageBytes(BigInt(state.inspection.totalBytes))} (
+                    {state.inspection.totalBytes} bytes)
+                  </dd>
+                </div>
+                <div>
+                  <dt>Files</dt>
+                  <dd>{state.inspection.files.length}</dd>
+                </div>
+              </dl>
+              <h3>Complete file list</h3>
+              <div className="vr-torrent__file-selection">
+                <p>Inspection only. Saving this torrent does not download media.</p>
+                <ul
+                  aria-label={`Files in verified Adult torrent for ${context.item.code}`}
+                >
+                  {state.inspection.files.map((file) => (
+                    <li key={file.path}>
+                      <div className="adult-torrent__file">
+                        <span>{file.path}</span>
+                        <span>
+                          {formatStorageBytes(BigInt(file.sizeBytes))} (
+                          {file.sizeBytes} bytes)
+                        </span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div className="vr-torrent__actions">
+                <Button
+                  disabled={saveState === "saving"}
+                  onClick={onSave}
+                  type="button"
+                  variant="outline"
+                >
+                  <AppIcon name="downloads" />
+                  {saveState === "saving" ? "Saving…" : "Save `.torrent`"}
+                </Button>
+                {saveState === "success" ? (
+                  <p role="status">Verified Adult torrent file saved.</p>
+                ) : saveState === "error" ? (
+                  <p role="alert">
+                    The verified Adult torrent file could not be saved.
+                  </p>
                 ) : null}
               </div>
             </div>
@@ -3396,6 +3564,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     useState<SukebeiRelease | null>(null);
   const [adultReleaseRequestVersion, setAdultReleaseRequestVersion] =
     useState(0);
+  const [adultTorrentInspectionContext, setAdultTorrentInspectionContext] =
+    useState<AdultTorrentInspectionContext | null>(null);
+  const [adultTorrentInspectionState, setAdultTorrentInspectionState] =
+    useState<TorrentInspectionState | null>(null);
+  const [adultTorrentInspectionRequestVersion, setAdultTorrentInspectionRequestVersion] =
+    useState(0);
+  const [adultTorrentSaveState, setAdultTorrentSaveState] =
+    useState<TorrentSaveState>("idle");
   const [vrSearchInput, setVrSearchInput] = useState("");
   const [vrSearchInputError, setVrSearchInputError] = useState<string | null>(
     null,
@@ -3418,11 +3594,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [torrentInspectionContext, setTorrentInspectionContext] =
     useState<VrTorrentInspectionContext | null>(null);
   const [torrentInspectionState, setTorrentInspectionState] =
-    useState<VrTorrentInspectionState | null>(null);
+    useState<TorrentInspectionState | null>(null);
   const [torrentInspectionRequestVersion, setTorrentInspectionRequestVersion] =
     useState(0);
   const [torrentSaveState, setTorrentSaveState] =
-    useState<VrTorrentSaveState>("idle");
+    useState<TorrentSaveState>("idle");
   const [torrentStartState, setTorrentStartState] =
     useState<VrTorrentStartState>({ status: "idle" });
   const [selectedTorrentFileIds, setSelectedTorrentFileIds] = useState<
@@ -3467,6 +3643,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const tvDetailsRequestId = useRef(0);
   const adultCatalogRequestId = useRef(0);
   const adultReleaseRequestId = useRef(0);
+  const adultTorrentInspectionRequestId = useRef(0);
+  const adultTorrentSaveRequestId = useRef(0);
   const vrCatalogRequestId = useRef(0);
   const releaseRequestId = useRef(0);
   const torrentInspectionRequestId = useRef(0);
@@ -3486,6 +3664,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const adultLibraryScanRequestId = useRef(0);
   const adultStorageRequestId = useRef(0);
   const torrentSavePending = useRef(false);
+  const adultTorrentSavePending = useRef(false);
   const torrentStartPending = useRef(false);
   const vrDownloadsRefreshPending = useRef(false);
   const vrDownloadLimitSavePending = useRef(false);
@@ -4435,6 +4614,29 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   }, [adultReleaseComparisonItem, adultReleaseRequestVersion]);
 
   useEffect(() => {
+    const requestId = ++adultTorrentInspectionRequestId.current;
+    if (adultTorrentInspectionContext === null) {
+      return;
+    }
+
+    setAdultTorrentInspectionState({ status: "loading" });
+    setAdultTorrentSaveState("idle");
+    void inspectVerifiedAdultSukebeiTorrent(
+      adultTorrentInspectionContext.item.code,
+      adultTorrentInspectionContext.release,
+    ).then((result) => {
+      if (requestId === adultTorrentInspectionRequestId.current) {
+        setAdultTorrentInspectionState(result);
+      }
+    });
+
+    return () => {
+      adultTorrentInspectionRequestId.current += 1;
+      void invalidateVerifiedAdultTorrent().catch(() => undefined);
+    };
+  }, [adultTorrentInspectionContext, adultTorrentInspectionRequestVersion]);
+
+  useEffect(() => {
     const requestId = ++vrCatalogRequestId.current;
     if (submittedVrCode === null) {
       return;
@@ -4523,7 +4725,20 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     navigationItems.current[nextIndex]?.focus();
   };
 
+  const closeAdultTorrentInspection = () => {
+    const hadCurrentInspection = adultTorrentInspectionContext !== null;
+    adultTorrentInspectionRequestId.current += 1;
+    adultTorrentSaveRequestId.current += 1;
+    setAdultTorrentInspectionContext(null);
+    setAdultTorrentInspectionState(null);
+    setAdultTorrentSaveState("idle");
+    if (hadCurrentInspection) {
+      void invalidateVerifiedAdultTorrent().catch(() => undefined);
+    }
+  };
+
   const closeAdultReleaseComparison = () => {
+    closeAdultTorrentInspection();
     setIsAdultReleaseComparisonOpen(false);
     adultReleaseRequestId.current += 1;
     if (adultReleaseComparisonState?.status === "loading") {
@@ -4533,6 +4748,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   };
 
   const resetAdultReleaseComparison = () => {
+    closeAdultTorrentInspection();
     setIsAdultReleaseComparisonOpen(false);
     adultReleaseRequestId.current += 1;
     setAdultReleaseComparisonItem(null);
@@ -5431,6 +5647,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       return;
     }
 
+    closeAdultTorrentInspection();
     adultReleaseRequestId.current += 1;
     setAdultReleaseComparisonState({ status: "loading" });
     setSelectedAdultRelease(null);
@@ -5442,7 +5659,74 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       adultReleaseComparisonState?.status === "ready" &&
       adultReleaseComparisonState.releases.includes(release)
     ) {
+      if (selectedAdultRelease !== release) {
+        closeAdultTorrentInspection();
+      }
       setSelectedAdultRelease(release);
+    }
+  };
+
+  const openAdultTorrentInspection = (
+    release: SukebeiRelease,
+    triggerId: string,
+  ) => {
+    if (
+      release.artifact === undefined ||
+      adultReleaseComparisonItem === null ||
+      selectedAdultRelease !== release
+    ) {
+      return;
+    }
+
+    adultTorrentInspectionRequestId.current += 1;
+    adultTorrentSaveRequestId.current += 1;
+    setAdultTorrentInspectionContext({
+      item: adultReleaseComparisonItem,
+      release,
+      triggerId,
+    });
+    setAdultTorrentInspectionState({ status: "loading" });
+    setAdultTorrentSaveState("idle");
+    setAdultTorrentInspectionRequestVersion((version) => version + 1);
+  };
+
+  const retryAdultTorrentInspection = () => {
+    if (adultTorrentInspectionContext === null) {
+      return;
+    }
+    adultTorrentInspectionRequestId.current += 1;
+    adultTorrentSaveRequestId.current += 1;
+    setAdultTorrentInspectionState({ status: "loading" });
+    setAdultTorrentSaveState("idle");
+    setAdultTorrentInspectionRequestVersion((version) => version + 1);
+  };
+
+  const saveAdultTorrent = async () => {
+    if (
+      adultTorrentSavePending.current ||
+      adultTorrentInspectionState?.status !== "ready"
+    ) {
+      return;
+    }
+
+    adultTorrentSavePending.current = true;
+    const requestId = ++adultTorrentSaveRequestId.current;
+    setAdultTorrentSaveState("saving");
+    try {
+      const saved = await saveVerifiedAdultTorrent(
+        adultTorrentInspectionState.inspection.inspectionId,
+      );
+      if (requestId === adultTorrentSaveRequestId.current && saved) {
+        setAdultTorrentSaveState("success");
+      } else if (requestId === adultTorrentSaveRequestId.current) {
+        setAdultTorrentSaveState("idle");
+      }
+    } catch {
+      if (requestId === adultTorrentSaveRequestId.current) {
+        setAdultTorrentSaveState("error");
+      }
+    } finally {
+      adultTorrentSavePending.current = false;
     }
   };
 
@@ -8657,7 +8941,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       </Dialog.Root>
       <Dialog.Root
         onOpenChange={(open) => {
-          if (!open) {
+          if (!open && adultTorrentInspectionContext === null) {
             closeAdultReleaseComparison();
           }
         }}
@@ -8668,11 +8952,31 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         adultReleaseComparisonTriggerId === null ? null : (
           <AdultReleaseComparison
             item={adultReleaseComparisonItem}
+            onInspectRelease={openAdultTorrentInspection}
             onRetry={retryAdultReleaseComparison}
             onSelectRelease={selectAdultRelease}
             selectedRelease={selectedAdultRelease}
             state={adultReleaseComparisonState}
             triggerId={adultReleaseComparisonTriggerId}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeAdultTorrentInspection();
+          }
+        }}
+        open={adultTorrentInspectionContext !== null}
+      >
+        {adultTorrentInspectionContext === null ||
+        adultTorrentInspectionState === null ? null : (
+          <AdultTorrentInspectionDialog
+            context={adultTorrentInspectionContext}
+            onRetry={retryAdultTorrentInspection}
+            onSave={() => void saveAdultTorrent()}
+            saveState={adultTorrentSaveState}
+            state={adultTorrentInspectionState}
           />
         )}
       </Dialog.Root>

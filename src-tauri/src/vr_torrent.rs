@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, HashSet},
-    io,
+    fs::OpenOptions,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -24,6 +25,15 @@ pub const VR_TORRENT_SAVE_FAILED: &str = "vr_torrent_save_failed";
 pub const VR_TORRENT_SOURCE_UNAVAILABLE: &str = "vr_torrent_source_unavailable";
 pub const VR_TORRENT_STALE: &str = "vr_torrent_stale";
 pub const VR_TORRENT_UNSUPPORTED: &str = "vr_torrent_unsupported";
+pub const ADULT_TORRENT_CONTEXT_INVALID: &str = "adult_torrent_context_invalid";
+pub const ADULT_TORRENT_INFOHASH_MISMATCH: &str = "adult_torrent_infohash_mismatch";
+pub const ADULT_TORRENT_MALFORMED: &str = "adult_torrent_malformed";
+pub const ADULT_TORRENT_NETWORK_ERROR: &str = "adult_torrent_network_error";
+pub const ADULT_TORRENT_PROVIDER_ERROR: &str = "adult_torrent_provider_error";
+pub const ADULT_TORRENT_SAVE_FAILED: &str = "adult_torrent_save_failed";
+pub const ADULT_TORRENT_SOURCE_UNAVAILABLE: &str = "adult_torrent_source_unavailable";
+pub const ADULT_TORRENT_STALE: &str = "adult_torrent_stale";
+pub const ADULT_TORRENT_UNSUPPORTED: &str = "adult_torrent_unsupported";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TrustedArtifact {
@@ -71,19 +81,58 @@ struct CachedTorrent {
     metadata: TorrentMetadata,
 }
 
-#[derive(Default)]
-struct VrTorrentContext {
+struct TorrentContext {
+    inspection_id_prefix: &'static str,
     release_generation: u64,
     inspection_generation: u64,
     release_feed: Option<TrustedReleaseFeed>,
     cached_torrent: Option<CachedTorrent>,
 }
 
-#[derive(Clone, Default)]
-pub struct VrTorrentState(Arc<Mutex<VrTorrentContext>>);
+impl Default for TorrentContext {
+    fn default() -> Self {
+        Self {
+            inspection_id_prefix: "vr",
+            release_generation: 0,
+            inspection_generation: 0,
+            release_feed: None,
+            cached_torrent: None,
+        }
+    }
+}
 
-impl VrTorrentState {
-    pub fn begin_release_lookup(&self) -> Result<u64, &'static str> {
+#[derive(Clone)]
+struct TorrentState(Arc<Mutex<TorrentContext>>);
+
+impl TorrentState {
+    fn new(inspection_id_prefix: &'static str) -> Self {
+        Self(Arc::new(Mutex::new(TorrentContext {
+            inspection_id_prefix,
+            ..TorrentContext::default()
+        })))
+    }
+}
+
+#[derive(Clone)]
+pub struct VrTorrentState(TorrentState);
+
+impl Default for VrTorrentState {
+    fn default() -> Self {
+        Self(TorrentState::new("vr"))
+    }
+}
+
+#[derive(Clone)]
+pub struct AdultTorrentState(TorrentState);
+
+impl Default for AdultTorrentState {
+    fn default() -> Self {
+        Self(TorrentState::new("adult"))
+    }
+}
+
+impl TorrentState {
+    fn begin_release_lookup(&self) -> Result<u64, &'static str> {
         let mut context = self.0.lock().map_err(|_| VR_TORRENT_PROVIDER_ERROR)?;
         context.release_generation = context.release_generation.wrapping_add(1);
         context.inspection_generation = context.inspection_generation.wrapping_add(1);
@@ -92,7 +141,7 @@ impl VrTorrentState {
         Ok(context.release_generation)
     }
 
-    pub fn finish_release_lookup(
+    fn finish_release_lookup(
         &self,
         generation: u64,
         code: &str,
@@ -111,7 +160,7 @@ impl VrTorrentState {
         Ok(())
     }
 
-    pub fn invalidate_inspection(&self) -> Result<(), &'static str> {
+    fn invalidate_inspection(&self) -> Result<(), &'static str> {
         let mut context = self.0.lock().map_err(|_| VR_TORRENT_PROVIDER_ERROR)?;
         context.inspection_generation = context.inspection_generation.wrapping_add(1);
         context.cached_torrent = None;
@@ -161,8 +210,8 @@ impl VrTorrentState {
         }
 
         let inspection_id = format!(
-            "{release_generation}-{inspection_generation}-{}",
-            artifact.provider_item_id
+            "{}-{release_generation}-{inspection_generation}-{}",
+            context.inspection_id_prefix, artifact.provider_item_id
         );
         context.cached_torrent = Some(CachedTorrent {
             artifact: artifact.clone(),
@@ -175,7 +224,7 @@ impl VrTorrentState {
         Ok(inspection_id)
     }
 
-    pub fn verified_download_source(
+    fn verified_download_source(
         &self,
         inspection_id: &str,
         selected_file_ids: &[usize],
@@ -217,6 +266,74 @@ impl VrTorrentState {
             release_name: artifact.release_name,
             selected_files,
         })
+    }
+}
+
+impl VrTorrentState {
+    pub fn begin_release_lookup(&self) -> Result<u64, &'static str> {
+        self.0.begin_release_lookup()
+    }
+
+    pub fn finish_release_lookup(
+        &self,
+        generation: u64,
+        code: &str,
+        document: &str,
+    ) -> Result<(), &'static str> {
+        self.0.finish_release_lookup(generation, code, document)
+    }
+
+    pub fn invalidate_inspection(&self) -> Result<(), &'static str> {
+        self.0.invalidate_inspection()
+    }
+
+    pub fn verified_download_source(
+        &self,
+        inspection_id: &str,
+        selected_file_ids: &[usize],
+    ) -> Result<VerifiedDownloadSource, VerifiedDownloadSourceError> {
+        self.0
+            .verified_download_source(inspection_id, selected_file_ids)
+    }
+}
+
+impl AdultTorrentState {
+    pub fn begin_release_lookup(&self) -> Result<u64, &'static str> {
+        self.0
+            .begin_release_lookup()
+            .map_err(adult_torrent_error_code)
+    }
+
+    pub fn finish_release_lookup(
+        &self,
+        generation: u64,
+        code: &str,
+        document: &str,
+    ) -> Result<(), &'static str> {
+        self.0
+            .finish_release_lookup(generation, code, document)
+            .map_err(adult_torrent_error_code)
+    }
+
+    pub fn invalidate_inspection(&self) -> Result<(), &'static str> {
+        self.0
+            .invalidate_inspection()
+            .map_err(adult_torrent_error_code)
+    }
+}
+
+fn adult_torrent_error_code(error: &'static str) -> &'static str {
+    match error {
+        VR_TORRENT_CONTEXT_INVALID => ADULT_TORRENT_CONTEXT_INVALID,
+        VR_TORRENT_INFOHASH_MISMATCH => ADULT_TORRENT_INFOHASH_MISMATCH,
+        VR_TORRENT_MALFORMED => ADULT_TORRENT_MALFORMED,
+        VR_TORRENT_NETWORK_ERROR => ADULT_TORRENT_NETWORK_ERROR,
+        VR_TORRENT_PROVIDER_ERROR => ADULT_TORRENT_PROVIDER_ERROR,
+        VR_TORRENT_SAVE_FAILED => ADULT_TORRENT_SAVE_FAILED,
+        VR_TORRENT_SOURCE_UNAVAILABLE => ADULT_TORRENT_SOURCE_UNAVAILABLE,
+        VR_TORRENT_STALE => ADULT_TORRENT_STALE,
+        VR_TORRENT_UNSUPPORTED => ADULT_TORRENT_UNSUPPORTED,
+        _ => ADULT_TORRENT_PROVIDER_ERROR,
     }
 }
 
@@ -357,6 +474,14 @@ pub fn inspect_sukebei_torrent_with(
     request: TorrentInspectionRequest,
     fetch: impl FnMut(&str) -> Result<ArtifactResponse, ArtifactRequestError>,
 ) -> Result<Vec<String>, &'static str> {
+    inspect_sukebei_torrent_state_with(&state.0, request, fetch)
+}
+
+fn inspect_sukebei_torrent_state_with(
+    state: &TorrentState,
+    request: TorrentInspectionRequest,
+    fetch: impl FnMut(&str) -> Result<ArtifactResponse, ArtifactRequestError>,
+) -> Result<Vec<String>, &'static str> {
     let artifact = TrustedArtifact::from(request);
     let (release_generation, inspection_generation) = state.begin_inspection(&artifact)?;
     let bytes = fetch_torrent_artifact(&artifact, fetch).map_err(TorrentInspectionError::code)?;
@@ -385,8 +510,25 @@ pub fn inspect_sukebei_torrent_with(
     Ok(response)
 }
 
+pub fn inspect_sukebei_adult_torrent_with(
+    state: &AdultTorrentState,
+    request: TorrentInspectionRequest,
+    fetch: impl FnMut(&str) -> Result<ArtifactResponse, ArtifactRequestError>,
+) -> Result<Vec<String>, &'static str> {
+    inspect_sukebei_torrent_state_with(&state.0, request, fetch).map_err(adult_torrent_error_code)
+}
+
 pub fn save_verified_torrent_with(
     state: &VrTorrentState,
+    inspection_id: &str,
+    choose_destination: impl FnOnce(&str) -> Option<PathBuf>,
+    write: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+) -> Result<bool, &'static str> {
+    save_verified_torrent_state_with(&state.0, inspection_id, choose_destination, write)
+}
+
+fn save_verified_torrent_state_with(
+    state: &TorrentState,
     inspection_id: &str,
     choose_destination: impl FnOnce(&str) -> Option<PathBuf>,
     write: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
@@ -418,6 +560,21 @@ pub fn save_verified_torrent_with(
         .ok_or(VR_TORRENT_STALE)?;
     write(&destination, &torrent.bytes).map_err(|_| VR_TORRENT_SAVE_FAILED)?;
     Ok(true)
+}
+
+pub fn save_verified_adult_torrent_with(
+    state: &AdultTorrentState,
+    inspection_id: &str,
+    choose_destination: impl FnOnce(&str) -> Option<PathBuf>,
+    write: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+) -> Result<bool, &'static str> {
+    save_verified_torrent_state_with(&state.0, inspection_id, choose_destination, write)
+        .map_err(adult_torrent_error_code)
+}
+
+pub fn write_new_torrent_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)
 }
 
 fn fetch_torrent_artifact(
@@ -1260,6 +1417,19 @@ mod tests {
         multi_file_torrent_with_piece_fields("16384", 1)
     }
 
+    fn duplicate_path_torrent() -> Vec<u8> {
+        let mut encoded = b"d4:infod5:filesl".to_vec();
+        for _ in 0..2 {
+            encoded.extend_from_slice(b"d6:lengthi1e4:pathl");
+            push_bencoded_bytes(&mut encoded, "same.mp4");
+            encoded.extend_from_slice(b"ee");
+        }
+        encoded.extend_from_slice(
+            b"e4:name4:Root12:piece lengthi1e6:pieces40:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaee",
+        );
+        encoded
+    }
+
     fn fixture_infohash(bytes: &[u8]) -> String {
         let info_start = b"d4:info".len();
         assert!(bytes.starts_with(b"d4:info") && bytes.ends_with(b"e"));
@@ -1300,6 +1470,34 @@ mod tests {
         state
     }
 
+    fn adult_trusted_request(name: &str, infohash: &str) -> TorrentInspectionRequest {
+        TorrentInspectionRequest {
+            code: "ADLT-123".to_owned(),
+            release_name: name.to_owned(),
+            provider_item_id: "321".to_owned(),
+            torrent_url: "https://sukebei.nyaa.si/download/321.torrent".to_owned(),
+            expected_infohash: infohash.to_owned(),
+        }
+    }
+
+    fn adult_state_with_release(name: &str, infohash: &str) -> AdultTorrentState {
+        let state = AdultTorrentState::default();
+        let generation = state.begin_release_lookup().expect("lookup must start");
+        state
+            .finish_release_lookup(
+                generation,
+                "ADLT-123",
+                &release_feed(
+                    name,
+                    "321",
+                    "https://sukebei.nyaa.si/download/321.torrent",
+                    infohash,
+                ),
+            )
+            .expect("feed must be current");
+        state
+    }
+
     fn assert_inspection_rejected_without_cached_save(
         bytes: Vec<u8>,
         expected_error: &'static str,
@@ -1320,6 +1518,7 @@ mod tests {
         );
         assert!(state
             .0
+             .0
             .lock()
             .expect("torrent state must remain readable")
             .cached_torrent
@@ -1416,6 +1615,360 @@ mod tests {
                 expected_infohash: valid_hash.to_owned(),
             }]
         );
+
+        let adult_document = format!(
+            "<rss><channel>{}{}<item><title>ADLT-123 metadata only</title></item></channel></rss>",
+            release_feed(
+                "ADLT-123 exact",
+                "321",
+                "https://sukebei.nyaa.si/download/321.torrent",
+                valid_hash,
+            ),
+            release_feed(
+                "ADLT-123 mismatched item",
+                "322",
+                "https://sukebei.nyaa.si/download/323.torrent",
+                valid_hash,
+            ),
+        );
+        assert_eq!(
+            trusted_artifacts_from_feed(&adult_document, "ADLT-123"),
+            vec![TrustedArtifact {
+                code: "ADLT-123".to_owned(),
+                release_name: "ADLT-123 exact".to_owned(),
+                provider_item_id: "321".to_owned(),
+                torrent_url: "https://sukebei.nyaa.si/download/321.torrent".to_owned(),
+                expected_infohash: valid_hash.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_fabricated_adult_context_before_artifact_dispatch() {
+        let bytes = single_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let exact_release_name = "【Adult】 ADLT-123  Exact\t—\n特別版";
+        let state = adult_state_with_release(exact_release_name, &infohash);
+        let mut fabricated_requests = Vec::new();
+        let mut wrong_code = adult_trusted_request(exact_release_name, &infohash);
+        wrong_code.code = "ADLT-124".to_owned();
+        fabricated_requests.push(wrong_code);
+        let mut wrong_name = adult_trusted_request(exact_release_name, &infohash);
+        wrong_name.release_name = "ADLT-123 fabricated".to_owned();
+        fabricated_requests.push(wrong_name);
+        let mut wrong_item = adult_trusted_request(exact_release_name, &infohash);
+        wrong_item.provider_item_id = "999".to_owned();
+        fabricated_requests.push(wrong_item);
+        let mut wrong_url = adult_trusted_request(exact_release_name, &infohash);
+        wrong_url.torrent_url = "https://sukebei.nyaa.si/download/999.torrent".to_owned();
+        fabricated_requests.push(wrong_url);
+        let mut wrong_hash = adult_trusted_request(exact_release_name, &infohash);
+        wrong_hash.expected_infohash = "0000000000000000000000000000000000000001".to_owned();
+        fabricated_requests.push(wrong_hash);
+
+        for request in fabricated_requests {
+            let dispatched = RefCell::new(false);
+            assert_eq!(
+                inspect_sukebei_adult_torrent_with(&state, request, |_| {
+                    dispatched.replace(true);
+                    unreachable!()
+                }),
+                Err(ADULT_TORRENT_CONTEXT_INVALID)
+            );
+            assert!(!dispatched.into_inner());
+        }
+    }
+
+    #[test]
+    fn adult_inspection_rejects_parser_and_artifact_failures_without_savable_bytes() {
+        let valid_hash = "0123456789abcdef0123456789abcdef01234567";
+        let cases = [
+            (b"not-bencode".to_vec(), ADULT_TORRENT_MALFORMED),
+            (
+                b"d4:infod12:meta versioni2eee".to_vec(),
+                ADULT_TORRENT_UNSUPPORTED,
+            ),
+            (
+                single_file_torrent_with_fields("+1", "16384", 1),
+                ADULT_TORRENT_MALFORMED,
+            ),
+            (
+                single_file_torrent_with_fields("5", "16384", 2),
+                ADULT_TORRENT_UNSUPPORTED,
+            ),
+            (
+                b"d4:infod5:filesld6:lengthi1e4:pathl2:..eee4:name4:Root12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec(),
+                ADULT_TORRENT_UNSUPPORTED,
+            ),
+        ];
+
+        for (bytes, expected_error) in cases {
+            let state = adult_state_with_release("ADLT-123 exact", valid_hash);
+            assert_eq!(
+                inspect_sukebei_adult_torrent_with(
+                    &state,
+                    adult_trusted_request("ADLT-123 exact", valid_hash),
+                    |_| {
+                        Ok(ArtifactResponse {
+                            status: 200,
+                            redirect_url: None,
+                            body: bytes.clone(),
+                        })
+                    },
+                ),
+                Err(expected_error)
+            );
+            let chose_destination = RefCell::new(false);
+            assert_eq!(
+                save_verified_adult_torrent_with(
+                    &state,
+                    "adult-rejected",
+                    |_| {
+                        chose_destination.replace(true);
+                        None
+                    },
+                    |_, _| unreachable!(),
+                ),
+                Err(ADULT_TORRENT_STALE)
+            );
+            assert!(!chose_destination.into_inner());
+        }
+
+        for (response, expected_error) in [
+            (
+                Ok(ArtifactResponse {
+                    status: 404,
+                    redirect_url: None,
+                    body: Vec::new(),
+                }),
+                ADULT_TORRENT_SOURCE_UNAVAILABLE,
+            ),
+            (
+                Ok(ArtifactResponse {
+                    status: 302,
+                    redirect_url: Some("https://example.com/321.torrent".to_owned()),
+                    body: Vec::new(),
+                }),
+                ADULT_TORRENT_PROVIDER_ERROR,
+            ),
+            (
+                Err(ArtifactRequestError::Network),
+                ADULT_TORRENT_NETWORK_ERROR,
+            ),
+            (Err(ArtifactRequestError::TooLarge), ADULT_TORRENT_MALFORMED),
+        ] {
+            let state = adult_state_with_release("ADLT-123 exact", valid_hash);
+            assert_eq!(
+                inspect_sukebei_adult_torrent_with(
+                    &state,
+                    adult_trusted_request("ADLT-123 exact", valid_hash),
+                    |_| response.clone(),
+                ),
+                Err(expected_error)
+            );
+        }
+    }
+
+    #[test]
+    fn adult_redirects_remain_same_item_and_bounded() {
+        let bytes = single_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let state = adult_state_with_release("ADLT-123 exact", &infohash);
+        let requests = RefCell::new(Vec::new());
+        let response = inspect_sukebei_adult_torrent_with(
+            &state,
+            adult_trusted_request("ADLT-123 exact", &infohash),
+            |url| {
+                let request_number = requests.borrow().len();
+                requests.borrow_mut().push(url.to_owned());
+                if request_number == 0 {
+                    Ok(ArtifactResponse {
+                        status: 302,
+                        redirect_url: Some(
+                            "https://sukebei.nyaa.si/download/321.torrent".to_owned(),
+                        ),
+                        body: Vec::new(),
+                    })
+                } else {
+                    Ok(ArtifactResponse {
+                        status: 200,
+                        redirect_url: None,
+                        body: bytes.clone(),
+                    })
+                }
+            },
+        )
+        .expect("the same Adult provider item redirect must remain inspectable");
+        assert_eq!(response[2], infohash);
+        assert_eq!(requests.into_inner().len(), 2);
+
+        let state = adult_state_with_release("ADLT-123 exact", &infohash);
+        let request_count = RefCell::new(0);
+        assert_eq!(
+            inspect_sukebei_adult_torrent_with(
+                &state,
+                adult_trusted_request("ADLT-123 exact", &infohash),
+                |_| {
+                    request_count.replace_with(|count| *count + 1);
+                    Ok(ArtifactResponse {
+                        status: 302,
+                        redirect_url: Some(
+                            "https://sukebei.nyaa.si/download/321.torrent".to_owned(),
+                        ),
+                        body: Vec::new(),
+                    })
+                },
+            ),
+            Err(ADULT_TORRENT_PROVIDER_ERROR)
+        );
+        assert_eq!(request_count.into_inner(), TORRENT_MAX_REDIRECTS + 1);
+    }
+
+    #[test]
+    fn adult_inspection_saves_exact_bytes_and_rejects_cross_category_identities() {
+        let bytes = multi_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let adult_release_name = "【Adult】 ADLT-123  Exact\t—\n特別版";
+        let adult_state = adult_state_with_release(adult_release_name, &infohash);
+        let adult_response = inspect_sukebei_adult_torrent_with(
+            &adult_state,
+            adult_trusted_request(adult_release_name, &infohash),
+            |_| {
+                Ok(ArtifactResponse {
+                    status: 200,
+                    redirect_url: None,
+                    body: bytes.clone(),
+                })
+            },
+        )
+        .expect("trusted Adult inspection must succeed");
+        let adult_inspection_id = &adult_response[0];
+        assert!(adult_inspection_id.starts_with("adult-"));
+        assert_eq!(adult_response[1], "VR  — 作品");
+        assert_eq!(adult_response[2], infohash);
+        assert_eq!(adult_response[4], "Folder/Part  1 — 映画.mkv");
+        assert_eq!(adult_response[6], "Folder/特別版  B.mp4");
+
+        let wrote_cancelled = RefCell::new(false);
+        assert_eq!(
+            save_verified_adult_torrent_with(
+                &adult_state,
+                adult_inspection_id,
+                |_| None,
+                |_, _| {
+                    wrote_cancelled.replace(true);
+                    Ok(())
+                },
+            ),
+            Ok(false)
+        );
+        assert!(!wrote_cancelled.into_inner());
+
+        let destination = std::env::temp_dir().join(format!(
+            "auto-video-adult-torrent-save-{}-{adult_inspection_id}.torrent",
+            std::process::id()
+        ));
+        assert_eq!(
+            save_verified_adult_torrent_with(
+                &adult_state,
+                adult_inspection_id,
+                |default_name| {
+                    assert_eq!(default_name, "ADLT-123-321.torrent");
+                    Some(destination.clone())
+                },
+                write_new_torrent_file,
+            ),
+            Ok(true)
+        );
+        assert_eq!(fs::read(&destination).expect("saved bytes"), bytes);
+        assert_eq!(
+            save_verified_adult_torrent_with(
+                &adult_state,
+                adult_inspection_id,
+                |_| Some(destination.clone()),
+                write_new_torrent_file,
+            ),
+            Err(ADULT_TORRENT_SAVE_FAILED)
+        );
+        assert_eq!(fs::read(&destination).expect("existing bytes"), bytes);
+
+        let vr_state = state_with_release("MDVR-419 exact", &infohash);
+        let vr_response = inspect_sukebei_torrent_with(
+            &vr_state,
+            trusted_request("MDVR-419 exact", &infohash),
+            |_| {
+                Ok(ArtifactResponse {
+                    status: 200,
+                    redirect_url: None,
+                    body: bytes.clone(),
+                })
+            },
+        )
+        .expect("trusted VR inspection must succeed");
+        assert!(vr_response[0].starts_with("vr-"));
+
+        let adult_dispatched_from_vr = RefCell::new(false);
+        assert_eq!(
+            inspect_sukebei_torrent_with(
+                &vr_state,
+                adult_trusted_request(adult_release_name, &infohash),
+                |_| {
+                    adult_dispatched_from_vr.replace(true);
+                    unreachable!()
+                },
+            ),
+            Err(VR_TORRENT_CONTEXT_INVALID)
+        );
+        assert!(!adult_dispatched_from_vr.into_inner());
+
+        let vr_dispatched_from_adult = RefCell::new(false);
+        assert_eq!(
+            inspect_sukebei_adult_torrent_with(
+                &adult_state,
+                trusted_request("MDVR-419 exact", &infohash),
+                |_| {
+                    vr_dispatched_from_adult.replace(true);
+                    unreachable!()
+                },
+            ),
+            Err(ADULT_TORRENT_CONTEXT_INVALID)
+        );
+        assert!(!vr_dispatched_from_adult.into_inner());
+
+        let chose_adult_destination = RefCell::new(false);
+        assert_eq!(
+            save_verified_adult_torrent_with(
+                &adult_state,
+                &vr_response[0],
+                |_| {
+                    chose_adult_destination.replace(true);
+                    None
+                },
+                |_, _| unreachable!(),
+            ),
+            Err(ADULT_TORRENT_STALE)
+        );
+        assert!(!chose_adult_destination.into_inner());
+
+        let chose_vr_destination = RefCell::new(false);
+        assert_eq!(
+            save_verified_torrent_with(
+                &vr_state,
+                adult_inspection_id,
+                |_| {
+                    chose_vr_destination.replace(true);
+                    None
+                },
+                |_, _| unreachable!(),
+            ),
+            Err(VR_TORRENT_STALE)
+        );
+        assert_eq!(
+            vr_state.verified_download_source(adult_inspection_id, &[0]),
+            Err(VerifiedDownloadSourceError::Context)
+        );
+        assert!(!chose_vr_destination.into_inner());
+        fs::remove_file(destination).expect("fixture must be removable");
     }
 
     #[test]
@@ -1453,6 +2006,10 @@ mod tests {
             parse_torrent_metadata(b"d4:infod5:filesld6:lengthi1e4:pathl2:..eee4:name4:Root12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee"),
             Err(TorrentInspectionError::Unsupported)
         );
+        assert_eq!(
+            parse_torrent_metadata(&duplicate_path_torrent()),
+            Err(TorrentInspectionError::Unsupported)
+        );
     }
 
     #[test]
@@ -1460,6 +2017,8 @@ mod tests {
         for bytes in [
             single_file_torrent_with_fields("+1", "16384", 1),
             single_file_torrent_with_fields("5", "+03", 2),
+            single_file_torrent_with_fields("05", "16384", 1),
+            single_file_torrent_with_fields("5", "016384", 1),
         ] {
             assert_inspection_rejected_without_cached_save(bytes, VR_TORRENT_MALFORMED);
         }
