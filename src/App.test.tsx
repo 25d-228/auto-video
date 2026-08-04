@@ -51,6 +51,13 @@ let trashMovieMock: Mock<
 let loadMoviesFolderMock: Mock<() => Promise<string | null>>;
 let openFolderMock: Mock<() => Promise<string | null>>;
 let clearMoviesFolderMock: Mock<() => Promise<void>>;
+let loadTvFolderMock: Mock<() => Promise<string[]>>;
+let chooseTvFolderMock: Mock<() => Promise<string | null>>;
+let clearTvFolderMock: Mock<() => Promise<void>>;
+let scanTvLibraryMock: Mock<() => Promise<string[]>>;
+let queryTvStorageMock: Mock<() => Promise<[string, string]>>;
+let openTvFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
+let revealTvFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
 let loadTmdbTokenMock: Mock<() => Promise<string | null>>;
 let saveTmdbTokenMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
@@ -112,6 +119,7 @@ let gallerySizes: Record<
   { width: number; height: number }
 >;
 let savedMoviesFolder: string | null;
+let savedTvFolder: string | null;
 let savedVrFolder: string | null;
 
 function createResizeEntry(
@@ -424,6 +432,7 @@ beforeEach(() => {
     library: { width: 2000, height: 3000 },
   };
   savedMoviesFolder = null;
+  savedTvFolder = null;
   savedVrFolder = null;
   scanMoviesMock = vi.fn().mockResolvedValue([]);
   queryMoviesStorageMock = vi
@@ -437,6 +446,19 @@ beforeEach(() => {
     .mockImplementation(() => Promise.resolve(savedMoviesFolder));
   openFolderMock = vi.fn().mockResolvedValue(null);
   clearMoviesFolderMock = vi.fn().mockResolvedValue(undefined);
+  loadTvFolderMock = vi.fn().mockImplementation(() =>
+    Promise.resolve(
+      savedTvFolder === null ? ["unconfigured"] : ["ready", savedTvFolder],
+    ),
+  );
+  chooseTvFolderMock = vi.fn().mockResolvedValue(null);
+  clearTvFolderMock = vi.fn().mockResolvedValue(undefined);
+  scanTvLibraryMock = vi.fn().mockResolvedValue([]);
+  queryTvStorageMock = vi
+    .fn()
+    .mockResolvedValue(["3298534883328", "1099511627776"]);
+  openTvFileMock = vi.fn().mockResolvedValue(undefined);
+  revealTvFileMock = vi.fn().mockResolvedValue(undefined);
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
@@ -526,6 +548,27 @@ beforeEach(() => {
           return revealMovieMock(parameters);
         case "trash_movie":
           return trashMovieMock(parameters);
+        case "load_tv_folder":
+          return loadTvFolderMock();
+        case "choose_tv_folder":
+          return chooseTvFolderMock().then((selectedFolder) => {
+            if (selectedFolder !== null) {
+              savedTvFolder = selectedFolder;
+            }
+            return selectedFolder;
+          });
+        case "clear_tv_folder":
+          return clearTvFolderMock().then(() => {
+            savedTvFolder = null;
+          });
+        case "scan_tv_library":
+          return scanTvLibraryMock();
+        case "query_tv_storage":
+          return queryTvStorageMock();
+        case "open_tv_file":
+          return openTvFileMock(parameters);
+        case "reveal_tv_file":
+          return revealTvFileMock(parameters);
         case "load_tmdb_token":
           return loadTmdbTokenMock();
         case "save_tmdb_token":
@@ -613,6 +656,301 @@ afterEach(() => {
   Reflect.deleteProperty(navigator, "clipboard");
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+describe("parsed TV Library and Dashboard", () => {
+  it("renders loading, scanning, empty, error, ready, and no-match states deterministically", async () => {
+    const folderLoad = createDeferred<string[]>();
+    const firstScan = createDeferred<string[]>();
+    loadTvFolderMock.mockReturnValue(folderLoad.promise);
+    scanTvLibraryMock
+      .mockReturnValueOnce(firstScan.promise)
+      .mockRejectedValueOnce("tv_library_scan_failed")
+      .mockResolvedValueOnce([
+        "/TV/Ready Show.S01E02.mp4",
+        "Ready Show.S01E02.mp4",
+        "1",
+      ]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Loading TV folder" }),
+    ).toBeTruthy();
+    await act(async () => {
+      folderLoad.resolve(["ready", "/TV"]);
+      await folderLoad.promise;
+    });
+    expect(
+      screen.getByRole("heading", { level: 2, name: "Scanning TV folder" }),
+    ).toBeTruthy();
+    await act(async () => {
+      firstScan.resolve([]);
+      await firstScan.promise;
+    });
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "No supported TV videos found",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(
+      await screen.findByRole("heading", {
+        level: 2,
+        name: "TV folder could not be scanned",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await screen.findByRole("heading", { level: 3, name: "Ready Show" });
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Search titles" }),
+      { target: { value: "missing title" } },
+    );
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: "No TV items match this search",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("chooses, changes, and clears only the native TV folder configuration", async () => {
+    chooseTvFolderMock
+      .mockResolvedValueOnce("/TV/First")
+      .mockResolvedValueOnce("/TV/Second");
+
+    render(<App />);
+    selectSettings();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Choose TV folder" }),
+    );
+    expect(await screen.findByText("/TV/First")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Change TV folder" }));
+    expect(await screen.findByText("/TV/Second")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Clear TV folder" }));
+    expect(await screen.findByText("No TV folder configured.")).toBeTruthy();
+    expect(chooseTvFolderMock).toHaveBeenCalledTimes(2);
+    expect(clearTvFolderMock).toHaveBeenCalledTimes(1);
+    expect(openFolderMock).not.toHaveBeenCalled();
+    expect(chooseVrFolderMock).not.toHaveBeenCalled();
+  });
+
+  it("shows independent folder, scan, aggregate, storage, and routing states", async () => {
+    savedTvFolder = "/TV/番組  Library";
+    scanTvLibraryMock.mockResolvedValue([
+      "/TV/番組  Library/星  Show.S01E02.mp4",
+      "星  Show.S01E02.mp4",
+      "1073741824",
+      "/TV/番組  Library/星  Show.S01E03.MKV",
+      "星  Show.S01E03.MKV",
+      "2147483648",
+      "/TV/番組  Library/Unknown release.mp4",
+      "Unknown release.mp4",
+      "5",
+    ]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "1 show · 2 episodes",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByText("1 file remains unassociated.")).toBeTruthy();
+    expect(
+      await screen.findByText("3.0 TiB", { selector: "dd" }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open TV Library" }));
+    expect(screen.getByRole("radio", { name: "TV" })).toHaveProperty(
+      "checked",
+      true,
+    );
+    expect(
+      screen.getByRole("list", { name: "TV shows and unassociated files" }),
+    ).toBeTruthy();
+    const showHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "星 Show",
+    });
+    expect(showHeading.textContent).toBe("星  Show");
+    expect(screen.getByText("Season 1 · Episode 2 · 1.0 GiB")).toBeTruthy();
+    expect(screen.getByText("Unknown release.mp4")).toBeTruthy();
+  });
+
+  it("searches then sorts then paginates immediately across 25, 7, and 10 item capacities", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      Array.from({ length: 30 }, (_, index) => {
+        const title = `Show ${String(index + 1).padStart(2, "0")}`;
+        const filename = `${title}.S01E01.mp4`;
+        return [`/TV/${filename}`, filename, "1"];
+      }).flat(),
+    );
+    gallerySizes.library = { width: 1088, height: 728 };
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    await screen.findByRole("heading", { level: 3, name: "Show 01" });
+    const gallery = document.querySelector('[data-gallery="library"]');
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("25");
+    expect(visibleCardCount("TV shows and unassociated files")).toBe(25);
+    fireEvent.click(screen.getByRole("button", { name: /Next TV shows/ }));
+    expect(gallery?.getAttribute("data-current-page")).toBe("2");
+
+    resizeGallery("library", 1528, 136);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
+    expect(gallery?.getAttribute("data-current-page")).toBe("2");
+    resizeGallery("library", 1088, 284);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
+    expect(gallery?.getAttribute("data-current-page")).toBe("2");
+
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Search titles" }),
+      { target: { value: "Show 2" } },
+    );
+    expect(gallery?.getAttribute("data-current-page")).toBe("1");
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort titles" }), {
+      target: { value: "descending" },
+    });
+    expect(
+      within(screen.getByRole("list", { name: "TV shows and unassociated files" }))
+        .getAllByRole("heading", { level: 3 })[0].textContent,
+    ).toBe("Show 29");
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectLibrary();
+    expect(screen.getByRole("radio", { name: "TV" })).toHaveProperty(
+      "checked",
+      true,
+    );
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "Show 2",
+    );
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryTvStorageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects stale scan and storage responses after the configured folder changes", async () => {
+    savedTvFolder = "/TV/Old";
+    const oldScan = createDeferred<string[]>();
+    const oldStorage = createDeferred<[string, string]>();
+    scanTvLibraryMock
+      .mockReturnValueOnce(oldScan.promise)
+      .mockResolvedValueOnce([
+        "/TV/New/New Show.S01E02.mp4",
+        "New Show.S01E02.mp4",
+        "2",
+      ]);
+    queryTvStorageMock
+      .mockReturnValueOnce(oldStorage.promise)
+      .mockResolvedValueOnce(["200", "50"]);
+    chooseTvFolderMock.mockResolvedValue("/TV/New");
+
+    render(<App />);
+    selectSettings();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Change TV folder" }),
+    );
+    await screen.findByText("/TV/New");
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "New Show" }),
+    ).toBeTruthy();
+
+    await act(async () => {
+      oldScan.resolve([
+        "/TV/Old/Old Show.S01E02.mp4",
+        "Old Show.S01E02.mp4",
+        "1",
+      ]);
+      oldStorage.resolve(["100", "25"]);
+      await Promise.all([oldScan.promise, oldStorage.promise]);
+    });
+    expect(screen.queryByText("Old Show")).toBeNull();
+    selectDashboard();
+    const tvSummary = screen
+      .getByRole("heading", { level: 2, name: "TV Library" })
+      .closest("section");
+    if (tvSummary === null) {
+      throw new Error("The TV Dashboard summary was not rendered.");
+    }
+    expect(within(tvSummary).getByText("150 B")).toBeTruthy();
+  });
+
+  it("recovers an unavailable folder without accepting a stale revalidation response", async () => {
+    loadTvFolderMock.mockResolvedValueOnce(["unavailable", "/TV/Old"]);
+    const staleRefresh = createDeferred<string[]>();
+    loadTvFolderMock.mockReturnValueOnce(staleRefresh.promise);
+    chooseTvFolderMock.mockResolvedValue("/TV/New");
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    await screen.findByRole("heading", { level: 2, name: "TV folder is unavailable" });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    selectSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Change TV folder" }));
+    await screen.findByText("/TV/New");
+    await act(async () => {
+      staleRefresh.resolve(["ready", "/TV/Old"]);
+      await staleRefresh.promise;
+    });
+    expect(screen.getByText("/TV/New")).toBeTruthy();
+    expect(screen.queryByText("/TV/Old")).toBeNull();
+  });
+
+  it("keeps copy, Open, Reveal, errors, and unrelated actions isolated per file", async () => {
+    savedTvFolder = "/TV";
+    const path = "/TV/星  Show.S01E02 — Pilot.mp4";
+    scanTvLibraryMock.mockResolvedValue([
+      path,
+      "星  Show.S01E02 — Pilot.mp4",
+      "1024",
+    ]);
+    openTvFileMock.mockRejectedValue("tv_file_open_stale");
+
+    render(<App />);
+    await screen.findByRole("heading", { level: 3, name: "1 show · 1 episode" });
+    fireEvent.click(screen.getByRole("button", { name: "Open TV Library" }));
+    expect(screen.getByRole("radio", { name: "TV" })).toHaveProperty(
+      "checked",
+      true,
+    );
+    expect(
+      screen.getByRole("list", { name: "TV shows and unassociated files" }),
+    ).toBeTruthy();
+    const showHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "星 Show",
+    });
+    expect(showHeading.textContent).toBe("星  Show");
+    fireEvent.click(screen.getByRole("button", { name: "Copy title: 星 Show" }));
+    expect(clipboardWriteMock).toHaveBeenCalledWith("星  Show");
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Open TV file: 星 Show.S01E02 — Pilot.mp4",
+      }),
+    );
+    expect(
+      await screen.findByText("This file is no longer part of the current TV Library."),
+    ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Reveal TV file: 星 Show.S01E02 — Pilot.mp4",
+      }),
+    );
+    expect(openTvFileMock).toHaveBeenCalledWith({ path });
+    expect(revealTvFileMock).toHaveBeenCalledWith({ path });
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("parsed VR Library and Dashboard", () => {
@@ -4564,7 +4902,7 @@ describe("completed VR download organization", () => {
     );
     render(<App />);
     const downloads = await screen.findByRole("region", { name: "Downloads" });
-    const summary = within(downloads).getByLabelText("VR transfer summary");
+    const summary = await within(downloads).findByLabelText("VR transfer summary");
     const completed = within(summary).getByText("Completed").closest("div");
     const attention = within(summary).getByText("Needs attention").closest("div");
     expect(within(completed as HTMLElement).getByText("1")).toBeTruthy();

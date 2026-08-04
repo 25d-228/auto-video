@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod tv_library;
 mod vr_download;
 mod vr_library;
 mod vr_torrent;
@@ -16,6 +17,12 @@ use std::process::{Command, Stdio};
 
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
+use tv_library::{
+    clear_tv_folder as clear_trusted_tv_folder, configured_tv_folder, load_tv_folder_with,
+    open_tv_file_with, reveal_tv_file_with, scan_tv_library_with, set_tv_folder, TvLibraryState,
+    TV_FILE_OPEN_FAILED, TV_FILE_REVEAL_FAILED, TV_FOLDER_STORAGE_FAILED, TV_FOLDER_UNAVAILABLE,
+    TV_LIBRARY_SCAN_FAILED,
+};
 use vr_download::{
     apply_organization, cancel_download, clear_vr_folder as clear_trusted_vr_folder,
     configured_vr_folder, dismiss_download, dismiss_organization, list_downloads,
@@ -34,6 +41,7 @@ use vr_torrent::{
 };
 
 const MOVIES_FOLDER_FILE_NAME: &str = ".movies-folder";
+const TV_FOLDER_FILE_NAME: &str = ".tv-folder";
 const VR_FOLDER_FILE_NAME: &str = ".vr-folder";
 const VR_DOWNLOADS_FILE_NAME: &str = ".vr-downloads";
 const VR_DOWNLOAD_LIMIT_FILE_NAME: &str = ".vr-download-limit";
@@ -44,6 +52,8 @@ const MOVIES_STORAGE_FAILED: &str = "movies_storage_failed";
 const MOVIES_STORAGE_UNAVAILABLE: &str = "movies_storage_unavailable";
 const VR_STORAGE_FAILED: &str = "vr_storage_failed";
 const VR_STORAGE_UNAVAILABLE: &str = "vr_storage_unavailable";
+const TV_STORAGE_FAILED: &str = "tv_storage_failed";
+const TV_STORAGE_UNAVAILABLE: &str = "tv_storage_unavailable";
 const MOVIES_SCAN_FAILED: &str = "movies_scan_failed";
 const MOVIE_OPEN_FAILED: &str = "movie_open_failed";
 const MOVIE_OPEN_NOT_FILE: &str = "movie_open_not_file";
@@ -709,6 +719,13 @@ fn movies_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|_| MOVIES_FOLDER_STORAGE_FAILED.to_owned())
 }
 
+fn tv_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(TV_FOLDER_FILE_NAME))
+        .map_err(|_| TV_FOLDER_STORAGE_FAILED.to_owned())
+}
+
 fn vr_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -869,6 +886,115 @@ async fn reveal_movie(path: String) -> Result<(), String> {
     })
     .await
     .map_err(|_| MOVIE_REVEAL_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn load_tv_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<Vec<String>, String> {
+    load_tv_folder_with(state.inner(), &tv_folder_path(&app)?).map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn choose_tv_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<Option<String>, String> {
+    let dialog_app = app.clone();
+    let selected_folder = tauri::async_runtime::spawn_blocking(move || {
+        dialog_app
+            .dialog()
+            .file()
+            .set_title("Choose TV folder")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|_| TV_FOLDER_UNAVAILABLE.to_owned())?;
+    let Some(selected_folder) = selected_folder else {
+        return Ok(None);
+    };
+    let folder = selected_folder
+        .into_path()
+        .map_err(|_| TV_FOLDER_UNAVAILABLE.to_owned())?;
+    set_tv_folder(state.inner(), &tv_folder_path(&app)?, folder)
+        .map(Some)
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn clear_tv_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<(), String> {
+    clear_trusted_tv_folder(state.inner(), &tv_folder_path(&app)?).map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn scan_tv_library(state: tauri::State<'_, TvLibraryState>) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_tv_library_with(&state).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| TV_LIBRARY_SCAN_FAILED.to_owned())?
+}
+
+#[tauri::command]
+async fn query_tv_storage(state: tauri::State<'_, TvLibraryState>) -> Result<[String; 2], String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let folder = configured_tv_folder(&state).map_err(str::to_owned)?;
+        let folder = folder
+            .as_deref()
+            .ok_or_else(|| TV_STORAGE_UNAVAILABLE.to_owned())?;
+        if fs::canonicalize(folder)
+            .ok()
+            .as_deref()
+            .is_none_or(|canonical_folder| canonical_folder != folder)
+        {
+            return Err(TV_STORAGE_UNAVAILABLE.to_owned());
+        }
+        let [total_bytes, free_bytes] = query_volume_storage_with(
+            Some(folder),
+            TV_STORAGE_UNAVAILABLE,
+            TV_STORAGE_FAILED,
+            query_movies_volume_storage,
+        )
+        .map_err(str::to_owned)?;
+        Ok([total_bytes.to_string(), free_bytes.to_string()])
+    })
+    .await
+    .map_err(|_| TV_STORAGE_FAILED.to_owned())?
+}
+
+#[tauri::command]
+async fn open_tv_file(path: String, state: tauri::State<'_, TvLibraryState>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        open_tv_file_with(Path::new(&path), &state, |file_path| {
+            tauri_plugin_opener::open_path(file_path, None::<&str>).map_err(|_| ())
+        })
+    })
+    .await
+    .map_err(|_| TV_FILE_OPEN_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn reveal_tv_file(
+    path: String,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        reveal_tv_file_with(Path::new(&path), &state, |file_path| {
+            tauri_plugin_opener::reveal_item_in_dir(file_path).map_err(|_| ())
+        })
+    })
+    .await
+    .map_err(|_| TV_FILE_REVEAL_FAILED.to_owned())?
     .map_err(str::to_owned)
 }
 
@@ -1279,6 +1405,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(MoviesLibraryState::default())
+        .manage(TvLibraryState::default())
         .manage(VrTorrentState::default())
         .manage(VrDownloadState::default())
         .manage(VrLibraryState::default())
@@ -1291,6 +1418,13 @@ fn main() {
             open_movie,
             reveal_movie,
             trash_movie,
+            load_tv_folder,
+            choose_tv_folder,
+            clear_tv_folder,
+            scan_tv_library,
+            query_tv_storage,
+            open_tv_file,
+            reveal_tv_file,
             load_tmdb_token,
             save_tmdb_token,
             clear_tmdb_token,
