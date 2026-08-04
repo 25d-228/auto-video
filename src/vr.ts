@@ -75,6 +75,10 @@ export type VrDownload = {
   isCurrentFolder: boolean;
 };
 
+export type VrDownloadLimit = {
+  mibPerSecond: string | null;
+};
+
 export type VrLibraryFile = {
   path: string;
   filename: string;
@@ -101,6 +105,7 @@ const productCodePattern = /^([A-Za-z]{2,16})[ _-]*([0-9]{1,10})$/;
 const unsignedU64Pattern = /^\d{1,20}$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const maximumSelectedVrFiles = 100_000;
+const maximumDownloadLimitMibPerSecond = 4095n;
 const vrLibraryPartPattern =
   /(^|[^A-Za-z0-9])((?:part|pt|cd|disc|disk)[ _-]*0*([0-9]{1,4}))(?=$|[^A-Za-z0-9])/gi;
 const vrLibraryPartPrefixes = new Set(["PART", "PT", "CD", "DISC", "DISK"]);
@@ -735,6 +740,48 @@ function parseVrDownloads(value: unknown): VrDownload[] {
     });
   }
   return downloads;
+}
+
+function parseVrDownloadLimit(value: unknown): VrDownloadLimit {
+  if (
+    Array.isArray(value) &&
+    value.length === 1 &&
+    value[0] === "unlimited"
+  ) {
+    return { mibPerSecond: null };
+  }
+  if (
+    Array.isArray(value) &&
+    value.length === 2 &&
+    value[0] === "limited" &&
+    typeof value[1] === "string" &&
+    /^[1-9]\d*$/.test(value[1]) &&
+    BigInt(value[1]) <= maximumDownloadLimitMibPerSecond
+  ) {
+    return { mibPerSecond: value[1] };
+  }
+  throw new Error("The native VR download limit store returned invalid data.");
+}
+
+export async function loadVrDownloadLimit() {
+  return parseVrDownloadLimit(
+    await window.__TAURI__.core.invoke<unknown>("load_vr_download_limit"),
+  );
+}
+
+export async function saveVrDownloadLimit(mibPerSecond: string | null) {
+  if (
+    mibPerSecond !== null &&
+    (!/^[1-9]\d*$/.test(mibPerSecond) ||
+      BigInt(mibPerSecond) > maximumDownloadLimitMibPerSecond)
+  ) {
+    throw new Error("A whole-number VR download limit from 1 to 4095 MiB/s is required.");
+  }
+  return parseVrDownloadLimit(
+    await window.__TAURI__.core.invoke<unknown>("save_vr_download_limit", {
+      mibPerSecond,
+    }),
+  );
 }
 
 export async function loadVrDownloads() {

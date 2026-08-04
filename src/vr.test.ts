@@ -5,9 +5,11 @@ import {
   fetchExactJavdbVrItem,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedSukebeiTorrent,
+  loadVrDownloadLimit,
   loadVrDownloads,
   loadVrFolder,
   scanVrLibrary,
+  saveVrDownloadLimit,
   startVerifiedVrDownload,
 } from "./vr";
 
@@ -535,6 +537,49 @@ describe("verified Sukebei torrent inspection", () => {
 });
 
 describe("trusted VR download boundary", () => {
+  it("loads and saves explicit aggregate download-limit states", async () => {
+    invokeMock
+      .mockResolvedValueOnce(["unlimited"])
+      .mockResolvedValueOnce(["limited", "8"])
+      .mockResolvedValueOnce(["unlimited"]);
+
+    await expect(loadVrDownloadLimit()).resolves.toEqual({
+      mibPerSecond: null,
+    });
+    await expect(saveVrDownloadLimit("8")).resolves.toEqual({
+      mibPerSecond: "8",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "save_vr_download_limit", {
+      mibPerSecond: "8",
+    });
+    await expect(saveVrDownloadLimit(null)).resolves.toEqual({
+      mibPerSecond: null,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "save_vr_download_limit", {
+      mibPerSecond: null,
+    });
+  });
+
+  it("rejects invalid aggregate limits and malformed native responses", async () => {
+    for (const invalid of ["", "0", "01", "-1", "+1", "1.5", "4096"]) {
+      await expect(saveVrDownloadLimit(invalid)).rejects.toThrow(
+        "whole-number VR download limit",
+      );
+    }
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    for (const malformed of [
+      [],
+      ["limited"],
+      ["limited", "0"],
+      ["limited", "4096"],
+      ["unlimited", "1"],
+    ]) {
+      invokeMock.mockResolvedValueOnce(malformed);
+      await expect(loadVrDownloadLimit()).rejects.toThrow("invalid data");
+    }
+  });
+
   it("parses exact persisted identities and selected-file progress", async () => {
     const exactReleaseName = "【VR】 MDVR-419  Exact\t—\n特別版";
     invokeMock.mockResolvedValue([

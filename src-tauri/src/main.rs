@@ -18,8 +18,9 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use vr_download::{
     cancel_download, clear_vr_folder as clear_trusted_vr_folder, configured_vr_folder,
-    dismiss_download, list_downloads, load_downloads, load_vr_folder_with, pause_download,
-    resume_download, set_vr_folder, start_download, VrDownloadState, VR_DOWNLOAD_FAILED,
+    dismiss_download, list_downloads, load_download_limit, load_downloads, load_vr_folder_with,
+    pause_download, resume_download, save_download_limit, set_vr_folder, start_download,
+    VrDownloadState, VR_DOWNLOAD_FAILED, VR_DOWNLOAD_LIMIT_STORAGE_FAILED,
     VR_DOWNLOAD_PERSISTENCE_FAILED, VR_FOLDER_STORAGE_FAILED, VR_FOLDER_UNAVAILABLE,
 };
 use vr_library::{
@@ -34,6 +35,7 @@ use vr_torrent::{
 const MOVIES_FOLDER_FILE_NAME: &str = ".movies-folder";
 const VR_FOLDER_FILE_NAME: &str = ".vr-folder";
 const VR_DOWNLOADS_FILE_NAME: &str = ".vr-downloads";
+const VR_DOWNLOAD_LIMIT_FILE_NAME: &str = ".vr-download-limit";
 const VR_SESSION_FOLDER_NAME: &str = "vr-session";
 const MOVIES_FOLDER_UNAVAILABLE: &str = "movies_folder_unavailable";
 const MOVIES_FOLDER_STORAGE_FAILED: &str = "movies_folder_storage_failed";
@@ -720,6 +722,13 @@ fn vr_downloads_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED.to_owned())
 }
 
+fn vr_download_limit_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(VR_DOWNLOAD_LIMIT_FILE_NAME))
+        .map_err(|_| VR_DOWNLOAD_LIMIT_STORAGE_FAILED.to_owned())
+}
+
 fn vr_session_folder(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -1037,6 +1046,28 @@ async fn reveal_vr_file(
 }
 
 #[tauri::command]
+fn load_vr_download_limit(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<Vec<String>, String> {
+    load_download_limit(state.inner(), &vr_download_limit_path(&app)?).map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn save_vr_download_limit(
+    app: tauri::AppHandle,
+    mib_per_second: Option<String>,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<Vec<String>, String> {
+    save_download_limit(
+        state.inner(),
+        &vr_download_limit_path(&app)?,
+        mib_per_second.as_deref(),
+    )
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn load_vr_downloads(
     app: tauri::AppHandle,
     state: tauri::State<'_, VrDownloadState>,
@@ -1045,6 +1076,7 @@ async fn load_vr_downloads(
         state.inner(),
         &vr_downloads_path(&app)?,
         &vr_session_folder(&app)?,
+        &vr_download_limit_path(&app)?,
     )
     .await
     .map_err(str::to_owned)
@@ -1235,6 +1267,8 @@ fn main() {
             query_vr_storage,
             open_vr_file,
             reveal_vr_file,
+            load_vr_download_limit,
+            save_vr_download_limit,
             load_vr_downloads,
             list_vr_downloads,
             start_verified_vr_download,

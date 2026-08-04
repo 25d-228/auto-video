@@ -63,16 +63,19 @@ import {
   inspectVerifiedSukebeiTorrent,
   invalidateVerifiedVrTorrent,
   listVrDownloads,
+  loadVrDownloadLimit,
   loadVrDownloads,
   loadVrFolder,
   openVrFile,
   pauseVrDownload,
   revealVrFile,
   resumeVrDownload,
+  saveVrDownloadLimit,
   saveVerifiedVrTorrent,
   scanVrLibrary,
   startVerifiedVrDownload,
   type VrDownload,
+  type VrDownloadLimit,
   type VrFolderState,
   type VrLibraryFile,
   type VrLibraryItem,
@@ -89,7 +92,7 @@ const destinations = [
   {
     id: "dashboard",
     label: "Dashboard",
-    description: "Current status for your local Movies and VR Libraries.",
+    description: "Current status for local libraries and VR transfers.",
     emptyHeading: "Dashboard data is not available yet",
     emptyMessage:
       "Metrics and storage details will appear here only after their data sources are implemented.",
@@ -120,7 +123,7 @@ const destinations = [
   {
     id: "settings",
     label: "Settings",
-    description: "Configure TMDB, local media folders, and appearance.",
+    description: "Configure TMDB, local media folders, VR transfers, and appearance.",
     emptyHeading: "Other settings are not configured",
     emptyMessage:
       "Provider credentials and additional preferences will appear only with the features they control.",
@@ -229,6 +232,18 @@ type VrDownloadsUiState =
   | { status: "loading" }
   | { status: "error" }
   | { status: "ready"; downloads: VrDownload[] };
+type VrDownloadLimitUiState =
+  | { status: "loading" }
+  | { status: "error" }
+  | { status: "ready"; limit: VrDownloadLimit };
+type VrDownloadLimitMode = "unlimited" | "limited";
+type VrDownloadSummary = {
+  activeCount: number;
+  pausedCount: number;
+  completedCount: number;
+  attentionCount: number;
+  aggregateSpeedBytesPerSecond: bigint;
+};
 type VrTorrentInspectionContext = {
   item: VrCatalogItem;
   release: VrRelease;
@@ -251,6 +266,7 @@ const systemDarkModeQuery = "(prefers-color-scheme: dark)";
 const copySuccessDuration = 2000;
 // Active rows refresh once per second so progress stays useful without overlapping native polls.
 const vrDownloadRefreshInterval = 1000;
+const maximumVrDownloadLimitMibPerSecond = 4095n;
 // These pixel values mirror the current 0.75rem gap and 13rem minimum card width.
 const galleryGap = 12;
 const minimumGalleryCardWidth = 208;
@@ -2081,6 +2097,39 @@ function compareVrLibraryItemsByTitle(
   return leftItem.id < rightItem.id ? -1 : leftItem.id > rightItem.id ? 1 : 0;
 }
 
+function summarizeVrDownloads(downloads: VrDownload[]): VrDownloadSummary {
+  let activeCount = 0;
+  let pausedCount = 0;
+  let completedCount = 0;
+  let attentionCount = 0;
+  let aggregateSpeedBytesPerSecond = 0n;
+  for (const download of downloads) {
+    if (download.state === "downloading") {
+      activeCount += 1;
+      aggregateSpeedBytesPerSecond += BigInt(download.speedBytesPerSecond);
+    } else if (download.state === "paused") {
+      pausedCount += 1;
+    } else if (download.state === "completed") {
+      completedCount += 1;
+    } else if (download.state === "offline" || download.state === "failed") {
+      attentionCount += 1;
+    }
+  }
+  return {
+    activeCount,
+    pausedCount,
+    completedCount,
+    attentionCount,
+    aggregateSpeedBytesPerSecond,
+  };
+}
+
+function formatVrDownloadLimit(limit: VrDownloadLimit) {
+  return limit.mibPerSecond === null
+    ? "Unlimited"
+    : `${limit.mibPerSecond} MiB/s`;
+}
+
 function formatStorageBytes(bytes: bigint) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
   const bytesPerUnit = 1024n;
@@ -2251,6 +2300,14 @@ export default function App() {
   );
   const [vrDownloadsState, setVrDownloadsState] =
     useState<VrDownloadsUiState>({ status: "loading" });
+  const [vrDownloadLimitState, setVrDownloadLimitState] =
+    useState<VrDownloadLimitUiState>({ status: "loading" });
+  const [vrDownloadLimitMode, setVrDownloadLimitMode] =
+    useState<VrDownloadLimitMode>("unlimited");
+  const [vrDownloadLimitInput, setVrDownloadLimitInput] = useState("");
+  const [isSavingVrDownloadLimit, setIsSavingVrDownloadLimit] = useState(false);
+  const [vrDownloadLimitMessage, setVrDownloadLimitMessage] =
+    useState<CredentialMessage | null>(null);
   const [pendingVrDownloadIds, setPendingVrDownloadIds] = useState<Set<string>>(
     new Set(),
   );
@@ -2272,12 +2329,14 @@ export default function App() {
   const torrentSaveRequestId = useRef(0);
   const torrentStartRequestId = useRef(0);
   const vrDownloadsRequestId = useRef(0);
+  const vrDownloadLimitRequestId = useRef(0);
   const vrFolderRequestId = useRef(0);
   const vrLibraryScanRequestId = useRef(0);
   const vrStorageRequestId = useRef(0);
   const torrentSavePending = useRef(false);
   const torrentStartPending = useRef(false);
   const vrDownloadsRefreshPending = useRef(false);
+  const vrDownloadLimitSavePending = useRef(false);
   const vrDownloadActionsPending = useRef(new Set<string>());
   const trendingDiscoverResult = useRef<{
     refreshVersion: number;
@@ -2354,19 +2413,46 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const requestId = ++vrDownloadsRequestId.current;
-    void loadVrDownloads()
-      .then((downloads) => {
-        if (requestId === vrDownloadsRequestId.current) {
-          setVrDownloadsState({ status: "ready", downloads });
-        }
-      })
-      .catch(() => {
-        if (requestId === vrDownloadsRequestId.current) {
+    const limitRequestId = ++vrDownloadLimitRequestId.current;
+    const downloadsRequestId = ++vrDownloadsRequestId.current;
+    void (async () => {
+      let limit: VrDownloadLimit;
+      try {
+        limit = await loadVrDownloadLimit();
+      } catch {
+        if (
+          limitRequestId === vrDownloadLimitRequestId.current &&
+          downloadsRequestId === vrDownloadsRequestId.current
+        ) {
+          setVrDownloadLimitState({ status: "error" });
           setVrDownloadsState({ status: "error" });
         }
-      });
+        return;
+      }
+      if (
+        limitRequestId !== vrDownloadLimitRequestId.current ||
+        downloadsRequestId !== vrDownloadsRequestId.current
+      ) {
+        return;
+      }
+      setVrDownloadLimitState({ status: "ready", limit });
+      setVrDownloadLimitMode(
+        limit.mibPerSecond === null ? "unlimited" : "limited",
+      );
+      setVrDownloadLimitInput(limit.mibPerSecond ?? "");
+      try {
+        const downloads = await loadVrDownloads();
+        if (downloadsRequestId === vrDownloadsRequestId.current) {
+          setVrDownloadsState({ status: "ready", downloads });
+        }
+      } catch {
+        if (downloadsRequestId === vrDownloadsRequestId.current) {
+          setVrDownloadsState({ status: "error" });
+        }
+      }
+    })();
     return () => {
+      vrDownloadLimitRequestId.current += 1;
       vrDownloadsRequestId.current += 1;
     };
   }, []);
@@ -3088,16 +3174,110 @@ export default function App() {
   };
 
   const retryVrDownloads = async () => {
-    const requestId = ++vrDownloadsRequestId.current;
+    const limitRequestId =
+      vrDownloadLimitState.status === "error"
+        ? ++vrDownloadLimitRequestId.current
+        : vrDownloadLimitRequestId.current;
+    const downloadsRequestId = ++vrDownloadsRequestId.current;
     setVrDownloadsState({ status: "loading" });
+    if (vrDownloadLimitState.status === "error") {
+      setVrDownloadLimitState({ status: "loading" });
+      setVrDownloadLimitMessage(null);
+      try {
+        const limit = await loadVrDownloadLimit();
+        if (limitRequestId !== vrDownloadLimitRequestId.current) {
+          return;
+        }
+        setVrDownloadLimitState({ status: "ready", limit });
+        setVrDownloadLimitMode(
+          limit.mibPerSecond === null ? "unlimited" : "limited",
+        );
+        setVrDownloadLimitInput(limit.mibPerSecond ?? "");
+      } catch {
+        if (limitRequestId === vrDownloadLimitRequestId.current) {
+          setVrDownloadLimitState({ status: "error" });
+          setVrDownloadsState({ status: "error" });
+        }
+        return;
+      }
+    }
     try {
       const downloads = await loadVrDownloads();
-      if (requestId === vrDownloadsRequestId.current) {
+      if (downloadsRequestId === vrDownloadsRequestId.current) {
         setVrDownloadsState({ status: "ready", downloads });
       }
     } catch {
-      if (requestId === vrDownloadsRequestId.current) {
+      if (downloadsRequestId === vrDownloadsRequestId.current) {
         setVrDownloadsState({ status: "error" });
+      }
+    }
+  };
+
+  const saveConfiguredVrDownloadLimit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (
+      vrDownloadLimitSavePending.current ||
+      vrDownloadLimitState.status !== "ready"
+    ) {
+      return;
+    }
+    const mibPerSecond = vrDownloadLimitInput.trim();
+    if (
+      vrDownloadLimitMode === "limited" &&
+      (!/^[1-9]\d*$/.test(mibPerSecond) ||
+        BigInt(mibPerSecond) > maximumVrDownloadLimitMibPerSecond)
+    ) {
+      setVrDownloadLimitMessage({
+        role: "alert",
+        text: "Enter a whole-number limit from 1 to 4095 MiB/s.",
+      });
+      return;
+    }
+
+    const requestId = ++vrDownloadLimitRequestId.current;
+    vrDownloadLimitSavePending.current = true;
+    setIsSavingVrDownloadLimit(true);
+    setVrDownloadLimitMessage(null);
+    try {
+      const limit = await saveVrDownloadLimit(
+        vrDownloadLimitMode === "limited" ? mibPerSecond : null,
+      );
+      if (requestId !== vrDownloadLimitRequestId.current) {
+        return;
+      }
+      setVrDownloadLimitState({ status: "ready", limit });
+      setVrDownloadLimitMode(
+        limit.mibPerSecond === null ? "unlimited" : "limited",
+      );
+      setVrDownloadLimitInput(limit.mibPerSecond ?? "");
+      setVrDownloadLimitMessage({
+        role: "status",
+        text:
+          limit.mibPerSecond === null
+            ? "VR downloads are now Unlimited."
+            : `VR download limit applied at ${limit.mibPerSecond} MiB/s.`,
+      });
+    } catch (error: unknown) {
+      if (requestId !== vrDownloadLimitRequestId.current) {
+        return;
+      }
+      const message = (() => {
+        switch (nativeErrorCode(error)) {
+          case "vr_download_limit_invalid":
+            return "Enter a whole-number limit from 1 to 4095 MiB/s.";
+          case "vr_download_limit_storage_failed":
+            return "The VR download limit could not be saved. The previous limit remains active.";
+          case "vr_download_limit_apply_failed":
+            return "The VR download limit could not be applied. The previous limit remains active.";
+          default:
+            return "The VR download limit is unavailable. Reload it before saving.";
+        }
+      })();
+      setVrDownloadLimitMessage({ role: "alert", text: message });
+    } finally {
+      if (requestId === vrDownloadLimitRequestId.current) {
+        vrDownloadLimitSavePending.current = false;
+        setIsSavingVrDownloadLimit(false);
       }
     }
   };
@@ -3670,6 +3850,23 @@ export default function App() {
     (count, item) => count + item.files.length,
     0,
   );
+  const currentVrDownloads =
+    vrDownloadsState.status === "ready" ? vrDownloadsState.downloads : [];
+  const vrDownloadSummary = summarizeVrDownloads(currentVrDownloads);
+  const vrDownloadLimitRequiresAttention =
+    vrDownloadLimitState.status === "error" ||
+    vrDownloadLimitMessage?.role === "alert";
+  const currentVrDownloadLimit =
+    vrDownloadLimitState.status === "ready"
+      ? formatVrDownloadLimit(vrDownloadLimitState.limit)
+      : vrDownloadLimitState.status === "loading"
+        ? "Loading…"
+        : "Needs attention";
+  const dashboardDownloadsDestination = vrDownloadLimitRequiresAttention
+    ? settingsDestination
+    : currentVrDownloads.length > 0 || vrDownloadsState.status === "error"
+      ? downloadsDestination
+      : null;
   let dashboardMoviesHeading = "Loading Movies Library";
   let dashboardMoviesMessage = "Loading the configured Movies folder.";
   let dashboardMoviesRole: "alert" | "status" | undefined = "status";
@@ -4039,6 +4236,96 @@ export default function App() {
                   {dashboardVrDestination.id === "library"
                     ? "Open VR Library"
                     : "Open VR Settings"}
+                </Button>
+              )}
+            </section>
+            <section
+              aria-busy={
+                vrDownloadsState.status === "loading" ||
+                vrDownloadLimitState.status === "loading"
+              }
+              aria-labelledby="dashboard-downloads-heading"
+              className="dashboard-library-summary"
+            >
+              <div className="dashboard-library-summary__heading">
+                <span className="empty-state__icon">
+                  <AppIcon name="downloads" />
+                </span>
+                <div>
+                  <p className="card-eyebrow">Current transfers</p>
+                  <h2 id="dashboard-downloads-heading">Downloads</h2>
+                  <p className="dashboard-library-summary__folder">
+                    Aggregate VR transfer activity
+                  </p>
+                </div>
+              </div>
+
+              {vrDownloadsState.status === "ready" ? (
+                <div className="dashboard-library-summary__storage">
+                  <p className="card-eyebrow">Current status</p>
+                  <dl aria-label="VR transfer summary">
+                    <div>
+                      <dt>Active</dt>
+                      <dd>{vrDownloadSummary.activeCount}</dd>
+                    </div>
+                    <div>
+                      <dt>Paused</dt>
+                      <dd>{vrDownloadSummary.pausedCount}</dd>
+                    </div>
+                    <div>
+                      <dt>Completed</dt>
+                      <dd>{vrDownloadSummary.completedCount}</dd>
+                    </div>
+                    <div>
+                      <dt>Needs attention</dt>
+                      <dd>{vrDownloadSummary.attentionCount}</dd>
+                    </div>
+                    <div>
+                      <dt>Download speed</dt>
+                      <dd>
+                        {formatStorageBytes(
+                          vrDownloadSummary.aggregateSpeedBytesPerSecond,
+                        )}
+                        /s
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Limit</dt>
+                      <dd>{currentVrDownloadLimit}</dd>
+                    </div>
+                  </dl>
+                </div>
+              ) : (
+                <div
+                  className="dashboard-library-summary__status"
+                  role={vrDownloadsState.status === "error" ? "alert" : "status"}
+                >
+                  <p className="card-eyebrow">Current status</p>
+                  <h3>
+                    {vrDownloadsState.status === "loading"
+                      ? "Loading VR transfers"
+                      : "VR transfers need attention"}
+                  </h3>
+                  <p>
+                    {vrDownloadsState.status === "loading"
+                      ? "Loading the current native transfer snapshot and aggregate limit."
+                      : vrDownloadLimitRequiresAttention
+                        ? "The aggregate limit could not be loaded or applied safely."
+                        : "The current transfer snapshot could not be loaded."}
+                  </p>
+                </div>
+              )}
+
+              {dashboardDownloadsDestination === null ? null : (
+                <Button
+                  className="dashboard-library-summary__action"
+                  onClick={() => navigateTo(dashboardDownloadsDestination)}
+                  type="button"
+                >
+                  <AppIcon name={dashboardDownloadsDestination.id} />
+                  {dashboardDownloadsDestination.id === "settings"
+                    ? "Open Download Settings"
+                    : "Open Downloads"}
                 </Button>
               )}
             </section>
@@ -4678,6 +4965,31 @@ export default function App() {
                   Refresh
                 </Button>
               </div>
+              {vrDownloadsState.status === "ready" ? (
+                <div
+                  aria-atomic="true"
+                  aria-live="polite"
+                  className="vr-downloads__summary"
+                  role="status"
+                >
+                  <p className="card-eyebrow">Aggregate activity</p>
+                  <dl aria-label="VR downloads aggregate status">
+                    <div>
+                      <dt>Network-active transfers</dt>
+                      <dd>{vrDownloadSummary.activeCount}</dd>
+                    </div>
+                    <div>
+                      <dt>Current download speed</dt>
+                      <dd>
+                        {formatStorageBytes(
+                          vrDownloadSummary.aggregateSpeedBytesPerSecond,
+                        )}
+                        /s
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+              ) : null}
               {vrDownloadsState.status === "ready" &&
               vrDownloadsState.downloads.length > 0 ? (
                 <div className="vr-downloads__list">
@@ -4960,6 +5272,134 @@ export default function App() {
                     </p>
                   )}
                 </div>
+              </section>
+
+              <section
+                aria-labelledby="vr-download-limit-heading"
+                className="settings-card"
+              >
+                <div className="settings-card__heading">
+                  <span className="empty-state__icon">
+                    <AppIcon name="downloads" />
+                  </span>
+                  <div>
+                    <h2 id="vr-download-limit-heading">VR download limit</h2>
+                    <p>
+                      Set one aggregate limit for all current and future VR
+                      downloads. Limits use whole MiB per second.
+                    </p>
+                  </div>
+                </div>
+
+                <form
+                  className="credential-setting download-limit-setting"
+                  noValidate
+                  onSubmit={saveConfiguredVrDownloadLimit}
+                >
+                  <p
+                    className={
+                      vrDownloadLimitState.status === "error"
+                        ? "field-error credential-setting__status"
+                        : "credential-setting__status"
+                    }
+                    id="vr-download-limit-status"
+                    role={
+                      vrDownloadLimitState.status === "error"
+                        ? "alert"
+                        : undefined
+                    }
+                  >
+                    {vrDownloadLimitState.status === "loading"
+                      ? "Loading the native-owned aggregate limit…"
+                      : vrDownloadLimitState.status === "error"
+                        ? "The aggregate limit could not be loaded or applied. Eligible saved transfers remain non-running."
+                        : `Current limit: ${formatVrDownloadLimit(vrDownloadLimitState.limit)}.`}
+                  </p>
+                  {vrDownloadLimitState.status === "ready" ? (
+                    <>
+                      <fieldset className="appearance-options download-limit-options">
+                        <legend>Limit mode</legend>
+                        <div>
+                          {([
+                            ["unlimited", "Unlimited"],
+                            ["limited", "Finite"],
+                          ] as const).map(([mode, label]) => (
+                            <label className="appearance-option" key={mode}>
+                              <input
+                                checked={vrDownloadLimitMode === mode}
+                                disabled={isSavingVrDownloadLimit}
+                                name="vr-download-limit-mode"
+                                onChange={() => {
+                                  setVrDownloadLimitMode(mode);
+                                  setVrDownloadLimitMessage(null);
+                                }}
+                                type="radio"
+                                value={mode}
+                              />
+                              <span className="appearance-option__content">
+                                {label}
+                              </span>
+                            </label>
+                          ))}
+                        </div>
+                      </fieldset>
+                      <label className="field-label" htmlFor="vr-download-limit-value">
+                        Finite limit (MiB/s)
+                      </label>
+                      <input
+                        aria-describedby="vr-download-limit-help"
+                        className="credential-input"
+                        disabled={
+                          isSavingVrDownloadLimit ||
+                          vrDownloadLimitMode === "unlimited"
+                        }
+                        id="vr-download-limit-value"
+                        inputMode="numeric"
+                        max="4095"
+                        min="1"
+                        onChange={(event) => {
+                          setVrDownloadLimitInput(event.target.value);
+                          setVrDownloadLimitMessage(null);
+                        }}
+                        step="1"
+                        type="number"
+                        value={vrDownloadLimitInput}
+                      />
+                      <p className="field-help" id="vr-download-limit-help">
+                        Enter a whole number from 1 to 4095. Unlimited removes
+                        the aggregate download cap.
+                      </p>
+                      <div className="folder-setting__actions">
+                        <Button disabled={isSavingVrDownloadLimit} type="submit">
+                          {isSavingVrDownloadLimit ? "Applying…" : "Apply limit"}
+                        </Button>
+                      </div>
+                    </>
+                  ) : vrDownloadLimitState.status === "error" ? (
+                    <div className="folder-setting__actions">
+                      <Button
+                        onClick={() => void retryVrDownloads()}
+                        type="button"
+                        variant="outline"
+                      >
+                        <AppIcon name="refresh" />
+                        Retry limit
+                      </Button>
+                    </div>
+                  ) : null}
+                  {vrDownloadLimitMessage === null ? null : (
+                    <p
+                      className={
+                        vrDownloadLimitMessage.role === "alert"
+                          ? "field-error"
+                          : "field-success"
+                      }
+                      role={vrDownloadLimitMessage.role}
+                    >
+                      {vrDownloadLimitMessage.text}
+                    </p>
+                  )}
+                </form>
               </section>
 
               <section
