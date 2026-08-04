@@ -24,6 +24,7 @@ import {
   PlayIcon,
   SquaresFourIcon,
   SunIcon,
+  TelevisionSimpleIcon,
   TrashIcon,
   WarningCircleIcon,
   XIcon,
@@ -52,6 +53,18 @@ import {
   type TmdbMoviesResult,
   tmdbPosterUrl,
 } from "@/tmdb";
+import {
+  chooseTvFolder,
+  clearTvFolder,
+  loadTvFolder,
+  openTvFile,
+  queryTvStorage,
+  revealTvFile,
+  scanTvLibrary,
+  type TvFolderState,
+  type TvLibraryFile,
+  type TvLibraryItem,
+} from "@/tv";
 import {
   applyVrOrganization,
   canonicalizeProductCode,
@@ -112,7 +125,7 @@ const destinations = [
   {
     id: "library",
     label: "Library",
-    description: "Browse supported video files from your local Movies and VR folders.",
+    description: "Browse supported video files from your local Movies, TV, and VR folders.",
     emptyHeading: "Choose a Movies folder to begin",
     emptyMessage:
       "Configure one local Movies folder in Settings before scanning your library.",
@@ -168,6 +181,7 @@ const appIcons = {
   search: MagnifyingGlassIcon,
   details: InfoIcon,
   vr: GogglesIcon,
+  tv: TelevisionSimpleIcon,
   releases: ListMagnifyingGlassIcon,
   pause: PauseIcon,
 } satisfies Record<string, Icon>;
@@ -184,6 +198,14 @@ type MovieScanState =
   | { status: "unavailable" }
   | { status: "error" }
   | { status: "ready"; movies: Movie[] };
+type TvLibraryScanState =
+  | { status: "loading" }
+  | { status: "unconfigured" }
+  | { status: "scanning" }
+  | { status: "empty" }
+  | { status: "unavailable" }
+  | { status: "error" }
+  | { status: "ready"; items: TvLibraryItem[] };
 type VolumeStorageState =
   | { status: "unconfigured" }
   | { status: "loading" }
@@ -205,7 +227,7 @@ type CredentialMessage = {
 };
 type CopyTitleState = "idle" | "success" | "error";
 type DiscoverCategory = "movies" | "vr";
-type LibraryCategory = "movies" | "vr";
+type LibraryCategory = "movies" | "tv" | "vr";
 type VrLibraryScanState =
   | { status: "loading" }
   | { status: "unconfigured" }
@@ -231,6 +253,10 @@ type VrTorrentStartState =
 type VrFolderUiState =
   | { status: "loading" }
   | VrFolderState
+  | { status: "error" };
+type TvFolderUiState =
+  | { status: "loading" }
+  | TvFolderState
   | { status: "error" };
 type VrDownloadsUiState =
   | { status: "loading" }
@@ -264,6 +290,7 @@ const appearanceStorageKey = "auto-video-appearance";
 const moviesFolderUnavailable = "movies_folder_unavailable";
 const moviesStorageUnavailable = "movies_storage_unavailable";
 const vrStorageUnavailable = "vr_storage_unavailable";
+const tvStorageUnavailable = "tv_storage_unavailable";
 const activeVrDownloadStates = new Set(["queued", "downloading", "paused"]);
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
 // Two seconds confirms a successful copy without leaving stale feedback on the card.
@@ -341,6 +368,59 @@ const vrLibraryScanMessages = {
     role: "alert",
   },
 } as const;
+
+const tvLibraryScanMessages = {
+  loading: {
+    heading: "Loading TV folder",
+    message: "Checking the configured TV folder.",
+    role: "status",
+  },
+  unconfigured: {
+    heading: "Choose a TV folder to begin",
+    message: "Configure one local TV folder in Settings before scanning your library.",
+    role: undefined,
+  },
+  scanning: {
+    heading: "Scanning TV folder",
+    message: "Looking recursively for .mp4 and .mkv files.",
+    role: "status",
+  },
+  empty: {
+    heading: "No supported TV videos found",
+    message: "This folder does not contain any .mp4 or .mkv files.",
+    role: undefined,
+  },
+  unavailable: {
+    heading: "TV folder is unavailable",
+    message: "The configured folder may have moved or become inaccessible. Check it in Settings or try Refresh.",
+    role: "alert",
+  },
+  error: {
+    heading: "TV folder could not be scanned",
+    message: "Auto-Video could not read every item in this folder. Check its access and try Refresh.",
+    role: "alert",
+  },
+} as const;
+
+const tvFileOpenErrorMessages: Record<string, string> = {
+  tv_file_open_not_found: "This file is no longer available.",
+  tv_file_open_unavailable: "Auto-Video could not access this file.",
+  tv_file_open_not_file: "This item is not an eligible video file.",
+  tv_file_open_unsupported: "This item is not a supported .mp4 or .mkv file.",
+  tv_file_open_outside_folder: "This file is outside the configured TV folder.",
+  tv_file_open_stale: "This file is no longer part of the current TV Library.",
+  tv_file_open_failed: "The operating system could not open this file.",
+};
+
+const tvFileRevealErrorMessages: Record<string, string> = {
+  tv_file_reveal_not_found: "This file is no longer available.",
+  tv_file_reveal_unavailable: "Auto-Video could not access this file.",
+  tv_file_reveal_not_file: "This item is not an eligible video file.",
+  tv_file_reveal_unsupported: "This item is not a supported .mp4 or .mkv file.",
+  tv_file_reveal_outside_folder: "This file is outside the configured TV folder.",
+  tv_file_reveal_stale: "This file is no longer part of the current TV Library.",
+  tv_file_reveal_failed: "The operating system could not reveal this file.",
+};
 
 const vrFileOpenErrorMessages: Record<string, string> = {
   vr_file_open_not_found: "This file is no longer available.",
@@ -1891,6 +1971,115 @@ function VrLibraryCard({ item }: { item: VrLibraryItem }) {
   );
 }
 
+function TvLibraryFileRow({ file }: { file: TvLibraryFile }) {
+  const [pendingAction, setPendingAction] = useState<"open" | "reveal" | null>(
+    null,
+  );
+  const [actionError, setActionError] = useState<string | null>(null);
+  const actionPending = useRef(false);
+
+  const runAction = async (action: "open" | "reveal") => {
+    if (actionPending.current) {
+      return;
+    }
+    actionPending.current = true;
+    setPendingAction(action);
+    setActionError(null);
+    try {
+      if (action === "open") {
+        await openTvFile(file.path);
+      } else {
+        await revealTvFile(file.path);
+      }
+    } catch (error: unknown) {
+      const errorCode = nativeErrorCode(error);
+      setActionError(
+        action === "open"
+          ? (tvFileOpenErrorMessages[errorCode] ??
+              "Auto-Video could not open this TV file.")
+          : (tvFileRevealErrorMessages[errorCode] ??
+              "Auto-Video could not reveal this TV file."),
+      );
+    } finally {
+      actionPending.current = false;
+      setPendingAction(null);
+    }
+  };
+
+  return (
+    <li className="vr-library-file" data-tv-file-path={file.path}>
+      <div className="vr-library-file__identity">
+        <span title={file.path}>{file.filename}</span>
+        <small>
+          {file.season === null || file.episode === null
+            ? "Unassociated"
+            : `Season ${file.season} · Episode ${file.episode}`}
+          {` · ${formatStorageBytes(BigInt(file.sizeBytes))}`}
+        </small>
+      </div>
+      <div className="vr-library-file__actions">
+        <Button
+          aria-label={`${pendingAction === "open" ? "Opening" : "Open"} TV file: ${file.filename}`}
+          disabled={pendingAction !== null}
+          onClick={() => void runAction("open")}
+          size="icon-xs"
+          title="Open file"
+          type="button"
+          variant="outline"
+        >
+          <AppIcon name="open" />
+        </Button>
+        <Button
+          aria-label={`${pendingAction === "reveal" ? "Revealing" : "Reveal"} TV file: ${file.filename}`}
+          disabled={pendingAction !== null}
+          onClick={() => void runAction("reveal")}
+          size="icon-xs"
+          title="Reveal file"
+          type="button"
+          variant="outline"
+        >
+          <AppIcon name="reveal" />
+        </Button>
+      </div>
+      {actionError === null ? null : (
+        <p aria-atomic="true" role="alert">
+          {actionError}
+        </p>
+      )}
+    </li>
+  );
+}
+
+function TvLibraryCard({ item }: { item: TvLibraryItem }) {
+  return (
+    <article className="movie-card vr-library-card tv-library-card">
+      <div className="media-title-row">
+        <div>
+          <p className="card-eyebrow">
+            {item.showTitle === null
+              ? "Unassociated file"
+              : `${item.files.length} ${item.files.length === 1 ? "episode" : "episodes"}`}
+          </p>
+          <h3>{item.title}</h3>
+        </div>
+        <CopyTitleAction title={item.title} />
+      </div>
+      <ul
+        aria-label={
+          item.showTitle === null
+            ? `File details for ${item.title}`
+            : `Episodes for ${item.title}`
+        }
+        className="vr-library-card__files"
+      >
+        {item.files.map((file) => (
+          <TvLibraryFileRow file={file} key={file.path} />
+        ))}
+      </ul>
+    </article>
+  );
+}
+
 function VrDownloadCard({
   download,
   error,
@@ -2254,6 +2443,23 @@ function compareVrLibraryItemsByTitle(
   return leftItem.id < rightItem.id ? -1 : leftItem.id > rightItem.id ? 1 : 0;
 }
 
+function compareTvLibraryItemsByTitle(
+  leftItem: TvLibraryItem,
+  rightItem: TvLibraryItem,
+  direction: LibraryTitleSortDirection,
+) {
+  const leftTitle = leftItem.title.toLowerCase();
+  const rightTitle = rightItem.title.toLowerCase();
+  const titleOrder = leftTitle < rightTitle ? -1 : leftTitle > rightTitle ? 1 : 0;
+  if (titleOrder !== 0) {
+    return direction === "ascending" ? titleOrder : -titleOrder;
+  }
+  if (leftItem.title !== rightItem.title) {
+    return leftItem.title < rightItem.title ? -1 : 1;
+  }
+  return leftItem.id < rightItem.id ? -1 : leftItem.id > rightItem.id ? 1 : 0;
+}
+
 function summarizeVrDownloads(downloads: VrDownload[]): VrDownloadSummary {
   let activeCount = 0;
   let pausedCount = 0;
@@ -2368,6 +2574,25 @@ export default function App() {
     useState<LibraryTitleSortDirection>("ascending");
   const [libraryCategory, setLibraryCategory] =
     useState<LibraryCategory>("movies");
+  const [tvFolderState, setTvFolderState] = useState<TvFolderUiState>({
+    status: "loading",
+  });
+  const [tvLibraryScanState, setTvLibraryScanState] =
+    useState<TvLibraryScanState>({ status: "loading" });
+  const [tvLibraryRefreshVersion, setTvLibraryRefreshVersion] = useState(0);
+  const [tvStorageRefreshVersion, setTvStorageRefreshVersion] = useState(0);
+  const [tvStorageState, setTvStorageState] = useState<VolumeStorageState>({
+    status: "unconfigured",
+  });
+  const [tvLibrarySelectedPage, setTvLibrarySelectedPage] = useState(1);
+  const [tvLibrarySearchQuery, setTvLibrarySearchQuery] = useState("");
+  const [tvLibraryTitleSortDirection, setTvLibraryTitleSortDirection] =
+    useState<LibraryTitleSortDirection>("ascending");
+  const [isChoosingTvFolder, setIsChoosingTvFolder] = useState(false);
+  const [isRevalidatingTvFolder, setIsRevalidatingTvFolder] = useState(false);
+  const [tvFolderActionError, setTvFolderActionError] = useState<string | null>(
+    null,
+  );
   const [vrLibraryScanState, setVrLibraryScanState] =
     useState<VrLibraryScanState>({ status: "loading" });
   const [vrLibraryRefreshVersion, setVrLibraryRefreshVersion] = useState(0);
@@ -2499,6 +2724,9 @@ export default function App() {
   const vrFolderRequestId = useRef(0);
   const vrLibraryScanRequestId = useRef(0);
   const vrStorageRequestId = useRef(0);
+  const tvFolderRequestId = useRef(0);
+  const tvLibraryScanRequestId = useRef(0);
+  const tvStorageRequestId = useRef(0);
   const torrentSavePending = useRef(false);
   const torrentStartPending = useRef(false);
   const vrDownloadsRefreshPending = useRef(false);
@@ -2559,6 +2787,24 @@ export default function App() {
     document.documentElement.dataset.theme = resolvedTheme;
     window.localStorage.setItem(appearanceStorageKey, appearance);
   }, [appearance, resolvedTheme]);
+
+  useEffect(() => {
+    const requestId = ++tvFolderRequestId.current;
+    void loadTvFolder()
+      .then((folderState) => {
+        if (requestId === tvFolderRequestId.current) {
+          setTvFolderState(folderState);
+        }
+      })
+      .catch(() => {
+        if (requestId === tvFolderRequestId.current) {
+          setTvFolderState({ status: "error" });
+        }
+      });
+    return () => {
+      tvFolderRequestId.current += 1;
+    };
+  }, []);
 
   useEffect(() => {
     const requestId = ++vrFolderRequestId.current;
@@ -2793,6 +3039,92 @@ export default function App() {
       vrStorageRequestId.current += 1;
     };
   }, [vrFolderState, vrStorageRefreshVersion]);
+
+  useEffect(() => {
+    const requestId = ++tvLibraryScanRequestId.current;
+    if (tvFolderState.status === "loading") {
+      setTvLibraryScanState({ status: "loading" });
+      return;
+    }
+    if (tvFolderState.status === "unconfigured") {
+      setTvLibraryScanState({ status: "unconfigured" });
+      return;
+    }
+    if (tvFolderState.status === "unavailable") {
+      setTvLibraryScanState({ status: "unavailable" });
+      return;
+    }
+    if (tvFolderState.status === "error") {
+      setTvLibraryScanState({ status: "error" });
+      return;
+    }
+
+    setTvLibraryScanState({ status: "scanning" });
+    void scanTvLibrary()
+      .then((items) => {
+        if (requestId === tvLibraryScanRequestId.current) {
+          setTvLibraryScanState(
+            items.length === 0
+              ? { status: "empty" }
+              : { status: "ready", items },
+          );
+        }
+      })
+      .catch((error: unknown) => {
+        if (requestId === tvLibraryScanRequestId.current) {
+          setTvLibraryScanState({
+            status:
+              nativeErrorCode(error) === "tv_folder_unavailable"
+                ? "unavailable"
+                : "error",
+          });
+        }
+      });
+    return () => {
+      tvLibraryScanRequestId.current += 1;
+    };
+  }, [tvFolderState, tvLibraryRefreshVersion]);
+
+  useEffect(() => {
+    const requestId = ++tvStorageRequestId.current;
+    if (tvFolderState.status === "loading") {
+      setTvStorageState({ status: "loading" });
+      return;
+    }
+    if (tvFolderState.status === "unconfigured") {
+      setTvStorageState({ status: "unconfigured" });
+      return;
+    }
+    if (tvFolderState.status === "unavailable") {
+      setTvStorageState({ status: "unavailable" });
+      return;
+    }
+    if (tvFolderState.status === "error") {
+      setTvStorageState({ status: "error" });
+      return;
+    }
+
+    setTvStorageState({ status: "loading" });
+    void queryTvStorage()
+      .then(({ totalBytes, freeBytes }) => {
+        if (requestId === tvStorageRequestId.current) {
+          setTvStorageState({ status: "ready", totalBytes, freeBytes });
+        }
+      })
+      .catch((error: unknown) => {
+        if (requestId === tvStorageRequestId.current) {
+          setTvStorageState({
+            status:
+              nativeErrorCode(error) === tvStorageUnavailable
+                ? "unavailable"
+                : "error",
+          });
+        }
+      });
+    return () => {
+      tvStorageRequestId.current += 1;
+    };
+  }, [tvFolderState, tvStorageRefreshVersion]);
 
   useEffect(() => {
     let isCurrent = true;
@@ -3234,6 +3566,102 @@ export default function App() {
       );
       setMovieRefreshVersion((version) => version + 1);
     }
+  };
+
+  const chooseConfiguredTvFolder = async () => {
+    if (isChoosingTvFolder) {
+      return;
+    }
+    const requestId = ++tvFolderRequestId.current;
+    setIsRevalidatingTvFolder(false);
+    setTvFolderActionError(null);
+    setIsChoosingTvFolder(true);
+    try {
+      const selectedFolder = await chooseTvFolder();
+      if (requestId === tvFolderRequestId.current && selectedFolder !== null) {
+        tvLibraryScanRequestId.current += 1;
+        tvStorageRequestId.current += 1;
+        setTvLibraryScanState({ status: "scanning" });
+        setTvStorageState({ status: "loading" });
+        setTvFolderState({ status: "ready", path: selectedFolder });
+      }
+    } catch {
+      if (requestId === tvFolderRequestId.current) {
+        setTvFolderActionError("The TV folder picker could not be opened.");
+      }
+    } finally {
+      setIsChoosingTvFolder(false);
+    }
+  };
+
+  const clearConfiguredTvFolder = async () => {
+    const requestId = ++tvFolderRequestId.current;
+    setIsRevalidatingTvFolder(false);
+    tvLibraryScanRequestId.current += 1;
+    tvStorageRequestId.current += 1;
+    setTvFolderActionError(null);
+    try {
+      await clearTvFolder();
+      if (requestId === tvFolderRequestId.current) {
+        setTvFolderState({ status: "unconfigured" });
+      }
+    } catch {
+      if (requestId === tvFolderRequestId.current) {
+        setTvFolderActionError(
+          "The TV folder configuration could not be cleared.",
+        );
+      }
+    }
+  };
+
+  const refreshTvLibrary = () => {
+    if (tvFolderState.status === "unavailable") {
+      if (isRevalidatingTvFolder) {
+        return;
+      }
+      const requestId = ++tvFolderRequestId.current;
+      tvLibraryScanRequestId.current += 1;
+      tvStorageRequestId.current += 1;
+      setIsRevalidatingTvFolder(true);
+      void loadTvFolder()
+        .then((folderState) => {
+          if (requestId === tvFolderRequestId.current) {
+            setTvFolderState(folderState);
+          }
+        })
+        .catch(() => {
+          if (requestId === tvFolderRequestId.current) {
+            setTvFolderState({ status: "error" });
+          }
+        })
+        .finally(() => {
+          if (requestId === tvFolderRequestId.current) {
+            setIsRevalidatingTvFolder(false);
+          }
+        });
+      return;
+    }
+    if (tvFolderState.status !== "ready") {
+      return;
+    }
+    tvLibraryScanRequestId.current += 1;
+    tvStorageRequestId.current += 1;
+    setTvLibraryScanState({ status: "scanning" });
+    setTvStorageState({ status: "loading" });
+    setTvLibraryRefreshVersion((version) => version + 1);
+    setTvStorageRefreshVersion((version) => version + 1);
+  };
+
+  const updateTvLibrarySearchQuery = (query: string) => {
+    setTvLibrarySearchQuery(query);
+    setTvLibrarySelectedPage(1);
+  };
+
+  const updateTvLibraryTitleSortDirection = (
+    direction: LibraryTitleSortDirection,
+  ) => {
+    setTvLibraryTitleSortDirection(direction);
+    setTvLibrarySelectedPage(1);
   };
 
   const chooseConfiguredVrFolder = async () => {
@@ -4173,6 +4601,46 @@ export default function App() {
     (count, item) => count + item.files.length,
     0,
   );
+  const currentTvLibraryScanMessage =
+    tvLibraryScanState.status === "ready"
+      ? null
+      : tvLibraryScanMessages[tvLibraryScanState.status];
+  const completeTvLibraryItems =
+    tvLibraryScanState.status === "ready" ? tvLibraryScanState.items : [];
+  const tvLibrarySearch = tvLibrarySearchQuery.toLowerCase();
+  const isTvLibrarySearchActive = tvLibrarySearchQuery.trim() !== "";
+  const matchingTvLibraryItems = isTvLibrarySearchActive
+    ? completeTvLibraryItems.filter(
+        (item) =>
+          item.title.toLowerCase().includes(tvLibrarySearch) ||
+          item.files.some((file) =>
+            file.filename.toLowerCase().includes(tvLibrarySearch),
+          ),
+      )
+    : completeTvLibraryItems;
+  const orderedTvLibraryItems = [...matchingTvLibraryItems].sort(
+    (leftItem, rightItem) =>
+      compareTvLibraryItemsByTitle(
+        leftItem,
+        rightItem,
+        tvLibraryTitleSortDirection,
+      ),
+  );
+  const completeTvLibraryFileCount = completeTvLibraryItems.reduce(
+    (count, item) => count + item.files.length,
+    0,
+  );
+  const completeTvLibraryEpisodeCount = completeTvLibraryItems.reduce(
+    (count, item) =>
+      count +
+      item.files.filter(
+        (file) => file.season !== null && file.episode !== null,
+      ).length,
+    0,
+  );
+  const completeTvLibraryShowCount = completeTvLibraryItems.filter(
+    (item) => item.showTitle !== null,
+  ).length;
   const currentVrDownloads =
     vrDownloadsState.status === "ready" ? vrDownloadsState.downloads : [];
   const vrDownloadSummary = summarizeVrDownloads(currentVrDownloads);
@@ -4271,6 +4739,71 @@ export default function App() {
         "Auto-Video could not read the containing volume capacity.";
       dashboardStorageRole = "alert";
     }
+  }
+  let dashboardTvHeading = "Loading TV Library";
+  let dashboardTvMessage = "Loading the configured TV folder.";
+  let dashboardTvRole: "alert" | "status" | undefined = "status";
+  let dashboardTvDestination: (typeof destinations)[number] = libraryDestination;
+
+  if (tvFolderState.status === "unconfigured") {
+    dashboardTvHeading = "TV Library is not configured";
+    dashboardTvMessage = "Choose one local TV folder in Settings.";
+    dashboardTvRole = undefined;
+    dashboardTvDestination = settingsDestination;
+  } else if (tvFolderState.status === "unavailable") {
+    dashboardTvHeading = "TV folder is unavailable";
+    dashboardTvMessage = "The configured folder may have moved or become inaccessible.";
+    dashboardTvRole = "alert";
+    dashboardTvDestination = settingsDestination;
+  } else if (tvFolderState.status === "error") {
+    dashboardTvHeading = "TV Library needs attention";
+    dashboardTvMessage = "The TV folder configuration could not be loaded.";
+    dashboardTvRole = "alert";
+    dashboardTvDestination = settingsDestination;
+  } else if (tvLibraryScanState.status === "scanning") {
+    dashboardTvHeading = "Scanning TV Library";
+    dashboardTvMessage = "Looking recursively for supported .mp4 and .mkv files.";
+  } else if (tvLibraryScanState.status === "empty") {
+    dashboardTvHeading = "0 supported TV files";
+    dashboardTvMessage = "The configured folder contains no supported video files.";
+    dashboardTvRole = undefined;
+  } else if (tvLibraryScanState.status === "ready") {
+    dashboardTvHeading = `${completeTvLibraryFileCount} supported TV ${completeTvLibraryFileCount === 1 ? "file" : "files"}`;
+    const unassociatedCount = completeTvLibraryItems.filter(
+      (item) => item.showTitle === null,
+    ).length;
+    const associatedSummary = `${completeTvLibraryShowCount} ${completeTvLibraryShowCount === 1 ? "show" : "shows"} · ${completeTvLibraryEpisodeCount} associated ${completeTvLibraryEpisodeCount === 1 ? "episode" : "episodes"}`;
+    dashboardTvMessage = unassociatedCount === 0
+      ? `${associatedSummary}. These totals come from the latest complete TV folder scan.`
+      : `${associatedSummary} · ${unassociatedCount} ${unassociatedCount === 1 ? "file remains" : "files remain"} unassociated.`;
+    dashboardTvRole = undefined;
+  } else if (tvLibraryScanState.status === "unavailable") {
+    dashboardTvHeading = "TV folder is unavailable";
+    dashboardTvMessage = "The configured folder may have moved or become inaccessible.";
+    dashboardTvRole = "alert";
+    dashboardTvDestination = settingsDestination;
+  } else if (tvLibraryScanState.status === "error") {
+    dashboardTvHeading = "TV Library scan failed";
+    dashboardTvMessage = "Auto-Video could not read every item in the configured folder.";
+    dashboardTvRole = "alert";
+  }
+
+  let dashboardTvStorageHeading = "Waiting for TV folder configuration";
+  let dashboardTvStorageMessage =
+    "Storage will load after the configured TV folder is known.";
+  let dashboardTvStorageRole: "alert" | "status" | undefined;
+  if (tvStorageState.status === "loading") {
+    dashboardTvStorageHeading = "Loading storage";
+    dashboardTvStorageMessage = "Reading the volume capacity for the configured TV folder.";
+    dashboardTvStorageRole = "status";
+  } else if (tvStorageState.status === "unavailable") {
+    dashboardTvStorageHeading = "TV volume is unavailable";
+    dashboardTvStorageMessage = "The configured folder or its containing volume is not accessible.";
+    dashboardTvStorageRole = "alert";
+  } else if (tvStorageState.status === "error") {
+    dashboardTvStorageHeading = "Storage could not be loaded";
+    dashboardTvStorageMessage = "Auto-Video could not read the containing volume capacity.";
+    dashboardTvStorageRole = "alert";
   }
   let dashboardVrHeading = "Loading VR Library";
   let dashboardVrMessage = "Loading the configured VR folder.";
@@ -4474,6 +5007,91 @@ export default function App() {
                 >
                   <AppIcon name={dashboardMoviesDestination.id} />
                   Open {dashboardMoviesDestination.label}
+                </Button>
+              )}
+            </section>
+            <section
+              aria-busy={
+                tvFolderState.status === "loading" ||
+                tvLibraryScanState.status === "scanning"
+              }
+              aria-labelledby="dashboard-tv-heading"
+              className="dashboard-library-summary"
+            >
+              <div className="dashboard-library-summary__heading">
+                <span className="empty-state__icon">
+                  <AppIcon name="tv" />
+                </span>
+                <div>
+                  <p className="card-eyebrow">Local library</p>
+                  <h2 id="dashboard-tv-heading">TV Library</h2>
+                  <p className="dashboard-library-summary__folder">
+                    {tvFolderState.status === "loading"
+                      ? "Loading configured TV folder…"
+                      : tvFolderState.status === "ready" ||
+                          tvFolderState.status === "unavailable"
+                        ? tvFolderState.path
+                        : "No TV folder configured"}
+                  </p>
+                </div>
+              </div>
+
+              <div
+                className="dashboard-library-summary__status"
+                role={dashboardTvRole}
+              >
+                <p className="card-eyebrow">Current status</p>
+                <h3>{dashboardTvHeading}</h3>
+                <p>{dashboardTvMessage}</p>
+              </div>
+
+              <div
+                aria-busy={tvStorageState.status === "loading"}
+                className="dashboard-library-summary__storage"
+              >
+                <p className="card-eyebrow">Storage</p>
+                {tvStorageState.status === "ready" ? (
+                  <dl aria-label="TV volume storage">
+                    <div>
+                      <dt>Total</dt>
+                      <dd>{formatStorageBytes(tvStorageState.totalBytes)}</dd>
+                    </div>
+                    <div>
+                      <dt>Used</dt>
+                      <dd>
+                        {formatStorageBytes(
+                          tvStorageState.totalBytes - tvStorageState.freeBytes,
+                        )}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Free</dt>
+                      <dd>{formatStorageBytes(tvStorageState.freeBytes)}</dd>
+                    </div>
+                  </dl>
+                ) : (
+                  <div role={dashboardTvStorageRole}>
+                    <h3>{dashboardTvStorageHeading}</h3>
+                    <p>{dashboardTvStorageMessage}</p>
+                  </div>
+                )}
+              </div>
+
+              {tvFolderState.status === "loading" ? null : (
+                <Button
+                  className="dashboard-library-summary__action"
+                  onClick={() => {
+                    if (dashboardTvDestination.id === "library") {
+                      setLibraryCategory("tv");
+                    }
+                    navigateTo(dashboardTvDestination);
+                  }}
+                  type="button"
+                >
+                  <AppIcon name={dashboardTvDestination.id} />
+                  {dashboardTvDestination.id === "library"
+                    ? "Open TV Library"
+                    : "Open TV Settings"}
                 </Button>
               )}
             </section>
@@ -4952,7 +5570,9 @@ export default function App() {
               aria-busy={
                 libraryCategory === "movies"
                   ? movieScanState.status === "scanning"
-                  : vrLibraryScanState.status === "scanning"
+                  : libraryCategory === "tv"
+                    ? tvLibraryScanState.status === "scanning"
+                    : vrLibraryScanState.status === "scanning"
               }
               aria-labelledby="library-heading"
               className="library-content"
@@ -4960,17 +5580,34 @@ export default function App() {
               <div className="library-toolbar library-toolbar--movies">
                 <div className="library-toolbar__heading">
                   <span className="empty-state__icon">
-                    <AppIcon name={libraryCategory === "movies" ? "library" : "vr"} />
+                    <AppIcon
+                      name={
+                        libraryCategory === "movies"
+                          ? "library"
+                          : libraryCategory
+                      }
+                    />
                   </span>
                   <div>
                     <p className="card-eyebrow">Local library</p>
                     <h2 id="library-heading">
-                      {libraryCategory === "movies" ? "Movies" : "VR"}
+                      {libraryCategory === "movies"
+                        ? "Movies"
+                        : libraryCategory === "tv"
+                          ? "TV"
+                          : "VR"}
                     </h2>
                     <p className="library-folder">
                       {libraryCategory === "movies"
                         ? (moviesFolder ?? "No Movies folder configured")
-                        : vrFolderState.status === "ready" ||
+                        : libraryCategory === "tv"
+                          ? tvFolderState.status === "ready" ||
+                            tvFolderState.status === "unavailable"
+                            ? tvFolderState.path
+                            : tvFolderState.status === "loading"
+                              ? "Loading configured TV folder…"
+                              : "No TV folder configured"
+                          : vrFolderState.status === "ready" ||
                             vrFolderState.status === "unavailable"
                           ? vrFolderState.path
                           : vrFolderState.status === "loading"
@@ -4985,6 +5622,7 @@ export default function App() {
                     <div>
                       {([
                         ["movies", "Movies"],
+                        ["tv", "TV"],
                         ["vr", "VR"],
                       ] as const).map(([category, label]) => (
                         <label key={category}>
@@ -5072,6 +5710,82 @@ export default function App() {
                     >
                       <AppIcon name="refresh" />
                       Refresh
+                    </Button>
+                  </div>
+                ) : libraryCategory === "tv" &&
+                  (tvFolderState.status === "ready" ||
+                    tvFolderState.status === "unavailable") ? (
+                  <div className="library-toolbar__controls">
+                    <div
+                      aria-label="TV title search"
+                      className="movie-search"
+                      role="search"
+                    >
+                      <label htmlFor="tv-library-title-search">Search titles</label>
+                      <div className="movie-search__field">
+                        <span className="movie-search__icon">
+                          <AppIcon name="search" />
+                        </span>
+                        <input
+                          aria-describedby={
+                            tvLibraryScanState.status === "ready"
+                              ? "tv-library-search-results"
+                              : undefined
+                          }
+                          className="movie-search__input"
+                          id="tv-library-title-search"
+                          onChange={(event) =>
+                            updateTvLibrarySearchQuery(event.target.value)
+                          }
+                          placeholder="Find a TV show or file"
+                          type="text"
+                          value={tvLibrarySearchQuery}
+                        />
+                        {tvLibrarySearchQuery === "" ? null : (
+                          <Button
+                            aria-label="Clear TV search"
+                            className="movie-search__clear"
+                            onClick={() => updateTvLibrarySearchQuery("")}
+                            size="icon-sm"
+                            type="button"
+                            variant="ghost"
+                          >
+                            <AppIcon name="close" />
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="movie-sort">
+                      <label htmlFor="tv-library-title-sort">Sort titles</label>
+                      <select
+                        className="movie-sort__select"
+                        id="tv-library-title-sort"
+                        onChange={(event) => {
+                          const direction = event.target.value;
+                          if (direction !== "ascending" && direction !== "descending") {
+                            throw new Error(
+                              "The TV title sort returned an invalid direction.",
+                            );
+                          }
+                          updateTvLibraryTitleSortDirection(direction);
+                        }}
+                        value={tvLibraryTitleSortDirection}
+                      >
+                        <option value="ascending">Title A–Z</option>
+                        <option value="descending">Title Z–A</option>
+                      </select>
+                    </div>
+                    <Button
+                      disabled={
+                        tvLibraryScanState.status === "scanning" ||
+                        isRevalidatingTvFolder
+                      }
+                      onClick={refreshTvLibrary}
+                      type="button"
+                      variant="outline"
+                    >
+                      <AppIcon name="refresh" />
+                      {isRevalidatingTvFolder ? "Refreshing…" : "Refresh"}
                     </Button>
                   </div>
                 ) : libraryCategory === "vr" &&
@@ -5212,6 +5926,59 @@ export default function App() {
                   <h2>{currentMovieScanMessage?.heading}</h2>
                   <p>{currentMovieScanMessage?.message}</p>
                 </div>
+                )
+              ) : libraryCategory === "tv" ? (
+                tvLibraryScanState.status === "ready" ? (
+                  <>
+                    <p
+                      aria-atomic="true"
+                      aria-live="polite"
+                      className="sr-only"
+                      id="tv-library-search-results"
+                    >
+                      {isTvLibrarySearchActive
+                        ? `${matchingTvLibraryItems.length} TV items match the current search.`
+                        : `${completeTvLibraryFileCount} supported files, ${completeTvLibraryShowCount} shows, ${completeTvLibraryEpisodeCount} associated episodes, and ${completeTvLibraryItems.length - completeTvLibraryShowCount} unassociated files in the complete current result.`}
+                    </p>
+                    {matchingTvLibraryItems.length === 0 &&
+                    isTvLibrarySearchActive ? (
+                      <div className="empty-state library-state library-search-empty">
+                        <span className="empty-state__icon">
+                          <AppIcon name="search" />
+                        </span>
+                        <h2>No TV items match this search</h2>
+                        <p>
+                          No show titles or filenames match “
+                          <span className="library-search-empty__query">
+                            {tvLibrarySearchQuery}
+                          </span>
+                          ”. Clear the search to restore the complete Library.
+                        </p>
+                      </div>
+                    ) : (
+                      <ResizeAwareGallery
+                        ariaLabel="TV shows and unassociated files"
+                        getItemKey={(item) => item.id}
+                        items={orderedTvLibraryItems}
+                        key="tv-library-gallery"
+                        onSelectedPageChange={setTvLibrarySelectedPage}
+                        renderItem={(item) => <TvLibraryCard item={item} />}
+                        selectedPage={tvLibrarySelectedPage}
+                        variant="library"
+                      />
+                    )}
+                  </>
+                ) : (
+                  <div
+                    className="empty-state library-state"
+                    role={currentTvLibraryScanMessage?.role}
+                  >
+                    <span className="empty-state__icon">
+                      <AppIcon name="tv" />
+                    </span>
+                    <h2>{currentTvLibraryScanMessage?.heading}</h2>
+                    <p>{currentTvLibraryScanMessage?.message}</p>
+                  </div>
                 )
               ) : vrLibraryScanState.status === "ready" ? (
                 <>
@@ -5521,6 +6288,89 @@ export default function App() {
                   {folderSelectionError === null ? null : (
                     <p className="field-error" role="alert">
                       {folderSelectionError}
+                    </p>
+                  )}
+                </div>
+              </section>
+
+              <section
+                aria-labelledby="tv-folder-heading"
+                className="settings-card"
+              >
+                <div className="settings-card__heading">
+                  <span className="empty-state__icon">
+                    <AppIcon name="tv" />
+                  </span>
+                  <div>
+                    <h2 id="tv-folder-heading">TV folder</h2>
+                    <p>
+                      Choose one local folder to scan recursively for supported
+                      TV episode files. Auto-Video never renames or moves them.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="folder-setting">
+                  {tvFolderState.status === "ready" ||
+                  tvFolderState.status === "unavailable" ? (
+                    <div>
+                      <p className="field-label">Configured folder</p>
+                      <p className="folder-path">{tvFolderState.path}</p>
+                      {tvFolderState.status === "unavailable" ? (
+                        <p className="field-error" role="alert">
+                          This folder has moved or is unavailable. Restore it,
+                          choose another folder, or clear the configuration.
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <p
+                      className={
+                        tvFolderState.status === "error"
+                          ? "field-error folder-setting__empty"
+                          : "folder-setting__empty"
+                      }
+                      role={tvFolderState.status === "error" ? "alert" : undefined}
+                    >
+                      {tvFolderState.status === "loading"
+                        ? "Loading TV folder configuration…"
+                        : tvFolderState.status === "error"
+                          ? "The TV folder configuration could not be loaded."
+                          : "No TV folder configured."}
+                    </p>
+                  )}
+                  <div className="folder-setting__actions">
+                    <Button
+                      disabled={
+                        isChoosingTvFolder || tvFolderState.status === "loading"
+                      }
+                      onClick={() => void chooseConfiguredTvFolder()}
+                      type="button"
+                    >
+                      <AppIcon name="folder" />
+                      {isChoosingTvFolder
+                        ? "Choosing…"
+                        : tvFolderState.status === "ready" ||
+                            tvFolderState.status === "unavailable"
+                          ? "Change TV folder"
+                          : "Choose TV folder"}
+                    </Button>
+                    {tvFolderState.status === "ready" ||
+                    tvFolderState.status === "unavailable" ? (
+                      <Button
+                        aria-label="Clear TV folder"
+                        disabled={isChoosingTvFolder}
+                        onClick={() => void clearConfiguredTvFolder()}
+                        type="button"
+                        variant="outline"
+                      >
+                        Clear folder
+                      </Button>
+                    ) : null}
+                  </div>
+                  {tvFolderActionError === null ? null : (
+                    <p className="field-error" role="alert">
+                      {tvFolderActionError}
                     </p>
                   )}
                 </div>
