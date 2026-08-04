@@ -295,7 +295,7 @@ function releaseArtifact(item: Element): VrReleaseArtifact | null {
   };
 }
 
-function productCodeCandidates(value: string) {
+export function productCodeCandidates(value: string) {
   const identityPattern =
     /(^|[^A-Za-z0-9])([A-Za-z]{2,16})[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])/gi;
   const candidates: Array<{ code: string; prefix: string }> = [];
@@ -596,7 +596,7 @@ function vrPartLabel(title: string) {
   return partNumbers.size === 1 && !partNumbers.has("0") ? matches[0][2] : null;
 }
 
-export function canonicalLibraryProductCode(title: string) {
+function canonicalVrLibraryProductCode(title: string) {
   const candidates = productCodeCandidates(title)
     .filter((candidate) => !vrLibraryPartPrefixes.has(candidate.prefix))
     .map((candidate) => candidate.code);
@@ -643,7 +643,7 @@ function parseVrLibrary(value: unknown): VrLibraryItem[] {
   const groupedItems = new Map<string, VrLibraryItem>();
   const unassociatedItems: VrLibraryItem[] = [];
   for (const file of files) {
-    const code = canonicalLibraryProductCode(file.title);
+    const code = canonicalVrLibraryProductCode(file.title);
     if (code === null) {
       unassociatedItems.push({
         id: `file:${file.path}`,

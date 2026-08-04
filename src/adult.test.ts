@@ -49,6 +49,7 @@ describe("conservative parsed Adult Library identity", () => {
     const firstPath = "/Adult/作品/ADLT-123 Part 01 — 前編.mp4";
     const secondPath = "/Adult/adlt_00123_CD2  特別版.MKV";
     const mixedPath = "/Adult/ADLT-123 + XYZ-7  pack.mp4";
+    const vrOnlyPartPath = "/Adult/ADLT-123 + PT-7.mp4";
     const conflictingPath = "/Adult/ADLT-123 ADLT-124.mp4";
     const noCodePath = "/Adult/作品  without code.mp4";
     invokeMock.mockResolvedValue([
@@ -70,6 +71,9 @@ describe("conservative parsed Adult Library identity", () => {
       mixedPath,
       "ADLT-123 + XYZ-7  pack.mp4",
       "60",
+      vrOnlyPartPath,
+      "ADLT-123 + PT-7.mp4",
+      "65",
       conflictingPath,
       "ADLT-123 ADLT-124.mp4",
       "70",
@@ -106,7 +110,12 @@ describe("conservative parsed Adult Library identity", () => {
     expect(items.find((item) => item.code === "ADLT-124")?.files).toHaveLength(1);
     expect(items.find((item) => item.code === "ADLT-1230")?.files).toHaveLength(1);
     expect(items.find((item) => item.code === "XADLT-123")?.files).toHaveLength(1);
-    for (const path of [mixedPath, conflictingPath, noCodePath]) {
+    for (const path of [
+      mixedPath,
+      vrOnlyPartPath,
+      conflictingPath,
+      noCodePath,
+    ]) {
       expect(items.find((item) => item.id === `file:${path}`)?.code).toBeNull();
     }
   });
@@ -122,6 +131,12 @@ describe("conservative parsed Adult Library identity", () => {
       "/Adult/ADLT-777 finale.mp4",
       "ADLT-777 finale.mp4",
       "5",
+      "/Adult/ADLT-777 Part 1-2.mp4",
+      "ADLT-777 Part 1-2.mp4",
+      "6",
+      "/Adult/ADLT-777 CD1+2.mkv",
+      "ADLT-777 CD1+2.mkv",
+      "7",
     ]);
 
     const items = await scanAdultLibrary();
@@ -131,6 +146,8 @@ describe("conservative parsed Adult Library identity", () => {
       ["ADLT-777 Disk 03.mp4", "Disk 03"],
       ["ADLT-777 Part 01 Disc 02.mkv", null],
       ["ADLT-777 finale.mp4", null],
+      ["ADLT-777 Part 1-2.mp4", null],
+      ["ADLT-777 CD1+2.mkv", null],
     ]);
   });
 

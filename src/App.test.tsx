@@ -1161,9 +1161,18 @@ describe("parsed Adult Library and Dashboard", () => {
       "/Adult/作品  Library/ADLT-123 Part 01 Disc 02.mp4",
       "ADLT-123 Part 01 Disc 02.mp4",
       "3221225472",
+      "/Adult/作品  Library/ADLT-123 Part 1-2.mp4",
+      "ADLT-123 Part 1-2.mp4",
+      "6",
+      "/Adult/作品  Library/ADLT-123 CD1+2.mkv",
+      "ADLT-123 CD1+2.mkv",
+      "7",
       "/Adult/作品  Library/ADLT-123 + XYZ-7  pack.mp4",
       "ADLT-123 + XYZ-7  pack.mp4",
       "4",
+      "/Adult/作品  Library/ADLT-123 + PT-7.mp4",
+      "ADLT-123 + PT-7.mp4",
+      "8",
       "/Adult/作品  Library/作品  without code.mkv",
       "作品  without code.mkv",
       "5",
@@ -1174,10 +1183,10 @@ describe("parsed Adult Library and Dashboard", () => {
     expect(
       await screen.findByRole("heading", {
         level: 3,
-        name: "1 grouped title · 5 supported files",
+        name: "1 grouped title · 8 supported files",
       }),
     ).toBeTruthy();
-    expect(screen.getByText("2 files remain unassociated.")).toBeTruthy();
+    expect(screen.getByText("3 files remain unassociated.")).toBeTruthy();
     expect(screen.getByText("4.0 TiB", { selector: "dd" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Open Adult Library" }));
     expect(screen.getByRole("radio", { name: "Adult" })).toHaveProperty(
@@ -1195,7 +1204,7 @@ describe("parsed Adult Library and Dashboard", () => {
     if (groupedCard === null) {
       throw new Error("The grouped Adult card was not rendered.");
     }
-    expect(groupedCard.querySelectorAll("[data-adult-file-path]")).toHaveLength(3);
+    expect(groupedCard.querySelectorAll("[data-adult-file-path]")).toHaveLength(5);
     expect(within(groupedCard).getByText("Part 01 · 1.0 GiB")).toBeTruthy();
     expect(within(groupedCard).getByText("CD2 · 2.0 GiB")).toBeTruthy();
     const ambiguousRow = groupedCard.querySelector(
@@ -1203,6 +1212,26 @@ describe("parsed Adult Library and Dashboard", () => {
     );
     expect(ambiguousRow?.textContent).toContain("3.0 GiB");
     expect(ambiguousRow?.textContent).not.toContain("Part 01 ·");
+    const compactPartRow = groupedCard.querySelector(
+      '[data-adult-file-path="/Adult/作品  Library/ADLT-123 Part 1-2.mp4"]',
+    );
+    expect(compactPartRow?.textContent).toContain("ADLT-123 Part 1-2.mp4");
+    expect(compactPartRow?.textContent).not.toContain("Part 1 ·");
+    const compactCdRow = groupedCard.querySelector(
+      '[data-adult-file-path="/Adult/作品  Library/ADLT-123 CD1+2.mkv"]',
+    );
+    expect(compactCdRow?.textContent).toContain("ADLT-123 CD1+2.mkv");
+    expect(compactCdRow?.textContent).not.toContain("CD1 ·");
+    expect(
+      groupedCard.querySelector(
+        '[data-adult-file-path="/Adult/作品  Library/ADLT-123 + PT-7.mp4"]',
+      ),
+    ).toBeNull();
+    const vrOnlyPartHeading = within(gallery).getByRole("heading", {
+      level: 3,
+      name: "ADLT-123 + PT-7",
+    });
+    expect(vrOnlyPartHeading.textContent).toBe("ADLT-123 + PT-7");
     const unassociatedHeading = within(gallery).getByRole("heading", {
       level: 3,
       name: "作品 without code",

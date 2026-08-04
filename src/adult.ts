@@ -1,4 +1,4 @@
-import { canonicalLibraryProductCode } from "@/vr";
+import { productCodeCandidates } from "@/vr";
 
 export type AdultFolderState =
   | { status: "unconfigured" }
@@ -29,7 +29,8 @@ export type AdultVolumeStorage = {
 const unsignedU64Pattern = /^\d{1,20}$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const multipartLabelPattern =
-  /(^|[^A-Za-z0-9])((?:part|cd|disc|disk)[ _-]*0*([0-9]{1,4}))(?=$|[^A-Za-z0-9])/gi;
+  /(^|[^A-Za-z0-9])((?:part|cd|disc|disk)[ _-]*0*([0-9]{1,4}))(?![ \t]*[-+][ \t]*[0-9])(?=$|[^A-Za-z0-9])/gi;
+const multipartIdentityPrefixes = new Set(["PART", "CD", "DISC", "DISK"]);
 
 function parseAdultFolderState(value: unknown): AdultFolderState {
   if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
@@ -71,6 +72,14 @@ function exactMultipartLabel(title: string) {
     return null;
   }
   return matches[0][2];
+}
+
+function canonicalAdultLibraryProductCode(title: string) {
+  const candidates = productCodeCandidates(title)
+    .filter((candidate) => !multipartIdentityPrefixes.has(candidate.prefix))
+    .map((candidate) => candidate.code);
+  const uniqueCandidates = new Set(candidates);
+  return uniqueCandidates.size === 1 ? candidates[0] : null;
 }
 
 function parseAdultLibrary(value: unknown): AdultLibraryItem[] {
@@ -115,7 +124,7 @@ function parseAdultLibrary(value: unknown): AdultLibraryItem[] {
       sizeBytes,
       partLabel: exactMultipartLabel(title),
     };
-    const code = canonicalLibraryProductCode(title);
+    const code = canonicalAdultLibraryProductCode(title);
     if (code === null) {
       unassociatedItems.push({
         id: `file:${path}`,
