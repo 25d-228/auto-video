@@ -91,7 +91,9 @@ import {
   clearVrFolder,
   dismissVrDownload,
   dismissVrOrganization,
+  fetchExactJavdbAdultItem,
   fetchExactJavdbVrItem,
+  fetchVerifiedAdultSukebeiReleases,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedSukebeiTorrent,
   invalidateVerifiedVrTorrent,
@@ -114,6 +116,10 @@ import {
   type VrLibraryFile,
   type VrLibraryItem,
   type VrOrganizationPreview,
+  type JavdbCatalogItem,
+  type JavdbCatalogResult,
+  type SukebeiRelease,
+  type SukebeiReleasesResult,
   type VrCatalogItem,
   type VrCatalogResult,
   type VrRelease,
@@ -135,7 +141,7 @@ const destinations = [
   {
     id: "discover",
     label: "Discover",
-    description: "Browse TMDB Movies and TV or find VR titles by exact product code.",
+    description: "Browse TMDB Movies and TV or find Adult and VR titles by exact product code.",
     emptyHeading: "Discovery is not configured",
     emptyMessage:
       "Add a TMDB API Read Access Token in Settings to load weekly trending Movies.",
@@ -252,7 +258,7 @@ type CredentialMessage = {
   text: string;
 };
 type CopyTitleState = "idle" | "success" | "error";
-type DiscoverCategory = "movies" | "tv" | "vr";
+type DiscoverCategory = "movies" | "tv" | "adult" | "vr";
 type LibraryCategory = "movies" | "tv" | "adult" | "vr";
 type VrLibraryScanState =
   | { status: "loading" }
@@ -267,6 +273,13 @@ type VrCatalogState =
   | { status: "loading" }
   | VrCatalogResult;
 type VrReleaseComparisonState = { status: "loading" } | VrReleasesResult;
+type AdultCatalogState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | JavdbCatalogResult;
+type AdultReleaseComparisonState =
+  | { status: "loading" }
+  | SukebeiReleasesResult<SukebeiRelease>;
 type VrTorrentInspectionState =
   | { status: "loading" }
   | VrTorrentInspectionResult;
@@ -815,6 +828,28 @@ const vrCatalogMessages = {
   },
 } as const;
 
+const adultCatalogMessages = {
+  idle: {
+    heading: "Search for an Adult title by product code",
+    message: "Submit one exact product code to search JavDB.",
+    role: undefined,
+  },
+  loading: {
+    heading: "Searching JavDB",
+    message: "Verifying the requested Adult product-code identity.",
+    role: "status",
+  },
+  "no-exact-match": {
+    heading: "No exact Adult title found",
+    message: "JavDB returned no media item with the requested product code.",
+    role: undefined,
+  },
+  "source-unavailable": vrCatalogMessages["source-unavailable"],
+  "network-error": vrCatalogMessages["network-error"],
+  "malformed-provider": vrCatalogMessages["malformed-provider"],
+  "provider-error": vrCatalogMessages["provider-error"],
+} as const;
+
 const vrReleaseMessages = {
   loading: {
     heading: "Finding verified releases",
@@ -1281,12 +1316,12 @@ function DiscoverTvCard({
   );
 }
 
-function DiscoverVrCard({
+function DiscoverJavdbCard({
   item,
   onFindReleases,
 }: {
-  item: VrCatalogItem;
-  onFindReleases: (item: VrCatalogItem, triggerId: string) => void;
+  item: JavdbCatalogItem;
+  onFindReleases: (item: JavdbCatalogItem, triggerId: string) => void;
 }) {
   const [coverFailed, setCoverFailed] = useState(false);
   const releasesTriggerId = useId();
@@ -1295,7 +1330,7 @@ function DiscoverVrCard({
   return (
     <article
       aria-labelledby={titleId}
-      className="discover-card discover-card--vr"
+      className="discover-card discover-card--code"
     >
       <div className="discover-card__poster">
         {item.coverUrl !== null && !coverFailed ? (
@@ -1516,6 +1551,163 @@ function VrReleaseComparison({
                       Inspect torrent
                     </Button>
                   )}
+                </section>
+              )}
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
+  );
+}
+
+function AdultReleaseComparison({
+  item,
+  onRetry,
+  onSelectRelease,
+  selectedRelease,
+  state,
+  triggerId,
+}: {
+  item: JavdbCatalogItem;
+  onRetry: () => void;
+  onSelectRelease: (release: SukebeiRelease) => void;
+  selectedRelease: SukebeiRelease | null;
+  state: AdultReleaseComparisonState;
+  triggerId: string;
+}) {
+  const releases = state.status === "ready" ? state.releases : null;
+  const noVerifiedReleases = releases !== null && releases.length === 0;
+  const currentMessage =
+    state.status === "ready" ? null : vrReleaseMessages[state.status];
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="vr-releases__backdrop" />
+      <Dialog.Viewport className="vr-releases__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading"}
+          className="vr-releases__popup"
+          finalFocus={() => document.getElementById(triggerId)}
+          onClick={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <div className="vr-releases__heading">
+            <div>
+              <p className="card-eyebrow">Sukebei release comparison</p>
+              <Dialog.Title>{item.code}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="vr-releases__description">
+            Metadata-only comparison of releases verified for this product code.
+          </Dialog.Description>
+
+          {releases === null || noVerifiedReleases ? (
+            <div
+              className="vr-releases__state"
+              role={noVerifiedReleases ? undefined : currentMessage?.role}
+            >
+              <span className="empty-state__icon">
+                <AppIcon name="releases" />
+              </span>
+              <div>
+                <h3>
+                  {noVerifiedReleases
+                    ? "No verified releases found"
+                    : currentMessage?.heading}
+                </h3>
+                <p>
+                  {noVerifiedReleases
+                    ? `Sukebei returned no releases verified as ${item.code}.`
+                    : currentMessage?.message}
+                </p>
+                {state.status !== "loading" && !noVerifiedReleases ? (
+                  <Button onClick={onRetry} type="button" variant="outline">
+                    <AppIcon name="refresh" />
+                    Retry
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <div className="vr-releases__content">
+              <div
+                aria-label="Verified Adult release totals"
+                className="vr-releases__totals"
+              >
+                <p>
+                  <strong>{releases.length}</strong> verified releases
+                </p>
+                <p>
+                  <strong>{releases.length}</strong> from Sukebei
+                </p>
+                <Button onClick={onRetry} size="sm" type="button" variant="outline">
+                  <AppIcon name="refresh" />
+                  Retry
+                </Button>
+              </div>
+              <ul aria-label={`Verified Adult releases for ${item.code}`}>
+                {releases.map((release, releaseIndex) => (
+                  <li key={`${release.name}-${releaseIndex}`}>
+                    <button
+                      aria-pressed={selectedRelease === release}
+                      onClick={() => onSelectRelease(release)}
+                      type="button"
+                    >
+                      <span className="vr-releases__release-name">
+                        {release.name}
+                      </span>
+                      <span className="vr-releases__release-metadata">
+                        <span>Source {release.source}</span>
+                        <span>Size {release.size ?? "Unavailable"}</span>
+                        <span>
+                          Seeders {release.seeders ?? "Unavailable"}
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {selectedRelease === null ? (
+                <p className="vr-releases__selection-prompt">
+                  Select one verified release to compare its metadata.
+                </p>
+              ) : (
+                <section
+                  aria-labelledby="selected-adult-release-heading"
+                  className="vr-releases__selection"
+                >
+                  <h3 id="selected-adult-release-heading">Selected release</h3>
+                  <dl>
+                    <div>
+                      <dt>Product code</dt>
+                      <dd>{item.code}</dd>
+                    </div>
+                    <div>
+                      <dt>Release name</dt>
+                      <dd>{selectedRelease.name}</dd>
+                    </div>
+                    <div>
+                      <dt>Source</dt>
+                      <dd>{selectedRelease.source}</dd>
+                    </div>
+                    <div>
+                      <dt>Size</dt>
+                      <dd>{selectedRelease.size ?? "Unavailable"}</dd>
+                    </div>
+                    <div>
+                      <dt>Seeders</dt>
+                      <dd>{selectedRelease.seeders ?? "Unavailable"}</dd>
+                    </div>
+                  </dl>
                 </section>
               )}
             </div>
@@ -3176,6 +3368,29 @@ export default function App() {
     null,
   );
   const [tvDetailsRequestVersion, setTvDetailsRequestVersion] = useState(0);
+  const [adultSearchInput, setAdultSearchInput] = useState("");
+  const [adultSearchInputError, setAdultSearchInputError] = useState<
+    string | null
+  >(null);
+  const [submittedAdultCode, setSubmittedAdultCode] = useState<string | null>(
+    null,
+  );
+  const [adultCatalogState, setAdultCatalogState] = useState<AdultCatalogState>(
+    { status: "idle" },
+  );
+  const [adultCatalogRequestVersion, setAdultCatalogRequestVersion] =
+    useState(0);
+  const [adultSelectedPage, setAdultSelectedPage] = useState(1);
+  const [adultReleaseComparisonItem, setAdultReleaseComparisonItem] =
+    useState<JavdbCatalogItem | null>(null);
+  const [adultReleaseComparisonState, setAdultReleaseComparisonState] =
+    useState<AdultReleaseComparisonState | null>(null);
+  const [adultReleaseComparisonTriggerId, setAdultReleaseComparisonTriggerId] =
+    useState<string | null>(null);
+  const [selectedAdultRelease, setSelectedAdultRelease] =
+    useState<SukebeiRelease | null>(null);
+  const [adultReleaseRequestVersion, setAdultReleaseRequestVersion] =
+    useState(0);
   const [vrSearchInput, setVrSearchInput] = useState("");
   const [vrSearchInputError, setVrSearchInputError] = useState<string | null>(
     null,
@@ -3245,6 +3460,8 @@ export default function App() {
   const movieDetailsRequestId = useRef(0);
   const tvDiscoverRequestId = useRef(0);
   const tvDetailsRequestId = useRef(0);
+  const adultCatalogRequestId = useRef(0);
+  const adultReleaseRequestId = useRef(0);
   const vrCatalogRequestId = useRef(0);
   const releaseRequestId = useRef(0);
   const torrentInspectionRequestId = useRef(0);
@@ -4175,6 +4392,44 @@ export default function App() {
   }, [selectedDiscoverTvShow, tmdbToken, tvDetailsRequestVersion]);
 
   useEffect(() => {
+    const requestId = ++adultCatalogRequestId.current;
+    if (submittedAdultCode === null) {
+      return;
+    }
+
+    setAdultCatalogState({ status: "loading" });
+    void fetchExactJavdbAdultItem(submittedAdultCode).then((result) => {
+      if (requestId === adultCatalogRequestId.current) {
+        setAdultCatalogState(result);
+      }
+    });
+
+    return () => {
+      adultCatalogRequestId.current += 1;
+    };
+  }, [adultCatalogRequestVersion, submittedAdultCode]);
+
+  useEffect(() => {
+    const requestId = ++adultReleaseRequestId.current;
+    if (adultReleaseComparisonItem === null) {
+      return;
+    }
+
+    setAdultReleaseComparisonState({ status: "loading" });
+    void fetchVerifiedAdultSukebeiReleases(
+      adultReleaseComparisonItem.code,
+    ).then((result) => {
+      if (requestId === adultReleaseRequestId.current) {
+        setAdultReleaseComparisonState(result);
+      }
+    });
+
+    return () => {
+      adultReleaseRequestId.current += 1;
+    };
+  }, [adultReleaseComparisonItem, adultReleaseRequestVersion]);
+
+  useEffect(() => {
     const requestId = ++vrCatalogRequestId.current;
     if (submittedVrCode === null) {
       return;
@@ -4264,6 +4519,21 @@ export default function App() {
   };
 
   const navigateTo = (destination: (typeof destinations)[number]) => {
+    if (
+      activeDestination.id === "discover" &&
+      destination.id !== "discover"
+    ) {
+      adultCatalogRequestId.current += 1;
+      setAdultCatalogState((currentState) =>
+        currentState.status === "loading"
+          ? { status: "idle" }
+          : currentState,
+      );
+      adultReleaseRequestId.current += 1;
+      setAdultReleaseComparisonItem(null);
+      setAdultReleaseComparisonState(null);
+      setSelectedAdultRelease(null);
+    }
     setActiveDestination(destination);
     if (workspace.current !== null) {
       workspace.current.scrollTop = 0;
@@ -5055,6 +5325,13 @@ export default function App() {
     setSelectedVrRelease(null);
   };
 
+  const closeAdultReleaseComparison = () => {
+    adultReleaseRequestId.current += 1;
+    setAdultReleaseComparisonItem(null);
+    setAdultReleaseComparisonState(null);
+    setSelectedAdultRelease(null);
+  };
+
   const changeDiscoverCategory = (category: DiscoverCategory) => {
     if (category === discoverCategory) {
       return;
@@ -5062,7 +5339,16 @@ export default function App() {
 
     closeDiscoverMovieDetails();
     closeDiscoverTvDetails();
+    closeAdultReleaseComparison();
     closeVrReleaseComparison();
+    if (discoverCategory === "adult") {
+      adultCatalogRequestId.current += 1;
+      setAdultCatalogState((currentState) =>
+        currentState.status === "loading"
+          ? { status: "idle" }
+          : currentState,
+      );
+    }
     if (discoverCategory === "vr") {
       vrCatalogRequestId.current += 1;
       setVrCatalogState((currentState) =>
@@ -5075,6 +5361,69 @@ export default function App() {
       setIsTvDiscoverActivated(true);
     }
     setDiscoverCategory(category);
+  };
+
+  const searchAdultCatalog = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const canonicalCode = canonicalizeProductCode(adultSearchInput);
+    if (canonicalCode === null) {
+      setAdultSearchInputError(
+        "Enter a valid Adult product code, such as ADLT-123.",
+      );
+      return;
+    }
+
+    closeAdultReleaseComparison();
+    adultCatalogRequestId.current += 1;
+    setAdultSearchInput(canonicalCode);
+    setAdultSearchInputError(null);
+    setSubmittedAdultCode(canonicalCode);
+    setAdultCatalogState({ status: "loading" });
+    setAdultSelectedPage(1);
+    setAdultCatalogRequestVersion((version) => version + 1);
+  };
+
+  const retryAdultCatalog = () => {
+    if (submittedAdultCode === null) {
+      return;
+    }
+
+    closeAdultReleaseComparison();
+    adultCatalogRequestId.current += 1;
+    setAdultCatalogState({ status: "loading" });
+    setAdultCatalogRequestVersion((version) => version + 1);
+  };
+
+  const openAdultReleaseComparison = (
+    item: JavdbCatalogItem,
+    triggerId: string,
+  ) => {
+    adultReleaseRequestId.current += 1;
+    setAdultReleaseComparisonItem(item);
+    setAdultReleaseComparisonState({ status: "loading" });
+    setAdultReleaseComparisonTriggerId(triggerId);
+    setSelectedAdultRelease(null);
+    setAdultReleaseRequestVersion((version) => version + 1);
+  };
+
+  const retryAdultReleaseComparison = () => {
+    if (adultReleaseComparisonItem === null) {
+      return;
+    }
+
+    adultReleaseRequestId.current += 1;
+    setAdultReleaseComparisonState({ status: "loading" });
+    setSelectedAdultRelease(null);
+    setAdultReleaseRequestVersion((version) => version + 1);
+  };
+
+  const selectAdultRelease = (release: SukebeiRelease) => {
+    if (
+      adultReleaseComparisonState?.status === "ready" &&
+      adultReleaseComparisonState.releases.includes(release)
+    ) {
+      setSelectedAdultRelease(release);
+    }
   };
 
   const searchVrCatalog = (event: FormEvent<HTMLFormElement>) => {
@@ -5486,6 +5835,14 @@ export default function App() {
   const tvDiscoverGalleryLabel = isTvDiscoverSearchActive
     ? "TMDB TV search results"
     : "Weekly trending TV";
+  const currentAdultCatalogMessage =
+    adultCatalogState.status === "ready"
+      ? null
+      : adultCatalogMessages[adultCatalogState.status];
+  const adultGalleryLabel =
+    submittedAdultCode === null
+      ? "Adult product-code search"
+      : `Adult result for ${submittedAdultCode}`;
   const currentVrCatalogMessage =
     vrCatalogState.status === "ready"
       ? null
@@ -6393,7 +6750,9 @@ export default function App() {
                   ? discoverState.status === "loading"
                   : discoverCategory === "tv"
                     ? tvDiscoverState.status === "loading"
-                    : vrCatalogState.status === "loading"
+                    : discoverCategory === "adult"
+                      ? adultCatalogState.status === "loading"
+                      : vrCatalogState.status === "loading"
               }
               aria-labelledby="discover-heading"
               className="discover-content"
@@ -6413,14 +6772,18 @@ export default function App() {
                     <p className="card-eyebrow">
                       {discoverCategory === "vr"
                         ? "JavDB VR Discover"
-                        : "TMDB Discover"}
+                        : discoverCategory === "adult"
+                          ? "JavDB Adult Discover"
+                          : "TMDB Discover"}
                     </p>
                     <h2 id="discover-heading">
                       {discoverCategory === "movies"
                         ? discoverGalleryLabel
                         : discoverCategory === "tv"
                           ? tvDiscoverGalleryLabel
-                          : vrGalleryLabel}
+                          : discoverCategory === "adult"
+                            ? adultGalleryLabel
+                            : vrGalleryLabel}
                     </h2>
                     <p className="library-folder">
                       {discoverCategory === "vr" ? (
@@ -6428,6 +6791,12 @@ export default function App() {
                           "Exact product-code lookup"
                         ) : (
                           <>Requested code {submittedVrCode}</>
+                        )
+                      ) : discoverCategory === "adult" ? (
+                        submittedAdultCode === null ? (
+                          "Exact product-code lookup"
+                        ) : (
+                          <>Requested code {submittedAdultCode}</>
                         )
                       ) : discoverCategory === "tv" ? (
                         isTvDiscoverSearchActive ? (
@@ -6462,6 +6831,7 @@ export default function App() {
                       {([
                         ["movies", "Movies"],
                         ["tv", "TV"],
+                        ["adult", "Adult"],
                         ["vr", "VR"],
                       ] as const).map(([category, label]) => (
                         <label key={category}>
@@ -6523,6 +6893,53 @@ export default function App() {
                           role="alert"
                         >
                           {vrSearchInputError}
+                        </p>
+                      )}
+                    </form>
+                  ) : discoverCategory === "adult" ? (
+                    <form
+                      aria-label="Search JavDB Adult titles"
+                      className="discover-search"
+                      onSubmit={searchAdultCatalog}
+                      role="search"
+                    >
+                      <label htmlFor="discover-adult-search">
+                        Search product code
+                      </label>
+                      <div className="discover-search__field">
+                        <input
+                          aria-describedby={
+                            adultSearchInputError === null
+                              ? undefined
+                              : "discover-adult-search-error"
+                          }
+                          aria-invalid={
+                            adultSearchInputError === null ? undefined : true
+                          }
+                          className="discover-search__input"
+                          id="discover-adult-search"
+                          onChange={(event) => {
+                            setAdultSearchInput(event.target.value);
+                            if (adultSearchInputError !== null) {
+                              setAdultSearchInputError(null);
+                            }
+                          }}
+                          placeholder="ADLT-123"
+                          type="text"
+                          value={adultSearchInput}
+                        />
+                        <Button type="submit">
+                          <AppIcon name="search" />
+                          Search
+                        </Button>
+                      </div>
+                      {adultSearchInputError === null ? null : (
+                        <p
+                          className="discover-search__error"
+                          id="discover-adult-search-error"
+                          role="alert"
+                        >
+                          {adultSearchInputError}
                         </p>
                       )}
                     </form>
@@ -6679,7 +7096,7 @@ export default function App() {
                     key={`vr-gallery-${vrCatalogState.item.code}`}
                     onSelectedPageChange={setVrSelectedPage}
                     renderItem={(item) => (
-                      <DiscoverVrCard
+                      <DiscoverJavdbCard
                         item={item}
                         onFindReleases={openVrReleaseComparison}
                       />
@@ -6704,6 +7121,49 @@ export default function App() {
                       <Button
                         className="empty-state__action"
                         onClick={retryVrCatalog}
+                        type="button"
+                        variant="outline"
+                      >
+                        <AppIcon name="refresh" />
+                        Retry search
+                      </Button>
+                    ) : null}
+                  </div>
+                )
+              ) : discoverCategory === "adult" ? (
+                adultCatalogState.status === "ready" ? (
+                  <ResizeAwareGallery
+                    ariaLabel={adultGalleryLabel}
+                    getItemKey={(item) => item.code}
+                    items={[adultCatalogState.item]}
+                    key={`adult-gallery-${adultCatalogState.item.code}`}
+                    onSelectedPageChange={setAdultSelectedPage}
+                    renderItem={(item) => (
+                      <DiscoverJavdbCard
+                        item={item}
+                        onFindReleases={openAdultReleaseComparison}
+                      />
+                    )}
+                    selectedPage={adultSelectedPage}
+                    variant="discover"
+                  />
+                ) : (
+                  <div
+                    className="empty-state discover-state"
+                    role={currentAdultCatalogMessage?.role}
+                  >
+                    <span className="empty-state__icon">
+                      <AppIcon name="adult" />
+                    </span>
+                    <h2>{currentAdultCatalogMessage?.heading}</h2>
+                    <p>{currentAdultCatalogMessage?.message}</p>
+                    {adultCatalogState.status === "source-unavailable" ||
+                    adultCatalogState.status === "network-error" ||
+                    adultCatalogState.status === "malformed-provider" ||
+                    adultCatalogState.status === "provider-error" ? (
+                      <Button
+                        className="empty-state__action"
+                        onClick={retryAdultCatalog}
                         type="button"
                         variant="outline"
                       >
@@ -6807,7 +7267,7 @@ export default function App() {
                   </div>
                 )}
 
-              {discoverCategory !== "vr" ? (
+              {discoverCategory === "movies" || discoverCategory === "tv" ? (
                 <footer aria-label="TMDB credits" className="tmdb-attribution">
                   <img alt="TMDB" src={tmdbLogo} />
                   <p>
@@ -8165,6 +8625,27 @@ export default function App() {
             show={selectedDiscoverTvShow}
             state={tvDetailsState}
             triggerId={tvDetailsTriggerId}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeAdultReleaseComparison();
+          }
+        }}
+        open={adultReleaseComparisonItem !== null}
+      >
+        {adultReleaseComparisonItem === null ||
+        adultReleaseComparisonState === null ||
+        adultReleaseComparisonTriggerId === null ? null : (
+          <AdultReleaseComparison
+            item={adultReleaseComparisonItem}
+            onRetry={retryAdultReleaseComparison}
+            onSelectRelease={selectAdultRelease}
+            selectedRelease={selectedAdultRelease}
+            state={adultReleaseComparisonState}
+            triggerId={adultReleaseComparisonTriggerId}
           />
         )}
       </Dialog.Root>

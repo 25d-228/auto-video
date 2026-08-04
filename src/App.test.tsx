@@ -74,7 +74,10 @@ let saveTmdbTokenMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
 let clearTmdbTokenMock: Mock<() => Promise<void>>;
-let fetchJavdbVrCatalogMock: Mock<
+let fetchJavdbCatalogMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string>
+>;
+let fetchSukebeiAdultReleasesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string>
 >;
 let fetchSukebeiVrReleasesMock: Mock<
@@ -250,6 +253,10 @@ function selectDiscover() {
 
 function selectVrDiscover() {
   fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+}
+
+function selectAdultDiscover() {
+  fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
 }
 
 function selectTvDiscover() {
@@ -501,9 +508,12 @@ beforeEach(() => {
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
-  fetchJavdbVrCatalogMock = vi
+  fetchJavdbCatalogMock = vi
     .fn()
     .mockResolvedValue('<div class="movie-list"></div>');
+  fetchSukebeiAdultReleasesMock = vi
+    .fn()
+    .mockResolvedValue(sukebeiReleaseFixture([]));
   fetchSukebeiVrReleasesMock = vi
     .fn()
     .mockResolvedValue(sukebeiReleaseFixture([]));
@@ -636,7 +646,10 @@ beforeEach(() => {
         case "clear_tmdb_token":
           return clearTmdbTokenMock();
         case "fetch_javdb_vr_catalog":
-          return fetchJavdbVrCatalogMock(parameters);
+        case "fetch_javdb_adult_catalog":
+          return fetchJavdbCatalogMock(parameters);
+        case "fetch_sukebei_adult_releases":
+          return fetchSukebeiAdultReleasesMock(parameters);
         case "fetch_sukebei_vr_releases":
           return fetchSukebeiVrReleasesMock(parameters);
         case "inspect_sukebei_vr_torrent":
@@ -1062,7 +1075,7 @@ describe("parsed TV Library and Dashboard", () => {
     expect(openTvFileMock).toHaveBeenCalledWith({ path });
     expect(revealTvFileMock).toHaveBeenCalledWith({ path });
     expect(scanMoviesMock).not.toHaveBeenCalled();
-    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
   });
 });
 
@@ -1337,7 +1350,7 @@ describe("parsed Adult Library and Dashboard", () => {
     expect(within(adultSummary).getByText("1 file remains unassociated.")).toBeTruthy();
     expect(scanAdultLibraryMock).toHaveBeenCalledTimes(1);
     expect(queryAdultStorageMock).toHaveBeenCalledTimes(1);
-    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
     expect(inspectSukebeiVrTorrentMock).not.toHaveBeenCalled();
     expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
   });
@@ -1497,7 +1510,7 @@ describe("parsed Adult Library and Dashboard", () => {
     expect(scanMoviesMock).not.toHaveBeenCalled();
     expect(scanTvLibraryMock).not.toHaveBeenCalled();
     expect(scanVrLibraryMock).not.toHaveBeenCalled();
-    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
   });
 
   it("keeps a complete Adult scan visible when its storage query fails", async () => {
@@ -1871,7 +1884,7 @@ describe("parsed VR Library and Dashboard", () => {
     expect(screen.getByText("MDVR-125")).toBeTruthy();
     expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
     expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
-    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
     expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
     expect(pauseVrDownloadMock).not.toHaveBeenCalled();
@@ -4461,12 +4474,374 @@ describe("TMDB TV Discover", () => {
   });
 });
 
+describe("Adult Discover and verified release comparison", () => {
+  it("requires an explicit exact-code search and exposes only exact verified releases for selection", async () => {
+    const exactTitle = "作品  —  Exact  Title!";
+    const exactReleaseName =
+      "【作品】 adlt_00123  Director’s Cut\t—\n特別版!?";
+    fetchJavdbCatalogMock.mockResolvedValue(
+      javdbCatalogFixture("adlt_00123", exactTitle),
+    );
+    fetchSukebeiAdultReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([
+        { name: "ADLT-123 standard" },
+        { name: exactReleaseName, seeders: 4, size: "8.0 GiB" },
+        { name: "ADLT-124 neighbor", seeders: 500 },
+        { name: "ADLT-1230 extension", seeders: 400 },
+        { name: "XADLT-123 embedded", seeders: 300 },
+        { name: "ADLT-123 + XYZ-7 pack", seeders: 200 },
+        { name: "ADLT-125 same-prefix neighbor", seeders: 100 },
+        { name: "Candidate with no product code", seeders: 90 },
+      ]),
+    );
+    render(<App />);
+    selectDiscover();
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
+    selectAdultDiscover();
+
+    const codeInput = screen.getByRole("textbox", {
+      name: "Search product code",
+    });
+    for (const invalidCode of ["", "ADLT-0", "ADLT-123 extra", "A-1"]) {
+      fireEvent.change(codeInput, { target: { value: invalidCode } });
+      fireEvent.click(screen.getByRole("button", { name: "Search" }));
+      expect(screen.getByRole("alert").textContent).toContain(
+        "Enter a valid Adult product code",
+      );
+    }
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
+
+    fireEvent.change(codeInput, { target: { value: "adlt_00123" } });
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    const codeHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "ADLT-123",
+    });
+    const adultCard = codeHeading.closest("article");
+    if (adultCard === null) {
+      throw new Error("The exact Adult catalog card was not rendered.");
+    }
+    expect(
+      within(adultCard).getByText("Title").parentElement?.querySelector("dd")
+        ?.textContent,
+    ).toBe(exactTitle);
+    expect(within(adultCard).getByText("JavDB")).toBeTruthy();
+    expect(fetchJavdbCatalogMock).toHaveBeenCalledWith({ code: "ADLT-123" });
+    expect(fetchSukebeiAdultReleasesMock).not.toHaveBeenCalled();
+
+    fireEvent.change(codeInput, { target: { value: "ADLT-124" } });
+    expect(screen.getByRole("heading", { level: 3, name: "ADLT-123" })).toBeTruthy();
+    expect(fetchJavdbCatalogMock).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(
+      within(adultCard).getByRole("button", {
+        name: "Copy title: ADLT-123",
+      }),
+    );
+    await waitFor(() =>
+      expect(clipboardWriteMock).toHaveBeenCalledWith("ADLT-123"),
+    );
+    const cover = adultCard.querySelector("img");
+    expect(cover).not.toBeNull();
+    fireEvent.error(cover as HTMLImageElement);
+    expect(within(adultCard).getByText("Cover unavailable")).toBeTruthy();
+
+    fireEvent.click(
+      within(adultCard).getByRole("button", {
+        name: "Find releases: ADLT-123",
+      }),
+    );
+    const releaseList = await screen.findByRole("list", {
+      name: "Verified Adult releases for ADLT-123",
+    });
+    expect(fetchSukebeiAdultReleasesMock).toHaveBeenCalledWith({
+      code: "ADLT-123",
+    });
+    expect(within(releaseList).getAllByRole("button")).toHaveLength(2);
+    expect(
+      within(releaseList).getByRole("button", {
+        name: /ADLT-123 standard/,
+      }).textContent,
+    ).toContain("Size UnavailableSeeders Unavailable");
+    expect(screen.getByLabelText("Verified Adult release totals").textContent).toBe(
+      "2 verified releases2 from SukebeiRetry",
+    );
+    for (const rejectedName of [
+      "ADLT-124 neighbor",
+      "ADLT-1230 extension",
+      "XADLT-123 embedded",
+      "ADLT-123 + XYZ-7 pack",
+      "ADLT-125 same-prefix neighbor",
+      "Candidate with no product code",
+    ]) {
+      expect(screen.queryByText(rejectedName)).toBeNull();
+    }
+    const exactReleaseRow = Array.from(
+      releaseList.querySelectorAll<HTMLElement>(".vr-releases__release-name"),
+    ).find((releaseName) => releaseName.textContent === exactReleaseName);
+    expect(exactReleaseRow).toBeDefined();
+    fireEvent.click(exactReleaseRow?.closest("button") as HTMLButtonElement);
+    const selectedSummary = screen
+      .getByRole("heading", { name: "Selected release" })
+      .closest("section");
+    expect(selectedSummary).not.toBeNull();
+    const selectedReleaseName = Array.from(
+      (selectedSummary as HTMLElement).querySelectorAll("dd"),
+    ).find((value) => value.textContent === exactReleaseName);
+    expect(selectedReleaseName).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Inspect torrent" })).toBeNull();
+    expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
+    expect(inspectSukebeiVrTorrentMock).not.toHaveBeenCalled();
+    expect(saveVerifiedVrTorrentMock).not.toHaveBeenCalled();
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("clears Adult release selection on retry and restores focus after close, Escape, and backdrop dismissal", async () => {
+    fetchJavdbCatalogMock.mockResolvedValue(javdbCatalogFixture("ADLT-123"));
+    fetchSukebeiAdultReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([{ name: "Exact ADLT-123 release" }]),
+    );
+    render(<App />);
+    selectDiscover();
+    selectAdultDiscover();
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Search product code" }),
+      { target: { value: "ADLT-123" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    const trigger = await screen.findByRole("button", {
+      name: "Find releases: ADLT-123",
+    });
+
+    fireEvent.click(trigger);
+    let releaseList = await screen.findByRole("list", {
+      name: "Verified Adult releases for ADLT-123",
+    });
+    fireEvent.click(within(releaseList).getByRole("button"));
+    expect(screen.getByRole("heading", { name: "Selected release" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    releaseList = await screen.findByRole("list", {
+      name: "Verified Adult releases for ADLT-123",
+    });
+    expect(screen.queryByRole("heading", { name: "Selected release" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    fireEvent.click(trigger);
+    await screen.findByRole("list", {
+      name: "Verified Adult releases for ADLT-123",
+    });
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    fireEvent.click(trigger);
+    await screen.findByRole("list", {
+      name: "Verified Adult releases for ADLT-123",
+    });
+    fireEvent.click(document.querySelector(".vr-releases__backdrop") as Element);
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it("blocks stale Adult catalog and release work across searches, categories, navigation, retries, and dismissal", async () => {
+    const firstCatalog = createDeferred<string>();
+    const secondCatalog = createDeferred<string>();
+    const categoryCatalog = createDeferred<string>();
+    const navigationCatalog = createDeferred<string>();
+    fetchJavdbCatalogMock
+      .mockReturnValueOnce(firstCatalog.promise)
+      .mockReturnValueOnce(secondCatalog.promise)
+      .mockReturnValueOnce(categoryCatalog.promise)
+      .mockReturnValueOnce(navigationCatalog.promise)
+      .mockResolvedValueOnce(javdbCatalogFixture("ADLT-130"));
+    const dismissedReleases = createDeferred<string>();
+    fetchSukebeiAdultReleasesMock
+      .mockReturnValueOnce(dismissedReleases.promise)
+      .mockResolvedValueOnce("<rss>")
+      .mockResolvedValueOnce(
+        sukebeiReleaseFixture([{ name: "Current ADLT-130 release" }]),
+      );
+    render(<App />);
+    selectDiscover();
+    selectAdultDiscover();
+    let codeInput = screen.getByRole("textbox", {
+      name: "Search product code",
+    });
+
+    fireEvent.change(codeInput, { target: { value: "ADLT-123" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    fireEvent.change(codeInput, { target: { value: "ADLT-124" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    await act(async () => {
+      firstCatalog.resolve(javdbCatalogFixture("ADLT-123", "Stale search"));
+      await firstCatalog.promise;
+    });
+    expect(screen.queryByText("Stale search")).toBeNull();
+    await act(async () => {
+      secondCatalog.resolve(javdbCatalogFixture("ADLT-124", "Current search"));
+      await secondCatalog.promise;
+    });
+    expect(await screen.findByText("Current search")).toBeTruthy();
+
+    fireEvent.change(codeInput, { target: { value: "ADLT-125" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+    await act(async () => {
+      categoryCatalog.resolve(javdbCatalogFixture("ADLT-125", "Stale category"));
+      await categoryCatalog.promise;
+    });
+    selectAdultDiscover();
+    expect(screen.queryByText("Stale category")).toBeNull();
+    codeInput = screen.getByRole("textbox", { name: "Search product code" });
+
+    fireEvent.change(codeInput, { target: { value: "ADLT-126" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    selectSettings();
+    await act(async () => {
+      navigationCatalog.resolve(
+        javdbCatalogFixture("ADLT-126", "Stale navigation"),
+      );
+      await navigationCatalog.promise;
+    });
+    selectDiscover();
+    expect(screen.queryByText("Stale navigation")).toBeNull();
+    codeInput = screen.getByRole("textbox", { name: "Search product code" });
+
+    fireEvent.change(codeInput, { target: { value: "ADLT-130" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    const trigger = await screen.findByRole("button", {
+      name: "Find releases: ADLT-130",
+    });
+    fireEvent.click(trigger);
+    await screen.findByRole("heading", { name: "Finding verified releases" });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await act(async () => {
+      dismissedReleases.resolve(
+        sukebeiReleaseFixture([{ name: "Dismissed ADLT-130 release" }]),
+      );
+      await dismissedReleases.promise;
+    });
+    expect(screen.queryByText("Dismissed ADLT-130 release")).toBeNull();
+
+    fireEvent.click(trigger);
+    await screen.findByRole("heading", {
+      name: "Sukebei returned invalid release data",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(
+      await screen.findByText("Current ADLT-130 release"),
+    ).toBeTruthy();
+  });
+
+  it("preserves completed Adult state through categories, navigation, appearance, and 25-to-7-to-10 resize changes", async () => {
+    fetchJavdbCatalogMock.mockResolvedValue(
+      javdbCatalogFixture("ADLT-123", "Preserved Adult title"),
+    );
+    gallerySizes.discover = { width: 1088, height: 2408 };
+    render(<App />);
+    selectDiscover();
+    selectAdultDiscover();
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Search product code" }),
+      { target: { value: "ADLT-123" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    expect(await screen.findByText("Preserved Adult title")).toBeTruthy();
+    const gallery = document.querySelector('[data-gallery="discover"]');
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("25");
+    resizeGallery("discover", 1528, 472);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
+    resizeGallery("discover", 1088, 956);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
+
+    fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+    selectAdultDiscover();
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectDashboard();
+    selectDiscover();
+    expect(
+      (screen.getByRole("radio", { name: "Adult" }) as HTMLInputElement).checked,
+    ).toBe(true);
+    expect(screen.getByRole("textbox", { name: "Search product code" })).toHaveProperty(
+      "value",
+      "ADLT-123",
+    );
+    expect(screen.getByText("Preserved Adult title")).toBeTruthy();
+    const restoredGallery = document.querySelector('[data-gallery="discover"]');
+    expect(restoredGallery?.getAttribute("data-page-capacity")).toBe("10");
+    expect(restoredGallery?.getAttribute("data-current-page")).toBe("1");
+    expect(fetchJavdbCatalogMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows distinct Adult provider failures and a safe no-verified-release state", async () => {
+    fetchJavdbCatalogMock
+      .mockRejectedValueOnce("adult_network_error")
+      .mockResolvedValueOnce("<html>invalid</html>")
+      .mockRejectedValueOnce("adult_source_unavailable")
+      .mockRejectedValueOnce("adult_provider_error")
+      .mockResolvedValueOnce('<div class="movie-list"></div>')
+      .mockResolvedValueOnce(javdbCatalogFixture("ADLT-123"));
+    fetchSukebeiAdultReleasesMock
+      .mockRejectedValueOnce("adult_source_unavailable")
+      .mockRejectedValueOnce("adult_network_error")
+      .mockResolvedValueOnce("<rss>")
+      .mockRejectedValueOnce("adult_provider_error")
+      .mockResolvedValueOnce(
+        sukebeiReleaseFixture([
+          { name: "ADLT-1230 extension" },
+          { name: "ADLT-123 + XYZ-7 pack" },
+        ]),
+      );
+    render(<App />);
+    selectDiscover();
+    selectAdultDiscover();
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Search product code" }),
+      { target: { value: "ADLT-123" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    for (const heading of [
+      "JavDB could not be reached",
+      "JavDB returned invalid catalog data",
+      "JavDB is unavailable",
+      "JavDB could not complete the search",
+    ]) {
+      expect(await screen.findByRole("heading", { name: heading })).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Retry search" }));
+    }
+    expect(
+      await screen.findByRole("heading", { name: "No exact Adult title found" }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    const trigger = await screen.findByRole("button", {
+      name: "Find releases: ADLT-123",
+    });
+    fireEvent.click(trigger);
+    for (const heading of [
+      "Sukebei is unavailable",
+      "Sukebei could not be reached",
+      "Sukebei returned invalid release data",
+      "Sukebei could not load releases",
+    ]) {
+      expect(await screen.findByRole("heading", { name: heading })).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    }
+    expect(
+      await screen.findByRole("heading", { name: "No verified releases found" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("ADLT-1230 extension")).toBeNull();
+    expect(screen.queryByText("ADLT-123 + XYZ-7 pack")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Selected release" })).toBeNull();
+  });
+});
+
 describe("VR Discover and verified release comparison", () => {
   it("requires an explicit exact-code search and exposes only verified releases for explicit selection", async () => {
     const exactReleaseName =
       "【VR】 MdVr_00419  Director’s Cut\t—\n特別版!?";
     const ambiguousPackName = "MDVR-419 + ABC-123 pack";
-    fetchJavdbVrCatalogMock.mockResolvedValue(
+    fetchJavdbCatalogMock.mockResolvedValue(
       javdbCatalogFixture("mdvr_00419", "Exact provider title"),
     );
     fetchSukebeiVrReleasesMock.mockResolvedValue(
@@ -4497,10 +4872,10 @@ describe("VR Discover and verified release comparison", () => {
         name: "",
       }).textContent,
     ).toContain("Enter a valid VR product code");
-    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
 
     fireEvent.change(codeInput, { target: { value: "mdvr_00419" } });
-    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Search" }));
 
     const codeHeading = await screen.findByRole("heading", {
@@ -4511,7 +4886,7 @@ describe("VR Discover and verified release comparison", () => {
     expect(vrCard).not.toBeNull();
     expect(within(vrCard as HTMLElement).getByText("Exact provider title")).toBeTruthy();
     expect(within(vrCard as HTMLElement).getByText("JavDB")).toBeTruthy();
-    expect(fetchJavdbVrCatalogMock).toHaveBeenCalledWith({ code: "MDVR-419" });
+    expect(fetchJavdbCatalogMock).toHaveBeenCalledWith({ code: "MDVR-419" });
     expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
     const cover = vrCard?.querySelector("img");
     expect(cover).not.toBeNull();
@@ -4600,7 +4975,7 @@ describe("VR Discover and verified release comparison", () => {
   it("inspects and saves only a complete explicitly selected provider artifact", async () => {
     const exactReleaseName = "【VR】 MDVR-419  Exact — 特別版";
     const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
-    fetchJavdbVrCatalogMock.mockResolvedValue(
+    fetchJavdbCatalogMock.mockResolvedValue(
       javdbCatalogFixture("MDVR-419", "Inspectable title"),
     );
     fetchSukebeiVrReleasesMock.mockResolvedValue(
@@ -4739,7 +5114,7 @@ describe("VR Discover and verified release comparison", () => {
 
   it("keeps every torrent inspection failure local and retryable", async () => {
     const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
-    fetchJavdbVrCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
+    fetchJavdbCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
     fetchSukebeiVrReleasesMock.mockResolvedValue(
       sukebeiReleaseFixture([
         {
@@ -4784,7 +5159,7 @@ describe("VR Discover and verified release comparison", () => {
 
   it("invalidates late inspection and save responses across selection and dismissal", async () => {
     const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
-    fetchJavdbVrCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
+    fetchJavdbCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
     fetchSukebeiVrReleasesMock.mockResolvedValue(
       sukebeiReleaseFixture([
         {
@@ -4862,7 +5237,7 @@ describe("VR Discover and verified release comparison", () => {
 
   it("dismisses pending torrent inspection by keyboard and restores its trigger", async () => {
     const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
-    fetchJavdbVrCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
+    fetchJavdbCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
     fetchSukebeiVrReleasesMock.mockResolvedValue(
       sukebeiReleaseFixture([
         {
@@ -4903,7 +5278,7 @@ describe("VR Discover and verified release comparison", () => {
     const firstCatalog = createDeferred<string>();
     const secondCatalog = createDeferred<string>();
     const closedCatalog = createDeferred<string>();
-    fetchJavdbVrCatalogMock
+    fetchJavdbCatalogMock
       .mockReturnValueOnce(firstCatalog.promise)
       .mockReturnValueOnce(secondCatalog.promise)
       .mockReturnValueOnce(closedCatalog.promise);
@@ -4951,7 +5326,7 @@ describe("VR Discover and verified release comparison", () => {
   });
 
   it("dismisses pending comparison safely and restores focus without accepting a late response", async () => {
-    fetchJavdbVrCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
+    fetchJavdbCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
     const firstReleases = createDeferred<string>();
     const secondReleases = createDeferred<string>();
     fetchSukebeiVrReleasesMock
@@ -4997,7 +5372,7 @@ describe("VR Discover and verified release comparison", () => {
   });
 
   it("shows distinct catalog and release provider failures and a safe accepted-only no-match state", async () => {
-    fetchJavdbVrCatalogMock
+    fetchJavdbCatalogMock
       .mockRejectedValueOnce("vr_network_error")
       .mockResolvedValueOnce("<html>invalid</html>")
       .mockRejectedValueOnce("vr_source_unavailable")
@@ -5073,7 +5448,7 @@ describe("VR Discover and verified release comparison", () => {
         ],
       }),
     );
-    fetchJavdbVrCatalogMock.mockResolvedValue(
+    fetchJavdbCatalogMock.mockResolvedValue(
       javdbCatalogFixture("MDVR-419", "Preserved VR title"),
     );
     render(<App />);
@@ -5106,7 +5481,7 @@ describe("VR Discover and verified release comparison", () => {
     ).toBe("MDVR-419");
     expect(screen.getByRole("heading", { level: 3, name: "MDVR-419" })).toBeTruthy();
     resizeGallery("discover", 520, 850);
-    expect(fetchJavdbVrCatalogMock).toHaveBeenCalledTimes(1);
+    expect(fetchJavdbCatalogMock).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
     expect(
@@ -5119,7 +5494,7 @@ describe("VR Discover and verified release comparison", () => {
     const exactReleaseName = "【VR】 MDVR-419  Exact\t—\n特別版";
     const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
     savedVrFolder = "/Volumes/VR — 作品";
-    fetchJavdbVrCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
+    fetchJavdbCatalogMock.mockResolvedValue(javdbCatalogFixture("MDVR-419"));
     fetchSukebeiVrReleasesMock.mockResolvedValue(
       sukebeiReleaseFixture([
         {
@@ -5556,7 +5931,7 @@ describe("aggregate VR download limit and transfer summaries", () => {
     expect(scanVrLibraryMock).not.toHaveBeenCalled();
     expect(queryMoviesStorageMock).not.toHaveBeenCalled();
     expect(queryVrStorageMock).not.toHaveBeenCalled();
-    expect(fetchJavdbVrCatalogMock).not.toHaveBeenCalled();
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
     expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
   });
 

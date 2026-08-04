@@ -4,7 +4,9 @@ import {
   applyVrOrganization,
   canonicalizeProductCode,
   dismissVrOrganization,
+  fetchExactJavdbAdultItem,
   fetchExactJavdbVrItem,
+  fetchVerifiedAdultSukebeiReleases,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedSukebeiTorrent,
   loadVrDownloadLimit,
@@ -434,6 +436,126 @@ describe("Sukebei identity-verified release request", () => {
         fetchVerifiedSukebeiReleases("MDVR-419"),
       ).resolves.toEqual({ status });
     }
+  });
+});
+
+describe("Adult exact-code provider boundaries", () => {
+  it("accepts only the exact ADLT-123 JavDB identity and preserves provider metadata", async () => {
+    invokeMock.mockResolvedValue(`
+      <div class="movie-list">
+        <div class="item"><div class="video-title"><strong>ADLT-124</strong> Neighbor</div></div>
+        <div class="item"><div class="video-title"><strong>ADLT-1230</strong> Extension</div></div>
+        <div class="item"><div class="video-title"><strong>XADLT-123</strong> Embedded</div></div>
+        <div class="item"><div class="video-title"><strong>ADLT-123 + XYZ-7</strong> Mixed</div></div>
+        <div class="item"><a class="box" href="/v/exact">
+          <img data-src="https://images.example/adult.jpg">
+          <div class="video-title"><strong>adlt_00123</strong> 作品  —  Exact  Title!</div>
+        </a></div>
+      </div>
+    `);
+
+    await expect(fetchExactJavdbAdultItem("ADLT-123")).resolves.toEqual({
+      status: "ready",
+      item: {
+        code: "ADLT-123",
+        title: "作品  —  Exact  Title!",
+        coverUrl: "https://images.example/adult.jpg",
+        source: "JavDB",
+      },
+    });
+    expect(invokeMock).toHaveBeenCalledWith("fetch_javdb_adult_catalog", {
+      code: "ADLT-123",
+    });
+  });
+
+  it("rejects every required false-positive Adult catalog identity", async () => {
+    invokeMock.mockResolvedValue(`
+      <div class="movie-list">
+        <div class="item"><div class="video-title"><strong>ADLT-124</strong> Neighbor</div></div>
+        <div class="item"><div class="video-title"><strong>ADLT-1230</strong> Extension</div></div>
+        <div class="item"><div class="video-title"><strong>XADLT-123</strong> Embedded</div></div>
+        <div class="item"><div class="video-title"><strong>ADLT-123 + XYZ-7</strong> Mixed</div></div>
+        <div class="item"><div class="video-title"><strong>ADLT-125</strong> Same prefix</div></div>
+        <div class="item"><div class="video-title"><strong>Unknown</strong> No code</div></div>
+      </div>
+    `);
+
+    await expect(fetchExactJavdbAdultItem("ADLT-123")).resolves.toEqual({
+      status: "no-exact-match",
+    });
+  });
+
+  it("keeps only unambiguous ADLT-123 releases and never returns torrent artifacts", async () => {
+    const exactName = "【作品】 adlt_00123  Director’s Cut\t—\n特別版!?";
+    invokeMock.mockResolvedValue(
+      releaseFeed(
+        [
+          `<item><title>${exactName}</title>
+            <nyaa:size>7.5 GiB</nyaa:size><nyaa:seeders>12</nyaa:seeders>
+            ${releaseArtifactElements("321")}
+          </item>`,
+          releaseItem("ADLT-124 neighbor"),
+          releaseItem("ADLT-1230 extension"),
+          releaseItem("XADLT-123 embedded"),
+          releaseItem("ADLT-123 + XYZ-7 mixed"),
+          releaseItem("ADLT-125 same prefix"),
+          releaseItem("Candidate with no established code"),
+        ].join(""),
+      ),
+    );
+
+    await expect(
+      fetchVerifiedAdultSukebeiReleases("ADLT-123"),
+    ).resolves.toEqual({
+      status: "ready",
+      releases: [
+        {
+          name: exactName,
+          source: "Sukebei",
+          size: "7.5 GiB",
+          seeders: 12,
+        },
+      ],
+    });
+    expect(invokeMock).toHaveBeenCalledWith("fetch_sukebei_adult_releases", {
+      code: "ADLT-123",
+    });
+  });
+
+  it("returns a safe empty Adult result for unverified candidates", async () => {
+    invokeMock.mockResolvedValue(
+      releaseFeed(
+        releaseItem("ADLT-1230 extension") +
+          releaseItem("ADLT-123 + XYZ-7 mixed") +
+          releaseItem("No product identity"),
+      ),
+    );
+
+    await expect(
+      fetchVerifiedAdultSukebeiReleases("ADLT-123"),
+    ).resolves.toEqual({ status: "ready", releases: [] });
+  });
+
+  it("distinguishes Adult release provider failures and rejects noncanonical requests", async () => {
+    invokeMock.mockResolvedValueOnce("<rss>");
+    await expect(
+      fetchVerifiedAdultSukebeiReleases("ADLT-123"),
+    ).resolves.toEqual({ status: "malformed-provider" });
+
+    for (const [error, status] of [
+      ["adult_source_unavailable", "source-unavailable"],
+      ["adult_network_error", "network-error"],
+      ["adult_provider_error", "provider-error"],
+    ]) {
+      invokeMock.mockRejectedValueOnce(error);
+      await expect(
+        fetchVerifiedAdultSukebeiReleases("ADLT-123"),
+      ).resolves.toEqual({ status });
+    }
+
+    await expect(
+      fetchVerifiedAdultSukebeiReleases("adlt-123"),
+    ).rejects.toThrow("A canonical Adult product code is required.");
   });
 });
 

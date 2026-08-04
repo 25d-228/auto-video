@@ -1,24 +1,30 @@
-export type VrCatalogItem = {
+export type JavdbCatalogItem = {
   code: string;
   title: string | null;
   coverUrl: string | null;
   source: "JavDB";
 };
 
-export type VrCatalogResult =
-  | { status: "ready"; item: VrCatalogItem }
+export type JavdbCatalogResult =
+  | { status: "ready"; item: JavdbCatalogItem }
   | { status: "no-exact-match" }
   | { status: "source-unavailable" }
   | { status: "network-error" }
   | { status: "malformed-provider" }
   | { status: "provider-error" };
 
-export type VrRelease = {
-  artifact?: VrReleaseArtifact;
+export type VrCatalogItem = JavdbCatalogItem;
+export type VrCatalogResult = JavdbCatalogResult;
+
+export type SukebeiRelease = {
   name: string;
   source: "Sukebei";
   size: string | null;
   seeders: number | null;
+};
+
+export type VrRelease = SukebeiRelease & {
+  artifact?: VrReleaseArtifact;
 };
 
 export type VrReleaseArtifact = {
@@ -111,12 +117,14 @@ export type VrLibraryItem = {
   files: VrLibraryFile[];
 };
 
-export type VrReleasesResult =
-  | { status: "ready"; releases: VrRelease[] }
+export type SukebeiReleasesResult<Release extends SukebeiRelease> =
+  | { status: "ready"; releases: Release[] }
   | { status: "source-unavailable" }
   | { status: "network-error" }
   | { status: "malformed-provider" }
   | { status: "provider-error" };
+
+export type VrReleasesResult = SukebeiReleasesResult<VrRelease>;
 
 const productCodePattern = /^([A-Za-z]{2,16})[ _-]*([0-9]{1,10})$/;
 const unsignedU64Pattern = /^\d{1,20}$/;
@@ -129,7 +137,7 @@ const vrLibraryPartPrefixes = new Set(["PART", "PT", "CD", "DISC", "DISK"]);
 const javdbBaseUrl = "https://javdb.com";
 
 function invokeErrorStatus(error: unknown): Exclude<
-  VrCatalogResult["status"],
+  JavdbCatalogResult["status"],
   "ready" | "no-exact-match" | "malformed-provider"
 > {
   const errorCode =
@@ -140,8 +148,10 @@ function invokeErrorStatus(error: unknown): Exclude<
         : "";
 
   switch (errorCode) {
+    case "adult_source_unavailable":
     case "vr_source_unavailable":
       return "source-unavailable";
+    case "adult_network_error":
     case "vr_network_error":
       return "network-error";
     default:
@@ -187,13 +197,14 @@ function javdbTitle(item: Element, codeElement: Element) {
     codeElement.tagName.toLowerCase(),
   );
   clonedCodeElement?.remove();
-  return normalizedText(titleWithoutCode.textContent);
+  const title = titleWithoutCode.textContent?.trim() ?? "";
+  return title === "" ? null : title;
 }
 
 function parseJavdbCatalog(
   documentText: string,
   requestedCode: string,
-): VrCatalogResult {
+): JavdbCatalogResult {
   const document = new DOMParser().parseFromString(documentText, "text/html");
   const movieList = document.querySelector(".movie-list");
   if (movieList === null) {
@@ -318,6 +329,7 @@ function releaseMatchesProductCode(name: string, requestedCode: string) {
 function parseSukebeiReleases(
   documentText: string,
   requestedCode: string,
+  includeArtifact: boolean,
 ): VrReleasesResult {
   const document = new DOMParser().parseFromString(
     documentText,
@@ -343,7 +355,7 @@ function parseSukebeiReleases(
       seedersText !== null && /^\d+$/.test(seedersText)
         ? Number(seedersText)
         : null;
-    const artifact = releaseArtifact(item);
+    const artifact = includeArtifact ? releaseArtifact(item) : null;
     releases.push({
       ...(artifact === null ? {} : { artifact }),
       name,
@@ -373,7 +385,7 @@ export function canonicalizeProductCode(value: string) {
 
 export async function fetchExactJavdbVrItem(
   code: string,
-): Promise<VrCatalogResult> {
+): Promise<JavdbCatalogResult> {
   const requestedCode = canonicalizeProductCode(code);
   if (requestedCode === null || requestedCode !== code) {
     throw new Error("A canonical VR product code is required.");
@@ -382,6 +394,28 @@ export async function fetchExactJavdbVrItem(
   try {
     const documentText = await window.__TAURI__.core.invoke<string>(
       "fetch_javdb_vr_catalog",
+      { code: requestedCode },
+    );
+    if (typeof documentText !== "string") {
+      return { status: "malformed-provider" };
+    }
+    return parseJavdbCatalog(documentText, requestedCode);
+  } catch (error: unknown) {
+    return { status: invokeErrorStatus(error) };
+  }
+}
+
+export async function fetchExactJavdbAdultItem(
+  code: string,
+): Promise<JavdbCatalogResult> {
+  const requestedCode = canonicalizeProductCode(code);
+  if (requestedCode === null || requestedCode !== code) {
+    throw new Error("A canonical Adult product code is required.");
+  }
+
+  try {
+    const documentText = await window.__TAURI__.core.invoke<string>(
+      "fetch_javdb_adult_catalog",
       { code: requestedCode },
     );
     if (typeof documentText !== "string") {
@@ -409,7 +443,29 @@ export async function fetchVerifiedSukebeiReleases(
     if (typeof documentText !== "string") {
       return { status: "malformed-provider" };
     }
-    return parseSukebeiReleases(documentText, requestedCode);
+    return parseSukebeiReleases(documentText, requestedCode, true);
+  } catch (error: unknown) {
+    return { status: invokeErrorStatus(error) };
+  }
+}
+
+export async function fetchVerifiedAdultSukebeiReleases(
+  code: string,
+): Promise<SukebeiReleasesResult<SukebeiRelease>> {
+  const requestedCode = canonicalizeProductCode(code);
+  if (requestedCode === null || requestedCode !== code) {
+    throw new Error("A canonical Adult product code is required.");
+  }
+
+  try {
+    const documentText = await window.__TAURI__.core.invoke<string>(
+      "fetch_sukebei_adult_releases",
+      { code: requestedCode },
+    );
+    if (typeof documentText !== "string") {
+      return { status: "malformed-provider" };
+    }
+    return parseSukebeiReleases(documentText, requestedCode, false);
   } catch (error: unknown) {
     return { status: invokeErrorStatus(error) };
   }

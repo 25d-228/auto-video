@@ -1192,7 +1192,7 @@ button {
   width: 4.25rem;
 }
 
-.discover-card--vr .media-title-row {
+.discover-card--code .media-title-row {
   grid-template-columns: minmax(0, 1fr) 6.5rem;
 }
 
@@ -1200,7 +1200,7 @@ button {
   width: 6.5rem;
 }
 
-.discover-card--vr dl dd {
+.discover-card--code dl dd {
   display: -webkit-box;
   overflow: hidden;
   overflow-wrap: anywhere;
