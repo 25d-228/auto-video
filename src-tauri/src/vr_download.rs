@@ -18,7 +18,8 @@ use librqbit::{
 use crate::vr_library::is_supported_media;
 use crate::vr_torrent::{
     hex_sha1, media_name_matches_product_code, revalidate_persisted_download_source,
-    VerifiedDownloadFile, VerifiedDownloadSource, VerifiedDownloadSourceError, VrTorrentState,
+    AdultTorrentState, VerifiedDownloadFile, VerifiedDownloadSource, VerifiedDownloadSourceError,
+    VrTorrentState,
 };
 
 pub const VR_DOWNLOAD_ACTION_INVALID: &str = "vr_download_action_invalid";
@@ -39,7 +40,8 @@ pub const VR_ORGANIZATION_FAILED: &str = "vr_organization_failed";
 pub const VR_ORGANIZATION_INELIGIBLE: &str = "vr_organization_ineligible";
 pub const VR_ORGANIZATION_STALE: &str = "vr_organization_stale";
 
-const PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_VR_DOWNLOADS_V1\n";
+const PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_DOWNLOADS_V2\n";
+const LEGACY_PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_VR_DOWNLOADS_V1\n";
 const ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_VR_ORGANIZATION_V1\n";
 const ORGANIZATION_RECOVERY_PREFIX: &str = ".auto-video-organization-";
 const ORGANIZATION_RECOVERY_SUFFIX: &str = ".recovery";
@@ -52,6 +54,29 @@ const MAX_DOWNLOAD_LIMIT_MIB_PER_SECOND: u32 = u32::MAX / BYTES_PER_MIB;
 const DOWNLOAD_LIMIT_UNLIMITED: &str = "unlimited\n";
 
 type ManagedTorrentHandle = Arc<ManagedTorrent>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransferCategory {
+    Adult,
+    Vr,
+}
+
+impl TransferCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Adult => "adult",
+            Self::Vr => "vr",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "adult" => Some(Self::Adult),
+            "vr" => Some(Self::Vr),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransferState {
@@ -138,6 +163,7 @@ impl OrganizationState {
 
 struct TransferRecord {
     transfer_id: String,
+    category: TransferCategory,
     code: String,
     release_name: String,
     infohash: String,
@@ -204,6 +230,7 @@ impl TransferRecord {
 
 struct CorruptTransferRecord {
     transfer_id: String,
+    category: Option<TransferCategory>,
     code: String,
     release_name: String,
     raw_line: Vec<u8>,
@@ -224,6 +251,7 @@ enum DownloadLimitState {
 #[derive(Default)]
 struct VrDownloadContext {
     future_folder: Option<PathBuf>,
+    adult_future_folder: Option<PathBuf>,
     session: Option<Arc<Session>>,
     session_starting: bool,
     download_limit: DownloadLimitState,
@@ -258,6 +286,15 @@ pub(crate) fn with_configured_vr_folder<T>(
 ) -> Result<T, &'static str> {
     let context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
     Ok(operation(context.future_folder.as_deref()))
+}
+
+pub fn configure_adult_download_folder(
+    state: &VrDownloadState,
+    folder: Option<PathBuf>,
+) -> Result<(), &'static str> {
+    let mut context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
+    context.adult_future_folder = folder;
+    Ok(())
 }
 
 pub fn load_vr_folder_file(path: &Path) -> Result<Option<PathBuf>, &'static str> {
@@ -582,7 +619,27 @@ fn identity_field(identity: &mut Vec<u8>, value: &[u8]) {
     identity.extend_from_slice(value);
 }
 
-fn transfer_identity(source: &VerifiedDownloadSource, destination: &Path) -> String {
+fn transfer_identity(
+    category: TransferCategory,
+    source: &VerifiedDownloadSource,
+    destination: &Path,
+) -> String {
+    let mut identity = Vec::new();
+    identity_field(&mut identity, category.as_str().as_bytes());
+    identity_field(&mut identity, source.code.as_bytes());
+    identity_field(&mut identity, source.release_name.as_bytes());
+    identity_field(&mut identity, source.infohash.as_bytes());
+    identity_field(&mut identity, &source.bytes);
+    identity_field(&mut identity, destination.to_string_lossy().as_bytes());
+    for file in &source.selected_files {
+        identity.extend_from_slice(&(file.file_id as u64).to_be_bytes());
+        identity_field(&mut identity, file.path.as_bytes());
+        identity.extend_from_slice(&file.size.to_be_bytes());
+    }
+    hex_sha1(&identity)
+}
+
+fn legacy_vr_transfer_identity(source: &VerifiedDownloadSource, destination: &Path) -> String {
     let mut identity = Vec::new();
     identity_field(&mut identity, source.code.as_bytes());
     identity_field(&mut identity, source.release_name.as_bytes());
@@ -598,6 +655,7 @@ fn transfer_identity(source: &VerifiedDownloadSource, destination: &Path) -> Str
 }
 
 fn transfer_from_source(
+    category: TransferCategory,
     source: VerifiedDownloadSource,
     destination: PathBuf,
     state: TransferState,
@@ -608,7 +666,8 @@ fn transfer_from_source(
         .map(|file| file.path.clone())
         .collect();
     TransferRecord {
-        transfer_id: transfer_identity(&source, &destination),
+        transfer_id: transfer_identity(category, &source, &destination),
+        category,
         code: source.code,
         release_name: source.release_name,
         infohash: source.infohash,
@@ -732,6 +791,7 @@ fn encode_transfer_state(
         encoded_boundary_segments(record)?,
         organization_state.as_str().to_owned(),
         encoded_paths(current_paths),
+        record.category.as_str().to_owned(),
     ]
     .join("\t")
     .into_bytes())
@@ -795,10 +855,14 @@ fn parse_boundary_segments(value: &[u8]) -> Option<BTreeMap<usize, Vec<SparseSeg
     (retained.len() <= MAX_SELECTED_FILES).then_some(retained)
 }
 
-fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
+fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRecord> {
     let fields = line.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-    let (fields, boundary_segments, organization_state, current_paths) = match fields.as_slice() {
-        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes] => {
+    let (fields, boundary_segments, organization_state, current_paths, category) = match fields
+        .as_slice()
+    {
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes]
+            if allow_legacy_vr =>
+        {
             (
                 [
                     *transfer_id,
@@ -815,9 +879,12 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
                 BTreeMap::new(),
                 OrganizationState::None,
                 None,
+                TransferCategory::Vr,
             )
         }
-        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments] => {
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments]
+            if allow_legacy_vr =>
+        {
             (
                 [
                     *transfer_id,
@@ -834,9 +901,12 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
                 parse_boundary_segments(boundary_segments)?,
                 OrganizationState::None,
                 None,
+                TransferCategory::Vr,
             )
         }
-        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths] => {
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths]
+            if allow_legacy_vr =>
+        {
             (
                 [
                     *transfer_id,
@@ -853,6 +923,27 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
                 parse_boundary_segments(boundary_segments)?,
                 OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
                 Some(parse_current_paths(current_paths)?),
+                TransferCategory::Vr,
+            )
+        }
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths, category] => {
+            (
+                [
+                    *transfer_id,
+                    *code,
+                    *release_name,
+                    *infohash,
+                    *destination,
+                    *state,
+                    *metainfo,
+                    *selected_ids,
+                    *fingerprints,
+                    *downloaded_bytes,
+                ],
+                parse_boundary_segments(boundary_segments)?,
+                OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
+                Some(parse_current_paths(current_paths)?),
+                TransferCategory::from_str(std::str::from_utf8(category).ok()?)?,
             )
         }
         _ => return None,
@@ -897,8 +988,11 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
             .collect()
     });
     let selected_total = checked_selected_total(&source.selected_files).ok()?;
-    if transfer_identity(&source, &destination) != transfer_id || downloaded_bytes > selected_total
-    {
+    let category_identity = transfer_identity(category, &source, &destination);
+    let identity_is_valid = category_identity == transfer_id
+        || (category == TransferCategory::Vr
+            && legacy_vr_transfer_identity(&source, &destination) == transfer_id);
+    if !identity_is_valid || downloaded_bytes > selected_total {
         return None;
     }
     if current_paths.len() != source.selected_files.len()
@@ -912,7 +1006,8 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
                 .zip(source.selected_files.iter())
                 .any(|(current, selected)| current != &selected.path))
         || (organization_state != OrganizationState::None
-            && (state != TransferState::Completed
+            && (category != TransferCategory::Vr
+                || state != TransferState::Completed
                 || downloaded_bytes != selected_total
                 || fingerprints.len() != source.selected_files.len()))
     {
@@ -921,6 +1016,7 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
 
     Some(TransferRecord {
         transfer_id,
+        category,
         code,
         release_name,
         infohash,
@@ -939,7 +1035,11 @@ fn parse_transfer_line(line: &[u8]) -> Option<TransferRecord> {
     })
 }
 
-fn corrupt_transfer(line: &[u8], line_number: usize) -> CorruptTransferRecord {
+fn corrupt_transfer(
+    line: &[u8],
+    line_number: usize,
+    category: Option<TransferCategory>,
+) -> CorruptTransferRecord {
     let decoded_line = line
         .strip_prefix(b"!")
         .and_then(decode_hex)
@@ -960,6 +1060,7 @@ fn corrupt_transfer(line: &[u8], line_number: usize) -> CorruptTransferRecord {
         .unwrap_or_else(|| "Persisted transfer data is corrupt.".to_owned());
     CorruptTransferRecord {
         transfer_id,
+        category,
         code,
         release_name,
         raw_line: decoded_line,
@@ -976,12 +1077,20 @@ fn read_persisted_transfers(path: &Path) -> Result<Vec<StoredTransfer>, &'static
         return Ok(vec![StoredTransfer::Corrupt(corrupt_transfer(
             b"oversized persistence",
             0,
+            None,
         ))]);
     }
     let bytes = fs::read(path).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
-    let Some(body) = bytes.strip_prefix(PERSISTENCE_HEADER) else {
-        return Ok(vec![StoredTransfer::Corrupt(corrupt_transfer(&bytes, 0))]);
+    let (body, allow_legacy_vr) = if let Some(body) = bytes.strip_prefix(PERSISTENCE_HEADER) {
+        (body, false)
+    } else if let Some(body) = bytes.strip_prefix(LEGACY_PERSISTENCE_HEADER) {
+        (body, true)
+    } else {
+        return Ok(vec![StoredTransfer::Corrupt(corrupt_transfer(
+            &bytes, 0, None,
+        ))]);
     };
+    let corrupt_category = allow_legacy_vr.then_some(TransferCategory::Vr);
     let mut transfers = Vec::new();
     let mut transfer_ids = BTreeSet::new();
     for (line_number, line) in body
@@ -990,12 +1099,17 @@ fn read_persisted_transfers(path: &Path) -> Result<Vec<StoredTransfer>, &'static
         .take(MAX_PERSISTED_TRANSFERS)
         .enumerate()
     {
-        transfers.push(match parse_transfer_line(line) {
+        transfers.push(match parse_transfer_line(line, allow_legacy_vr) {
+            Some(record) if allow_legacy_vr && record.category != TransferCategory::Vr => {
+                StoredTransfer::Corrupt(corrupt_transfer(line, line_number, corrupt_category))
+            }
             Some(record) if transfer_ids.insert(record.transfer_id.clone()) => {
                 StoredTransfer::Valid(record)
             }
-            None => StoredTransfer::Corrupt(corrupt_transfer(line, line_number)),
-            Some(_) => StoredTransfer::Corrupt(corrupt_transfer(line, line_number)),
+            None => StoredTransfer::Corrupt(corrupt_transfer(line, line_number, corrupt_category)),
+            Some(_) => {
+                StoredTransfer::Corrupt(corrupt_transfer(line, line_number, corrupt_category))
+            }
         });
     }
     Ok(transfers)
@@ -1207,7 +1321,7 @@ fn parse_organization_recovery_file(path: &Path) -> Option<TransferRecord> {
     let line = bytes
         .strip_prefix(ORGANIZATION_RECOVERY_HEADER)?
         .strip_suffix(b"\n")?;
-    let record = parse_transfer_line(line)?;
+    let record = parse_transfer_line(line, true)?;
     if record.organization_state != OrganizationState::Attention
         || record.state != TransferState::Completed
         || (organization_recovery_path(&record) != path
@@ -1901,6 +2015,7 @@ async fn restore_record(
         let should_resume = record.state != TransferState::Paused;
         let snapshot = TransferRecord {
             transfer_id: record.transfer_id.clone(),
+            category: record.category,
             code: record.code.clone(),
             release_name: record.release_name.clone(),
             infohash: record.infohash.clone(),
@@ -2273,7 +2388,8 @@ fn organization_entries(
     record: &TransferRecord,
     current_folder: Option<&Path>,
 ) -> Result<Vec<OrganizationEntry>, &'static str> {
-    if record.state != TransferState::Completed
+    if record.category != TransferCategory::Vr
+        || record.state != TransferState::Completed
         || record.handle.is_some()
         || record.pending_action.is_some()
         || record.organization_state == OrganizationState::Organized
@@ -2715,10 +2831,15 @@ pub fn apply_organization(
 
 fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
     let mut rows = Vec::new();
-    let current_folder = context.future_folder.clone();
+    let current_vr_folder = context.future_folder.clone();
+    let current_adult_folder = context.adult_future_folder.clone();
     for transfer in &mut context.transfers {
         match transfer {
             StoredTransfer::Valid(record) => {
+                let current_folder = match record.category {
+                    TransferCategory::Adult => &current_adult_folder,
+                    TransferCategory::Vr => &current_vr_folder,
+                };
                 let mut speed = 0;
                 if let Some(handle) = &record.handle {
                     let (downloaded, current_speed) = selected_progress(record, handle);
@@ -2737,6 +2858,7 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                 }
                 rows.extend([
                     record.transfer_id.clone(),
+                    record.category.as_str().to_owned(),
                     record.code.clone(),
                     record.release_name.clone(),
                     record.selected_files.len().to_string(),
@@ -2751,13 +2873,18 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                     } else {
                         format!("{}/", record.code)
                     },
-                    organization_entries(record, current_folder.as_deref())
+                    organization_entries(record, current_vr_folder.as_deref())
                         .is_ok()
                         .to_string(),
                 ]);
             }
             StoredTransfer::Corrupt(record) => rows.extend([
                 record.transfer_id.clone(),
+                record
+                    .category
+                    .map(TransferCategory::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
                 record.code.clone(),
                 record.release_name.clone(),
                 "0".to_owned(),
@@ -2813,17 +2940,13 @@ pub fn list_downloads(
     }
 }
 
-pub async fn start_download(
+async fn start_download_source(
     state: &VrDownloadState,
-    torrent_state: &VrTorrentState,
     persistence_path: &Path,
     session_folder: &Path,
-    inspection_id: &str,
-    selected_file_ids: &[usize],
+    category: TransferCategory,
+    source: VerifiedDownloadSource,
 ) -> Result<String, &'static str> {
-    let source = torrent_state
-        .verified_download_source(inspection_id, selected_file_ids)
-        .map_err(map_source_error)?;
     checked_selected_total(&source.selected_files)?;
     let destination = {
         let context = state.0.lock().map_err(|_| VR_DOWNLOAD_FAILED)?;
@@ -2833,19 +2956,18 @@ pub async fn start_download(
         if matches!(context.download_limit, DownloadLimitState::Unloaded) {
             return Err(VR_DOWNLOAD_LIMIT_UNAVAILABLE);
         }
-        let destination = canonical_destination(
-            context
-                .future_folder
-                .as_deref()
-                .ok_or(VR_FOLDER_UNAVAILABLE)?,
-        )?;
+        let future_folder = match category {
+            TransferCategory::Adult => context.adult_future_folder.as_deref(),
+            TransferCategory::Vr => context.future_folder.as_deref(),
+        };
+        let destination = canonical_destination(future_folder.ok_or(VR_FOLDER_UNAVAILABLE)?)?;
         if has_active_duplicate(&context.transfers, &source.infohash, &destination) {
             return Err(VR_DOWNLOAD_DUPLICATE);
         }
         destination
     };
     validate_new_targets(&destination, &source.selected_files)?;
-    let mut record = transfer_from_source(source, destination, TransferState::Queued);
+    let mut record = transfer_from_source(category, source, destination, TransferState::Queued);
     let transfer_id = record.transfer_id.clone();
     {
         let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_FAILED)?;
@@ -2878,6 +3000,7 @@ pub async fn start_download(
                 StoredTransfer::Valid(record) if record.transfer_id == transfer_id => {
                     Some(TransferRecord {
                         transfer_id: record.transfer_id.clone(),
+                        category: record.category,
                         code: record.code.clone(),
                         release_name: record.release_name.clone(),
                         infohash: record.infohash.clone(),
@@ -2949,6 +3072,48 @@ pub async fn start_download(
         persistence_path.to_owned(),
     );
     Ok(transfer_id)
+}
+
+pub async fn start_download(
+    state: &VrDownloadState,
+    torrent_state: &VrTorrentState,
+    persistence_path: &Path,
+    session_folder: &Path,
+    inspection_id: &str,
+    selected_file_ids: &[usize],
+) -> Result<String, &'static str> {
+    let source = torrent_state
+        .verified_download_source(inspection_id, selected_file_ids)
+        .map_err(map_source_error)?;
+    start_download_source(
+        state,
+        persistence_path,
+        session_folder,
+        TransferCategory::Vr,
+        source,
+    )
+    .await
+}
+
+pub async fn start_adult_download(
+    state: &VrDownloadState,
+    torrent_state: &AdultTorrentState,
+    persistence_path: &Path,
+    session_folder: &Path,
+    inspection_id: &str,
+    selected_file_ids: &[usize],
+) -> Result<String, &'static str> {
+    let source = torrent_state
+        .verified_download_source(inspection_id, selected_file_ids)
+        .map_err(map_source_error)?;
+    start_download_source(
+        state,
+        persistence_path,
+        session_folder,
+        TransferCategory::Adult,
+        source,
+    )
+    .await
 }
 
 fn mark_transfer_failed(state: &VrDownloadState, persistence_path: &Path, transfer_id: &str) {
@@ -3169,6 +3334,20 @@ mod tests {
         }
     }
 
+    fn persistable_adult_fixture_source() -> VerifiedDownloadSource {
+        VerifiedDownloadSource {
+            bytes: b"d4:infod6:lengthi5e4:name12:Movie  A.mp412:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec(),
+            code: "ADLT-123".to_owned(),
+            infohash: "8b16011989123e1d68a8aaf18f5a599e6a4a0bc7".to_owned(),
+            release_name: "【Adult】 ADLT-123  Exact — 特別版".to_owned(),
+            selected_files: vec![VerifiedDownloadFile {
+                file_id: 0,
+                path: "Movie  A.mp4".to_owned(),
+                size: 5,
+            }],
+        }
+    }
+
     fn organization_source(files: Vec<(&str, u64)>) -> VerifiedDownloadSource {
         VerifiedDownloadSource {
             bytes: b"organization fixture torrent".to_vec(),
@@ -3191,8 +3370,12 @@ mod tests {
         destination: &Path,
         source: VerifiedDownloadSource,
     ) -> TransferRecord {
-        let mut record =
-            transfer_from_source(source, destination.to_owned(), TransferState::Completed);
+        let mut record = transfer_from_source(
+            TransferCategory::Vr,
+            source,
+            destination.to_owned(),
+            TransferState::Completed,
+        );
         for (index, file) in record.selected_files.iter().enumerate() {
             let target = selected_target(destination, file).expect("selected target must resolve");
             fs::create_dir_all(target.parent().expect("selected target must have a parent"))
@@ -3223,6 +3406,7 @@ mod tests {
         let fixture = FilesystemFixture::new();
         let destination = fixture.path.join("current");
         let record = transfer_from_source(
+            TransferCategory::Vr,
             fixture_source(),
             destination.clone(),
             TransferState::Cancelled,
@@ -3233,9 +3417,9 @@ mod tests {
             ..VrDownloadContext::default()
         };
 
-        assert_eq!(download_rows(&mut context)[8], "true");
+        assert_eq!(download_rows(&mut context)[9], "true");
         context.future_folder = Some(fixture.path.join("replacement"));
-        assert_eq!(download_rows(&mut context)[8], "false");
+        assert_eq!(download_rows(&mut context)[9], "false");
     }
 
     #[test]
@@ -3302,7 +3486,7 @@ mod tests {
         ))
         .expect("organized transfer must reload");
         assert_eq!(
-            &rows[7..12],
+            &rows[8..13],
             &["completed", "true", "organized", "MDVR-419/", "false"]
         );
         assert!(
@@ -3779,7 +3963,7 @@ mod tests {
         ))
         .expect("attention state must reload");
         assert_eq!(
-            &rows[7..12],
+            &rows[8..13],
             &["completed", "true", "attention", "MDVR-419/", "true"]
         );
         assert!(
@@ -3869,7 +4053,7 @@ mod tests {
         ))
         .expect("durable recovery must load");
         assert_eq!(
-            &rows[7..12],
+            &rows[8..13],
             &["completed", "true", "attention", "MDVR-419/", "true"]
         );
         let context = restarted.0.lock().expect("state must lock");
@@ -3899,7 +4083,7 @@ mod tests {
         ))
         .expect("reconciled attention state must remain durable");
         assert_eq!(
-            &rows[7..12],
+            &rows[8..13],
             &["completed", "true", "attention", "MDVR-419/", "true"]
         );
         assert!(!recovery_path.exists());
@@ -3918,7 +4102,7 @@ mod tests {
         ))
         .expect("persisted attention state must survive another restart");
         assert_eq!(
-            &rows[7..12],
+            &rows[8..13],
             &["completed", "true", "attention", "MDVR-419/", "true"]
         );
     }
@@ -3989,7 +4173,7 @@ mod tests {
         ))
         .expect("interrupted paths must recover on restart");
         assert_eq!(
-            &rows[7..12],
+            &rows[8..13],
             &["completed", "true", "attention", "MDVR-419/", "true"]
         );
         let context = restarted.0.lock().expect("state must lock");
@@ -4110,7 +4294,7 @@ mod tests {
         ))
         .expect("complete recovery must survive a partial successor");
         assert_eq!(
-            &rows[7..12],
+            &rows[8..13],
             &["completed", "true", "attention", "MDVR-419/", "true"]
         );
         let context = restarted.0.lock().expect("state must lock");
@@ -4268,7 +4452,7 @@ mod tests {
         ))
         .expect("retained row must reload after failed dismissal");
         assert_eq!(
-            &rows[7..12],
+            &rows[8..13],
             &["completed", "true", "attention", "MDVR-419/", "true"]
         );
         assert_eq!(
@@ -4356,8 +4540,12 @@ mod tests {
         tauri::async_runtime::block_on(session_for(&state, &fixture.path.join("session")))
             .expect("local session must start");
         let destination = fixture.path.join("destination");
-        let record =
-            transfer_from_source(fixture_source(), destination.clone(), TransferState::Paused);
+        let record = transfer_from_source(
+            TransferCategory::Vr,
+            fixture_source(),
+            destination.clone(),
+            TransferState::Paused,
+        );
         let expected_identity = (
             record.transfer_id.clone(),
             record.infohash.clone(),
@@ -4536,7 +4724,12 @@ mod tests {
             &[1],
         )
         .expect("selected boundary fixture must revalidate");
-        let mut record = transfer_from_source(source, destination, TransferState::Downloading);
+        let mut record = transfer_from_source(
+            TransferCategory::Vr,
+            source,
+            destination,
+            TransferState::Downloading,
+        );
         fs::write(record.destination.join("Folder/特別版  B.mp4"), b"1234567")
             .expect("completed selected file must exist");
         record.fingerprints = capture_fingerprints(&record).expect("fingerprint must resolve");
@@ -4588,6 +4781,7 @@ mod tests {
             .expect("state must lock")
             .transfers
             .push(StoredTransfer::Valid(transfer_from_source(
+                TransferCategory::Vr,
                 fixture_source(),
                 first.clone(),
                 TransferState::Cancelled,
@@ -4683,24 +4877,167 @@ mod tests {
         let fixture = FilesystemFixture::new();
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
         let source = fixture_source();
-        let identity = transfer_identity(&source, &destination);
+        let identity = transfer_identity(TransferCategory::Vr, &source, &destination);
         assert_eq!(identity.len(), 40);
 
         let mut changed_release = source.clone();
         changed_release.release_name.push(' ');
-        assert_ne!(identity, transfer_identity(&changed_release, &destination));
+        assert_ne!(
+            identity,
+            transfer_identity(TransferCategory::Vr, &changed_release, &destination)
+        );
         let mut changed_selection = source.clone();
         changed_selection.selected_files[0].file_id = 1;
         assert_ne!(
             identity,
-            transfer_identity(&changed_selection, &destination)
+            transfer_identity(TransferCategory::Vr, &changed_selection, &destination)
         );
         let mut changed_metainfo = source.clone();
         changed_metainfo.bytes.push(b'!');
-        assert_ne!(identity, transfer_identity(&changed_metainfo, &destination));
+        assert_ne!(
+            identity,
+            transfer_identity(TransferCategory::Vr, &changed_metainfo, &destination)
+        );
         let other_destination = destination.join("other");
         fs::create_dir(&other_destination).expect("other destination must exist");
-        assert_ne!(identity, transfer_identity(&source, &other_destination));
+        assert_ne!(
+            identity,
+            transfer_identity(TransferCategory::Vr, &source, &other_destination)
+        );
+        assert_ne!(
+            identity,
+            transfer_identity(TransferCategory::Adult, &source, &destination)
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_vr_records_without_reclassification_or_identity_reset() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = persistable_fixture_source();
+        let mut record = transfer_from_source(
+            TransferCategory::Vr,
+            source.clone(),
+            destination.clone(),
+            TransferState::Cancelled,
+        );
+        record.transfer_id = legacy_vr_transfer_identity(&source, &destination);
+        fs::write(destination.join("Movie  A.mp4"), b"abcde")
+            .expect("legacy selected file must exist");
+        record.fingerprints = capture_fingerprints(&record).expect("fingerprint must resolve");
+        let legacy_transfer_id = record.transfer_id.clone();
+        let mut legacy_line = encode_transfer(&record).expect("legacy record must encode");
+        let category_separator = legacy_line
+            .iter()
+            .rposition(|byte| *byte == b'\t')
+            .expect("encoded category separator must exist");
+        legacy_line.truncate(category_separator);
+        let persistence_path = fixture.path.join("downloads");
+        let mut bytes = LEGACY_PERSISTENCE_HEADER.to_vec();
+        bytes.extend_from_slice(&legacy_line);
+        bytes.push(b'\n');
+        fs::write(&persistence_path, bytes).expect("legacy record must persist");
+
+        let state = VrDownloadState::default();
+        state.0.lock().expect("state must lock").future_folder = Some(destination);
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &state,
+            &persistence_path,
+            &fixture.path.join("session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("legacy VR record must migrate");
+        assert_eq!(rows[0], legacy_transfer_id);
+        assert_eq!(rows[1], "vr");
+        assert_eq!(rows[8], "cancelled");
+        let migrated = fs::read(&persistence_path).expect("migrated record must persist");
+        assert!(migrated.starts_with(PERSISTENCE_HEADER));
+        assert!(migrated.ends_with(b"\tvr\n"));
+        let reloaded = read_persisted_transfers(&persistence_path)
+            .expect("migrated VR record must remain readable");
+        let StoredTransfer::Valid(reloaded_record) = &reloaded[0] else {
+            panic!("migrated VR record must remain valid");
+        };
+        assert_eq!(reloaded_record.transfer_id, legacy_transfer_id);
+        assert_eq!(reloaded_record.category, TransferCategory::Vr);
+    }
+
+    #[test]
+    fn damaged_v2_adult_categories_stay_unknown_and_dismiss_keeps_media() {
+        for category_case in ["missing", "invalid", "mismatched"] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let record = transfer_from_source(
+                TransferCategory::Adult,
+                persistable_adult_fixture_source(),
+                destination.clone(),
+                TransferState::Cancelled,
+            );
+            let media_path = destination.join("Movie  A.mp4");
+            fs::write(&media_path, b"media").expect("existing Adult media must be created");
+            let mut encoded = encode_transfer(&record).expect("Adult record must encode");
+            assert!(encoded.ends_with(b"\tadult"));
+            let category_start = encoded.len() - "adult".len();
+            match category_case {
+                "missing" => encoded.truncate(category_start - 1),
+                "invalid" => {
+                    encoded.truncate(category_start);
+                    encoded.extend_from_slice(b"invalid");
+                }
+                "mismatched" => {
+                    encoded.truncate(category_start);
+                    encoded.extend_from_slice(b"vr");
+                }
+                _ => unreachable!(),
+            }
+            assert!(parse_transfer_line(&encoded, false).is_none());
+
+            let persistence_path = fixture.path.join("downloads");
+            let mut persisted = PERSISTENCE_HEADER.to_vec();
+            persisted.extend_from_slice(&encoded);
+            persisted.push(b'\n');
+            fs::write(&persistence_path, persisted).expect("damaged V2 row must persist");
+            let state = VrDownloadState::default();
+            let rows = tauri::async_runtime::block_on(load_downloads(
+                &state,
+                &persistence_path,
+                &fixture.path.join("session"),
+                &fixture.path.join("limit"),
+            ))
+            .expect("damaged V2 row must load as a terminal corrupt row");
+            assert_eq!(rows[1], "unknown", "{category_case} category fell back");
+            assert_eq!(rows[2], "ADLT-123");
+            assert_eq!(rows[8], "offline");
+            assert_eq!(rows[9], "false");
+            assert_eq!(rows[10], "none");
+            assert_eq!(rows[12], "false");
+            assert_eq!(
+                preview_organization(&state, &rows[0]),
+                Err(VR_ORGANIZATION_STALE)
+            );
+            assert!(state.0.lock().expect("state must lock").session.is_none());
+
+            dismiss_download(&state, &persistence_path, &rows[0])
+                .expect("corrupt terminal row must dismiss");
+            assert_eq!(
+                fs::read(&media_path).expect("dismissed media must remain at its exact path"),
+                b"media"
+            );
+            let restarted = VrDownloadState::default();
+            assert!(tauri::async_runtime::block_on(load_downloads(
+                &restarted,
+                &persistence_path,
+                &fixture.path.join("restart-session"),
+                &fixture.path.join("limit"),
+            ))
+            .expect("dismissed row state must reload")
+            .is_empty());
+            assert_eq!(
+                fs::read(&media_path).expect("relaunch must not alter dismissed media"),
+                b"media"
+            );
+        }
     }
 
     #[test]
@@ -4709,7 +5046,12 @@ mod tests {
         let path = fixture.path.join("downloads");
         let source = persistable_fixture_source();
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
-        let record = transfer_from_source(source, destination, TransferState::Cancelled);
+        let record = transfer_from_source(
+            TransferCategory::Vr,
+            source,
+            destination,
+            TransferState::Cancelled,
+        );
         let mut bytes = PERSISTENCE_HEADER.to_vec();
         bytes.extend_from_slice(&encode_transfer(&record).expect("valid transfer must encode"));
         bytes.extend_from_slice(b"\nnot-a-record\n");
@@ -4752,6 +5094,7 @@ mod tests {
         let session_folder = fixture.path.join("session");
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
         let mut record = transfer_from_source(
+            TransferCategory::Vr,
             persistable_fixture_source(),
             destination.clone(),
             TransferState::Cancelled,
@@ -4769,7 +5112,7 @@ mod tests {
             &fixture.path.join("download-limit"),
         ))
         .expect("valid terminal row must load");
-        assert_eq!(available_rows[7], "cancelled");
+        assert_eq!(available_rows[8], "cancelled");
         assert!(available_state
             .0
             .lock()
@@ -4787,7 +5130,7 @@ mod tests {
             &fixture.path.join("download-limit"),
         ))
         .expect("missing terminal row must remain visible");
-        assert_eq!(missing_rows[7], "offline");
+        assert_eq!(missing_rows[8], "offline");
         assert!(missing_state
             .0
             .lock()
@@ -4814,8 +5157,12 @@ mod tests {
             &[0],
         )
         .expect("completion fixture must revalidate");
-        let mut record =
-            transfer_from_source(source, destination.clone(), TransferState::Downloading);
+        let mut record = transfer_from_source(
+            TransferCategory::Vr,
+            source,
+            destination.clone(),
+            TransferState::Downloading,
+        );
         fs::write(destination.join("Movie.mp4"), contents)
             .expect("completed selected file must exist");
         record.fingerprints = capture_fingerprints(&record).expect("fingerprint must resolve");
@@ -4840,7 +5187,7 @@ mod tests {
             for _ in 0..COMPLETION_ATTEMPTS {
                 let rows = list_downloads(&state, &persistence_path)
                     .expect("completion progress must remain readable");
-                if rows[7] == "completed" {
+                if rows[8] == "completed" {
                     completed_rows = Some(rows);
                     break;
                 }
@@ -4851,8 +5198,8 @@ mod tests {
                 panic!("verified selected content must complete locally: {last_rows:?}")
             });
             assert_eq!(rows[0], transfer_id);
-            assert_eq!(rows[4], contents.len().to_string());
             assert_eq!(rows[5], contents.len().to_string());
+            assert_eq!(rows[6], contents.len().to_string());
             let context = state.0.lock().expect("state must lock");
             let StoredTransfer::Valid(record) = &context.transfers[0] else {
                 panic!("completed transfer must remain valid");
@@ -4894,7 +5241,7 @@ mod tests {
             for _ in 0..COMPLETION_ATTEMPTS {
                 let rows = list_downloads(&state, &persistence_path)
                     .expect("restored boundary progress must remain readable");
-                if rows[7] == "completed" {
+                if rows[8] == "completed" {
                     completed_rows = Some(rows);
                     break;
                 }
@@ -4905,8 +5252,8 @@ mod tests {
                 panic!("retained boundary piece must complete locally: {last_rows:?}")
             });
             assert_eq!(rows[0], transfer_id);
-            assert_eq!(rows[4], "7");
             assert_eq!(rows[5], "7");
+            assert_eq!(rows[6], "7");
             let context = state.0.lock().expect("state must lock");
             let StoredTransfer::Valid(record) = &context.transfers[0] else {
                 panic!("completed boundary transfer must remain valid");
@@ -4938,8 +5285,8 @@ mod tests {
                 &fixture.path.join("download-limit"),
             ))
             .expect("invalid retained state must remain dismissable");
-            assert_eq!(rows[5], "0", "{case} boundary state reported progress");
-            assert_eq!(rows[7], "offline", "{case} boundary state resumed");
+            assert_eq!(rows[6], "0", "{case} boundary state reported progress");
+            assert_eq!(rows[8], "offline", "{case} boundary state resumed");
             let context = state.0.lock().expect("state must lock");
             let StoredTransfer::Valid(record) = &context.transfers[0] else {
                 panic!("{case} boundary transfer must remain valid");
@@ -4950,6 +5297,121 @@ mod tests {
             );
             assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
         }
+    }
+
+    #[test]
+    fn adult_transfer_uses_native_folder_selected_only_writes_and_category_isolated_restart() {
+        let fixture = FilesystemFixture::new();
+        let adult_destination = fixture.path.join("Adult — 現在");
+        let unrelated_destination = fixture.path.join("Adult — unrelated");
+        fs::create_dir_all(&adult_destination).expect("Adult destination must exist");
+        fs::create_dir_all(&unrelated_destination).expect("unrelated destination must exist");
+        let adult_destination =
+            fs::canonicalize(adult_destination).expect("Adult destination must canonicalize");
+        let unrelated_destination = fs::canonicalize(unrelated_destination)
+            .expect("unrelated destination must canonicalize");
+        let unrelated_file = unrelated_destination.join("Folder/特別版  B.mp4");
+        fs::create_dir_all(
+            unrelated_file
+                .parent()
+                .expect("unrelated parent must exist"),
+        )
+        .expect("unrelated parent must be created");
+        fs::write(&unrelated_file, b"unrelated").expect("unrelated media must exist");
+
+        let metainfo = selected_file_torrent();
+        let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+        let source = revalidate_persisted_download_source(
+            &metainfo,
+            "ADLT-123",
+            "【Adult】 ADLT-123  Exact — 特別版",
+            &infohash,
+            &[1],
+        )
+        .expect("Adult selected source must revalidate");
+        let persistence_path = fixture.path.join("downloads");
+        let session_folder = fixture.path.join("session");
+        let download_limit_path = fixture.path.join("limit");
+        let state = VrDownloadState::default();
+        {
+            let mut context = state.0.lock().expect("state must lock");
+            context.adult_future_folder = Some(adult_destination.clone());
+            context.download_limit = DownloadLimitState::Loaded(None);
+            context.transfers_loaded = true;
+        }
+
+        tauri::async_runtime::block_on(async {
+            let transfer_id = start_download_source(
+                &state,
+                &persistence_path,
+                &session_folder,
+                TransferCategory::Adult,
+                source.clone(),
+            )
+            .await
+            .expect("Adult transfer must start from native state");
+            assert_eq!(
+                start_download_source(
+                    &state,
+                    &persistence_path,
+                    &session_folder,
+                    TransferCategory::Adult,
+                    source,
+                )
+                .await,
+                Err(VR_DOWNLOAD_DUPLICATE)
+            );
+            assert!(!adult_destination.join("Folder/Part  1 — 映画.mkv").exists());
+            assert!(adult_destination.join("Folder/特別版  B.mp4").is_file());
+            assert_eq!(
+                fs::read(&unrelated_file).expect("unrelated media must remain readable"),
+                b"unrelated"
+            );
+
+            configure_adult_download_folder(&state, Some(unrelated_destination.clone()))
+                .expect("future Adult folder must change");
+            let rows =
+                list_downloads(&state, &persistence_path).expect("Adult row must remain readable");
+            assert_eq!(rows[0], transfer_id);
+            assert_eq!(rows[1], "adult");
+            assert_eq!(rows[2], "ADLT-123");
+            assert_eq!(rows[9], "false");
+            assert_eq!(rows[10], "none");
+            assert_eq!(rows[12], "false");
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE)
+            );
+            cancel_download(&state, &persistence_path, &transfer_id)
+                .await
+                .expect("Adult transfer must cancel without deleting media");
+            assert!(adult_destination.join("Folder/特別版  B.mp4").is_file());
+
+            let restarted = VrDownloadState::default();
+            configure_adult_download_folder(&restarted, Some(adult_destination.clone()))
+                .expect("current Adult folder must restore");
+            let rows = load_downloads(
+                &restarted,
+                &persistence_path,
+                &fixture.path.join("restart-session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("cancelled Adult transfer must reload");
+            assert_eq!(rows[0], transfer_id);
+            assert_eq!(rows[1], "adult");
+            assert_eq!(rows[8], "cancelled");
+            assert_eq!(rows[9], "true");
+            assert!(restarted
+                .0
+                .lock()
+                .expect("state must lock")
+                .session
+                .is_none());
+            dismiss_download(&restarted, &persistence_path, &transfer_id)
+                .expect("terminal Adult row must dismiss");
+            assert!(adult_destination.join("Folder/特別版  B.mp4").is_file());
+        });
     }
 
     #[test]
@@ -5062,7 +5524,7 @@ mod tests {
             )
             .await
             .expect("valid paused transfer must restore");
-            assert_eq!(resumed_rows[7], "paused");
+            assert_eq!(resumed_rows[8], "paused");
             assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
             resume_download(&resumed_state, &persistence_path, &transfer_id)
                 .await

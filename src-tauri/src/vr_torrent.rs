@@ -320,6 +320,15 @@ impl AdultTorrentState {
             .invalidate_inspection()
             .map_err(adult_torrent_error_code)
     }
+
+    pub fn verified_download_source(
+        &self,
+        inspection_id: &str,
+        selected_file_ids: &[usize],
+    ) -> Result<VerifiedDownloadSource, VerifiedDownloadSourceError> {
+        self.0
+            .verified_download_source(inspection_id, selected_file_ids)
+    }
 }
 
 fn adult_torrent_error_code(error: &'static str) -> &'static str {
@@ -1848,6 +1857,25 @@ mod tests {
         assert_eq!(adult_response[2], infohash);
         assert_eq!(adult_response[4], "Folder/Part  1 — 映画.mkv");
         assert_eq!(adult_response[6], "Folder/特別版  B.mp4");
+        let adult_download_source = adult_state
+            .verified_download_source(adult_inspection_id, &[1])
+            .expect("current Adult inspection must authorize exact selected files");
+        assert_eq!(adult_download_source.code, "ADLT-123");
+        assert_eq!(adult_download_source.release_name, adult_release_name);
+        assert_eq!(adult_download_source.infohash, infohash);
+        assert_eq!(adult_download_source.bytes, bytes);
+        assert_eq!(
+            adult_download_source.selected_files,
+            vec![VerifiedDownloadFile {
+                file_id: 1,
+                path: "Folder/特別版  B.mp4".to_owned(),
+                size: 7,
+            }]
+        );
+        assert_eq!(
+            adult_state.verified_download_source(adult_inspection_id, &[]),
+            Err(VerifiedDownloadSourceError::Selection)
+        );
 
         let wrote_cancelled = RefCell::new(false);
         assert_eq!(
@@ -1965,6 +1993,10 @@ mod tests {
         );
         assert_eq!(
             vr_state.verified_download_source(adult_inspection_id, &[0]),
+            Err(VerifiedDownloadSourceError::Context)
+        );
+        assert_eq!(
+            adult_state.verified_download_source(&vr_response[0], &[0]),
             Err(VerifiedDownloadSourceError::Context)
         );
         assert!(!chose_vr_destination.into_inner());

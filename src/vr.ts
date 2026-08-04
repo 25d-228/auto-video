@@ -72,6 +72,7 @@ export type VrDownloadState =
 
 export type VrDownload = {
   transferId: string;
+  category: "adult" | "unknown" | "vr";
   code: string;
   releaseName: string;
   selectedFileCount: number;
@@ -819,17 +820,18 @@ const vrDownloadStates = new Set<VrDownloadState>([
 function parseVrDownloads(value: unknown): VrDownload[] {
   if (
     !Array.isArray(value) ||
-    value.length % 12 !== 0 ||
+    value.length % 13 !== 0 ||
     !value.every((entry) => typeof entry === "string")
   ) {
-    throw new Error("The native VR download store returned invalid data.");
+    throw new Error("The native download store returned invalid data.");
   }
 
   const downloads: VrDownload[] = [];
   const transferIds = new Set<string>();
-  for (let index = 0; index < value.length; index += 12) {
+  for (let index = 0; index < value.length; index += 13) {
     const [
       transferId,
+      category,
       code,
       releaseName,
       selectedFileCount,
@@ -841,13 +843,26 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       organizationStatus,
       organizationRelativeDirectory,
       canOrganize,
-    ] = value.slice(index, index + 12) as string[];
+    ] = value.slice(index, index + 13) as string[];
     const count = Number(selectedFileCount);
     const canonicalCode = canonicalizeProductCode(code);
     if (
       transferId === "" ||
       transferIds.has(transferId) ||
+      (category !== "adult" && category !== "unknown" && category !== "vr") ||
       code.trim() === "" ||
+      (category === "adult" &&
+        (canOrganize !== "false" || organizationStatus !== "none")) ||
+      (category === "unknown" &&
+        (count !== 0 ||
+          totalBytes !== "0" ||
+          downloadedBytes !== "0" ||
+          speedBytesPerSecond !== "0" ||
+          state !== "offline" ||
+          currentFolder !== "false" ||
+          organizationStatus !== "none" ||
+          organizationRelativeDirectory !== "" ||
+          canOrganize !== "false")) ||
       ((canOrganize === "true" || organizationStatus !== "none") &&
         canonicalCode !== code) ||
       releaseName.trim() === "" ||
@@ -875,11 +890,12 @@ function parseVrDownloads(value: unknown): VrDownload[] {
           currentFolder !== "true" ||
           organizationStatus === "organized"))
     ) {
-      throw new Error("The native VR download store returned invalid data.");
+      throw new Error("The native download store returned invalid data.");
     }
     transferIds.add(transferId);
     downloads.push({
       transferId,
+      category: category as VrDownload["category"],
       code,
       releaseName,
       selectedFileCount: count,
@@ -986,7 +1002,7 @@ function parseVrDownloadLimit(value: unknown): VrDownloadLimit {
   ) {
     return { mibPerSecond: value[1] };
   }
-  throw new Error("The native VR download limit store returned invalid data.");
+  throw new Error("The native download limit store returned invalid data.");
 }
 
 export async function loadVrDownloadLimit() {
@@ -1001,7 +1017,7 @@ export async function saveVrDownloadLimit(mibPerSecond: string | null) {
     (!/^[1-9]\d*$/.test(mibPerSecond) ||
       BigInt(mibPerSecond) > maximumDownloadLimitMibPerSecond)
   ) {
-    throw new Error("A whole-number VR download limit from 1 to 4095 MiB/s is required.");
+    throw new Error("A whole-number download limit from 1 to 4095 MiB/s is required.");
   }
   return parseVrDownloadLimit(
     await window.__TAURI__.core.invoke<unknown>("save_vr_download_limit", {
@@ -1043,6 +1059,31 @@ export async function startVerifiedVrDownload(
   );
   if (typeof transferId !== "string" || transferId === "") {
     throw new Error("The native VR download response was invalid.");
+  }
+  return transferId;
+}
+
+export async function startVerifiedAdultDownload(
+  inspectionId: string,
+  selectedFileIds: number[],
+) {
+  const uniqueIds = new Set(selectedFileIds);
+  if (
+    inspectionId.trim() === "" ||
+    selectedFileIds.length === 0 ||
+    uniqueIds.size !== selectedFileIds.length ||
+    selectedFileIds.some(
+      (fileId) => !Number.isSafeInteger(fileId) || fileId < 0,
+    )
+  ) {
+    throw new Error("A current Adult inspection and valid file selection are required.");
+  }
+  const transferId = await window.__TAURI__.core.invoke<unknown>(
+    "start_verified_adult_download",
+    { inspectionId, selectedFileIds },
+  );
+  if (typeof transferId !== "string" || transferId === "") {
+    throw new Error("The native Adult download response was invalid.");
   }
   return transferId;
 }

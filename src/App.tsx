@@ -112,6 +112,7 @@ import {
   saveVerifiedAdultTorrent,
   saveVerifiedVrTorrent,
   scanVrLibrary,
+  startVerifiedAdultDownload,
   startVerifiedVrDownload,
   type VrDownload,
   type VrDownloadLimit,
@@ -136,7 +137,7 @@ const destinations = [
   {
     id: "dashboard",
     label: "Dashboard",
-    description: "Current status for local libraries and VR transfers.",
+    description: "Current status for local libraries and Adult and VR transfers.",
     emptyHeading: "Dashboard data is not available yet",
     emptyMessage:
       "Metrics and storage details will appear here only after their data sources are implemented.",
@@ -160,14 +161,14 @@ const destinations = [
   {
     id: "downloads",
     label: "Downloads",
-    description: "Review and manage selected-file VR transfers.",
-    emptyHeading: "No VR downloads",
+    description: "Review and manage selected-file Adult and VR transfers.",
+    emptyHeading: "No downloads",
     emptyMessage: "Start a selected-file transfer from a verified torrent inspection.",
   },
   {
     id: "settings",
     label: "Settings",
-    description: "Configure TMDB, local media folders, VR transfers, and appearance.",
+    description: "Configure TMDB, local media folders, transfers, and appearance.",
     emptyHeading: "Other settings are not configured",
     emptyMessage:
       "Provider credentials and additional preferences will appear only with the features they control.",
@@ -290,7 +291,7 @@ type TorrentInspectionState =
   | { status: "loading" }
   | TorrentInspectionResult;
 type TorrentSaveState = "idle" | "saving" | "success" | "error";
-type VrTorrentStartState =
+type TorrentStartState =
   | { status: "idle" }
   | { status: "starting" }
   | { status: "success" }
@@ -1785,7 +1786,7 @@ function VrTorrentInspectionDialog({
   onToggleFile: (fileId: number) => void;
   saveState: TorrentSaveState;
   selectedFileIds: Set<number>;
-  startState: VrTorrentStartState;
+  startState: TorrentStartState;
   state: TorrentInspectionState;
 }) {
   const currentMessage =
@@ -1959,26 +1960,57 @@ function VrTorrentInspectionDialog({
 
 function AdultTorrentInspectionDialog({
   context,
+  downloadsReady,
+  folderState,
+  onOpenDownloads,
+  onOpenSettings,
   onRetry,
   onSave,
+  onStart,
+  onToggleFile,
   saveState,
+  selectedFileIds,
+  startState,
   state,
 }: {
   context: AdultTorrentInspectionContext;
+  downloadsReady: boolean;
+  folderState: AdultFolderUiState;
+  onOpenDownloads: () => void;
+  onOpenSettings: () => void;
   onRetry: () => void;
   onSave: () => void;
+  onStart: () => void;
+  onToggleFile: (fileId: number) => void;
   saveState: TorrentSaveState;
+  selectedFileIds: Set<number>;
+  startState: TorrentStartState;
   state: TorrentInspectionState;
 }) {
   const currentMessage =
     vrTorrentMessages[state.status === "ready" ? "loading" : state.status];
+  const isFolderReady = folderState.status === "ready";
+  const folderMessage =
+    folderState.status === "loading"
+      ? "Loading the configured Adult folder…"
+      : folderState.status === "ready"
+        ? `Selected files will download to ${folderState.path}.`
+        : folderState.status === "unavailable"
+          ? "The configured Adult folder is unavailable. Change or clear it in Settings."
+          : folderState.status === "unconfigured"
+            ? "Choose an Adult folder in Settings before starting a download."
+            : "The Adult folder configuration could not be loaded.";
 
   return (
     <Dialog.Portal>
       <Dialog.Backdrop className="vr-torrent__backdrop" />
       <Dialog.Viewport className="vr-torrent__viewport">
         <Dialog.Popup
-          aria-busy={state.status === "loading" || saveState === "saving"}
+          aria-busy={
+            state.status === "loading" ||
+            saveState === "saving" ||
+            startState.status === "starting"
+          }
           className="vr-torrent__popup"
           finalFocus={() => document.getElementById(context.triggerId)}
         >
@@ -2027,27 +2059,60 @@ function AdultTorrentInspectionDialog({
                 </div>
               </dl>
               <h3>Complete file list</h3>
-              <div className="vr-torrent__file-selection">
-                <p>Inspection only. Saving this torrent does not download media.</p>
-                <ul
-                  aria-label={`Files in verified Adult torrent for ${context.item.code}`}
-                >
-                  {state.inspection.files.map((file) => (
+              <fieldset className="vr-torrent__file-selection">
+                <legend className="sr-only">Adult files to download</legend>
+                <p>Select the files to download. No files are selected initially.</p>
+                <ul aria-label={`Files in verified Adult torrent for ${context.item.code}`}>
+                  {state.inspection.files.map((file, fileId) => (
                     <li key={file.path}>
-                      <div className="adult-torrent__file">
+                      <label>
+                        <input
+                          checked={selectedFileIds.has(fileId)}
+                          disabled={
+                            startState.status === "starting" ||
+                            startState.status === "success"
+                          }
+                          onChange={() => onToggleFile(fileId)}
+                          type="checkbox"
+                        />
                         <span>{file.path}</span>
                         <span>
                           {formatStorageBytes(BigInt(file.sizeBytes))} (
                           {file.sizeBytes} bytes)
                         </span>
-                      </div>
+                      </label>
                     </li>
                   ))}
                 </ul>
+              </fieldset>
+              <div className="vr-torrent__destination">
+                <p>{folderMessage}</p>
+                {!isFolderReady ? (
+                  <Button onClick={onOpenSettings} type="button" variant="outline">
+                    <AppIcon name="settings" />
+                    Open Settings
+                  </Button>
+                ) : null}
               </div>
               <div className="vr-torrent__actions">
                 <Button
-                  disabled={saveState === "saving"}
+                  disabled={
+                    selectedFileIds.size === 0 ||
+                    startState.status === "starting" ||
+                    startState.status === "success" ||
+                    !isFolderReady ||
+                    !downloadsReady
+                  }
+                  onClick={onStart}
+                  type="button"
+                >
+                  <AppIcon name="downloads" />
+                  {startState.status === "starting" ? "Starting…" : "Start download"}
+                </Button>
+                <Button
+                  disabled={
+                    saveState === "saving" || startState.status === "starting"
+                  }
                   onClick={onSave}
                   type="button"
                   variant="outline"
@@ -2061,6 +2126,16 @@ function AdultTorrentInspectionDialog({
                   <p role="alert">
                     The verified Adult torrent file could not be saved.
                   </p>
+                ) : null}
+                {startState.status === "success" ? (
+                  <div className="vr-torrent__start-result" role="status">
+                    <p>Selected Adult files were added to Downloads.</p>
+                    <Button onClick={onOpenDownloads} type="button" variant="outline">
+                      View Downloads
+                    </Button>
+                  </div>
+                ) : startState.status === "error" ? (
+                  <p role="alert">{startState.message}</p>
                 ) : null}
               </div>
             </div>
@@ -2959,6 +3034,18 @@ function VrDownloadCard({
         ? "organized"
         : download.state;
   const isTerminal = !activeVrDownloadStates.has(download.state);
+  const categoryLabel =
+    download.category === "adult"
+      ? "Adult"
+      : download.category === "vr"
+        ? "VR"
+        : "Category unavailable";
+  const acceptedFolderName =
+    download.category === "adult"
+      ? "accepted Adult folder"
+      : download.category === "vr"
+        ? "accepted VR folder"
+        : "accepted download folder";
 
   return (
     <article
@@ -2967,7 +3054,9 @@ function VrDownloadCard({
     >
       <div className="vr-download-card__heading">
         <div>
-          <p className="card-eyebrow">{download.code}</p>
+          <p className="card-eyebrow">
+            {categoryLabel} · {download.code}
+          </p>
           <h2 id={`vr-download-${download.transferId}`}>
             {download.releaseName}
           </h2>
@@ -3181,7 +3270,7 @@ function VrDownloadCard({
                   <AlertDialog.Title>Cancel this download?</AlertDialog.Title>
                   <AlertDialog.Description>
                     The transfer will stop. Downloaded files and partial data
-                    will remain in the VR folder.
+                    will remain in the {acceptedFolderName}.
                   </AlertDialog.Description>
                   <div className="trash-dialog__actions">
                     <AlertDialog.Close
@@ -3382,14 +3471,14 @@ function nativeErrorCode(error: unknown) {
       : "";
 }
 
-function vrDownloadStartError(error: unknown) {
+function downloadStartError(error: unknown, category: "Adult" | "VR") {
   switch (nativeErrorCode(error)) {
     case "vr_download_destination_conflict":
-      return "A selected file already exists in the VR folder. Nothing was overwritten.";
+      return `A selected file already exists in the ${category} folder. Nothing was overwritten.`;
     case "vr_download_duplicate":
-      return "This torrent is already active in the configured VR folder.";
+      return `This torrent is already active in the configured ${category} folder.`;
     case "vr_folder_unavailable":
-      return "The configured VR folder is unavailable. Check it in Settings.";
+      return `The configured ${category} folder is unavailable. Check it in Settings.`;
     case "vr_download_stale":
     case "vr_download_context_invalid":
       return "This inspection or file selection is no longer current. Inspect the release again.";
@@ -3572,6 +3661,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     useState(0);
   const [adultTorrentSaveState, setAdultTorrentSaveState] =
     useState<TorrentSaveState>("idle");
+  const [adultTorrentStartState, setAdultTorrentStartState] =
+    useState<TorrentStartState>({ status: "idle" });
+  const [selectedAdultTorrentFileIds, setSelectedAdultTorrentFileIds] =
+    useState<Set<number>>(new Set());
   const [vrSearchInput, setVrSearchInput] = useState("");
   const [vrSearchInputError, setVrSearchInputError] = useState<string | null>(
     null,
@@ -3600,7 +3693,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [torrentSaveState, setTorrentSaveState] =
     useState<TorrentSaveState>("idle");
   const [torrentStartState, setTorrentStartState] =
-    useState<VrTorrentStartState>({ status: "idle" });
+    useState<TorrentStartState>({ status: "idle" });
   const [selectedTorrentFileIds, setSelectedTorrentFileIds] = useState<
     Set<number>
   >(new Set());
@@ -3645,6 +3738,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const adultReleaseRequestId = useRef(0);
   const adultTorrentInspectionRequestId = useRef(0);
   const adultTorrentSaveRequestId = useRef(0);
+  const adultTorrentStartRequestId = useRef(0);
   const vrCatalogRequestId = useRef(0);
   const releaseRequestId = useRef(0);
   const torrentInspectionRequestId = useRef(0);
@@ -3665,6 +3759,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const adultStorageRequestId = useRef(0);
   const torrentSavePending = useRef(false);
   const adultTorrentSavePending = useRef(false);
+  const adultTorrentStartPending = useRef(false);
   const torrentStartPending = useRef(false);
   const vrDownloadsRefreshPending = useRef(false);
   const vrDownloadLimitSavePending = useRef(false);
@@ -3681,10 +3776,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const currentMoviesFolder = useRef(moviesFolder);
   const currentMovieScanState = useRef(movieScanState);
   const currentVrDownloadsState = useRef(vrDownloadsState);
-  const previousVrDownloadStates = useRef<Map<string, VrDownload["state"]>>(
+  const previousDownloadStates = useRef<Map<string, VrDownload["state"]>>(
     new Map(),
   );
-  const hasObservedVrDownloads = useRef(false);
+  const hasObservedDownloads = useRef(false);
+  const pendingCompletedAdultRefresh = useRef(false);
   const pendingCompletedVrRefresh = useRef(false);
   // Late Trash responses read current state so an old card cannot modify replacement results.
   currentMoviesFolder.current = moviesFolder;
@@ -3875,19 +3971,41 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         download.state,
       ]),
     );
-    const completedTransferAppeared =
-      hasObservedVrDownloads.current &&
+    const completedAdultTransferAppeared =
+      hasObservedDownloads.current &&
       vrDownloadsState.downloads.some(
         (download) =>
+          download.category === "adult" &&
           download.state === "completed" &&
           download.isCurrentFolder &&
-          previousVrDownloadStates.current.get(download.transferId) !==
+          previousDownloadStates.current.get(download.transferId) !==
             "completed",
       );
-    previousVrDownloadStates.current = nextStates;
-    hasObservedVrDownloads.current = true;
-    if (completedTransferAppeared) {
+    const completedVrTransferAppeared =
+      hasObservedDownloads.current &&
+      vrDownloadsState.downloads.some(
+        (download) =>
+          download.category === "vr" &&
+          download.state === "completed" &&
+          download.isCurrentFolder &&
+          previousDownloadStates.current.get(download.transferId) !==
+            "completed",
+      );
+    previousDownloadStates.current = nextStates;
+    hasObservedDownloads.current = true;
+    if (completedAdultTransferAppeared) {
+      pendingCompletedAdultRefresh.current = true;
+    }
+    if (completedVrTransferAppeared) {
       pendingCompletedVrRefresh.current = true;
+    }
+    if (
+      pendingCompletedAdultRefresh.current &&
+      adultFolderState.status === "ready"
+    ) {
+      pendingCompletedAdultRefresh.current = false;
+      setAdultLibraryRefreshVersion((version) => version + 1);
+      setAdultStorageRefreshVersion((version) => version + 1);
     }
     if (
       pendingCompletedVrRefresh.current &&
@@ -3897,7 +4015,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       setVrLibraryRefreshVersion((version) => version + 1);
       setVrStorageRefreshVersion((version) => version + 1);
     }
-  }, [vrDownloadsState, vrFolderState.status]);
+  }, [adultFolderState.status, vrDownloadsState, vrFolderState.status]);
 
   useEffect(() => {
     const requestId = ++vrLibraryScanRequestId.current;
@@ -4729,9 +4847,12 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     const hadCurrentInspection = adultTorrentInspectionContext !== null;
     adultTorrentInspectionRequestId.current += 1;
     adultTorrentSaveRequestId.current += 1;
+    adultTorrentStartRequestId.current += 1;
     setAdultTorrentInspectionContext(null);
     setAdultTorrentInspectionState(null);
     setAdultTorrentSaveState("idle");
+    setAdultTorrentStartState({ status: "idle" });
+    setSelectedAdultTorrentFileIds(new Set());
     if (hadCurrentInspection) {
       void invalidateVerifiedAdultTorrent().catch(() => undefined);
     }
@@ -5214,8 +5335,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         role: "status",
         text:
           limit.mibPerSecond === null
-            ? "VR downloads are now Unlimited."
-            : `VR download limit applied at ${limit.mibPerSecond} MiB/s.`,
+            ? "Downloads are now Unlimited."
+            : `Download limit applied at ${limit.mibPerSecond} MiB/s.`,
       });
     } catch (error: unknown) {
       if (requestId !== vrDownloadLimitRequestId.current) {
@@ -5226,11 +5347,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           case "vr_download_limit_invalid":
             return "Enter a whole-number limit from 1 to 4095 MiB/s.";
           case "vr_download_limit_storage_failed":
-            return "The VR download limit could not be saved. The previous limit remains active.";
+            return "The download limit could not be saved. The previous limit remains active.";
           case "vr_download_limit_apply_failed":
-            return "The VR download limit could not be applied. The previous limit remains active.";
+            return "The download limit could not be applied. The previous limit remains active.";
           default:
-            return "The VR download limit is unavailable. Reload it before saving.";
+            return "The download limit is unavailable. Reload it before saving.";
         }
       })();
       setVrDownloadLimitMessage({ role: "alert", text: message });
@@ -5680,6 +5801,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     adultTorrentInspectionRequestId.current += 1;
     adultTorrentSaveRequestId.current += 1;
+    adultTorrentStartRequestId.current += 1;
     setAdultTorrentInspectionContext({
       item: adultReleaseComparisonItem,
       release,
@@ -5687,6 +5809,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     });
     setAdultTorrentInspectionState({ status: "loading" });
     setAdultTorrentSaveState("idle");
+    setAdultTorrentStartState({ status: "idle" });
+    setSelectedAdultTorrentFileIds(new Set());
     setAdultTorrentInspectionRequestVersion((version) => version + 1);
   };
 
@@ -5696,8 +5820,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
     adultTorrentInspectionRequestId.current += 1;
     adultTorrentSaveRequestId.current += 1;
+    adultTorrentStartRequestId.current += 1;
     setAdultTorrentInspectionState({ status: "loading" });
     setAdultTorrentSaveState("idle");
+    setAdultTorrentStartState({ status: "idle" });
+    setSelectedAdultTorrentFileIds(new Set());
     setAdultTorrentInspectionRequestVersion((version) => version + 1);
   };
 
@@ -5727,6 +5854,65 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       }
     } finally {
       adultTorrentSavePending.current = false;
+    }
+  };
+
+  const toggleAdultTorrentFile = (fileId: number) => {
+    if (
+      adultTorrentStartState.status === "starting" ||
+      adultTorrentStartState.status === "success" ||
+      adultTorrentInspectionState?.status !== "ready" ||
+      fileId < 0 ||
+      fileId >= adultTorrentInspectionState.inspection.files.length
+    ) {
+      return;
+    }
+    setAdultTorrentStartState({ status: "idle" });
+    setSelectedAdultTorrentFileIds((selectedFileIds) => {
+      const nextSelection = new Set(selectedFileIds);
+      if (nextSelection.has(fileId)) {
+        nextSelection.delete(fileId);
+      } else {
+        nextSelection.add(fileId);
+      }
+      return nextSelection;
+    });
+  };
+
+  const startAdultDownload = async () => {
+    if (
+      adultTorrentStartPending.current ||
+      adultTorrentInspectionState?.status !== "ready" ||
+      selectedAdultTorrentFileIds.size === 0 ||
+      adultFolderState.status !== "ready" ||
+      vrDownloadsState.status !== "ready"
+    ) {
+      return;
+    }
+    adultTorrentStartPending.current = true;
+    const requestId = ++adultTorrentStartRequestId.current;
+    const selectedFileIds = [...selectedAdultTorrentFileIds].sort(
+      (left, right) => left - right,
+    );
+    setAdultTorrentStartState({ status: "starting" });
+    try {
+      await startVerifiedAdultDownload(
+        adultTorrentInspectionState.inspection.inspectionId,
+        selectedFileIds,
+      );
+      await refreshVrDownloads();
+      if (requestId === adultTorrentStartRequestId.current) {
+        setAdultTorrentStartState({ status: "success" });
+      }
+    } catch (error: unknown) {
+      if (requestId === adultTorrentStartRequestId.current) {
+        setAdultTorrentStartState({
+          status: "error",
+          message: downloadStartError(error, "Adult"),
+        });
+      }
+    } finally {
+      adultTorrentStartPending.current = false;
     }
   };
 
@@ -5916,7 +6102,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       if (requestId === torrentStartRequestId.current) {
         setTorrentStartState({
           status: "error",
-          message: vrDownloadStartError(error),
+          message: downloadStartError(error, "VR"),
         });
       }
     } finally {
@@ -5924,10 +6110,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
   };
 
-  const openVrDestinationFromInspection = (
+  const openDownloadDestinationFromInspection = (
     destination: typeof settingsDestination | typeof downloadsDestination,
+    category: "adult" | "vr",
   ) => {
-    closeVrReleaseComparison();
+    if (category === "adult") {
+      closeAdultReleaseComparison();
+    } else {
+      closeVrReleaseComparison();
+    }
     navigateTo(destination);
   };
 
@@ -6977,7 +7168,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   <p className="card-eyebrow">Current transfers</p>
                   <h2 id="dashboard-downloads-heading">Downloads</h2>
                   <p className="dashboard-library-summary__folder">
-                    Aggregate VR transfer activity
+                    Aggregate Adult and VR transfer activity
                   </p>
                 </div>
               </div>
@@ -6985,7 +7176,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
               {vrDownloadsState.status === "ready" ? (
                 <div className="dashboard-library-summary__storage">
                   <p className="card-eyebrow">Current status</p>
-                  <dl aria-label="VR transfer summary">
+                  <dl aria-label="Transfer summary">
                     <div>
                       <dt>Active</dt>
                       <dd>{vrDownloadSummary.activeCount}</dd>
@@ -7025,8 +7216,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   <p className="card-eyebrow">Current status</p>
                   <h3>
                     {vrDownloadsState.status === "loading"
-                      ? "Loading VR transfers"
-                      : "VR transfers need attention"}
+                      ? "Loading transfers"
+                      : "Transfers need attention"}
                   </h3>
                   <p>
                     {vrDownloadsState.status === "loading"
@@ -8202,7 +8393,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
               <div className="library-toolbar">
                 <div>
                   <p className="card-eyebrow">Selected-file transfers</p>
-                  <h2 id="vr-downloads-heading">VR downloads</h2>
+                  <h2 id="vr-downloads-heading">Adult and VR downloads</h2>
                   <p>
                     Each row is managed independently. Cancelling keeps all
                     downloaded files and partial data.
@@ -8227,7 +8418,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   role="status"
                 >
                   <p className="card-eyebrow">Aggregate activity</p>
-                  <dl aria-label="VR downloads aggregate status">
+                  <dl aria-label="Downloads aggregate status">
                     <div>
                       <dt>Network-active transfers</dt>
                       <dd>{vrDownloadSummary.activeCount}</dd>
@@ -8290,9 +8481,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   </span>
                   <h2>
                     {vrDownloadsState.status === "loading"
-                      ? "Loading VR downloads"
+                      ? "Loading downloads"
                       : vrDownloadsState.status === "error"
-                        ? "VR downloads could not be loaded"
+                        ? "Downloads could not be loaded"
                         : activeDestination.emptyHeading}
                   </h2>
                   <p>
@@ -8739,10 +8930,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     <AppIcon name="downloads" />
                   </span>
                   <div>
-                    <h2 id="vr-download-limit-heading">VR download limit</h2>
+                    <h2 id="vr-download-limit-heading">Aggregate download limit</h2>
                     <p>
-                      Set one aggregate limit for all current and future VR
-                      downloads. Limits use whole MiB per second.
+                      Set one aggregate limit for all current and future Adult
+                      and VR downloads. Limits use whole MiB per second.
                     </p>
                   </div>
                 </div>
@@ -8973,9 +9164,21 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         adultTorrentInspectionState === null ? null : (
           <AdultTorrentInspectionDialog
             context={adultTorrentInspectionContext}
+            downloadsReady={vrDownloadsState.status === "ready"}
+            folderState={adultFolderState}
+            onOpenDownloads={() =>
+              openDownloadDestinationFromInspection(downloadsDestination, "adult")
+            }
+            onOpenSettings={() =>
+              openDownloadDestinationFromInspection(settingsDestination, "adult")
+            }
             onRetry={retryAdultTorrentInspection}
             onSave={() => void saveAdultTorrent()}
+            onStart={() => void startAdultDownload()}
+            onToggleFile={toggleAdultTorrentFile}
             saveState={adultTorrentSaveState}
+            selectedFileIds={selectedAdultTorrentFileIds}
+            startState={adultTorrentStartState}
             state={adultTorrentInspectionState}
           />
         )}
@@ -9017,10 +9220,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
             downloadsReady={vrDownloadsState.status === "ready"}
             folderState={vrFolderState}
             onOpenDownloads={() =>
-              openVrDestinationFromInspection(downloadsDestination)
+              openDownloadDestinationFromInspection(downloadsDestination, "vr")
             }
             onOpenSettings={() =>
-              openVrDestinationFromInspection(settingsDestination)
+              openDownloadDestinationFromInspection(settingsDestination, "vr")
             }
             onRetry={retryVrTorrentInspection}
             onSave={() => void saveVrTorrent()}
