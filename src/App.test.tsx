@@ -5199,6 +5199,361 @@ describe("TMDB TV Discover", () => {
     expect(summaryHeading.textContent).toBe(summaryName);
   });
 
+  it("loads only an explicitly selected exact season and preserves the completed guide across UI changes", async () => {
+    const showName = "Exact  Show — 特別版";
+    const seasonName = "第二期  —  Director's “Cut”!";
+    const episodeName = "第一話  —  The  Beginning!";
+    loadTmdbTokenMock.mockResolvedValue("season-guide-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 701, name: showName }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 701,
+          name: showName,
+          seasons: [
+            {
+              id: 9000,
+              season_number: 1,
+              name: "Season  One",
+              air_date: "2025-01-01",
+              poster_path: "/season-one.jpg",
+              episode_count: 10,
+            },
+            {
+              id: 9001,
+              season_number: 2,
+              name: seasonName,
+              air_date: "2026-01-02",
+              poster_path: "/season-two.jpg",
+              episode_count: 2,
+            },
+            { id: 8999, season_number: 0, name: "Specials" },
+            { id: 0, season_number: 3, name: "Invalid identity" },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 9001,
+          season_number: 2,
+          episodes: [
+            {
+              id: 9101,
+              season_number: 2,
+              episode_number: 1,
+              name: episodeName,
+              air_date: "2026-01-02",
+              runtime: 47,
+              overview: "Exact  overview — punctuation preserved!",
+              still_path: "/episode-one.jpg",
+            },
+            {
+              id: 9102,
+              season_number: 2,
+              episode_number: 2,
+              name: "第二話: CAPS & punctuation",
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 701,
+          name: showName,
+          seasons: [
+            { id: 9003, season_number: 3, name: "Replacement Season" },
+          ],
+        }),
+      );
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    const detailsButton = await screen.findByRole("button", {
+      name: /View details: Exact Show — 特別版/,
+    });
+    expect(detailsButton.getAttribute("aria-label")).toBe(
+      `View details: ${showName}`,
+    );
+    fireEvent.click(detailsButton);
+    let dialog = await screen.findByRole("dialog");
+    await within(dialog).findByRole("button", { name: "View seasons" });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "View seasons" }));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(
+      within(dialog).getByText("2 verified seasons"),
+    ).toBeTruthy();
+    expect(within(dialog).queryByText("Specials")).toBeNull();
+    expect(
+      within(dialog).queryByRole("button", { name: "Select Season 0" }),
+    ).toBeNull();
+    const exactSeasonHeading = within(dialog).getByRole("heading", {
+      level: 4,
+      name: "第二期 — Director's “Cut”!",
+    });
+    expect(exactSeasonHeading.textContent).toBe(seasonName);
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Select Season 2" }),
+    );
+    expect(fetchMock.mock.calls[3][0]).toBe(
+      "https://api.themoviedb.org/3/tv/701/season/2",
+    );
+    expect(fetchMock.mock.calls[3][1]?.headers).toEqual({
+      Accept: "application/json",
+      Authorization: "Bearer season-guide-token",
+    });
+    const exactEpisodeHeading = await within(dialog).findByRole("heading", {
+      level: 5,
+      name: "第一話 — The Beginning!",
+    });
+    expect(exactEpisodeHeading.textContent).toBe(episodeName);
+    expect(within(dialog).getByText("2 verified episodes")).toBeTruthy();
+    expect(
+      within(dialog).getByText("Exact overview — punctuation preserved!")
+        .textContent,
+    ).toBe("Exact  overview — punctuation preserved!");
+    expect(within(dialog).getByText("47 minutes")).toBeTruthy();
+    expect(within(dialog).getByText("Overview unavailable")).toBeTruthy();
+    dialog.scrollTop = 180;
+    fireEvent.scroll(dialog);
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    fireEvent(window, new Event("resize"));
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+    selectTvDiscover();
+    const reopenedDetailsButton = await screen.findByRole("button", {
+      name: /View details: Exact Show — 特別版/,
+    });
+    fireEvent.click(reopenedDetailsButton);
+    dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", {
+        level: 5,
+        name: "第一話 — The Beginning!",
+      }).textContent,
+    ).toBe(episodeName);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(dialog.scrollTop).toBe(180);
+    expect(document.documentElement.dataset.theme).toBe("dark");
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Retry details" }),
+    );
+    await within(dialog).findByRole("button", { name: "View seasons" });
+    expect(within(dialog).queryByText(episodeName)).toBeNull();
+    fireEvent.click(within(dialog).getByRole("button", { name: "View seasons" }));
+    expect(within(dialog).getByText("1 verified season")).toBeTruthy();
+    expect(
+      within(dialog).getByRole("button", { name: "Select Season 3" }),
+    ).toBeTruthy();
+    expect(
+      within(dialog).queryByRole("button", { name: "Select Season 2" }),
+    ).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(scanTvLibraryMock).not.toHaveBeenCalled();
+    expect(openTvFileMock).not.toHaveBeenCalled();
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+    expect(startVerifiedAdultDownloadMock).not.toHaveBeenCalled();
+    expect(startVerifiedMovieDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts only the newest exact season context and blocks a dismissed pending guide", async () => {
+    const seasonOneResponse = createDeferred<Response>();
+    const seasonTwoResponse = createDeferred<Response>();
+    const dismissedSeasonResponse = createDeferred<Response>();
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 701, name: "Exact Show" }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 701,
+          name: "Exact Show",
+          seasons: [
+            { id: 9000, season_number: 1, name: "Season One" },
+            { id: 9001, season_number: 2, name: "Season Two" },
+          ],
+        }),
+      )
+      .mockReturnValueOnce(seasonOneResponse.promise)
+      .mockReturnValueOnce(seasonTwoResponse.promise)
+      .mockReturnValueOnce(dismissedSeasonResponse.promise);
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "View details: Exact Show" }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      await within(dialog).findByRole("button", { name: "View seasons" }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Select Season 1" }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Select Season 2" }),
+    );
+
+    await act(async () => {
+      seasonTwoResponse.resolve(
+        jsonResponse({
+          id: 9001,
+          season_number: 2,
+          episodes: [
+            {
+              id: 9201,
+              season_number: 2,
+              episode_number: 1,
+              name: "Newest season result",
+            },
+          ],
+        }),
+      );
+      await seasonTwoResponse.promise;
+    });
+    expect(await within(dialog).findByText("Newest season result")).toBeTruthy();
+
+    await act(async () => {
+      seasonOneResponse.resolve(
+        jsonResponse({
+          id: 9000,
+          season_number: 1,
+          episodes: [
+            {
+              id: 9101,
+              season_number: 1,
+              episode_number: 1,
+              name: "Stale season result",
+            },
+          ],
+        }),
+      );
+      await seasonOneResponse.promise;
+    });
+    expect(within(dialog).queryByText("Stale season result")).toBeNull();
+    expect(within(dialog).getByText("Newest season result")).toBeTruthy();
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Select Season 1" }),
+    );
+    expect(
+      await within(dialog).findByRole("heading", {
+        name: "Loading season episodes",
+      }),
+    ).toBeTruthy();
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    await act(async () => {
+      dismissedSeasonResponse.resolve(
+        jsonResponse({
+          id: 9000,
+          season_number: 1,
+          episodes: [
+            {
+              id: 9301,
+              season_number: 1,
+              episode_number: 1,
+              name: "Dismissed late result",
+            },
+          ],
+        }),
+      );
+      await dismissedSeasonResponse.promise;
+    });
+    expect(screen.queryByText("Dismissed late result")).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", { name: "View details: Exact Show" }),
+    );
+    const reopenedDialog = await screen.findByRole("dialog");
+    expect(within(reopenedDialog).queryByText("Dismissed late result")).toBeNull();
+    expect(
+      within(reopenedDialog).getByText(
+        "Select Season 1 again to load its episodes.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("shows distinct local season outcomes and retries the current exact season", async () => {
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 701, name: "Retry Show" }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 701,
+          name: "Retry Show",
+          seasons: [{ id: 9001, season_number: 2, name: "Retry Season" }],
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({}, 401))
+      .mockResolvedValueOnce(jsonResponse({}, 429))
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockResolvedValueOnce(
+        jsonResponse({ id: 9001, season_number: 3, episodes: [] }),
+      )
+      .mockResolvedValueOnce(jsonResponse({}, 500))
+      .mockResolvedValueOnce(
+        jsonResponse({ id: 9001, season_number: 2, episodes: [] }),
+      );
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "View details: Retry Show" }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      await within(dialog).findByRole("button", { name: "View seasons" }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Select Season 2" }),
+    );
+
+    for (const heading of [
+      "TMDB token was not accepted",
+      "TMDB season rate limit reached",
+      "TMDB season guide could not be reached",
+      "TMDB returned an invalid season guide",
+      "TMDB could not load the season guide",
+      "No episodes returned",
+    ]) {
+      expect(
+        await within(dialog).findByRole("heading", { name: heading }),
+      ).toBeTruthy();
+      if (heading !== "No episodes returned") {
+        fireEvent.click(
+          within(dialog).getByRole("button", { name: "Retry Season 2" }),
+        );
+      }
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(9);
+    for (const call of fetchMock.mock.calls.slice(3)) {
+      expect(call[0]).toBe("https://api.themoviedb.org/3/tv/701/season/2");
+    }
+  });
+
   it("keeps details errors local and blocks late details across selection, category, and dismissal", async () => {
     const showADetails = createDeferred<Response>();
     const showBDetails = createDeferred<Response>();

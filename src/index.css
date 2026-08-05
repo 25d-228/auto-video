@@ -1450,6 +1450,185 @@ button {
   margin: 0;
 }
 
+.tv-season-guide__detail-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 1rem;
+}
+
+.tv-season-guide {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.tv-season-guide__heading h3,
+.tv-season-guide__heading p,
+.tv-season-guide__empty h4,
+.tv-season-guide__empty p,
+.tv-season-guide__episode-heading h4,
+.tv-season-guide__episode-heading p,
+.tv-season-guide__prompt {
+  margin: 0;
+}
+
+.tv-season-guide__heading h3,
+.tv-season-guide__empty h4,
+.tv-season-guide__episode-heading h4 {
+  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-size: 0.8125rem;
+}
+
+.tv-season-guide__heading p,
+.tv-season-guide__empty p,
+.tv-season-guide__episode-heading p,
+.tv-season-guide__prompt {
+  margin-top: 0.375rem;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  line-height: 1.45;
+}
+
+.tv-season-guide__empty {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  background: var(--card);
+}
+
+.tv-season-guide__seasons,
+.tv-season-guide__episodes ol {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tv-season-guide__seasons > li,
+.tv-season-guide__episodes ol > li {
+  display: grid;
+  grid-template-columns: 5rem minmax(0, 1fr);
+  gap: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  background: var(--card);
+}
+
+.tv-season-guide__season-poster,
+.tv-season-guide__still {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: var(--muted);
+  color: var(--muted-foreground);
+  font-size: 0.625rem;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.tv-season-guide__season-poster {
+  aspect-ratio: 2 / 3;
+}
+
+.tv-season-guide__season-poster img,
+.tv-season-guide__still img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.tv-season-guide__season-information,
+.tv-season-guide__episode-information {
+  min-width: 0;
+}
+
+.tv-season-guide__season-information h4,
+.tv-season-guide__episode-information h5 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+.tv-season-guide__season-information dl,
+.tv-season-guide__episode-information dl {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0.625rem 0;
+  font-size: 0.6875rem;
+  line-height: 1.4;
+}
+
+.tv-season-guide__season-information dl div,
+.tv-season-guide__episode-information dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.tv-season-guide__season-information dt,
+.tv-season-guide__season-information dd,
+.tv-season-guide__episode-information dt,
+.tv-season-guide__episode-information dd {
+  margin: 0;
+}
+
+.tv-season-guide__season-information dt,
+.tv-season-guide__episode-information dt {
+  color: var(--muted-foreground);
+}
+
+.tv-season-guide__episodes {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.tv-season-guide__episodes ol > li {
+  grid-template-columns: 9rem minmax(0, 1fr);
+}
+
+.tv-season-guide__still {
+  aspect-ratio: 16 / 9;
+  align-self: start;
+}
+
+.tv-season-guide__episode-information > p {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.tv-season-guide__state {
+  min-height: 8rem;
+}
+
+.tv-season-guide__state h4,
+.tv-season-guide__state p {
+  margin: 0;
+}
+
+.tv-season-guide__state h4 {
+  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-size: 0.75rem;
+}
+
+.tv-season-guide__state button {
+  margin-top: 0.75rem;
+}
+
+.tv-season-guide__actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.75rem;
+}
+
 .vr-releases__backdrop {
   position: fixed;
   z-index: 70;
