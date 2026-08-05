@@ -5399,6 +5399,10 @@ describe("TMDB TV Discover", () => {
       "Exact Show 2x03/04",
       "Exact Show S02E03:04",
       "Exact Show S02E03 04",
+      "Exact Show S02E03-E-04",
+      "Exact Show S02E03 / E 04",
+      "Exact Show 2x03/x04",
+      "Exact Show 2x03 x 04",
     ];
     const standardHash = "0123456789abcdef0123456789abcdef01234567";
     const hdHash = "abcdef0123456789abcdef0123456789abcdef01";
@@ -5809,6 +5813,19 @@ describe("TMDB TV Discover", () => {
         "API Bay returned no exact releases for Season 2, Episode 3.",
       ),
     ).toBeTruthy();
+    expect(
+      within(comparisonDialog).queryByLabelText("Verified TV release totals"),
+    ).toBeNull();
+    expect(
+      within(comparisonDialog).queryByRole("list", {
+        name: /Verified API Bay releases/,
+      }),
+    ).toBeNull();
+    expect(
+      within(comparisonDialog).queryByRole("heading", {
+        name: "Selected release",
+      }),
+    ).toBeNull();
     expect(fetchApiBayTvReleasesMock).toHaveBeenCalledTimes(12);
     for (const [parameters] of fetchApiBayTvReleasesMock.mock.calls) {
       expect(parameters).toEqual({

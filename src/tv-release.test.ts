@@ -101,6 +101,27 @@ describe("verified API Bay TV release boundary", () => {
     });
   });
 
+  it("preserves a native no-match without inventing release rows", async () => {
+    const noMatchResponse = releaseResponse().slice(0, 9);
+    noMatchResponse[8] = "0";
+    invokeMock.mockResolvedValue(noMatchResponse);
+
+    await expect(fetchVerifiedApiBayTvReleases(701, 9001, 9103)).resolves.toEqual({
+      status: "ready",
+      context: {
+        tmdbTvId: 701,
+        showName: "Exact  Show — 特別版",
+        providerSeasonId: 9001,
+        seasonNumber: 2,
+        providerEpisodeId: 9103,
+        episodeNumber: 3,
+        episodeName: "第三話  —  Exact Episode",
+        imdbId: "tt0123456",
+      },
+      releases: [],
+    });
+  });
+
   it("rejects malformed rows and maps each native failure locally", async () => {
     const malformed = releaseResponse();
     malformed[22] = "999";

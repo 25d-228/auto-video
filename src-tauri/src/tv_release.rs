@@ -23,6 +23,8 @@ pub(crate) const TV_APIBAY_PROVIDER_ERROR: &str = "tv_release_apibay_provider_er
 
 const TMDB_TV_URL: &str = "https://api.themoviedb.org/3/tv/";
 const API_BAY_QUERY_URL: &str = "https://apibay.org/q.php?q=";
+const API_BAY_NO_RESULTS_NAME: &str = "No results returned";
+const API_BAY_NO_RESULTS_INFOHASH: &str = "0000000000000000000000000000000000000000";
 const TV_CATEGORIES: [u64; 2] = [205, 208];
 const MAX_PROVIDER_ROWS: usize = 500;
 
@@ -251,6 +253,12 @@ fn verified_apibay_releases(
     let mut releases = Vec::new();
     for row in rows {
         if let Some(object) = json_object(row) {
+            if json_string(object, "id") == Some("0")
+                && json_string(object, "name") == Some(API_BAY_NO_RESULTS_NAME)
+                && json_string(object, "info_hash") == Some(API_BAY_NO_RESULTS_INFOHASH)
+            {
+                continue;
+            }
             if let Some(item_id) = canonical_positive_string(object, "id") {
                 if !item_ids.insert(item_id) {
                     return Err(TV_APIBAY_CONFLICTING);
@@ -451,21 +459,24 @@ fn is_identity_end(bytes: &[u8], end: usize) -> bool {
 }
 
 fn has_episode_continuation(bytes: &[u8], end: usize) -> bool {
-    let mut position = end;
+    let position = skip_continuation_separators(bytes, end);
+    let position = if bytes.get(position).is_some_and(|character| {
+        character.eq_ignore_ascii_case(&b'e') || character.eq_ignore_ascii_case(&b'x')
+    }) {
+        skip_continuation_separators(bytes, position + 1)
+    } else {
+        position
+    };
+    parse_component(bytes, position).is_some_and(|(_, end)| is_identity_end(bytes, end))
+}
+
+fn skip_continuation_separators(bytes: &[u8], mut position: usize) -> usize {
     while bytes.get(position).is_some_and(|character| {
         character.is_ascii_whitespace() || character.is_ascii_punctuation()
     }) {
         position += 1;
     }
-    let position = if bytes
-        .get(position)
-        .is_some_and(|character| character.eq_ignore_ascii_case(&b'e'))
-    {
-        position + 1
-    } else {
-        position
-    };
-    parse_component(bytes, position).is_some_and(|(_, end)| is_identity_end(bytes, end))
+    position
 }
 
 #[cfg(test)]
@@ -476,6 +487,7 @@ mod tests {
     const DETAILS: &str = r#"{"id":701,"name":"Exact  Show — 特別版","seasons":[{"id":9000,"season_number":0},{"id":9001,"season_number":2}]}"#;
     const SEASON: &str = r#"{"id":9001,"season_number":2,"episodes":[{"id":9103,"season_number":2,"episode_number":3,"name":"第三話  —  Exact Episode"}]}"#;
     const EXTERNAL_IDS: &str = r#"{"id":701,"imdb_id":"tt0123456"}"#;
+    const NO_RESULTS: &str = r#"[{"id":"0","name":"No results returned","info_hash":"0000000000000000000000000000000000000000","leechers":"0","seeders":"0","num_files":"0","size":"0","username":"","added":"0","status":"member","category":"0","imdb":""}]"#;
 
     fn release(id: &str, name: &str, category: &str, imdb: &str, info_hash: &str) -> String {
         format!(
@@ -510,10 +522,14 @@ mod tests {
             "Show S02E03,04",
             "Show S02E03:04",
             "Show S02E03 04",
+            "Show S02E03-E-04",
+            "Show S02E03 / e 04",
             "Show 2x03x04",
             "Show 2x03-04",
             "Show 2x03+04",
             "Show 2x03/04",
+            "Show 2x03/X04",
+            "Show 2x03 x 04",
             "Show S02E03 2x03",
             "Show S02E03 S03E03",
         ] {
@@ -548,6 +564,10 @@ mod tests {
             ("22", "Exact Show S02E03 04", "205", "tt0123456"),
             ("23", "Exact Show S02E03", "201", "tt0123456"),
             ("24", "Exact Show S02E03", "205", ""),
+            ("29", "Exact Show S02E03-E-04", "205", "tt0123456"),
+            ("30", "Exact Show S02E03 / E 04", "205", "tt0123456"),
+            ("31", "Exact Show 2x03/x04", "205", "tt0123456"),
+            ("32", "Exact Show 2x03 x 04", "205", "tt0123456"),
         ];
         let mut standard_rows = vec![release(
             "1",
@@ -636,6 +656,10 @@ mod tests {
             "Exact Show 2x03/04",
             "Exact Show S02E03:04",
             "Exact Show S02E03 04",
+            "Exact Show S02E03-E-04",
+            "Exact Show S02E03 / E 04",
+            "Exact Show 2x03/x04",
+            "Exact Show 2x03 x 04",
         ] {
             assert!(!values.iter().any(|value| value == compact_continuation));
         }
@@ -648,6 +672,80 @@ mod tests {
         assert_eq!(requests[4].1, None);
         assert_eq!(requests[3].0, "https://apibay.org/q.php?q=Exact%20%20Show%20%E2%80%94%20%E7%89%B9%E5%88%A5%E7%89%88%20S02E03&cat=205");
         assert_eq!(requests[4].0, "https://apibay.org/q.php?q=Exact%20%20Show%20%E2%80%94%20%E7%89%B9%E5%88%A5%E7%89%88%20S02E03&cat=208");
+    }
+
+    #[test]
+    fn treats_both_api_bay_no_result_sentinels_as_an_empty_lookup() {
+        let values = fetch_apibay_tv_releases_with(701, 9001, 9103, "token", |url, _| {
+            if url.ends_with("/tv/701") {
+                Ok(DETAILS.to_owned())
+            } else if url.ends_with("/season/2") {
+                Ok(SEASON.to_owned())
+            } else if url.ends_with("/external_ids") {
+                Ok(EXTERNAL_IDS.to_owned())
+            } else {
+                Ok(NO_RESULTS.to_owned())
+            }
+        })
+        .expect("two ordinary no-result responses must remain a no-match");
+
+        assert_eq!(values[8], "0");
+        assert_eq!(values.len(), 9);
+    }
+
+    #[test]
+    fn separator_hidden_episode_continuations_produce_no_verified_rows() {
+        let standard = format!(
+            "[{},{}]",
+            release(
+                "1",
+                "Exact Show S02E03-E-04",
+                "205",
+                "tt0123456",
+                &"1".repeat(40)
+            ),
+            release(
+                "2",
+                "Exact Show S02E03 / E 04",
+                "205",
+                "tt0123456",
+                &"2".repeat(40)
+            )
+        );
+        let hd = format!(
+            "[{},{}]",
+            release(
+                "3",
+                "Exact Show 2x03/x04",
+                "208",
+                "tt0123456",
+                &"3".repeat(40)
+            ),
+            release(
+                "4",
+                "Exact Show 2x03 x 04",
+                "208",
+                "tt0123456",
+                &"4".repeat(40)
+            )
+        );
+        let values = fetch_apibay_tv_releases_with(701, 9001, 9103, "token", |url, _| {
+            if url.ends_with("/tv/701") {
+                Ok(DETAILS.to_owned())
+            } else if url.ends_with("/season/2") {
+                Ok(SEASON.to_owned())
+            } else if url.ends_with("/external_ids") {
+                Ok(EXTERNAL_IDS.to_owned())
+            } else if url.ends_with("cat=205") {
+                Ok(standard.clone())
+            } else {
+                Ok(hd.clone())
+            }
+        })
+        .expect("ambiguous continuations must be excluded without a fallback");
+
+        assert_eq!(values[8], "0");
+        assert_eq!(values.len(), 9);
     }
 
     #[test]
