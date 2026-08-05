@@ -1507,7 +1507,7 @@ fn provider_item_id(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
-fn canonical_infohash(value: &str) -> Option<String> {
+pub(crate) fn canonical_infohash(value: &str) -> Option<String> {
     (value.len() == 40 && value.bytes().all(|character| character.is_ascii_hexdigit()))
         .then(|| value.to_ascii_lowercase())
 }
@@ -1517,7 +1517,7 @@ fn yts_artifact_infohash(url: &str) -> Option<String> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum JsonValue {
+pub(crate) enum JsonValue {
     Null,
     Boolean,
     Number(String),
@@ -1526,14 +1526,14 @@ enum JsonValue {
     Object(BTreeMap<String, JsonValue>),
 }
 
-struct JsonParser<'a> {
+pub(crate) struct JsonParser<'a> {
     input: &'a [u8],
     position: usize,
     value_count: usize,
 }
 
 impl<'a> JsonParser<'a> {
-    fn new(input: &'a str) -> Self {
+    pub(crate) fn new(input: &'a str) -> Self {
         Self {
             input: input.as_bytes(),
             position: 0,
@@ -1541,7 +1541,7 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse(mut self) -> Option<JsonValue> {
+    pub(crate) fn parse(mut self) -> Option<JsonValue> {
         let value = self.parse_value(0)?;
         self.skip_whitespace();
         (self.position == self.input.len()).then_some(value)
@@ -1776,21 +1776,24 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-fn json_object(value: &JsonValue) -> Option<&BTreeMap<String, JsonValue>> {
+pub(crate) fn json_object(value: &JsonValue) -> Option<&BTreeMap<String, JsonValue>> {
     match value {
         JsonValue::Object(entries) => Some(entries),
         _ => None,
     }
 }
 
-fn json_array(value: &JsonValue) -> Option<&[JsonValue]> {
+pub(crate) fn json_array(value: &JsonValue) -> Option<&[JsonValue]> {
     match value {
         JsonValue::Array(values) => Some(values),
         _ => None,
     }
 }
 
-fn json_string<'a>(object: &'a BTreeMap<String, JsonValue>, key: &str) -> Option<&'a str> {
+pub(crate) fn json_string<'a>(
+    object: &'a BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Option<&'a str> {
     match object.get(key) {
         Some(JsonValue::String(value)) => Some(value),
         _ => None,
@@ -1803,7 +1806,7 @@ fn json_optional_text(object: &BTreeMap<String, JsonValue>, key: &str) -> Option
         .map(str::to_owned)
 }
 
-fn json_u64(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<u64> {
+pub(crate) fn json_u64(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<u64> {
     match object.get(key) {
         Some(JsonValue::Number(value)) => value.parse().ok(),
         _ => None,
@@ -1821,7 +1824,7 @@ fn valid_release_date(value: &str) -> bool {
             .all(|(index, character)| matches!(index, 4 | 7) || character.is_ascii_digit())
 }
 
-fn canonical_imdb_id(value: &str) -> Option<String> {
+pub(crate) fn canonical_imdb_id(value: &str) -> Option<String> {
     let canonical = value.to_ascii_lowercase();
     let digits = canonical.strip_prefix("tt")?;
     ((7..=10).contains(&digits.len()) && digits.bytes().all(|character| character.is_ascii_digit()))
