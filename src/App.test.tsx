@@ -6322,6 +6322,9 @@ describe("Adult Discover and verified release comparison", () => {
       }),
     );
     expect(screen.queryByText("Verified Adult torrent file saved.")).toBeNull();
+    await waitFor(() =>
+      expect((saveButton as HTMLButtonElement).disabled).toBe(false),
+    );
     fireEvent.click(saveButton);
     expect(
       await screen.findByText("Verified Adult torrent file saved."),
