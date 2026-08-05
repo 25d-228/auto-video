@@ -3761,7 +3761,7 @@ function VrDownloadCard({
                   >
                     <div className="trash-dialog__heading">
                       <AlertDialog.Title>
-                        Organize {organizationPreview.code} files?
+                        Organize {organizationPreview.identity} files?
                       </AlertDialog.Title>
                       <AlertDialog.Close
                         render={
@@ -3783,7 +3783,7 @@ function VrDownloadCard({
                       {" "}will move within the current {categoryLabel} folder.
                     </AlertDialog.Description>
                     <ul
-                      aria-label={`Organization plan for ${organizationPreview.code}`}
+                      aria-label={`Organization plan for ${organizationPreview.identity}`}
                       className="vr-organization-dialog__files"
                     >
                       {organizationPreview.entries.map((entry) => (
@@ -5620,6 +5620,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   };
 
   const chooseMoviesFolder = async () => {
+    vrOrganizationRequestId.current += 1;
+    if (vrOrganizationPreview !== null) {
+      void dismissVrOrganization();
+    }
+    setVrOrganizationPreview(null);
     setFolderSelectionError(null);
     setIsChoosingFolder(true);
 
@@ -5651,6 +5656,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   };
 
   const clearMoviesFolder = async () => {
+    vrOrganizationRequestId.current += 1;
+    if (vrOrganizationPreview !== null) {
+      void dismissVrOrganization();
+    }
+    setVrOrganizationPreview(null);
     scanRequestId.current += 1;
     setFolderSelectionError(null);
     setMovieScanState({ status: "unconfigured" });
@@ -6098,7 +6108,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       case "vr_organization_conflict":
         return "The complete organization plan conflicts with an existing or duplicate destination.";
       case "vr_organization_ineligible":
-        return `This transfer is no longer eligible for organization in the current ${category === "adult" ? "Adult" : "VR"} folder.`;
+        return `This transfer is no longer eligible for organization in the current ${category === "adult" ? "Adult" : category === "movie" ? "Movies" : "VR"} folder.`;
       case "vr_organization_stale":
         return "The organization plan is stale because its transfer, folder, or files changed.";
       default:
@@ -6150,7 +6160,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       if (
         latestDownload?.canOrganize !== true ||
         preview.transferId !== download.transferId ||
-        preview.code !== download.identity ||
+        preview.identity !== download.identity ||
         latestDownload.category !== download.category
       ) {
         await dismissVrOrganization();
@@ -6222,6 +6232,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       await refreshVrDownloads();
       if (currentDownload.category === "adult") {
         refreshAdultLibrary();
+      } else if (currentDownload.category === "movie") {
+        refreshMovies();
       } else {
         refreshVrLibrary();
       }

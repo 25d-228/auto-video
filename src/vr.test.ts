@@ -1008,6 +1008,95 @@ describe("trusted VR download boundary", () => {
     ]);
   });
 
+  it("accepts only canonical eligible, attention, and organized Movie rows", async () => {
+    invokeMock.mockResolvedValue([
+      "movie-ready-419",
+      "movie",
+      "tt0123456",
+      "Exact  Movie — 特別版",
+      "1",
+      "7",
+      "7",
+      "0",
+      "completed",
+      "true",
+      "none",
+      "",
+      "true",
+      "movie-attention-419",
+      "movie",
+      "tt0123456",
+      "Exact  Movie — 特別版",
+      "2",
+      "14",
+      "14",
+      "0",
+      "completed",
+      "true",
+      "attention",
+      "Exact  Movie — 特別版 (1999)/",
+      "true",
+      "movie-organized-419",
+      "movie",
+      "tt0123456",
+      "Exact  Movie — 特別版",
+      "1",
+      "7",
+      "7",
+      "0",
+      "completed",
+      "true",
+      "organized",
+      "Exact  Movie — 特別版 (1999)/",
+      "false",
+    ]);
+
+    await expect(loadVrDownloads()).resolves.toEqual([
+      expect.objectContaining({
+        transferId: "movie-ready-419",
+        category: "movie",
+        organizationStatus: "none",
+        canOrganize: true,
+      }),
+      expect.objectContaining({
+        transferId: "movie-attention-419",
+        organizationStatus: "attention",
+        organizationRelativeDirectory: "Exact  Movie — 特別版 (1999)/",
+        canOrganize: true,
+      }),
+      expect.objectContaining({
+        transferId: "movie-organized-419",
+        organizationStatus: "organized",
+        organizationRelativeDirectory: "Exact  Movie — 特別版 (1999)/",
+        canOrganize: false,
+      }),
+    ]);
+
+    for (const directory of [
+      "YTS title (1999)/",
+      "Exact  Movie — 特別版 (99)/",
+      "Exact  Movie — 特別版 (0000)/",
+      "../Exact  Movie — 特別版 (1999)/",
+    ]) {
+      invokeMock.mockResolvedValueOnce([
+        "movie-attention-419",
+        "movie",
+        "tt0123456",
+        "Exact  Movie — 特別版",
+        "1",
+        "7",
+        "7",
+        "0",
+        "completed",
+        "true",
+        "attention",
+        directory,
+        "true",
+      ]);
+      await expect(loadVrDownloads()).rejects.toThrow("invalid data");
+    }
+  });
+
   it("accepts category-unknown persisted transfers only as inert offline rows", async () => {
     invokeMock.mockResolvedValue([
       "corrupt-1",
@@ -1089,7 +1178,7 @@ describe("trusted VR download boundary", () => {
     await expect(previewVrOrganization("transfer-123")).resolves.toEqual({
       planId: "plan-123",
       transferId: "transfer-123",
-      code: "MDVR-419",
+      identity: "MDVR-419",
       moveCount: 1,
       entries: [
         {
@@ -1134,7 +1223,7 @@ describe("trusted VR download boundary", () => {
     await expect(previewVrOrganization("adult-transfer-123")).resolves.toEqual({
       planId: "adult-plan-123",
       transferId: "adult-transfer-123",
-      code: "ADLT-123",
+      identity: "ADLT-123",
       moveCount: 2,
       entries: [
         {
@@ -1146,6 +1235,51 @@ describe("trusted VR download boundary", () => {
           kind: "move",
           sourceRelativePath: "Source/ADLT-123 CD1+2.mkv",
           destinationRelativePath: "ADLT-123/ADLT-123 CD1+2.mkv",
+        },
+      ],
+    });
+  });
+
+  it("parses exact Movie organization destinations without product-code coercion", async () => {
+    invokeMock.mockResolvedValueOnce([
+      "movie-plan-419",
+      "movie-transfer-419",
+      "tt0123456",
+      "2",
+      "3",
+      "move",
+      "Provider/Feature  Cut.mp4",
+      "Exact  Movie — 特別版 (1999)/Feature  Cut.mp4",
+      "move",
+      "Provider/Second — 特別.MKV",
+      "Exact  Movie — 特別版 (1999)/Second — 特別.MKV",
+      "non-media-unchanged",
+      "Provider/notes.txt",
+      "",
+    ]);
+
+    await expect(previewVrOrganization("movie-transfer-419")).resolves.toEqual({
+      planId: "movie-plan-419",
+      transferId: "movie-transfer-419",
+      identity: "tt0123456",
+      moveCount: 2,
+      entries: [
+        {
+          kind: "move",
+          sourceRelativePath: "Provider/Feature  Cut.mp4",
+          destinationRelativePath:
+            "Exact  Movie — 特別版 (1999)/Feature  Cut.mp4",
+        },
+        {
+          kind: "move",
+          sourceRelativePath: "Provider/Second — 特別.MKV",
+          destinationRelativePath:
+            "Exact  Movie — 特別版 (1999)/Second — 特別.MKV",
+        },
+        {
+          kind: "non-media-unchanged",
+          sourceRelativePath: "Provider/notes.txt",
+          destinationRelativePath: null,
         },
       ],
     });
@@ -1197,6 +1331,16 @@ describe("trusted VR download boundary", () => {
         "media-unchanged",
         "source.mp4",
         "outside/file.mp4",
+      ],
+      [
+        "plan",
+        "transfer",
+        "tt0123456",
+        "1",
+        "1",
+        "move",
+        "source.mp4",
+        "YTS title/file.mp4",
       ],
     ]) {
       invokeMock.mockResolvedValueOnce(malformed);

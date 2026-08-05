@@ -95,7 +95,7 @@ export type VrOrganizationPreviewEntry = {
 export type VrOrganizationPreview = {
   planId: string;
   transferId: string;
-  code: string;
+  identity: string;
   moveCount: number;
   entries: VrOrganizationPreviewEntry[];
 };
@@ -846,6 +846,16 @@ function parseVrDownloads(value: unknown): VrDownload[] {
     ] = value.slice(index, index + 13) as string[];
     const count = Number(selectedFileCount);
     const canonicalCode = canonicalizeProductCode(identity);
+    const movieOrganizationPath = organizationRelativeDirectory.endsWith("/")
+      ? organizationRelativeDirectory.slice(0, -1)
+      : null;
+    const movieOrganizationDirectory =
+      movieOrganizationPath !== null &&
+      !movieOrganizationPath.includes("/") &&
+      safeOrganizationRelativePath(movieOrganizationPath) &&
+      organizationRelativeDirectory.startsWith(`${releaseName} (`)
+        ? organizationRelativeDirectory.slice(releaseName.length + 2, -2)
+        : null;
     if (
       transferId === "" ||
       transferIds.has(transferId) ||
@@ -855,9 +865,9 @@ function parseVrDownloads(value: unknown): VrDownload[] {
         canonicalCode !== identity) ||
       (category === "movie" &&
         (!/^tt\d{7,10}$/.test(identity) ||
-          organizationStatus !== "none" ||
-          organizationRelativeDirectory !== "" ||
-          canOrganize !== "false")) ||
+          (organizationStatus !== "none" &&
+            (movieOrganizationDirectory === null ||
+              !/^(?!0000)\d{4}$/.test(movieOrganizationDirectory))))) ||
       (category === "unknown" &&
         (count !== 0 ||
           totalBytes !== "0" ||
@@ -868,8 +878,6 @@ function parseVrDownloads(value: unknown): VrDownload[] {
           organizationStatus !== "none" ||
           organizationRelativeDirectory !== "" ||
           canOrganize !== "false")) ||
-      ((canOrganize === "true" || organizationStatus !== "none") &&
-        canonicalCode !== identity) ||
       releaseName.trim() === "" ||
       !Number.isSafeInteger(count) ||
       count < 0 ||
@@ -888,7 +896,9 @@ function parseVrDownloads(value: unknown): VrDownload[] {
         (organizationRelativeDirectory === "") ||
       (organizationStatus !== "none" &&
         (state !== "completed" ||
-          organizationRelativeDirectory !== `${identity}/`)) ||
+          (category === "movie"
+            ? movieOrganizationDirectory === null
+            : organizationRelativeDirectory !== `${identity}/`))) ||
       (canOrganize !== "true" && canOrganize !== "false") ||
       (canOrganize === "true" &&
         (state !== "completed" ||
@@ -937,13 +947,15 @@ function parseVrOrganizationPreview(value: unknown): VrOrganizationPreview {
   ) {
     throw new Error("The native VR organization preview returned invalid data.");
   }
-  const [planId, transferId, code, moveCountValue, entryCountValue] = value as string[];
+  const [planId, transferId, identity, moveCountValue, entryCountValue] = value as string[];
   const moveCount = Number(moveCountValue);
   const entryCount = Number(entryCountValue);
+  const productIdentity = canonicalizeProductCode(identity) === identity;
+  const movieIdentity = /^tt\d{7,10}$/.test(identity);
   if (
     planId === "" ||
     transferId === "" ||
-    canonicalizeProductCode(code) !== code ||
+    (!productIdentity && !movieIdentity) ||
     !Number.isSafeInteger(moveCount) ||
     moveCount < 0 ||
     !Number.isSafeInteger(entryCount) ||
@@ -955,6 +967,7 @@ function parseVrOrganizationPreview(value: unknown): VrOrganizationPreview {
   }
   const entries: VrOrganizationPreviewEntry[] = [];
   const sources = new Set<string>();
+  let destinationDirectory: string | null = null;
   let observedMoveCount = 0;
   for (let index = 5; index < value.length; index += 3) {
     const [kind, sourceRelativePath, destinationRelativePath] = value.slice(
@@ -967,10 +980,22 @@ function parseVrOrganizationPreview(value: unknown): VrOrganizationPreview {
       sources.has(sourceRelativePath) ||
       (kind === "non-media-unchanged"
         ? destinationRelativePath !== ""
-        : !safeOrganizationRelativePath(destinationRelativePath) ||
-          !destinationRelativePath.startsWith(`${code}/`))
+        : !safeOrganizationRelativePath(destinationRelativePath))
     ) {
       throw new Error("The native VR organization preview returned invalid data.");
+    }
+    if (kind !== "non-media-unchanged") {
+      const destinationParts = destinationRelativePath.split("/");
+      const directory = destinationParts.length === 2 ? destinationParts[0] : null;
+      if (
+        directory === null ||
+        (productIdentity && directory !== identity) ||
+        (movieIdentity && !/^.+ \((?!0000)\d{4}\)$/.test(directory)) ||
+        (destinationDirectory !== null && destinationDirectory !== directory)
+      ) {
+        throw new Error("The native VR organization preview returned invalid data.");
+      }
+      destinationDirectory = directory;
     }
     sources.add(sourceRelativePath);
     if (kind === "move") {
@@ -986,7 +1011,10 @@ function parseVrOrganizationPreview(value: unknown): VrOrganizationPreview {
   if (observedMoveCount !== moveCount) {
     throw new Error("The native VR organization preview returned invalid data.");
   }
-  return { planId, transferId, code, moveCount, entries };
+  if (destinationDirectory === null) {
+    throw new Error("The native VR organization preview returned invalid data.");
+  }
+  return { planId, transferId, identity, moveCount, entries };
 }
 
 function parseVrDownloadLimit(value: unknown): VrDownloadLimit {

@@ -218,7 +218,7 @@ struct OrganizationPlan {
     generation: u64,
     transfer_id: String,
     category: TransferCategory,
-    code: String,
+    identity: String,
     entries: Vec<OrganizationEntry>,
 }
 
@@ -319,6 +319,7 @@ pub fn configure_movie_download_folder(
     folder: Option<PathBuf>,
 ) -> Result<(), &'static str> {
     let mut context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
+    invalidate_organization_plan(&mut context);
     context.movie_future_folder = folder;
     Ok(())
 }
@@ -1140,10 +1141,7 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
     let identity_is_valid = category_identity == transfer_id
         || (category == TransferCategory::Vr
             && legacy_vr_transfer_identity(&source, &destination) == transfer_id);
-    if !identity_is_valid
-        || downloaded_bytes > selected_total
-        || (category == TransferCategory::Movie && organization_state != OrganizationState::None)
-    {
+    if !identity_is_valid || downloaded_bytes > selected_total {
         return None;
     }
     if current_paths.len() != source.selected_files.len()
@@ -1164,7 +1162,7 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
         return None;
     }
 
-    Some(TransferRecord {
+    let record = TransferRecord {
         transfer_id,
         category,
         code,
@@ -1183,7 +1181,36 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
         handle: None,
         handle_generation: 0,
         pending_action: None,
-    })
+    };
+    if record.category == TransferCategory::Movie
+        && record.organization_state != OrganizationState::None
+    {
+        let eligible_media = record
+            .selected_files
+            .iter()
+            .filter(|file| is_supported_media(Path::new(&file.path)))
+            .count();
+        if eligible_media == 0 {
+            return None;
+        }
+        for (selected_index, current_path) in record.current_paths.iter().enumerate() {
+            let original_path = &record.selected_files[selected_index].path;
+            let expected_path =
+                organization_destination_relative(&record, selected_index, eligible_media).ok()?;
+            let valid = match (record.organization_state, expected_path) {
+                (_, None) => current_path == original_path,
+                (OrganizationState::Organized, Some(expected)) => current_path == &expected,
+                (OrganizationState::Attention, Some(expected)) => {
+                    current_path == original_path || current_path == &expected
+                }
+                (OrganizationState::None, _) => unreachable!(),
+            };
+            if !valid {
+                return None;
+            }
+        }
+    }
+    Some(record)
 }
 
 fn corrupt_transfer(
@@ -1419,9 +1446,9 @@ fn reconcile_interrupted_organization(mut record: TransferRecord) -> Option<Tran
         return Some(record);
     }
     let eligible_media = record
-        .current_paths
+        .selected_files
         .iter()
-        .filter(|path| is_supported_media(Path::new(path)))
+        .filter(|file| is_supported_media(Path::new(&file.path)))
         .count();
     if eligible_media == 0 {
         return None;
@@ -2285,6 +2312,7 @@ pub async fn load_downloads(
         [
             (TransferCategory::Vr, context.future_folder.clone()),
             (TransferCategory::Adult, context.adult_future_folder.clone()),
+            (TransferCategory::Movie, context.movie_future_folder.clone()),
         ]
     };
     let persisted_transfers = read_persisted_transfers(persistence_path);
@@ -2484,9 +2512,143 @@ fn validate_current_organization_file(
     Ok(path)
 }
 
+fn validate_movie_organization_identity(record: &TransferRecord) -> Result<(), &'static str> {
+    let identity = record
+        .movie_identity
+        .as_deref()
+        .ok_or(VR_ORGANIZATION_INELIGIBLE)?;
+    let source = revalidate_persisted_movie_download_source(
+        &record.metainfo,
+        identity,
+        &record.infohash,
+        &record.selected_file_ids(),
+    )
+    .map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
+    if source.selected_files != record.selected_files
+        || source.release_name != record.release_name
+        || source.movie_identity.as_ref() != Some(identity)
+        || transfer_identity(record.category, &source, &record.destination) != record.transfer_id
+    {
+        return Err(VR_ORGANIZATION_INELIGIBLE);
+    }
+    Ok(())
+}
+
+fn movie_release_year(release_date: &str) -> Option<&str> {
+    let bytes = release_date.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 4 | 7) && !byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let year = release_date[..4].parse::<u16>().ok()?;
+    let month = release_date[5..7].parse::<u8>().ok()?;
+    let day = release_date[8..].parse::<u8>().ok()?;
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return None,
+    };
+    (year > 0 && day > 0 && day <= days).then_some(&release_date[..4])
+}
+
+fn portable_movie_organization_directory(
+    identity: &MovieDownloadIdentity,
+) -> Result<String, &'static str> {
+    let title = identity.tmdb_title.as_str();
+    let reserved_base = title.split('.').next().unwrap_or(title);
+    let reserved_name = reserved_base.to_ascii_uppercase();
+    let is_reserved = matches!(
+        reserved_name.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "CLOCK$"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    );
+    if title.is_empty()
+        || matches!(title, "." | "..")
+        || title.ends_with(' ')
+        || title.ends_with('.')
+        || is_reserved
+        || title
+            .chars()
+            .any(|character| character.is_control() || r#"<>:"/\|?*"#.contains(character))
+    {
+        return Err(VR_ORGANIZATION_INELIGIBLE);
+    }
+    let year = identity
+        .release_date
+        .as_deref()
+        .and_then(movie_release_year)
+        .ok_or(VR_ORGANIZATION_INELIGIBLE)?;
+    let directory = format!("{title} ({year})");
+    if directory.len() > 255 || directory.encode_utf16().count() > 255 {
+        return Err(VR_ORGANIZATION_INELIGIBLE);
+    }
+    relative_file_path(&directory).map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
+    Ok(directory)
+}
+
+fn organization_identity(record: &TransferRecord) -> Result<String, &'static str> {
+    match record.category {
+        TransferCategory::Adult | TransferCategory::Vr => Ok(record.code.clone()),
+        TransferCategory::Movie => record
+            .movie_identity
+            .as_ref()
+            .map(|identity| identity.imdb_id.clone())
+            .ok_or(VR_ORGANIZATION_INELIGIBLE),
+    }
+}
+
+fn organization_directory_name(record: &TransferRecord) -> Result<String, &'static str> {
+    match record.category {
+        TransferCategory::Adult | TransferCategory::Vr => Ok(record.code.clone()),
+        TransferCategory::Movie => portable_movie_organization_directory(
+            record
+                .movie_identity
+                .as_deref()
+                .ok_or(VR_ORGANIZATION_INELIGIBLE)?,
+        ),
+    }
+}
+
 fn validate_organization_directory(
     destination: &Path,
-    code: &str,
+    directory_name: &str,
 ) -> Result<Option<PathBuf>, &'static str> {
     for entry in fs::read_dir(destination).map_err(|_| VR_ORGANIZATION_INELIGIBLE)? {
         let entry = entry.map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
@@ -2495,11 +2657,11 @@ fn validate_organization_directory(
             .to_str()
             .ok_or(VR_ORGANIZATION_CONFLICT)?
             .to_owned();
-        if name.to_lowercase() == code.to_lowercase() && name != code {
+        if name.to_lowercase() == directory_name.to_lowercase() && name != directory_name {
             return Err(VR_ORGANIZATION_CONFLICT);
         }
     }
-    let directory = destination.join(code);
+    let directory = destination.join(directory_name);
     match fs::symlink_metadata(&directory) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             Err(VR_ORGANIZATION_CONFLICT)
@@ -2537,14 +2699,15 @@ fn organization_destination_relative(
     selected_index: usize,
     eligible_media: usize,
 ) -> Result<Option<String>, &'static str> {
-    let source_relative = record
-        .current_paths
+    let original_relative = record
+        .selected_files
         .get(selected_index)
+        .map(|file| file.path.as_str())
         .ok_or(VR_ORGANIZATION_STALE)?;
-    if !is_supported_media(Path::new(source_relative)) {
+    if !is_supported_media(Path::new(original_relative)) {
         return Ok(None);
     }
-    let source_name = Path::new(source_relative)
+    let source_name = Path::new(original_relative)
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(VR_ORGANIZATION_STALE)?;
@@ -2552,28 +2715,37 @@ fn organization_destination_relative(
         .file_stem()
         .and_then(|title| title.to_str())
         .ok_or(VR_ORGANIZATION_STALE)?;
-    let identity_matches = match record.category {
-        TransferCategory::Adult => {
-            adult_media_name_matches_product_code(source_title, &record.code)
-        }
-        TransferCategory::Movie => false,
-        TransferCategory::Vr => media_name_matches_product_code(source_title, &record.code),
-    };
-    if !identity_matches {
-        return Err(VR_ORGANIZATION_INELIGIBLE);
-    }
     let extension = Path::new(source_name)
         .extension()
         .and_then(|extension| extension.to_str())
         .ok_or(VR_ORGANIZATION_STALE)?;
-    let destination_name = if eligible_media == 1 {
-        format!("{}.{}", record.code, extension)
-    } else if let Some(part_label) = exact_part_label(source_name, record.category) {
-        format!("{} - {}.{}", record.code, part_label, extension)
-    } else {
-        source_name.to_owned()
+    let directory_name = organization_directory_name(record)?;
+    let destination_name = match record.category {
+        TransferCategory::Movie if eligible_media == 1 => {
+            format!("{directory_name}.{extension}")
+        }
+        TransferCategory::Movie => source_name.to_owned(),
+        TransferCategory::Adult | TransferCategory::Vr => {
+            let identity_matches = match record.category {
+                TransferCategory::Adult => {
+                    adult_media_name_matches_product_code(source_title, &record.code)
+                }
+                TransferCategory::Vr => media_name_matches_product_code(source_title, &record.code),
+                TransferCategory::Movie => unreachable!(),
+            };
+            if !identity_matches {
+                return Err(VR_ORGANIZATION_INELIGIBLE);
+            }
+            if eligible_media == 1 {
+                format!("{}.{}", record.code, extension)
+            } else if let Some(part_label) = exact_part_label(source_name, record.category) {
+                format!("{} - {}.{}", record.code, part_label, extension)
+            } else {
+                source_name.to_owned()
+            }
+        }
     };
-    let destination_relative = format!("{}/{}", record.code, destination_name);
+    let destination_relative = format!("{directory_name}/{destination_name}");
     relative_file_path(&destination_relative).map_err(|_| VR_ORGANIZATION_CONFLICT)?;
     Ok(Some(destination_relative))
 }
@@ -2582,8 +2754,7 @@ fn organization_entries(
     record: &TransferRecord,
     current_folder: Option<&Path>,
 ) -> Result<Vec<OrganizationEntry>, &'static str> {
-    if record.category == TransferCategory::Movie
-        || record.state != TransferState::Completed
+    if record.state != TransferState::Completed
         || record.handle.is_some()
         || record.pending_action.is_some()
         || record.organization_state == OrganizationState::Organized
@@ -2595,16 +2766,20 @@ fn organization_entries(
     {
         return Err(VR_ORGANIZATION_INELIGIBLE);
     }
+    if record.category == TransferCategory::Movie {
+        validate_movie_organization_identity(record)?;
+    }
 
     let eligible_media = record
-        .current_paths
+        .selected_files
         .iter()
-        .filter(|path| is_supported_media(Path::new(path)))
+        .filter(|file| is_supported_media(Path::new(&file.path)))
         .count();
     if eligible_media == 0 {
         return Err(VR_ORGANIZATION_INELIGIBLE);
     }
-    let existing_directory = validate_organization_directory(&record.destination, &record.code)?;
+    let directory_name = organization_directory_name(record)?;
+    let existing_directory = validate_organization_directory(&record.destination, &directory_name)?;
     let current_paths = record
         .current_paths
         .iter()
@@ -2696,7 +2871,7 @@ fn organization_plan_response(plan: &OrganizationPlan) -> Vec<String> {
     let mut response = vec![
         plan.plan_id.clone(),
         plan.transfer_id.clone(),
-        plan.code.clone(),
+        plan.identity.clone(),
         move_count.to_string(),
         plan.entries.len().to_string(),
     ];
@@ -2731,7 +2906,7 @@ pub fn preview_organization(
         generation,
         transfer_id: record.transfer_id.clone(),
         category: record.category,
-        code: record.code.clone(),
+        identity: organization_identity(record)?,
         entries,
     };
     let response = organization_plan_response(&plan);
@@ -2845,7 +3020,7 @@ fn apply_organization_with_persistence(
     invalidate_organization_plan(&mut context);
     let current_folder = match plan.category {
         TransferCategory::Adult => context.adult_future_folder.clone(),
-        TransferCategory::Movie => return Err(VR_ORGANIZATION_INELIGIBLE),
+        TransferCategory::Movie => context.movie_future_folder.clone(),
         TransferCategory::Vr => context.future_folder.clone(),
     };
     let record_index = context
@@ -2860,13 +3035,17 @@ fn apply_organization_with_persistence(
         StoredTransfer::Corrupt(_) => return Err(VR_ORGANIZATION_STALE),
     };
     let entries = organization_entries(record, current_folder.as_deref())?;
-    if plan.category != record.category || plan.code != record.code || plan.entries != entries {
+    if plan.category != record.category
+        || plan.identity != organization_identity(record)?
+        || plan.entries != entries
+    {
         return Err(VR_ORGANIZATION_STALE);
     }
     let previous_state = record.organization_state;
     let original_paths = record.current_paths.clone();
     let destination_root = record.destination.clone();
-    let organization_directory = destination_root.join(&record.code);
+    let directory_name = organization_directory_name(record)?;
+    let organization_directory = destination_root.join(&directory_name);
     let move_entries = entries
         .iter()
         .filter(|entry| entry.kind == OrganizationEntryKind::Move)
@@ -2886,12 +3065,12 @@ fn apply_organization_with_persistence(
 
     let mut created_directory = false;
     if !move_entries.is_empty()
-        && validate_organization_directory(&destination_root, &plan.code)?.is_none()
+        && validate_organization_directory(&destination_root, &directory_name)?.is_none()
     {
         match fs::create_dir(&organization_directory) {
             Ok(()) => created_directory = true,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                validate_organization_directory(&destination_root, &plan.code)?;
+                validate_organization_directory(&destination_root, &directory_name)?;
             }
             Err(_) => return Err(VR_ORGANIZATION_FAILED),
         }
@@ -3058,6 +3237,14 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                 if record.state == TransferState::Completed {
                     record.downloaded_bytes = record.selected_total();
                 }
+                let organization_relative_directory =
+                    if record.organization_state == OrganizationState::None {
+                        String::new()
+                    } else {
+                        organization_directory_name(record)
+                            .map(|directory| format!("{directory}/"))
+                            .unwrap_or_default()
+                    };
                 rows.extend([
                     record.transfer_id.clone(),
                     record.category.as_str().to_owned(),
@@ -3074,14 +3261,10 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                     record.state.as_str().to_owned(),
                     (current_folder.as_ref() == Some(&record.destination)).to_string(),
                     record.organization_state.as_str().to_owned(),
-                    if record.organization_state == OrganizationState::None {
-                        String::new()
-                    } else {
-                        format!("{}/", record.code)
-                    },
-                    (record.category != TransferCategory::Movie
-                        && organization_entries(record, current_folder.as_deref()).is_ok())
-                    .to_string(),
+                    organization_relative_directory,
+                    organization_entries(record, current_folder.as_deref())
+                        .is_ok()
+                        .to_string(),
                 ]);
             }
             StoredTransfer::Corrupt(record) => rows.extend([
@@ -3136,9 +3319,7 @@ pub fn list_downloads(
         Ok(()) => {
             for transfer in &context.transfers {
                 if let StoredTransfer::Valid(record) = transfer {
-                    if record.category != TransferCategory::Movie {
-                        clear_organization_recovery(record);
-                    }
+                    clear_organization_recovery(record);
                 }
             }
             Ok(rows)
@@ -3509,12 +3690,10 @@ pub fn dismiss_download(
         return Err(error);
     }
     if let StoredTransfer::Valid(record) = &dismissed {
-        if record.category != TransferCategory::Movie {
-            if let Err(error) = remove_organization_recovery(record) {
-                context.transfers.insert(position, dismissed);
-                let _ = write_persisted_transfers(persistence_path, &context.transfers);
-                return Err(error);
-            }
+        if let Err(error) = remove_organization_recovery(record) {
+            context.transfers.insert(position, dismissed);
+            let _ = write_persisted_transfers(persistence_path, &context.transfers);
+            return Err(error);
         }
     }
     Ok(())
@@ -3635,6 +3814,68 @@ mod tests {
         }
     }
 
+    fn movie_organization_metainfo(files: &[(&str, u64)]) -> Vec<u8> {
+        let mut info = b"d5:filesl".to_vec();
+        for (path, size) in files {
+            info.extend_from_slice(format!("d6:lengthi{size}e4:pathl").as_bytes());
+            for component in path.split('/') {
+                info.extend_from_slice(format!("{}:{component}", component.len()).as_bytes());
+            }
+            info.extend_from_slice(b"ee");
+        }
+        info.extend_from_slice(
+            b"e4:name12:Movie Bundle12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae",
+        );
+        let mut metainfo = b"d4:info".to_vec();
+        metainfo.extend_from_slice(&info);
+        metainfo.push(b'e');
+        metainfo
+    }
+
+    fn movie_organization_source(
+        title: &str,
+        release_date: Option<&str>,
+        provider_title: &str,
+        files: &[(&str, u64)],
+        selected_file_ids: &[usize],
+    ) -> VerifiedDownloadSource {
+        let metainfo = movie_organization_metainfo(files);
+        let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+        let selected_size = selected_file_ids
+            .iter()
+            .map(|file_id| files[*file_id].1)
+            .sum::<u64>();
+        let identity = MovieDownloadIdentity {
+            tmdb_movie_id: 419,
+            tmdb_title: title.to_owned(),
+            release_date: release_date.map(str::to_owned),
+            imdb_id: "tt0123456".to_owned(),
+            provider_movie_id: 700,
+            provider_title: Some(provider_title.to_owned()),
+            provider_year: Some("1999".to_owned()),
+            row_id: "700:0".to_owned(),
+            quality: Some("1080p".to_owned()),
+            type_label: Some("bluray".to_owned()),
+            video_codec: Some("x264".to_owned()),
+            size: Some(format!("{selected_size} B")),
+            size_bytes: Some(selected_size.to_string()),
+            seeds: Some("0".to_owned()),
+            peers: Some("0".to_owned()),
+            expected_infohash: infohash.clone(),
+            torrent_url: format!(
+                "https://yts.mx/torrent/download/{}",
+                infohash.to_ascii_uppercase()
+            ),
+        };
+        revalidate_persisted_movie_download_source(
+            &metainfo,
+            &identity,
+            &infohash,
+            selected_file_ids,
+        )
+        .expect("Movie organization source must revalidate")
+    }
+
     fn completed_organization_record_for_category(
         category: TransferCategory,
         destination: &Path,
@@ -3670,6 +3911,13 @@ mod tests {
         source: VerifiedDownloadSource,
     ) -> TransferRecord {
         completed_organization_record_for_category(TransferCategory::Adult, destination, source)
+    }
+
+    fn completed_movie_organization_record(
+        destination: &Path,
+        source: VerifiedDownloadSource,
+    ) -> TransferRecord {
+        completed_organization_record_for_category(TransferCategory::Movie, destination, source)
     }
 
     fn organization_state(record: TransferRecord) -> (VrDownloadState, String) {
@@ -3861,6 +4109,339 @@ mod tests {
                 .session
                 .is_none(),
             "organized Adult completion restarted a native session"
+        );
+    }
+
+    #[test]
+    fn movie_preview_applies_reloads_and_dismisses_the_exact_tmdb_single_file() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = movie_organization_source(
+            "Exact  Movie — 特別版",
+            Some("1999-04-19"),
+            "Different YTS Provider Title",
+            &[("Provider/Unrelated  Name.MP4", 5)],
+            &[0],
+        );
+        let record = completed_movie_organization_record(&destination, source);
+        let expected_identity = record.movie_identity.clone();
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(&preview[1..5], &[&transfer_id, "tt0123456", "1", "1"]);
+        assert_eq!(
+            &preview[5..],
+            &[
+                "move",
+                "Provider/Unrelated  Name.MP4",
+                "Exact  Movie — 特別版 (1999)/Exact  Movie — 特別版 (1999).MP4",
+            ]
+        );
+        apply_organization(&state, &persistence_path, &preview[0])
+            .expect("Movie organization must succeed");
+        let organized_file =
+            destination.join("Exact  Movie — 特別版 (1999)/Exact  Movie — 特別版 (1999).MP4");
+        assert_eq!(
+            fs::read(&organized_file).expect("organized Movie must remain readable"),
+            vec![b'a'; 5]
+        );
+
+        let restarted = VrDownloadState::default();
+        configure_movie_download_folder(&restarted, Some(destination.clone()))
+            .expect("Movies folder must restore");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("movie-organized-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("organized Movie transfer must reload");
+        assert_eq!(rows[1], "movie");
+        assert_eq!(rows[2], "tt0123456");
+        assert_eq!(rows[3], "Exact  Movie — 特別版");
+        assert_eq!(
+            &rows[8..13],
+            &[
+                "completed",
+                "true",
+                "organized",
+                "Exact  Movie — 特別版 (1999)/",
+                "false",
+            ]
+        );
+        let context = restarted.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("organized Movie transfer must remain valid");
+        };
+        assert_eq!(record.movie_identity, expected_identity);
+        assert!(
+            context.session.is_none(),
+            "organized Movie restarted a session"
+        );
+        drop(context);
+
+        dismiss_download(&restarted, &persistence_path, &transfer_id)
+            .expect("organized Movie row must dismiss");
+        for restart_index in 0..2 {
+            let dismissed = VrDownloadState::default();
+            configure_movie_download_folder(&dismissed, Some(destination.clone()))
+                .expect("Movies folder must restore after dismissal");
+            let rows = tauri::async_runtime::block_on(load_downloads(
+                &dismissed,
+                &persistence_path,
+                &fixture
+                    .path
+                    .join(format!("movie-dismissed-session-{restart_index}")),
+                &fixture.path.join("limit"),
+            ))
+            .expect("dismissed Movie transfer must remain absent");
+            assert!(rows.is_empty());
+            assert_eq!(
+                fs::read(&organized_file).expect("dismissal must retain organized Movie media"),
+                vec![b'a'; 5]
+            );
+        }
+    }
+
+    #[test]
+    fn movie_multi_file_organization_preserves_exact_basenames_and_non_media_paths() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = movie_organization_source(
+            "Exact  Movie — 特別版",
+            Some("1999-04-19"),
+            "YTS title must not name files",
+            &[
+                ("Provider/Feature  Cut.mp4", 3),
+                ("Provider/Second — 特別.MKV", 4),
+                ("Provider/notes  exact.txt", 5),
+            ],
+            &[0, 1, 2],
+        );
+        let record = completed_movie_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(&preview[3..5], &["2", "3"]);
+        assert_eq!(
+            &preview[5..],
+            &[
+                "move",
+                "Provider/Feature  Cut.mp4",
+                "Exact  Movie — 特別版 (1999)/Feature  Cut.mp4",
+                "move",
+                "Provider/Second — 特別.MKV",
+                "Exact  Movie — 特別版 (1999)/Second — 特別.MKV",
+                "non-media-unchanged",
+                "Provider/notes  exact.txt",
+                "",
+            ]
+        );
+        apply_organization(&state, &fixture.path.join("downloads"), &preview[0])
+            .expect("Movie multi-file organization must succeed");
+        for path in [
+            "Exact  Movie — 特別版 (1999)/Feature  Cut.mp4",
+            "Exact  Movie — 特別版 (1999)/Second — 特別.MKV",
+            "Provider/notes  exact.txt",
+        ] {
+            assert!(destination.join(path).is_file(), "missing {path:?}");
+        }
+        assert!(!destination
+            .join("Exact  Movie — 特別版 (1999)/Exact  Movie — 特別版 (1999).mp4")
+            .exists());
+    }
+
+    #[test]
+    fn movie_organization_rejects_unsafe_title_or_year_and_altered_identity_without_mutation() {
+        for (title, release_date) in [
+            ("Unsafe/Title", Some("1999-04-19")),
+            ("Unsafe:Title", Some("1999-04-19")),
+            (".", Some("1999-04-19")),
+            ("..", Some("1999-04-19")),
+            ("CON", Some("1999-04-19")),
+            ("COM¹", Some("1999-04-19")),
+            ("Trailing.", Some("1999-04-19")),
+            ("Trailing ", Some("1999-04-19")),
+            ("Exact Movie", None),
+            ("Exact Movie", Some("1999-02-30")),
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let source = movie_organization_source(
+                title,
+                release_date,
+                "Provider title",
+                &[("Provider/Feature.mp4", 3)],
+                &[0],
+            );
+            let record = completed_movie_organization_record(&destination, source);
+            let source_path = destination.join("Provider/Feature.mp4");
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE),
+                "unsafe identity {title:?} {release_date:?} was eligible"
+            );
+            assert_eq!(
+                fs::read(source_path).expect("source must remain"),
+                vec![b'a'; 3]
+            );
+        }
+
+        for alteration in 0..6 {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let source = movie_organization_source(
+                "Exact  Movie — 特別版",
+                Some("1999-04-19"),
+                "YTS Substitute Title",
+                &[("Provider/Feature.mp4", 3)],
+                &[0],
+            );
+            let mut record = completed_movie_organization_record(&destination, source);
+            let identity = record
+                .movie_identity
+                .as_mut()
+                .expect("Movie identity must exist");
+            match alteration {
+                0 => identity.tmdb_movie_id = 420,
+                1 => identity.imdb_id = "tt7654321".to_owned(),
+                2 => identity.provider_movie_id = 701,
+                3 => identity.row_id = "700:1".to_owned(),
+                4 => identity.release_date = Some("1999".to_owned()),
+                5 => record.release_name = "YTS Substitute Title".to_owned(),
+                _ => unreachable!(),
+            }
+            let source_path = destination.join("Provider/Feature.mp4");
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE),
+                "altered Movie identity {alteration} was eligible"
+            );
+            assert_eq!(
+                fs::read(source_path).expect("source must remain"),
+                vec![b'a'; 3]
+            );
+        }
+    }
+
+    #[test]
+    fn movie_preview_rejects_duplicate_and_case_colliding_canonical_targets() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = movie_organization_source(
+            "Exact Movie",
+            Some("1999-04-19"),
+            "Provider title",
+            &[("A/Feature.mp4", 3), ("B/feature.MP4", 4)],
+            &[0, 1],
+        );
+        let record = completed_movie_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_CONFLICT)
+        );
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = movie_organization_source(
+            "Exact Movie",
+            Some("1999-04-19"),
+            "Provider title",
+            &[("Provider/Feature.mp4", 3)],
+            &[0],
+        );
+        let record = completed_movie_organization_record(&destination, source);
+        fs::create_dir(destination.join("exact movie (1999)"))
+            .expect("case-colliding directory must exist");
+        let (state, transfer_id) = organization_state(record);
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_CONFLICT)
+        );
+    }
+
+    #[test]
+    fn movie_folder_change_invalidates_the_plan_before_move_dispatch() {
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("current");
+        let replacement = fixture.path.join("replacement");
+        fs::create_dir(&destination).expect("current Movies folder must exist");
+        fs::create_dir(&replacement).expect("replacement Movies folder must exist");
+        let destination =
+            fs::canonicalize(destination).expect("current Movies folder must canonicalize");
+        let replacement =
+            fs::canonicalize(replacement).expect("replacement Movies folder must canonicalize");
+        let source = movie_organization_source(
+            "Exact Movie",
+            Some("1999-04-19"),
+            "Provider title",
+            &[("Provider/Feature.mp4", 3)],
+            &[0],
+        );
+        let record = completed_movie_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        configure_movie_download_folder(&state, Some(replacement))
+            .expect("Movies folder must change");
+
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |_, _| panic!("folder-stale Movie plan dispatched"),
+            ),
+            Err(VR_ORGANIZATION_STALE)
+        );
+    }
+
+    #[test]
+    fn movie_noncanonical_persisted_organization_is_inert_and_keeps_media() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = movie_organization_source(
+            "Exact Movie",
+            Some("1999-04-19"),
+            "Provider title",
+            &[("Provider/Feature.mp4", 3)],
+            &[0],
+        );
+        let mut record = completed_movie_organization_record(&destination, source);
+        record.organization_state = OrganizationState::Attention;
+        record.current_paths[0] = "Fabricated/Feature.mp4".to_owned();
+        let mut persisted = PERSISTENCE_HEADER.to_vec();
+        persisted.extend_from_slice(&encode_transfer(&record).expect("Movie transfer must encode"));
+        persisted.push(b'\n');
+        let persistence_path = fixture.path.join("downloads");
+        fs::write(&persistence_path, persisted).expect("fabricated Movie state must persist");
+
+        let state = VrDownloadState::default();
+        configure_movie_download_folder(&state, Some(destination.clone()))
+            .expect("Movies folder must configure");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &state,
+            &persistence_path,
+            &fixture.path.join("corrupt-movie-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("fabricated Movie state must load inertly");
+        assert_eq!(rows[1], "unknown");
+        assert_eq!(&rows[8..13], &["offline", "false", "none", "", "false"]);
+        assert_eq!(
+            preview_organization(&state, &rows[0]),
+            Err(VR_ORGANIZATION_STALE)
+        );
+        assert!(state.0.lock().expect("state must lock").session.is_none());
+        assert_eq!(
+            fs::read(destination.join("Provider/Feature.mp4"))
+                .expect("original Movie media must remain"),
+            vec![b'a'; 3]
         );
     }
 
@@ -4972,6 +5553,228 @@ mod tests {
     }
 
     #[test]
+    fn movie_persistence_and_rollback_failure_recovers_exact_paths_and_dismisses_durably() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = movie_organization_source(
+            "Exact  Movie — 特別版",
+            Some("1999-04-19"),
+            "Different YTS title",
+            &[
+                ("Provider/Feature  A.mp4", 3),
+                ("Provider/Feature  B.MKV", 4),
+            ],
+            &[0, 1],
+        );
+        let record = completed_movie_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+        {
+            let context = state.0.lock().expect("state must lock");
+            write_persisted_transfers(&persistence_path, &context.transfers)
+                .expect("original Movie paths must persist");
+        }
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let mut move_calls = 0;
+        assert_eq!(
+            apply_organization_with_persistence(
+                &state,
+                &persistence_path,
+                &preview[0],
+                |source, destination| {
+                    move_calls += 1;
+                    if move_calls == 4 {
+                        Err(io::Error::other("injected Movie rollback failure"))
+                    } else {
+                        fs::rename(source, destination)
+                    }
+                },
+                |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+            ),
+            Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+        );
+        assert_eq!(move_calls, 4);
+        let moved_path = destination.join("Exact  Movie — 特別版 (1999)/Feature  A.mp4");
+        let unmoved_path = destination.join("Provider/Feature  B.MKV");
+        assert_eq!(
+            fs::read(&moved_path).expect("moved Movie must remain"),
+            vec![b'a'; 3]
+        );
+        assert_eq!(
+            fs::read(&unmoved_path).expect("unmoved Movie must remain"),
+            vec![b'b'; 4]
+        );
+
+        let restarted = VrDownloadState::default();
+        configure_movie_download_folder(&restarted, Some(destination.clone()))
+            .expect("Movies folder must restore");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("movie-recovery-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("Movie attention recovery must load");
+        assert_eq!(rows[1], "movie");
+        assert_eq!(
+            &rows[8..13],
+            &[
+                "completed",
+                "true",
+                "attention",
+                "Exact  Movie — 特別版 (1999)/",
+                "true",
+            ]
+        );
+        let context = restarted.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("recovered Movie transfer must remain valid");
+        };
+        assert_eq!(
+            record.current_paths,
+            [
+                "Exact  Movie — 特別版 (1999)/Feature  A.mp4",
+                "Provider/Feature  B.MKV",
+            ]
+        );
+        assert!(
+            context.session.is_none(),
+            "Movie recovery started a session"
+        );
+        drop(context);
+
+        dismiss_download(&restarted, &persistence_path, &transfer_id)
+            .expect("Movie attention row must dismiss");
+        for restart_index in 0..2 {
+            let dismissed = VrDownloadState::default();
+            configure_movie_download_folder(&dismissed, Some(destination.clone()))
+                .expect("Movies folder must restore after dismissal");
+            let rows = tauri::async_runtime::block_on(load_downloads(
+                &dismissed,
+                &persistence_path,
+                &fixture
+                    .path
+                    .join(format!("movie-recovery-dismissed-{restart_index}")),
+                &fixture.path.join("limit"),
+            ))
+            .expect("dismissed Movie recovery must remain absent");
+            assert!(rows.is_empty());
+            assert_eq!(
+                fs::read(&moved_path).expect("moved Movie must remain"),
+                vec![b'a'; 3]
+            );
+            assert_eq!(
+                fs::read(&unmoved_path).expect("unmoved Movie must remain"),
+                vec![b'b'; 4]
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_movie_move_reconstructs_exact_paths_from_the_durable_record() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = movie_organization_source(
+            "Exact  Movie — 特別版",
+            Some("1999-04-19"),
+            "Different YTS title",
+            &[
+                ("Provider/Feature  A.mp4", 3),
+                ("Provider/Feature  B.MKV", 4),
+            ],
+            &[0, 1],
+        );
+        let record = completed_movie_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(preview[3], "2");
+        let persistence_path = fixture.path.join("downloads");
+        fs::create_dir(destination.join("Exact  Movie — 特別版 (1999)"))
+            .expect("canonical Movie directory must exist");
+        let recovery_path = {
+            let context = state.0.lock().expect("state must lock");
+            write_persisted_transfers(&persistence_path, &context.transfers)
+                .expect("original Movie transfer must persist");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("Movie transfer must remain valid");
+            };
+            write_organization_recovery(record, &record.current_paths, None)
+                .expect("pre-mutation Movie recovery must persist");
+            organization_recovery_path(record)
+        };
+        let moved_path = destination.join("Exact  Movie — 特別版 (1999)/Feature  A.mp4");
+        let unmoved_path = destination.join("Provider/Feature  B.MKV");
+        fs::rename(destination.join("Provider/Feature  A.mp4"), &moved_path)
+            .expect("first Movie move must complete before interruption");
+
+        let restarted = VrDownloadState::default();
+        configure_movie_download_folder(&restarted, Some(destination))
+            .expect("Movies folder must restore");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("movie-interrupted-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("interrupted Movie paths must recover");
+        assert_eq!(rows[10], "attention");
+        assert_eq!(&rows[11..13], &["Exact  Movie — 特別版 (1999)/", "true"]);
+        assert!(!recovery_path.exists());
+        assert_eq!(
+            fs::read(moved_path).expect("moved Movie must remain"),
+            vec![b'a'; 3]
+        );
+        assert_eq!(
+            fs::read(unmoved_path).expect("unmoved Movie must remain"),
+            vec![b'b'; 4]
+        );
+    }
+
+    #[test]
+    fn movie_recovery_cleanup_failure_rejects_dismiss_and_keeps_media() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = movie_organization_source(
+            "Exact  Movie — 特別版",
+            Some("1999-04-19"),
+            "Different YTS title",
+            &[("Provider/Feature.mp4", 3)],
+            &[0],
+        );
+        let mut record = completed_movie_organization_record(&destination, source);
+        record.organization_state = OrganizationState::Attention;
+        let media_path = destination.join("Provider/Feature.mp4");
+        let recovery_path = organization_recovery_path(&record);
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+        {
+            let context = state.0.lock().expect("state must lock");
+            write_persisted_transfers(&persistence_path, &context.transfers)
+                .expect("attention Movie transfer must persist");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("Movie transfer must remain valid");
+            };
+            write_organization_recovery(record, &record.current_paths, None)
+                .expect("Movie recovery must persist");
+        }
+        fs::remove_file(&recovery_path).expect("recovery file must be replaceable");
+        fs::create_dir(&recovery_path).expect("cleanup failure must be deterministic");
+
+        assert_eq!(
+            dismiss_download(&state, &persistence_path, &transfer_id),
+            Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+        );
+        assert_eq!(
+            fs::read(media_path).expect("failed dismiss must retain media"),
+            vec![b'a'; 3]
+        );
+        assert!(matches!(
+            state.0.lock().expect("state must lock").transfers.as_slice(),
+            [StoredTransfer::Valid(record)] if record.transfer_id == transfer_id
+        ));
+    }
+
+    #[test]
     fn adult_persistence_and_rollback_failure_recovers_and_dismisses_without_moving_media_again() {
         let fixture = FilesystemFixture::new();
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
@@ -5052,11 +5855,15 @@ mod tests {
     fn organization_recovery_loading_is_category_isolated() {
         let fixture = FilesystemFixture::new();
         let adult_destination = fixture.path.join("Adult");
+        let movie_destination = fixture.path.join("Movies");
         let vr_destination = fixture.path.join("VR");
         fs::create_dir(&adult_destination).expect("Adult destination must exist");
+        fs::create_dir(&movie_destination).expect("Movies destination must exist");
         fs::create_dir(&vr_destination).expect("VR destination must exist");
         let adult_destination =
             fs::canonicalize(adult_destination).expect("Adult destination must canonicalize");
+        let movie_destination =
+            fs::canonicalize(movie_destination).expect("Movies destination must canonicalize");
         let vr_destination =
             fs::canonicalize(vr_destination).expect("VR destination must canonicalize");
         let adult_record = completed_adult_organization_record(
@@ -5065,8 +5872,20 @@ mod tests {
         );
         let vr_record =
             completed_organization_record(&vr_destination, persistable_fixture_source());
+        let movie_record = completed_movie_organization_record(
+            &movie_destination,
+            movie_organization_source(
+                "Exact Movie",
+                Some("1999-04-19"),
+                "Provider title",
+                &[("Provider/Feature.mp4", 3)],
+                &[0],
+            ),
+        );
         write_organization_recovery(&adult_record, &adult_record.current_paths, None)
             .expect("Adult recovery must persist");
+        write_organization_recovery(&movie_record, &movie_record.current_paths, None)
+            .expect("Movie recovery must persist");
         write_organization_recovery(&vr_record, &vr_record.current_paths, None)
             .expect("VR recovery must persist");
         let persistence_path = fixture.path.join("downloads");
@@ -5075,7 +5894,8 @@ mod tests {
         {
             let mut context = swapped.0.lock().expect("state must lock");
             context.adult_future_folder = Some(vr_destination.clone());
-            context.future_folder = Some(adult_destination.clone());
+            context.movie_future_folder = Some(adult_destination.clone());
+            context.future_folder = Some(movie_destination.clone());
         }
         let rows = tauri::async_runtime::block_on(load_downloads(
             &swapped,
@@ -5090,6 +5910,7 @@ mod tests {
         {
             let mut context = current.0.lock().expect("state must lock");
             context.adult_future_folder = Some(adult_destination);
+            context.movie_future_folder = Some(movie_destination);
             context.future_folder = Some(vr_destination);
         }
         let rows = tauri::async_runtime::block_on(load_downloads(
@@ -5099,9 +5920,10 @@ mod tests {
             &fixture.path.join("limit"),
         ))
         .expect("category-matched recoveries must load");
-        assert_eq!(rows.len(), 26);
+        assert_eq!(rows.len(), 39);
         assert_eq!(rows[1], "vr");
         assert_eq!(rows[14], "adult");
+        assert_eq!(rows[27], "movie");
     }
 
     #[test]
