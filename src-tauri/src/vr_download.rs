@@ -2561,6 +2561,14 @@ fn movie_release_year(release_date: &str) -> Option<&str> {
     (year > 0 && day > 0 && day <= days).then_some(&release_date[..4])
 }
 
+fn validate_movie_organization_component_length(value: &str) -> Result<(), &'static str> {
+    if value.len() > 255 || value.encode_utf16().count() > 255 {
+        Err(VR_ORGANIZATION_INELIGIBLE)
+    } else {
+        Ok(())
+    }
+}
+
 fn portable_movie_organization_directory(
     identity: &MovieDownloadIdentity,
 ) -> Result<String, &'static str> {
@@ -2616,9 +2624,7 @@ fn portable_movie_organization_directory(
         .and_then(movie_release_year)
         .ok_or(VR_ORGANIZATION_INELIGIBLE)?;
     let directory = format!("{title} ({year})");
-    if directory.len() > 255 || directory.encode_utf16().count() > 255 {
-        return Err(VR_ORGANIZATION_INELIGIBLE);
-    }
+    validate_movie_organization_component_length(&directory)?;
     relative_file_path(&directory).map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
     Ok(directory)
 }
@@ -2722,7 +2728,9 @@ fn organization_destination_relative(
     let directory_name = organization_directory_name(record)?;
     let destination_name = match record.category {
         TransferCategory::Movie if eligible_media == 1 => {
-            format!("{directory_name}.{extension}")
+            let destination_name = format!("{directory_name}.{extension}");
+            validate_movie_organization_component_length(&destination_name)?;
+            destination_name
         }
         TransferCategory::Movie => source_name.to_owned(),
         TransferCategory::Adult | TransferCategory::Vr => {
@@ -4250,6 +4258,70 @@ mod tests {
         assert!(!destination
             .join("Exact  Movie — 特別版 (1999)/Exact  Movie — 特別版 (1999).mp4")
             .exists());
+    }
+
+    #[test]
+    fn movie_single_file_component_limit_preserves_the_boundary_and_rejects_the_next_title() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let title = "A".repeat(244);
+        let directory_name = format!("{title} (1999)");
+        let file_name = format!("{directory_name}.mp4");
+        assert_eq!(file_name.len(), 255);
+        assert_eq!(file_name.encode_utf16().count(), 255);
+        let source = movie_organization_source(
+            &title,
+            Some("1999-04-19"),
+            "Provider title",
+            &[("Provider/Feature.mp4", 3)],
+            &[0],
+        );
+        let record = completed_movie_organization_record(&destination, source);
+        let recovery_path = organization_recovery_path(&record);
+        let (state, transfer_id) = organization_state(record);
+
+        let preview = preview_organization(&state, &transfer_id)
+            .expect("largest portable Movie filename must preview");
+        assert_eq!(preview[7], format!("{directory_name}/{file_name}"));
+        assert!(!destination.join(&directory_name).exists());
+        assert!(!recovery_path.exists());
+        assert_eq!(
+            fs::read(destination.join("Provider/Feature.mp4"))
+                .expect("preview must retain the exact source"),
+            vec![b'a'; 3]
+        );
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let title = "A".repeat(245);
+        let directory_name = format!("{title} (1999)");
+        let file_name = format!("{directory_name}.mp4");
+        assert_eq!(directory_name.len(), 252);
+        assert_eq!(directory_name.encode_utf16().count(), 252);
+        assert_eq!(file_name.len(), 256);
+        assert_eq!(file_name.encode_utf16().count(), 256);
+        let source = movie_organization_source(
+            &title,
+            Some("1999-04-19"),
+            "Provider title",
+            &[("Provider/Feature.mp4", 3)],
+            &[0],
+        );
+        let record = completed_movie_organization_record(&destination, source);
+        let recovery_path = organization_recovery_path(&record);
+        let (state, transfer_id) = organization_state(record);
+
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+        assert!(!destination.join(directory_name).exists());
+        assert!(!recovery_path.exists());
+        assert_eq!(
+            fs::read(destination.join("Provider/Feature.mp4"))
+                .expect("rejected preview must retain the exact source"),
+            vec![b'a'; 3]
+        );
     }
 
     #[test]
