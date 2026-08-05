@@ -29,6 +29,14 @@ The approved shadcn/ui preset is `b3wnVLs40m`. Base UI is the single component b
 
 **View seasons** does not request episodes. Selecting one verified season requests only that exact show ID, provider season ID, and season number. Auto-Video accepts a completed guide only when the response and every episode retain those identities. Duplicate, cross-season, missing, and malformed episode identities fail safely. Exact provider names and valid optional dates, runtimes, overviews, posters, and stills are preserved without inventing episodes from provider totals or local filenames. The guide does not inspect torrents, start downloads, enrich the local TV Library, rename media, or provide playback or air schedules.
 
+## TV episode release comparison
+
+**Find releases** on a completed positive episode first resolves the exact TMDB show to a canonical IMDb series identity with the native-stored TMDB token. Native code rebuilds the trusted show, season, and episode context from their positive provider IDs, then queries API Bay with the exact provider show name and canonical `SxxExx` marker in only TV Shows and HD TV Shows. The interface cannot supply a provider URL, raw query, category, IMDb identifier, show name, season number, or episode number.
+
+Only rows with the exact IMDb series identity, an approved TV category, a positive unique item ID, a canonical infohash, and exactly one unambiguous matching `SxxExx` or `NxNN` episode marker contribute to counts and comparison. Raw canonical item IDs and infohashes are checked independently across both category responses before other identity filters can discard a conflict. Wrong, missing, extended, embedded, pack, multipart, continuation, conflicting, malformed, and duplicate identities are excluded or fail safely. Exact accepted names and available provider metadata are preserved. No request occurs before the explicit action, no release is selected automatically, and a no-match result does not fall back to another show or episode.
+
+This comparison is metadata only. It does not inspect torrent contents, expose magnets, save `.torrent` files, start downloads, select releases automatically, rename downloaded files, organize TV media, enrich the TV Library, provide playback or air schedules, or use local filenames as provider identity.
+
 ## Movie torrent comparison, inspection, and selected-file downloads
 
 **Find releases** on a Movie card or its exact-ID details resolves that TMDB Movie to its IMDb identity through the native-stored TMDB token, then queries YTS by the literal IMDb identifier. Only a YTS Movie object with that exact IMDb identity contributes rows; missing, wrong, unrelated, malformed, and conflicting identities are excluded or fail safely. No request is made before the explicit action, and no release is selected automatically.
