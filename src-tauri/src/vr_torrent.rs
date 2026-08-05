@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::OpenOptions,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -9,6 +9,7 @@ use std::{
 
 const SUKEBEI_DOWNLOAD_PREFIX: &str = "https://sukebei.nyaa.si/download/";
 const SUKEBEI_VIEW_PREFIX: &str = "https://sukebei.nyaa.si/view/";
+const YTS_DOWNLOAD_PREFIX: &str = "https://yts.mx/torrent/download/";
 const PROVIDER_ITEM_ID_MAX_DIGITS: usize = 20;
 const SHA1_DIGEST_BYTES: usize = 20;
 const TORRENT_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -34,6 +35,19 @@ pub const ADULT_TORRENT_SAVE_FAILED: &str = "adult_torrent_save_failed";
 pub const ADULT_TORRENT_SOURCE_UNAVAILABLE: &str = "adult_torrent_source_unavailable";
 pub const ADULT_TORRENT_STALE: &str = "adult_torrent_stale";
 pub const ADULT_TORRENT_UNSUPPORTED: &str = "adult_torrent_unsupported";
+pub const MOVIE_NO_IMDB_IDENTITY: &str = "movie_no_imdb_identity";
+pub const MOVIE_TMDB_MALFORMED: &str = "movie_tmdb_malformed";
+pub const MOVIE_TORRENT_CONTEXT_INVALID: &str = "movie_torrent_context_invalid";
+pub const MOVIE_TORRENT_INFOHASH_MISMATCH: &str = "movie_torrent_infohash_mismatch";
+pub const MOVIE_TORRENT_MALFORMED: &str = "movie_torrent_malformed";
+pub const MOVIE_TORRENT_NETWORK_ERROR: &str = "movie_torrent_network_error";
+pub const MOVIE_TORRENT_PROVIDER_ERROR: &str = "movie_torrent_provider_error";
+pub const MOVIE_TORRENT_SAVE_FAILED: &str = "movie_torrent_save_failed";
+pub const MOVIE_TORRENT_SOURCE_UNAVAILABLE: &str = "movie_torrent_source_unavailable";
+pub const MOVIE_TORRENT_STALE: &str = "movie_torrent_stale";
+pub const MOVIE_TORRENT_UNSUPPORTED: &str = "movie_torrent_unsupported";
+pub const MOVIE_YTS_CONFLICTING_PROVIDER: &str = "movie_yts_conflicting_provider";
+pub const MOVIE_YTS_MALFORMED: &str = "movie_yts_malformed";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TrustedArtifact {
@@ -51,6 +65,88 @@ pub struct TorrentInspectionRequest {
     pub provider_item_id: String,
     pub torrent_url: String,
     pub expected_infohash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrustedMovieContext {
+    tmdb_movie_id: u64,
+    tmdb_title: String,
+    release_date: Option<String>,
+    imdb_id: String,
+    provider_movie_id: u64,
+    provider_title: Option<String>,
+    provider_year: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrustedMovieTorrent {
+    row_id: String,
+    quality: Option<String>,
+    type_label: Option<String>,
+    video_codec: Option<String>,
+    size: Option<String>,
+    size_bytes: Option<String>,
+    seeds: Option<String>,
+    peers: Option<String>,
+    expected_infohash: Option<String>,
+    torrent_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrustedMovieReleaseSet {
+    generation: u64,
+    context: TrustedMovieContext,
+    torrents: Vec<TrustedMovieTorrent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovieTorrentInspectionRequest {
+    pub tmdb_movie_id: u64,
+    pub tmdb_title: String,
+    pub release_date: Option<String>,
+    pub imdb_id: String,
+    pub provider_movie_id: u64,
+    pub provider_title: Option<String>,
+    pub provider_year: Option<String>,
+    pub row_id: String,
+    pub quality: Option<String>,
+    pub type_label: Option<String>,
+    pub video_codec: Option<String>,
+    pub size: Option<String>,
+    pub size_bytes: Option<String>,
+    pub seeds: Option<String>,
+    pub peers: Option<String>,
+    pub expected_infohash: String,
+    pub torrent_url: String,
+}
+
+impl MovieTorrentInspectionRequest {
+    fn context(&self) -> TrustedMovieContext {
+        TrustedMovieContext {
+            tmdb_movie_id: self.tmdb_movie_id,
+            tmdb_title: self.tmdb_title.clone(),
+            release_date: self.release_date.clone(),
+            imdb_id: self.imdb_id.clone(),
+            provider_movie_id: self.provider_movie_id,
+            provider_title: self.provider_title.clone(),
+            provider_year: self.provider_year.clone(),
+        }
+    }
+
+    fn torrent(&self) -> TrustedMovieTorrent {
+        TrustedMovieTorrent {
+            row_id: self.row_id.clone(),
+            quality: self.quality.clone(),
+            type_label: self.type_label.clone(),
+            video_codec: self.video_codec.clone(),
+            size: self.size.clone(),
+            size_bytes: self.size_bytes.clone(),
+            seeds: self.seeds.clone(),
+            peers: self.peers.clone(),
+            expected_infohash: Some(self.expected_infohash.clone()),
+            torrent_url: Some(self.torrent_url.clone()),
+        }
+    }
 }
 
 impl From<TorrentInspectionRequest> for TrustedArtifact {
@@ -128,6 +224,151 @@ pub struct AdultTorrentState(TorrentState);
 impl Default for AdultTorrentState {
     fn default() -> Self {
         Self(TorrentState::new("adult"))
+    }
+}
+
+struct CachedMovieTorrent {
+    generation: u64,
+    inspection_id: String,
+    default_file_name: String,
+    bytes: Vec<u8>,
+    metadata: TorrentMetadata,
+}
+
+#[derive(Default)]
+struct MovieTorrentContext {
+    release_generation: u64,
+    inspection_generation: u64,
+    release_set: Option<TrustedMovieReleaseSet>,
+    cached_torrent: Option<CachedMovieTorrent>,
+}
+
+#[derive(Clone, Default)]
+pub struct MovieTorrentState(Arc<Mutex<MovieTorrentContext>>);
+
+impl MovieTorrentState {
+    pub fn begin_release_lookup(&self) -> Result<u64, &'static str> {
+        let mut context = self.0.lock().map_err(|_| MOVIE_TORRENT_PROVIDER_ERROR)?;
+        context.release_generation = context.release_generation.wrapping_add(1);
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.release_set = None;
+        context.cached_torrent = None;
+        Ok(context.release_generation)
+    }
+
+    pub fn finish_release_lookup(
+        &self,
+        generation: u64,
+        requested_tmdb_movie_id: u64,
+        tmdb_details_document: &str,
+        tmdb_external_ids_document: &str,
+        yts_document: &str,
+    ) -> Result<Vec<String>, &'static str> {
+        let trusted_movie = trusted_movie_release_set(
+            generation,
+            requested_tmdb_movie_id,
+            tmdb_details_document,
+            tmdb_external_ids_document,
+            yts_document,
+        )?;
+        let response = encode_movie_release_set(&trusted_movie);
+        let mut context = self.0.lock().map_err(|_| MOVIE_TORRENT_PROVIDER_ERROR)?;
+        if context.release_generation != generation {
+            return Err(MOVIE_TORRENT_STALE);
+        }
+        context.release_set = Some(trusted_movie);
+        Ok(response)
+    }
+
+    pub fn invalidate_inspection(&self) -> Result<(), &'static str> {
+        let mut context = self.0.lock().map_err(|_| MOVIE_TORRENT_PROVIDER_ERROR)?;
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.cached_torrent = None;
+        Ok(())
+    }
+
+    pub fn invalidate_release_context(&self) -> Result<(), &'static str> {
+        self.begin_release_lookup().map(|_| ())
+    }
+
+    pub fn begin_inspection(
+        &self,
+        request: &MovieTorrentInspectionRequest,
+    ) -> Result<(u64, u64), &'static str> {
+        let mut context = self.0.lock().map_err(|_| MOVIE_TORRENT_PROVIDER_ERROR)?;
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.cached_torrent = None;
+        let release_set = context
+            .release_set
+            .as_ref()
+            .filter(|release_set| {
+                release_set.generation == context.release_generation
+                    && release_set.context == request.context()
+            })
+            .ok_or(MOVIE_TORRENT_CONTEXT_INVALID)?;
+        if !release_set.torrents.contains(&request.torrent()) {
+            return Err(MOVIE_TORRENT_CONTEXT_INVALID);
+        }
+        Ok((context.release_generation, context.inspection_generation))
+    }
+
+    fn validate_inspection(
+        &self,
+        release_generation: u64,
+        inspection_generation: u64,
+        request: &MovieTorrentInspectionRequest,
+    ) -> Result<(), &'static str> {
+        let context = self.0.lock().map_err(|_| MOVIE_TORRENT_PROVIDER_ERROR)?;
+        let request_is_current = context.release_set.as_ref().is_some_and(|release_set| {
+            release_set.generation == release_generation
+                && release_set.context == request.context()
+                && release_set.torrents.contains(&request.torrent())
+        });
+        if context.release_generation != release_generation
+            || context.inspection_generation != inspection_generation
+            || !request_is_current
+        {
+            return Err(MOVIE_TORRENT_CONTEXT_INVALID);
+        }
+        Ok(())
+    }
+
+    fn finish_inspection(
+        &self,
+        release_generation: u64,
+        inspection_generation: u64,
+        request: &MovieTorrentInspectionRequest,
+        bytes: Vec<u8>,
+        metadata: TorrentMetadata,
+    ) -> Result<String, &'static str> {
+        let mut context = self.0.lock().map_err(|_| MOVIE_TORRENT_PROVIDER_ERROR)?;
+        let request_is_current = context.release_set.as_ref().is_some_and(|release_set| {
+            release_set.generation == release_generation
+                && release_set.context == request.context()
+                && release_set.torrents.contains(&request.torrent())
+        });
+        if context.release_generation != release_generation
+            || context.inspection_generation != inspection_generation
+            || !request_is_current
+        {
+            return Err(MOVIE_TORRENT_STALE);
+        }
+
+        let inspection_id = format!(
+            "movie-{release_generation}-{inspection_generation}-{}",
+            request.expected_infohash
+        );
+        context.cached_torrent = Some(CachedMovieTorrent {
+            generation: inspection_generation,
+            inspection_id: inspection_id.clone(),
+            default_file_name: format!(
+                "movie-{}-{}.torrent",
+                request.tmdb_movie_id, request.expected_infohash
+            ),
+            bytes,
+            metadata,
+        });
+        Ok(inspection_id)
     }
 }
 
@@ -506,17 +747,7 @@ fn inspect_sukebei_torrent_state_with(
         bytes,
         metadata.clone(),
     )?;
-    let mut response = vec![
-        inspection_id,
-        metadata.display_name,
-        metadata.infohash,
-        metadata.total_size.to_string(),
-    ];
-    for file in metadata.files {
-        response.push(file.path);
-        response.push(file.size.to_string());
-    }
-    Ok(response)
+    Ok(encode_torrent_inspection(inspection_id, metadata))
 }
 
 pub fn inspect_sukebei_adult_torrent_with(
@@ -525,6 +756,29 @@ pub fn inspect_sukebei_adult_torrent_with(
     fetch: impl FnMut(&str) -> Result<ArtifactResponse, ArtifactRequestError>,
 ) -> Result<Vec<String>, &'static str> {
     inspect_sukebei_torrent_state_with(&state.0, request, fetch).map_err(adult_torrent_error_code)
+}
+
+pub fn inspect_yts_movie_torrent_with(
+    state: &MovieTorrentState,
+    release_generation: u64,
+    inspection_generation: u64,
+    request: MovieTorrentInspectionRequest,
+    fetch: impl FnMut(&str) -> Result<ArtifactResponse, ArtifactRequestError>,
+) -> Result<Vec<String>, &'static str> {
+    state.validate_inspection(release_generation, inspection_generation, &request)?;
+    let bytes = fetch_yts_torrent_artifact(&request, fetch).map_err(movie_torrent_error_code)?;
+    let metadata = parse_torrent_metadata(&bytes).map_err(movie_torrent_error_code)?;
+    if metadata.infohash != request.expected_infohash {
+        return Err(MOVIE_TORRENT_INFOHASH_MISMATCH);
+    }
+    let inspection_id = state.finish_inspection(
+        release_generation,
+        inspection_generation,
+        &request,
+        bytes,
+        metadata.clone(),
+    )?;
+    Ok(encode_torrent_inspection(inspection_id, metadata))
 }
 
 pub fn save_verified_torrent_with(
@@ -581,6 +835,45 @@ pub fn save_verified_adult_torrent_with(
         .map_err(adult_torrent_error_code)
 }
 
+pub fn save_verified_movie_torrent_with(
+    state: &MovieTorrentState,
+    inspection_id: &str,
+    choose_destination: impl FnOnce(&str) -> Option<PathBuf>,
+    write: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+) -> Result<bool, &'static str> {
+    let default_file_name = {
+        let context = state.0.lock().map_err(|_| MOVIE_TORRENT_SAVE_FAILED)?;
+        context
+            .cached_torrent
+            .as_ref()
+            .filter(|torrent| {
+                torrent.inspection_id == inspection_id
+                    && torrent.generation == context.inspection_generation
+            })
+            .map(|torrent| torrent.default_file_name.clone())
+            .ok_or(MOVIE_TORRENT_STALE)?
+    };
+    let Some(destination) = choose_destination(&default_file_name) else {
+        return Ok(false);
+    };
+
+    let context = state.0.lock().map_err(|_| MOVIE_TORRENT_SAVE_FAILED)?;
+    let torrent = context
+        .cached_torrent
+        .as_ref()
+        .filter(|torrent| {
+            torrent.inspection_id == inspection_id
+                && torrent.generation == context.inspection_generation
+        })
+        .ok_or(MOVIE_TORRENT_STALE)?;
+    let reparsed = parse_torrent_metadata(&torrent.bytes).map_err(movie_torrent_error_code)?;
+    if reparsed != torrent.metadata {
+        return Err(MOVIE_TORRENT_MALFORMED);
+    }
+    write(&destination, &torrent.bytes).map_err(|_| MOVIE_TORRENT_SAVE_FAILED)?;
+    Ok(true)
+}
+
 pub fn write_new_torrent_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)
@@ -628,6 +921,75 @@ fn fetch_torrent_artifact(
     }
 
     Err(TorrentInspectionError::Provider)
+}
+
+fn fetch_yts_torrent_artifact(
+    request: &MovieTorrentInspectionRequest,
+    mut fetch: impl FnMut(&str) -> Result<ArtifactResponse, ArtifactRequestError>,
+) -> Result<Vec<u8>, TorrentInspectionError> {
+    if yts_artifact_infohash(&request.torrent_url).as_deref()
+        != Some(request.expected_infohash.as_str())
+    {
+        return Err(TorrentInspectionError::Provider);
+    }
+
+    let mut current_url = request.torrent_url.clone();
+    for redirect_count in 0..=TORRENT_MAX_REDIRECTS {
+        let response = fetch(&current_url).map_err(|error| match error {
+            ArtifactRequestError::Network => TorrentInspectionError::Network,
+            ArtifactRequestError::TooLarge => TorrentInspectionError::Malformed,
+        })?;
+        if response.body.len() > TORRENT_MAX_BYTES {
+            return Err(TorrentInspectionError::Malformed);
+        }
+
+        match response.status {
+            200..=299 => {
+                if response.body.is_empty() {
+                    return Err(TorrentInspectionError::Malformed);
+                }
+                return Ok(response.body);
+            }
+            301 | 302 | 303 | 307 | 308 if redirect_count < TORRENT_MAX_REDIRECTS => {
+                let redirect_url = response
+                    .redirect_url
+                    .filter(|url| {
+                        yts_artifact_infohash(url).as_deref()
+                            == Some(request.expected_infohash.as_str())
+                    })
+                    .ok_or(TorrentInspectionError::Provider)?;
+                current_url = redirect_url;
+            }
+            404 | 410 | 451 => return Err(TorrentInspectionError::SourceUnavailable),
+            _ => return Err(TorrentInspectionError::Provider),
+        }
+    }
+
+    Err(TorrentInspectionError::Provider)
+}
+
+fn encode_torrent_inspection(inspection_id: String, metadata: TorrentMetadata) -> Vec<String> {
+    let mut response = vec![
+        inspection_id,
+        metadata.display_name,
+        metadata.infohash,
+        metadata.total_size.to_string(),
+    ];
+    for file in metadata.files {
+        response.push(file.path);
+        response.push(file.size.to_string());
+    }
+    response
+}
+
+fn movie_torrent_error_code(error: TorrentInspectionError) -> &'static str {
+    match error {
+        TorrentInspectionError::SourceUnavailable => MOVIE_TORRENT_SOURCE_UNAVAILABLE,
+        TorrentInspectionError::Network => MOVIE_TORRENT_NETWORK_ERROR,
+        TorrentInspectionError::Provider => MOVIE_TORRENT_PROVIDER_ERROR,
+        TorrentInspectionError::Malformed => MOVIE_TORRENT_MALFORMED,
+        TorrentInspectionError::Unsupported => MOVIE_TORRENT_UNSUPPORTED,
+    }
 }
 
 pub fn fetch_artifact_response(url: &str) -> Result<ArtifactResponse, ArtifactRequestError> {
@@ -989,6 +1351,539 @@ fn provider_item_id(value: &str) -> Option<String> {
 fn canonical_infohash(value: &str) -> Option<String> {
     (value.len() == 40 && value.bytes().all(|character| character.is_ascii_hexdigit()))
         .then(|| value.to_ascii_lowercase())
+}
+
+fn yts_artifact_infohash(url: &str) -> Option<String> {
+    canonical_infohash(url.strip_prefix(YTS_DOWNLOAD_PREFIX)?)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum JsonValue {
+    Null,
+    Boolean,
+    Number(String),
+    String(String),
+    Array(Vec<JsonValue>),
+    Object(BTreeMap<String, JsonValue>),
+}
+
+struct JsonParser<'a> {
+    input: &'a [u8],
+    position: usize,
+    value_count: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input: input.as_bytes(),
+            position: 0,
+            value_count: 0,
+        }
+    }
+
+    fn parse(mut self) -> Option<JsonValue> {
+        let value = self.parse_value(0)?;
+        self.skip_whitespace();
+        (self.position == self.input.len()).then_some(value)
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Option<JsonValue> {
+        if depth > 64 || self.value_count >= 100_000 {
+            return None;
+        }
+        self.value_count += 1;
+        self.skip_whitespace();
+        match self.input.get(self.position).copied()? {
+            b'n' => self.parse_literal(b"null", JsonValue::Null),
+            b't' => self.parse_literal(b"true", JsonValue::Boolean),
+            b'f' => self.parse_literal(b"false", JsonValue::Boolean),
+            b'"' => self.parse_string().map(JsonValue::String),
+            b'[' => self.parse_array(depth + 1),
+            b'{' => self.parse_object(depth + 1),
+            b'-' | b'0'..=b'9' => self.parse_number().map(JsonValue::Number),
+            _ => None,
+        }
+    }
+
+    fn parse_literal(&mut self, literal: &[u8], value: JsonValue) -> Option<JsonValue> {
+        if !self.input[self.position..].starts_with(literal) {
+            return None;
+        }
+        self.position += literal.len();
+        Some(value)
+    }
+
+    fn parse_string(&mut self) -> Option<String> {
+        self.position += 1;
+        let mut decoded = String::new();
+        let mut plain_start = self.position;
+        loop {
+            let character = *self.input.get(self.position)?;
+            match character {
+                b'"' => {
+                    decoded.push_str(
+                        std::str::from_utf8(&self.input[plain_start..self.position]).ok()?,
+                    );
+                    self.position += 1;
+                    return Some(decoded);
+                }
+                b'\\' => {
+                    decoded.push_str(
+                        std::str::from_utf8(&self.input[plain_start..self.position]).ok()?,
+                    );
+                    self.position += 1;
+                    let escaped = *self.input.get(self.position)?;
+                    self.position += 1;
+                    match escaped {
+                        b'"' => decoded.push('"'),
+                        b'\\' => decoded.push('\\'),
+                        b'/' => decoded.push('/'),
+                        b'b' => decoded.push('\u{0008}'),
+                        b'f' => decoded.push('\u{000c}'),
+                        b'n' => decoded.push('\n'),
+                        b'r' => decoded.push('\r'),
+                        b't' => decoded.push('\t'),
+                        b'u' => decoded.push(self.parse_unicode_escape()?),
+                        _ => return None,
+                    }
+                    plain_start = self.position;
+                }
+                0x00..=0x1f => return None,
+                _ => self.position += 1,
+            }
+        }
+    }
+
+    fn parse_unicode_escape(&mut self) -> Option<char> {
+        let first = self.parse_hex_quad()?;
+        let scalar = if (0xd800..=0xdbff).contains(&first) {
+            if self.input.get(self.position..self.position + 2)? != b"\\u" {
+                return None;
+            }
+            self.position += 2;
+            let second = self.parse_hex_quad()?;
+            if !(0xdc00..=0xdfff).contains(&second) {
+                return None;
+            }
+            0x10000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00)
+        } else if (0xdc00..=0xdfff).contains(&first) {
+            return None;
+        } else {
+            u32::from(first)
+        };
+        char::from_u32(scalar)
+    }
+
+    fn parse_hex_quad(&mut self) -> Option<u16> {
+        let encoded = self.input.get(self.position..self.position + 4)?;
+        if !encoded
+            .iter()
+            .all(|character| character.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        self.position += 4;
+        u16::from_str_radix(std::str::from_utf8(encoded).ok()?, 16).ok()
+    }
+
+    fn parse_number(&mut self) -> Option<String> {
+        let start = self.position;
+        if self.input.get(self.position) == Some(&b'-') {
+            self.position += 1;
+        }
+        match self.input.get(self.position).copied()? {
+            b'0' => self.position += 1,
+            b'1'..=b'9' => {
+                self.position += 1;
+                while self
+                    .input
+                    .get(self.position)
+                    .is_some_and(u8::is_ascii_digit)
+                {
+                    self.position += 1;
+                }
+            }
+            _ => return None,
+        }
+        if self.input.get(self.position) == Some(&b'.') {
+            self.position += 1;
+            let fraction_start = self.position;
+            while self
+                .input
+                .get(self.position)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                self.position += 1;
+            }
+            if self.position == fraction_start {
+                return None;
+            }
+        }
+        if self
+            .input
+            .get(self.position)
+            .is_some_and(|character| matches!(character, b'e' | b'E'))
+        {
+            self.position += 1;
+            if self
+                .input
+                .get(self.position)
+                .is_some_and(|character| matches!(character, b'+' | b'-'))
+            {
+                self.position += 1;
+            }
+            let exponent_start = self.position;
+            while self
+                .input
+                .get(self.position)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                self.position += 1;
+            }
+            if self.position == exponent_start {
+                return None;
+            }
+        }
+        Some(
+            std::str::from_utf8(&self.input[start..self.position])
+                .ok()?
+                .to_owned(),
+        )
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Option<JsonValue> {
+        self.position += 1;
+        self.skip_whitespace();
+        let mut values = Vec::new();
+        if self.input.get(self.position) == Some(&b']') {
+            self.position += 1;
+            return Some(JsonValue::Array(values));
+        }
+        loop {
+            values.push(self.parse_value(depth)?);
+            self.skip_whitespace();
+            match self.input.get(self.position).copied()? {
+                b',' => self.position += 1,
+                b']' => {
+                    self.position += 1;
+                    return Some(JsonValue::Array(values));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Option<JsonValue> {
+        self.position += 1;
+        self.skip_whitespace();
+        let mut entries = BTreeMap::new();
+        if self.input.get(self.position) == Some(&b'}') {
+            self.position += 1;
+            return Some(JsonValue::Object(entries));
+        }
+        loop {
+            self.skip_whitespace();
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            if self.input.get(self.position) != Some(&b':') {
+                return None;
+            }
+            self.position += 1;
+            let value = self.parse_value(depth)?;
+            if entries.insert(key, value).is_some() {
+                return None;
+            }
+            self.skip_whitespace();
+            match self.input.get(self.position).copied()? {
+                b',' => self.position += 1,
+                b'}' => {
+                    self.position += 1;
+                    return Some(JsonValue::Object(entries));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .input
+            .get(self.position)
+            .is_some_and(|character| matches!(character, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.position += 1;
+        }
+    }
+}
+
+fn json_object(value: &JsonValue) -> Option<&BTreeMap<String, JsonValue>> {
+    match value {
+        JsonValue::Object(entries) => Some(entries),
+        _ => None,
+    }
+}
+
+fn json_array(value: &JsonValue) -> Option<&[JsonValue]> {
+    match value {
+        JsonValue::Array(values) => Some(values),
+        _ => None,
+    }
+}
+
+fn json_string<'a>(object: &'a BTreeMap<String, JsonValue>, key: &str) -> Option<&'a str> {
+    match object.get(key) {
+        Some(JsonValue::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn json_optional_text(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {
+    json_string(object, key)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn json_u64(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<u64> {
+    match object.get(key) {
+        Some(JsonValue::Number(value)) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn valid_release_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, character)| matches!(index, 4 | 7) || character.is_ascii_digit())
+}
+
+fn canonical_imdb_id(value: &str) -> Option<String> {
+    let canonical = value.to_ascii_lowercase();
+    let digits = canonical.strip_prefix("tt")?;
+    ((7..=10).contains(&digits.len()) && digits.bytes().all(|character| character.is_ascii_digit()))
+        .then_some(canonical)
+}
+
+pub fn verified_movie_imdb_id(
+    requested_tmdb_movie_id: u64,
+    tmdb_details_document: &str,
+    tmdb_external_ids_document: &str,
+) -> Result<String, &'static str> {
+    trusted_tmdb_movie_context(
+        requested_tmdb_movie_id,
+        tmdb_details_document,
+        tmdb_external_ids_document,
+    )
+    .map(|context| context.imdb_id)
+}
+
+fn trusted_tmdb_movie_context(
+    requested_tmdb_movie_id: u64,
+    tmdb_details_document: &str,
+    tmdb_external_ids_document: &str,
+) -> Result<TrustedMovieContext, &'static str> {
+    let details = JsonParser::new(tmdb_details_document)
+        .parse()
+        .and_then(|value| json_object(&value).cloned())
+        .ok_or(MOVIE_TMDB_MALFORMED)?;
+    if json_u64(&details, "id") != Some(requested_tmdb_movie_id) {
+        return Err(MOVIE_TMDB_MALFORMED);
+    }
+    let tmdb_title = json_string(&details, "title")
+        .filter(|title| !title.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or(MOVIE_TMDB_MALFORMED)?;
+    let release_date = match details.get("release_date") {
+        None | Some(JsonValue::Null) => None,
+        Some(JsonValue::String(value)) if value.is_empty() => None,
+        Some(JsonValue::String(value)) if valid_release_date(value) => Some(value.clone()),
+        _ => return Err(MOVIE_TMDB_MALFORMED),
+    };
+
+    let external_ids = JsonParser::new(tmdb_external_ids_document)
+        .parse()
+        .and_then(|value| json_object(&value).cloned())
+        .ok_or(MOVIE_TMDB_MALFORMED)?;
+    if json_u64(&external_ids, "id") != Some(requested_tmdb_movie_id) {
+        return Err(MOVIE_TMDB_MALFORMED);
+    }
+    let imdb_id = match external_ids.get("imdb_id") {
+        None | Some(JsonValue::Null) => return Err(MOVIE_NO_IMDB_IDENTITY),
+        Some(JsonValue::String(value)) if value.is_empty() => {
+            return Err(MOVIE_NO_IMDB_IDENTITY);
+        }
+        Some(JsonValue::String(value)) => canonical_imdb_id(value).ok_or(MOVIE_TMDB_MALFORMED)?,
+        _ => return Err(MOVIE_TMDB_MALFORMED),
+    };
+
+    Ok(TrustedMovieContext {
+        tmdb_movie_id: requested_tmdb_movie_id,
+        tmdb_title,
+        release_date,
+        imdb_id,
+        provider_movie_id: 0,
+        provider_title: None,
+        provider_year: None,
+    })
+}
+
+fn trusted_movie_release_set(
+    generation: u64,
+    requested_tmdb_movie_id: u64,
+    tmdb_details_document: &str,
+    tmdb_external_ids_document: &str,
+    yts_document: &str,
+) -> Result<TrustedMovieReleaseSet, &'static str> {
+    let mut context = trusted_tmdb_movie_context(
+        requested_tmdb_movie_id,
+        tmdb_details_document,
+        tmdb_external_ids_document,
+    )?;
+    let imdb_id = context.imdb_id.clone();
+
+    let yts = JsonParser::new(yts_document)
+        .parse()
+        .and_then(|value| json_object(&value).cloned())
+        .ok_or(MOVIE_YTS_MALFORMED)?;
+    if json_string(&yts, "status") != Some("ok") {
+        return Err(MOVIE_YTS_MALFORMED);
+    }
+    let data = yts
+        .get("data")
+        .and_then(json_object)
+        .ok_or(MOVIE_YTS_MALFORMED)?;
+    let movies = match data.get("movies") {
+        None | Some(JsonValue::Null) => &[][..],
+        Some(value) => json_array(value).ok_or(MOVIE_YTS_MALFORMED)?,
+    };
+    let mut accepted_movies = Vec::new();
+    for movie in movies {
+        let Some(movie) = json_object(movie) else {
+            continue;
+        };
+        let Some(candidate_imdb_id) = json_string(movie, "imdb_code").and_then(canonical_imdb_id)
+        else {
+            continue;
+        };
+        if candidate_imdb_id != imdb_id {
+            continue;
+        }
+        let provider_movie_id = json_u64(movie, "id")
+            .filter(|id| *id > 0)
+            .ok_or(MOVIE_YTS_MALFORMED)?;
+        let provider_title = json_optional_text(movie, "title");
+        let provider_year = json_u64(movie, "year")
+            .filter(|year| *year > 0)
+            .map(|year| year.to_string());
+        let torrents = match movie.get("torrents") {
+            None | Some(JsonValue::Null) => Vec::new(),
+            Some(value) => json_array(value)
+                .ok_or(MOVIE_YTS_MALFORMED)?
+                .iter()
+                .enumerate()
+                .filter_map(|(index, torrent)| parse_yts_torrent(torrent, provider_movie_id, index))
+                .collect(),
+        };
+        accepted_movies.push((provider_movie_id, provider_title, provider_year, torrents));
+    }
+
+    let Some((provider_movie_id, provider_title, provider_year, torrents)) =
+        accepted_movies.first().cloned()
+    else {
+        return Ok(TrustedMovieReleaseSet {
+            generation,
+            context,
+            torrents: Vec::new(),
+        });
+    };
+    if accepted_movies
+        .iter()
+        .skip(1)
+        .any(|candidate| candidate != accepted_movies.first().expect("accepted movie exists"))
+    {
+        return Err(MOVIE_YTS_CONFLICTING_PROVIDER);
+    }
+
+    context.provider_movie_id = provider_movie_id;
+    context.provider_title = provider_title;
+    context.provider_year = provider_year;
+    Ok(TrustedMovieReleaseSet {
+        generation,
+        context,
+        torrents,
+    })
+}
+
+fn parse_yts_torrent(
+    value: &JsonValue,
+    provider_movie_id: u64,
+    index: usize,
+) -> Option<TrustedMovieTorrent> {
+    let torrent = json_object(value)?;
+    let expected_infohash = json_string(torrent, "hash").and_then(canonical_infohash);
+    let torrent_url = json_string(torrent, "url")
+        .filter(|url| {
+            expected_infohash
+                .as_deref()
+                .is_some_and(|expected| yts_artifact_infohash(url).as_deref() == Some(expected))
+        })
+        .map(str::to_owned);
+    let trusted_infohash = torrent_url.as_ref().and(expected_infohash);
+    let parsed = TrustedMovieTorrent {
+        row_id: format!("{provider_movie_id}:{index}"),
+        quality: json_optional_text(torrent, "quality"),
+        type_label: json_optional_text(torrent, "type"),
+        video_codec: json_optional_text(torrent, "video_codec"),
+        size: json_optional_text(torrent, "size"),
+        size_bytes: json_u64(torrent, "size_bytes").map(|value| value.to_string()),
+        seeds: json_u64(torrent, "seeds").map(|value| value.to_string()),
+        peers: json_u64(torrent, "peers").map(|value| value.to_string()),
+        expected_infohash: trusted_infohash,
+        torrent_url,
+    };
+    (parsed.quality.is_some()
+        || parsed.type_label.is_some()
+        || parsed.video_codec.is_some()
+        || parsed.size.is_some()
+        || parsed.size_bytes.is_some()
+        || parsed.seeds.is_some()
+        || parsed.peers.is_some()
+        || parsed.expected_infohash.is_some())
+    .then_some(parsed)
+}
+
+fn encode_movie_release_set(release_set: &TrustedMovieReleaseSet) -> Vec<String> {
+    let context = &release_set.context;
+    let mut response = vec![
+        context.tmdb_movie_id.to_string(),
+        context.tmdb_title.clone(),
+        context.release_date.clone().unwrap_or_default(),
+        context.imdb_id.clone(),
+        context.provider_movie_id.to_string(),
+        context.provider_title.clone().unwrap_or_default(),
+        context.provider_year.clone().unwrap_or_default(),
+        release_set.torrents.len().to_string(),
+    ];
+    for torrent in &release_set.torrents {
+        response.extend([
+            torrent.row_id.clone(),
+            torrent.quality.clone().unwrap_or_default(),
+            torrent.type_label.clone().unwrap_or_default(),
+            torrent.video_codec.clone().unwrap_or_default(),
+            torrent.size.clone().unwrap_or_default(),
+            torrent.size_bytes.clone().unwrap_or_default(),
+            torrent.seeds.clone().unwrap_or_default(),
+            torrent.peers.clone().unwrap_or_default(),
+            torrent.expected_infohash.clone().unwrap_or_default(),
+            torrent.torrent_url.clone().unwrap_or_default(),
+        ]);
+    }
+    response
 }
 
 #[derive(Debug)]
@@ -2436,5 +3331,452 @@ mod tests {
             ),
             Err(VerifiedDownloadSourceError::Selection)
         );
+    }
+
+    fn tmdb_movie_documents() -> (&'static str, &'static str) {
+        (
+            r#"{"id":419,"title":"Exact  Movie — 特別版","release_date":"1999-04-19"}"#,
+            r#"{"id":419,"imdb_id":"tt0123456"}"#,
+        )
+    }
+
+    fn exact_yts_document(infohash: &str) -> String {
+        format!(
+            r#"{{"status":"ok","data":{{"movies":[
+              {{"id":700,"imdb_code":"tt0123456","title":"Exact  Movie — 特別版","year":1999,"torrents":[
+                {{"quality":"1080p","type":"bluray","video_codec":"x264","size":"1.5 GB","size_bytes":1500000000,"seeds":42,"peers":7,"hash":"{upper_hash}","url":"https://yts.mx/torrent/download/{upper_hash}"}},
+                {{"quality":"2160p","type":"web","video_codec":"x265","size":"Unavailable","seeds":2}}
+              ]}},
+              {{"id":701,"imdb_code":"tt7654321","title":"Exact  Movie — 特別版","year":1999,"torrents":[{{"quality":"wrong identity"}}]}},
+              {{"id":702,"imdb_code":"tt7654322","title":"Exact  Movie — 特別版","year":2000,"torrents":[{{"quality":"neighboring year"}}]}},
+              {{"id":703,"title":"Exact  Movie — 特別版","year":1999,"torrents":[{{"quality":"missing identity"}}]}},
+              {{"id":704,"imdb_code":"not-an-imdb-id","title":"Exact  Movie — 特別版","year":1999,"torrents":[{{"quality":"malformed identity"}}]}},
+              {{"id":705,"imdb_code":"tt9999999","title":"Unrelated result","year":1980,"torrents":[{{"quality":"unrelated"}}]}}
+            ]}}}}"#,
+            upper_hash = infohash.to_ascii_uppercase(),
+        )
+    }
+
+    fn trusted_movie_request(infohash: &str) -> MovieTorrentInspectionRequest {
+        MovieTorrentInspectionRequest {
+            tmdb_movie_id: 419,
+            tmdb_title: "Exact  Movie — 特別版".to_owned(),
+            release_date: Some("1999-04-19".to_owned()),
+            imdb_id: "tt0123456".to_owned(),
+            provider_movie_id: 700,
+            provider_title: Some("Exact  Movie — 特別版".to_owned()),
+            provider_year: Some("1999".to_owned()),
+            row_id: "700:0".to_owned(),
+            quality: Some("1080p".to_owned()),
+            type_label: Some("bluray".to_owned()),
+            video_codec: Some("x264".to_owned()),
+            size: Some("1.5 GB".to_owned()),
+            size_bytes: Some("1500000000".to_owned()),
+            seeds: Some("42".to_owned()),
+            peers: Some("7".to_owned()),
+            expected_infohash: infohash.to_owned(),
+            torrent_url: format!(
+                "https://yts.mx/torrent/download/{}",
+                infohash.to_ascii_uppercase()
+            ),
+        }
+    }
+
+    fn movie_state_with_release(infohash: &str) -> MovieTorrentState {
+        let state = MovieTorrentState::default();
+        let generation = state
+            .begin_release_lookup()
+            .expect("Movie release lookup must begin");
+        let (details, external_ids) = tmdb_movie_documents();
+        state
+            .finish_release_lookup(
+                generation,
+                419,
+                details,
+                external_ids,
+                &exact_yts_document(infohash),
+            )
+            .expect("exact Movie release set must be accepted");
+        state
+    }
+
+    #[test]
+    fn movie_identity_accepts_only_the_exact_imdb_movie_and_preserves_metadata() {
+        let infohash = "0123456789abcdef0123456789abcdef01234567";
+        let (details, external_ids) = tmdb_movie_documents();
+        assert_eq!(
+            verified_movie_imdb_id(419, details, external_ids),
+            Ok("tt0123456".to_owned())
+        );
+        let release_set =
+            trusted_movie_release_set(3, 419, details, external_ids, &exact_yts_document(infohash))
+                .expect("the exact IMDb candidate must be accepted");
+
+        assert_eq!(release_set.context.tmdb_title, "Exact  Movie — 特別版");
+        assert_eq!(release_set.context.imdb_id, "tt0123456");
+        assert_eq!(release_set.context.provider_movie_id, 700);
+        assert_eq!(
+            release_set.context.provider_title.as_deref(),
+            Some("Exact  Movie — 特別版")
+        );
+        assert_eq!(release_set.torrents.len(), 2);
+        assert_eq!(release_set.torrents[0].quality.as_deref(), Some("1080p"));
+        assert_eq!(
+            release_set.torrents[0].expected_infohash.as_deref(),
+            Some(infohash)
+        );
+        assert_eq!(release_set.torrents[1].quality.as_deref(), Some("2160p"));
+        assert_eq!(release_set.torrents[1].expected_infohash, None);
+        assert_eq!(encode_movie_release_set(&release_set)[7], "2");
+        for rejected_quality in [
+            "wrong identity",
+            "neighboring year",
+            "missing identity",
+            "malformed identity",
+            "unrelated",
+        ] {
+            assert!(release_set
+                .torrents
+                .iter()
+                .all(|torrent| torrent.quality.as_deref() != Some(rejected_quality)));
+        }
+    }
+
+    #[test]
+    fn movie_identity_rejects_wrong_tmdb_context_and_missing_or_malformed_imdb_ids() {
+        let (details, external_ids) = tmdb_movie_documents();
+        for (details_document, external_ids_document, expected) in [
+            (
+                r#"{"id":420,"title":"Exact Movie","release_date":"1999-04-19"}"#,
+                external_ids,
+                MOVIE_TMDB_MALFORMED,
+            ),
+            (
+                r#"{"id":419,"title":" ","release_date":"1999-04-19"}"#,
+                external_ids,
+                MOVIE_TMDB_MALFORMED,
+            ),
+            (
+                r#"{"id":419,"title":"Exact Movie","release_date":"1999"}"#,
+                external_ids,
+                MOVIE_TMDB_MALFORMED,
+            ),
+            (
+                details,
+                r#"{"id":420,"imdb_id":"tt0123456"}"#,
+                MOVIE_TMDB_MALFORMED,
+            ),
+            (
+                details,
+                r#"{"id":419,"imdb_id":null}"#,
+                MOVIE_NO_IMDB_IDENTITY,
+            ),
+            (
+                details,
+                r#"{"id":419,"imdb_id":""}"#,
+                MOVIE_NO_IMDB_IDENTITY,
+            ),
+            (
+                details,
+                r#"{"id":419,"imdb_id":"tt123"}"#,
+                MOVIE_TMDB_MALFORMED,
+            ),
+        ] {
+            assert_eq!(
+                verified_movie_imdb_id(419, details_document, external_ids_document),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn movie_identity_rejects_conflicting_exact_imdb_provider_objects() {
+        let (details, external_ids) = tmdb_movie_documents();
+        let conflicting = r#"{"status":"ok","data":{"movies":[
+          {"id":700,"imdb_code":"tt0123456","title":"Exact Movie","year":1999,"torrents":[]},
+          {"id":701,"imdb_code":"tt0123456","title":"Conflicting Movie","year":1999,"torrents":[]}
+        ]}}"#;
+        assert_eq!(
+            trusted_movie_release_set(1, 419, details, external_ids, conflicting),
+            Err(MOVIE_YTS_CONFLICTING_PROVIDER)
+        );
+    }
+
+    #[test]
+    fn newer_movie_release_generation_rejects_an_older_provider_result() {
+        let infohash = "0123456789abcdef0123456789abcdef01234567";
+        let state = MovieTorrentState::default();
+        let older_generation = state
+            .begin_release_lookup()
+            .expect("older Movie lookup must begin");
+        let current_generation = state
+            .begin_release_lookup()
+            .expect("current Movie lookup must begin");
+        let (details, external_ids) = tmdb_movie_documents();
+        assert!(state
+            .finish_release_lookup(
+                current_generation,
+                419,
+                details,
+                external_ids,
+                &exact_yts_document(infohash),
+            )
+            .is_ok());
+        assert_eq!(
+            state.finish_release_lookup(
+                older_generation,
+                419,
+                details,
+                external_ids,
+                &exact_yts_document(infohash),
+            ),
+            Err(MOVIE_TORRENT_STALE)
+        );
+        assert!(state
+            .begin_inspection(&trusted_movie_request(infohash))
+            .is_ok());
+    }
+
+    #[test]
+    fn movie_inspection_rejects_fabricated_context_before_artifact_dispatch() {
+        let infohash = "0123456789abcdef0123456789abcdef01234567";
+        let state = movie_state_with_release(infohash);
+        let exact = trusted_movie_request(infohash);
+        let mut fabricated = Vec::new();
+        let mut request = exact.clone();
+        request.tmdb_movie_id = 420;
+        fabricated.push(request);
+        let mut request = exact.clone();
+        request.imdb_id = "tt7654321".to_owned();
+        fabricated.push(request);
+        let mut request = exact.clone();
+        request.provider_movie_id = 701;
+        fabricated.push(request);
+        let mut request = exact.clone();
+        request.quality = Some("2160p".to_owned());
+        fabricated.push(request);
+        let mut request = exact.clone();
+        request.torrent_url = format!("https://example.com/torrent/{infohash}");
+        fabricated.push(request);
+        let mut request = exact.clone();
+        request.row_id = "700:fabricated".to_owned();
+        fabricated.push(request);
+        let mut request = exact.clone();
+        request.provider_title = Some("Fabricated provider title".to_owned());
+        fabricated.push(request);
+        let mut request = exact.clone();
+        request.expected_infohash = "abcdef0123456789abcdef0123456789abcdef01".to_owned();
+        request.torrent_url = format!(
+            "https://yts.mx/torrent/download/{}",
+            request.expected_infohash
+        );
+        fabricated.push(request);
+        let dispatch_count = RefCell::new(0_u32);
+        let (release_generation, inspection_generation) = state
+            .begin_inspection(&exact)
+            .expect("exact Movie inspection must begin");
+
+        for request in fabricated {
+            assert_eq!(
+                inspect_yts_movie_torrent_with(
+                    &state,
+                    release_generation,
+                    inspection_generation,
+                    request,
+                    |_| {
+                        dispatch_count.replace_with(|count| *count + 1);
+                        unreachable!("fabricated Movie context must fail before dispatch")
+                    }
+                ),
+                Err(MOVIE_TORRENT_CONTEXT_INVALID)
+            );
+        }
+        assert_eq!(dispatch_count.into_inner(), 0);
+    }
+
+    #[test]
+    fn movie_artifact_redirects_remain_on_the_exact_hash_and_are_bounded() {
+        let infohash = "0123456789abcdef0123456789abcdef01234567";
+        let request = trusted_movie_request(infohash);
+        assert_eq!(
+            fetch_yts_torrent_artifact(&request, |_| Ok(ArtifactResponse {
+                status: 302,
+                redirect_url: Some(format!("https://example.com/{infohash}")),
+                body: Vec::new(),
+            })),
+            Err(TorrentInspectionError::Provider)
+        );
+
+        let bytes = multi_file_torrent();
+        let dispatch_count = RefCell::new(0_u32);
+        assert_eq!(
+            fetch_yts_torrent_artifact(&request, |_| {
+                let current_count = dispatch_count.replace_with(|count| *count + 1);
+                Ok(if current_count == 0 {
+                    ArtifactResponse {
+                        status: 302,
+                        redirect_url: Some(request.torrent_url.clone()),
+                        body: Vec::new(),
+                    }
+                } else {
+                    ArtifactResponse {
+                        status: 200,
+                        redirect_url: None,
+                        body: bytes.clone(),
+                    }
+                })
+            }),
+            Ok(bytes)
+        );
+        assert_eq!(dispatch_count.into_inner(), 2);
+
+        let dispatch_count = RefCell::new(0_u32);
+        assert_eq!(
+            fetch_yts_torrent_artifact(&request, |_| {
+                dispatch_count.replace_with(|count| *count + 1);
+                Ok(ArtifactResponse {
+                    status: 302,
+                    redirect_url: Some(request.torrent_url.clone()),
+                    body: Vec::new(),
+                })
+            }),
+            Err(TorrentInspectionError::Provider)
+        );
+        assert_eq!(dispatch_count.into_inner(), 4);
+    }
+
+    #[test]
+    fn newer_movie_inspection_generation_rejects_late_artifact_bytes() {
+        let bytes = multi_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let state = movie_state_with_release(&infohash);
+        let request = trusted_movie_request(&infohash);
+        let (older_release_generation, older_inspection_generation) = state
+            .begin_inspection(&request)
+            .expect("older Movie inspection must begin");
+        let current_generation = RefCell::new(None);
+        assert_eq!(
+            inspect_yts_movie_torrent_with(
+                &state,
+                older_release_generation,
+                older_inspection_generation,
+                request.clone(),
+                |_| {
+                    current_generation.replace(Some(
+                        state
+                            .begin_inspection(&request)
+                            .expect("current Movie inspection must begin"),
+                    ));
+                    Ok(ArtifactResponse {
+                        status: 200,
+                        redirect_url: None,
+                        body: bytes.clone(),
+                    })
+                },
+            ),
+            Err(MOVIE_TORRENT_STALE)
+        );
+
+        let (current_release_generation, current_inspection_generation) = current_generation
+            .into_inner()
+            .expect("current Movie inspection generation must be recorded");
+        assert!(inspect_yts_movie_torrent_with(
+            &state,
+            current_release_generation,
+            current_inspection_generation,
+            request,
+            |_| Ok(ArtifactResponse {
+                status: 200,
+                redirect_url: None,
+                body: bytes.clone(),
+            }),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn movie_inspection_verifies_and_saves_only_the_exact_cached_bytes() {
+        let bytes = multi_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let state = movie_state_with_release(&infohash);
+        let request = trusted_movie_request(&infohash);
+        let (release_generation, inspection_generation) = state
+            .begin_inspection(&request)
+            .expect("exact Movie inspection must begin");
+        let response = inspect_yts_movie_torrent_with(
+            &state,
+            release_generation,
+            inspection_generation,
+            request,
+            |url| {
+                assert_eq!(
+                    url,
+                    format!(
+                        "https://yts.mx/torrent/download/{}",
+                        infohash.to_ascii_uppercase()
+                    )
+                );
+                Ok(ArtifactResponse {
+                    status: 200,
+                    redirect_url: None,
+                    body: bytes.clone(),
+                })
+            },
+        )
+        .expect("exact YTS artifact must inspect");
+        assert_eq!(response[2], infohash);
+        assert_eq!(response[4], "Folder/Part  1 — 映画.mkv");
+        assert_eq!(
+            save_verified_movie_torrent_with(
+                &state,
+                &response[0],
+                |_| None,
+                |_, _| { unreachable!("cancelled Save must not write") }
+            ),
+            Ok(false)
+        );
+
+        let destination = std::env::temp_dir().join(format!(
+            "auto-video-movie-torrent-{}-{}.torrent",
+            std::process::id(),
+            infohash
+        ));
+        let _ = fs::remove_file(&destination);
+        assert_eq!(
+            save_verified_movie_torrent_with(
+                &state,
+                &response[0],
+                |_| Some(destination.clone()),
+                write_new_torrent_file,
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read(&destination).expect("saved torrent must exist"),
+            bytes
+        );
+        assert_eq!(
+            save_verified_movie_torrent_with(
+                &state,
+                &response[0],
+                |_| Some(destination.clone()),
+                write_new_torrent_file,
+            ),
+            Err(MOVIE_TORRENT_SAVE_FAILED)
+        );
+        assert_eq!(
+            fs::read(&destination).expect("existing torrent must remain"),
+            bytes
+        );
+        assert_eq!(
+            save_verified_movie_torrent_with(
+                &state,
+                "vr-1-1-123",
+                |_| Some(destination.clone()),
+                write_new_torrent_file,
+            ),
+            Err(MOVIE_TORRENT_STALE)
+        );
+        fs::remove_file(destination).expect("fixture torrent must be removable");
     }
 }
