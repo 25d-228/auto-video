@@ -32,17 +32,18 @@ use tv_library::{
     TV_LIBRARY_SCAN_FAILED,
 };
 use tv_release::{
-    fetch_apibay_tv_releases_with, TV_APIBAY_PROVIDER_ERROR, TV_TMDB_MALFORMED,
-    TV_TMDB_UNAUTHORIZED,
+    fetch_apibay_tv_releases_for_state_with, TvReleaseState, TvTorrentInspectionRequest,
+    TV_APIBAY_PROVIDER_ERROR, TV_TMDB_MALFORMED, TV_TMDB_UNAUTHORIZED, TV_TORRENT_SAVE_FAILED,
 };
 use vr_download::{
     apply_organization, cancel_download, clear_vr_folder as clear_trusted_vr_folder,
-    configure_adult_download_folder, configure_movie_download_folder, configured_vr_folder,
-    dismiss_download, dismiss_organization, list_downloads, load_download_limit, load_downloads,
-    load_vr_folder_with, pause_download, preview_organization, resume_download,
-    save_download_limit, set_vr_folder, start_adult_download, start_download, start_movie_download,
-    VrDownloadState, VR_DOWNLOAD_FAILED, VR_DOWNLOAD_LIMIT_STORAGE_FAILED,
-    VR_DOWNLOAD_PERSISTENCE_FAILED, VR_FOLDER_STORAGE_FAILED, VR_FOLDER_UNAVAILABLE,
+    configure_adult_download_folder, configure_movie_download_folder, configure_tv_download_folder,
+    configured_vr_folder, dismiss_download, dismiss_organization, inspect_tv_torrent,
+    list_downloads, load_download_limit, load_downloads, load_vr_folder_with, pause_download,
+    preview_organization, resume_download, save_download_limit, set_vr_folder,
+    start_adult_download, start_download, start_movie_download, start_tv_download, VrDownloadState,
+    VR_DOWNLOAD_FAILED, VR_DOWNLOAD_LIMIT_STORAGE_FAILED, VR_DOWNLOAD_PERSISTENCE_FAILED,
+    VR_FOLDER_STORAGE_FAILED, VR_FOLDER_UNAVAILABLE,
 };
 use vr_library::{
     invalidate_vr_library, open_vr_file_with, reveal_vr_file_with, scan_vr_library_with,
@@ -1131,14 +1132,20 @@ async fn reveal_movie(path: String) -> Result<(), String> {
 fn load_tv_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, TvLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
 ) -> Result<Vec<String>, String> {
-    load_tv_folder_with(state.inner(), &tv_folder_path(&app)?).map_err(str::to_owned)
+    let response =
+        load_tv_folder_with(state.inner(), &tv_folder_path(&app)?).map_err(str::to_owned)?;
+    let folder = configured_tv_folder(state.inner()).map_err(str::to_owned)?;
+    configure_tv_download_folder(download_state.inner(), folder).map_err(str::to_owned)?;
+    Ok(response)
 }
 
 #[tauri::command]
 async fn choose_tv_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, TvLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
 ) -> Result<Option<String>, String> {
     let dialog_app = app.clone();
     let selected_folder = tauri::async_runtime::spawn_blocking(move || {
@@ -1156,17 +1163,21 @@ async fn choose_tv_folder(
     let folder = selected_folder
         .into_path()
         .map_err(|_| TV_FOLDER_UNAVAILABLE.to_owned())?;
-    set_tv_folder(state.inner(), &tv_folder_path(&app)?, folder)
-        .map(Some)
-        .map_err(str::to_owned)
+    let path =
+        set_tv_folder(state.inner(), &tv_folder_path(&app)?, folder).map_err(str::to_owned)?;
+    let folder = configured_tv_folder(state.inner()).map_err(str::to_owned)?;
+    configure_tv_download_folder(download_state.inner(), folder).map_err(str::to_owned)?;
+    Ok(Some(path))
 }
 
 #[tauri::command]
 fn clear_tv_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, TvLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
 ) -> Result<(), String> {
-    clear_trusted_tv_folder(state.inner(), &tv_folder_path(&app)?).map_err(str::to_owned)
+    clear_trusted_tv_folder(state.inner(), &tv_folder_path(&app)?).map_err(str::to_owned)?;
+    configure_tv_download_folder(download_state.inner(), None).map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -1653,6 +1664,26 @@ async fn start_verified_movie_download(
 }
 
 #[tauri::command]
+async fn start_verified_tv_download(
+    app: tauri::AppHandle,
+    inspection_id: String,
+    selected_file_ids: Vec<usize>,
+    download_state: tauri::State<'_, VrDownloadState>,
+    torrent_state: tauri::State<'_, TvReleaseState>,
+) -> Result<String, String> {
+    start_tv_download(
+        download_state.inner(),
+        torrent_state.inner(),
+        &vr_downloads_path(&app)?,
+        &vr_session_folder(&app)?,
+        &inspection_id,
+        &selected_file_ids,
+    )
+    .await
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn pause_vr_download(
     app: tauri::AppHandle,
     transfer_id: String,
@@ -1814,6 +1845,7 @@ async fn fetch_apibay_tv_releases(
     tmdb_tv_id: u64,
     provider_season_id: u64,
     provider_episode_id: u64,
+    state: tauri::State<'_, TvReleaseState>,
 ) -> Result<Vec<String>, String> {
     if tmdb_tv_id == 0 || provider_season_id == 0 || provider_episode_id == 0 {
         return Err(TV_TMDB_MALFORMED.to_owned());
@@ -1824,8 +1856,12 @@ async fn fetch_apibay_tv_releases(
     if !is_valid_tmdb_token(&token) {
         return Err(TV_TMDB_MALFORMED.to_owned());
     }
+    let state = state.inner().clone();
+    let generation = state.begin_release_lookup().map_err(str::to_owned)?;
     tauri::async_runtime::spawn_blocking(move || {
-        fetch_apibay_tv_releases_with(
+        fetch_apibay_tv_releases_for_state_with(
+            &state,
+            generation,
             tmdb_tv_id,
             provider_season_id,
             provider_episode_id,
@@ -1836,6 +1872,48 @@ async fn fetch_apibay_tv_releases(
     })
     .await
     .map_err(|_| TV_APIBAY_PROVIDER_ERROR.to_owned())?
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn inspect_apibay_tv_torrent(
+    app: tauri::AppHandle,
+    tmdb_tv_id: u64,
+    show_name: String,
+    provider_season_id: u64,
+    season_number: u64,
+    provider_episode_id: u64,
+    episode_number: u64,
+    episode_name: String,
+    imdb_id: String,
+    provider_item_id: String,
+    provider_category: String,
+    release_name: String,
+    expected_infohash: String,
+    download_state: tauri::State<'_, VrDownloadState>,
+    torrent_state: tauri::State<'_, TvReleaseState>,
+) -> Result<Vec<String>, String> {
+    inspect_tv_torrent(
+        download_state.inner(),
+        torrent_state.inner(),
+        &vr_session_folder(&app)?,
+        TvTorrentInspectionRequest {
+            tmdb_tv_id,
+            show_name,
+            provider_season_id,
+            season_number,
+            provider_episode_id,
+            episode_number,
+            episode_name,
+            imdb_id,
+            provider_item_id,
+            provider_category,
+            release_name,
+            expected_infohash,
+        },
+    )
+    .await
+    .map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -1979,6 +2057,16 @@ fn invalidate_movie_release_context(
 }
 
 #[tauri::command]
+fn invalidate_verified_tv_torrent(state: tauri::State<'_, TvReleaseState>) -> Result<(), String> {
+    state.invalidate_inspection().map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn invalidate_tv_release_context(state: tauri::State<'_, TvReleaseState>) -> Result<(), String> {
+    state.invalidate_release_context().map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn save_verified_vr_torrent(
     app: tauri::AppHandle,
     inspection_id: String,
@@ -2062,6 +2150,34 @@ async fn save_verified_movie_torrent(
     .map_err(|_| MOVIE_TORRENT_SAVE_FAILED.to_owned())?
 }
 
+#[tauri::command]
+async fn save_verified_tv_torrent(
+    app: tauri::AppHandle,
+    inspection_id: String,
+    state: tauri::State<'_, TvReleaseState>,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .save_verified_torrent_with(
+                &inspection_id,
+                |default_file_name| {
+                    app.dialog()
+                        .file()
+                        .set_title("Save verified TV torrent")
+                        .add_filter("Torrent", &["torrent"])
+                        .set_file_name(default_file_name)
+                        .blocking_save_file()
+                        .and_then(|path| path.into_path().ok())
+                },
+                write_new_torrent_file,
+            )
+            .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| TV_TORRENT_SAVE_FAILED.to_owned())?
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2070,6 +2186,7 @@ fn main() {
         .manage(AdultLibraryState::default())
         .manage(AdultTorrentState::default())
         .manage(TvLibraryState::default())
+        .manage(TvReleaseState::default())
         .manage(VrTorrentState::default())
         .manage(VrDownloadState::default())
         .manage(VrLibraryState::default())
@@ -2113,6 +2230,7 @@ fn main() {
             start_verified_vr_download,
             start_verified_adult_download,
             start_verified_movie_download,
+            start_verified_tv_download,
             pause_vr_download,
             resume_vr_download,
             cancel_vr_download,
@@ -2126,6 +2244,7 @@ fn main() {
             fetch_sukebei_vr_releases,
             fetch_yts_movie_releases,
             fetch_apibay_tv_releases,
+            inspect_apibay_tv_torrent,
             inspect_sukebei_adult_torrent,
             inspect_sukebei_vr_torrent,
             inspect_yts_movie_torrent,
@@ -2133,9 +2252,12 @@ fn main() {
             invalidate_verified_vr_torrent,
             invalidate_verified_movie_torrent,
             invalidate_movie_release_context,
+            invalidate_verified_tv_torrent,
+            invalidate_tv_release_context,
             save_verified_adult_torrent,
             save_verified_vr_torrent,
-            save_verified_movie_torrent
+            save_verified_movie_torrent,
+            save_verified_tv_torrent
         ])
         .run(tauri::generate_context!())
         .expect("failed to run the Auto-Video desktop application");

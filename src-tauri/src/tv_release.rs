@@ -1,10 +1,17 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     is_valid_tmdb_token,
     vr_torrent::{
-        canonical_imdb_id, canonical_infohash, json_array, json_object, json_string, json_u64,
-        JsonParser, JsonValue,
+        canonical_imdb_id, canonical_infohash, encode_torrent_inspection, json_array, json_object,
+        json_string, json_u64, parse_torrent_metadata, revalidate_persisted_tv_download_source,
+        JsonParser, JsonValue, TorrentInspectionError, TorrentMetadata, TvDownloadIdentity,
+        VerifiedDownloadSource, VerifiedDownloadSourceError,
     },
     MovieProviderRequestError,
 };
@@ -20,6 +27,16 @@ pub(crate) const TV_APIBAY_NETWORK_ERROR: &str = "tv_release_apibay_network_erro
 pub(crate) const TV_APIBAY_MALFORMED: &str = "tv_release_apibay_malformed";
 pub(crate) const TV_APIBAY_CONFLICTING: &str = "tv_release_apibay_conflicting";
 pub(crate) const TV_APIBAY_PROVIDER_ERROR: &str = "tv_release_apibay_provider_error";
+pub(crate) const TV_TORRENT_CONTEXT_INVALID: &str = "tv_torrent_context_invalid";
+pub(crate) const TV_TORRENT_INFOHASH_MISMATCH: &str = "tv_torrent_infohash_mismatch";
+pub(crate) const TV_TORRENT_MALFORMED: &str = "tv_torrent_malformed";
+pub(crate) const TV_TORRENT_NETWORK_ERROR: &str = "tv_torrent_network_error";
+pub(crate) const TV_TORRENT_NO_PEERS: &str = "tv_torrent_no_peers";
+pub(crate) const TV_TORRENT_SAVE_FAILED: &str = "tv_torrent_save_failed";
+pub(crate) const TV_TORRENT_SOURCE_UNAVAILABLE: &str = "tv_torrent_source_unavailable";
+pub(crate) const TV_TORRENT_STALE: &str = "tv_torrent_stale";
+pub(crate) const TV_TORRENT_TIMEOUT: &str = "tv_torrent_timeout";
+pub(crate) const TV_TORRENT_UNSUPPORTED: &str = "tv_torrent_unsupported";
 
 const TMDB_TV_URL: &str = "https://api.themoviedb.org/3/tv/";
 const API_BAY_QUERY_URL: &str = "https://apibay.org/q.php?q=";
@@ -28,6 +45,7 @@ const API_BAY_NO_RESULTS_INFOHASH: &str = "0000000000000000000000000000000000000
 const TV_CATEGORIES: [u64; 2] = [205, 208];
 const MAX_PROVIDER_ROWS: usize = 500;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TrustedEpisodeContext {
     tmdb_tv_id: u64,
     show_name: String,
@@ -39,6 +57,7 @@ struct TrustedEpisodeContext {
     imdb_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ApiBayRelease {
     provider_item_id: String,
     name: String,
@@ -50,6 +69,292 @@ struct ApiBayRelease {
     status: String,
     added: String,
     infohash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrustedTvReleaseSet {
+    generation: u64,
+    context: TrustedEpisodeContext,
+    releases: Vec<ApiBayRelease>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TvTorrentInspectionRequest {
+    pub(crate) tmdb_tv_id: u64,
+    pub(crate) show_name: String,
+    pub(crate) provider_season_id: u64,
+    pub(crate) season_number: u64,
+    pub(crate) provider_episode_id: u64,
+    pub(crate) episode_number: u64,
+    pub(crate) episode_name: String,
+    pub(crate) imdb_id: String,
+    pub(crate) provider_item_id: String,
+    pub(crate) provider_category: String,
+    pub(crate) release_name: String,
+    pub(crate) expected_infohash: String,
+}
+
+impl TvTorrentInspectionRequest {
+    fn context(&self) -> TrustedEpisodeContext {
+        TrustedEpisodeContext {
+            tmdb_tv_id: self.tmdb_tv_id,
+            show_name: self.show_name.clone(),
+            provider_season_id: self.provider_season_id,
+            season_number: self.season_number,
+            provider_episode_id: self.provider_episode_id,
+            episode_number: self.episode_number,
+            episode_name: self.episode_name.clone(),
+            imdb_id: self.imdb_id.clone(),
+        }
+    }
+
+    fn identity(&self) -> TvDownloadIdentity {
+        TvDownloadIdentity {
+            tmdb_tv_id: self.tmdb_tv_id,
+            show_name: self.show_name.clone(),
+            provider_season_id: self.provider_season_id,
+            season_number: self.season_number,
+            provider_episode_id: self.provider_episode_id,
+            episode_number: self.episode_number,
+            episode_name: self.episode_name.clone(),
+            imdb_id: self.imdb_id.clone(),
+            provider_item_id: self.provider_item_id.clone(),
+            provider_category: self.provider_category.clone(),
+            release_name: self.release_name.clone(),
+            expected_infohash: self.expected_infohash.clone(),
+        }
+    }
+}
+
+struct CachedTvTorrent {
+    generation: u64,
+    inspection_id: String,
+    default_file_name: String,
+    identity: TvDownloadIdentity,
+    bytes: Vec<u8>,
+    metadata: TorrentMetadata,
+}
+
+#[derive(Default)]
+struct TvReleaseContext {
+    release_generation: u64,
+    inspection_generation: u64,
+    release_set: Option<TrustedTvReleaseSet>,
+    cached_torrent: Option<CachedTvTorrent>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct TvReleaseState(Arc<Mutex<TvReleaseContext>>);
+
+#[derive(Clone)]
+pub(crate) struct TvInspectionTicket {
+    release_generation: u64,
+    inspection_generation: u64,
+    request: TvTorrentInspectionRequest,
+}
+
+impl TvInspectionTicket {
+    pub(crate) fn magnet_url(&self) -> String {
+        let display_name = percent_encode(&self.request.release_name);
+        format!(
+            "magnet:?xt=urn:btih:{}&dn={display_name}",
+            self.request.expected_infohash
+        )
+    }
+}
+
+impl TvReleaseState {
+    pub(crate) fn begin_release_lookup(&self) -> Result<u64, &'static str> {
+        let mut context = self.0.lock().map_err(|_| TV_APIBAY_PROVIDER_ERROR)?;
+        context.release_generation = context.release_generation.wrapping_add(1);
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.release_set = None;
+        context.cached_torrent = None;
+        Ok(context.release_generation)
+    }
+
+    fn finish_release_lookup(
+        &self,
+        release_set: TrustedTvReleaseSet,
+    ) -> Result<Vec<String>, &'static str> {
+        let response = flatten_releases(&release_set.context, &release_set.releases);
+        let mut context = self.0.lock().map_err(|_| TV_APIBAY_PROVIDER_ERROR)?;
+        if context.release_generation != release_set.generation {
+            return Err(TV_TORRENT_STALE);
+        }
+        context.release_set = Some(release_set);
+        Ok(response)
+    }
+
+    pub(crate) fn begin_inspection(
+        &self,
+        request: TvTorrentInspectionRequest,
+    ) -> Result<TvInspectionTicket, &'static str> {
+        let mut context = self.0.lock().map_err(|_| TV_APIBAY_PROVIDER_ERROR)?;
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.cached_torrent = None;
+        let release_is_current = context.release_set.as_ref().is_some_and(|release_set| {
+            release_set.generation == context.release_generation
+                && release_set.context == request.context()
+                && release_set.releases.iter().any(|release| {
+                    release.provider_item_id == request.provider_item_id
+                        && release.name == request.release_name
+                        && release.category == request.provider_category
+                        && release.infohash == request.expected_infohash
+                })
+        });
+        if !release_is_current {
+            return Err(TV_TORRENT_CONTEXT_INVALID);
+        }
+        Ok(TvInspectionTicket {
+            release_generation: context.release_generation,
+            inspection_generation: context.inspection_generation,
+            request,
+        })
+    }
+
+    pub(crate) fn finish_inspection(
+        &self,
+        ticket: TvInspectionTicket,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<String>, &'static str> {
+        let metadata = parse_torrent_metadata(&bytes).map_err(tv_torrent_parse_error)?;
+        if metadata.infohash != ticket.request.expected_infohash {
+            return Err(TV_TORRENT_INFOHASH_MISMATCH);
+        }
+        let mut context = self.0.lock().map_err(|_| TV_APIBAY_PROVIDER_ERROR)?;
+        let is_current = context.release_set.as_ref().is_some_and(|release_set| {
+            release_set.generation == ticket.release_generation
+                && release_set.context == ticket.request.context()
+                && release_set.releases.iter().any(|release| {
+                    release.provider_item_id == ticket.request.provider_item_id
+                        && release.name == ticket.request.release_name
+                        && release.category == ticket.request.provider_category
+                        && release.infohash == ticket.request.expected_infohash
+                })
+        });
+        if context.release_generation != ticket.release_generation
+            || context.inspection_generation != ticket.inspection_generation
+            || !is_current
+        {
+            return Err(TV_TORRENT_STALE);
+        }
+        let inspection_id = format!(
+            "tv-{}-{}-{}",
+            ticket.release_generation,
+            ticket.inspection_generation,
+            ticket.request.provider_item_id
+        );
+        context.cached_torrent = Some(CachedTvTorrent {
+            generation: ticket.inspection_generation,
+            inspection_id: inspection_id.clone(),
+            default_file_name: format!(
+                "tv-{}-{}.torrent",
+                ticket.request.provider_item_id, ticket.request.expected_infohash
+            ),
+            identity: ticket.request.identity(),
+            bytes,
+            metadata: metadata.clone(),
+        });
+        Ok(encode_torrent_inspection(inspection_id, metadata))
+    }
+
+    pub(crate) fn invalidate_inspection(&self) -> Result<(), &'static str> {
+        let mut context = self.0.lock().map_err(|_| TV_APIBAY_PROVIDER_ERROR)?;
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.cached_torrent = None;
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_release_context(&self) -> Result<(), &'static str> {
+        self.begin_release_lookup().map(|_| ())
+    }
+
+    pub(crate) fn verified_download_source(
+        &self,
+        inspection_id: &str,
+        selected_file_ids: &[usize],
+    ) -> Result<VerifiedDownloadSource, VerifiedDownloadSourceError> {
+        let (identity, bytes, expected_metadata) = {
+            let context = self
+                .0
+                .lock()
+                .map_err(|_| VerifiedDownloadSourceError::Context)?;
+            context
+                .cached_torrent
+                .as_ref()
+                .filter(|torrent| {
+                    torrent.inspection_id == inspection_id
+                        && torrent.generation == context.inspection_generation
+                })
+                .map(|torrent| {
+                    (
+                        torrent.identity.clone(),
+                        torrent.bytes.clone(),
+                        torrent.metadata.clone(),
+                    )
+                })
+                .ok_or(VerifiedDownloadSourceError::Context)?
+        };
+        let source = revalidate_persisted_tv_download_source(
+            &bytes,
+            &identity,
+            &identity.expected_infohash,
+            selected_file_ids,
+        )?;
+        let reparsed =
+            parse_torrent_metadata(&bytes).map_err(|_| VerifiedDownloadSourceError::Metainfo)?;
+        if reparsed != expected_metadata {
+            return Err(VerifiedDownloadSourceError::Metainfo);
+        }
+        Ok(source)
+    }
+
+    pub(crate) fn save_verified_torrent_with(
+        &self,
+        inspection_id: &str,
+        choose_destination: impl FnOnce(&str) -> Option<PathBuf>,
+        write: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+    ) -> Result<bool, &'static str> {
+        let default_file_name = {
+            let context = self.0.lock().map_err(|_| TV_TORRENT_SAVE_FAILED)?;
+            context
+                .cached_torrent
+                .as_ref()
+                .filter(|torrent| {
+                    torrent.inspection_id == inspection_id
+                        && torrent.generation == context.inspection_generation
+                })
+                .map(|torrent| torrent.default_file_name.clone())
+                .ok_or(TV_TORRENT_STALE)?
+        };
+        let Some(destination) = choose_destination(&default_file_name) else {
+            return Ok(false);
+        };
+        let context = self.0.lock().map_err(|_| TV_TORRENT_SAVE_FAILED)?;
+        let torrent = context
+            .cached_torrent
+            .as_ref()
+            .filter(|torrent| {
+                torrent.inspection_id == inspection_id
+                    && torrent.generation == context.inspection_generation
+            })
+            .ok_or(TV_TORRENT_STALE)?;
+        let reparsed = parse_torrent_metadata(&torrent.bytes).map_err(tv_torrent_parse_error)?;
+        if reparsed != torrent.metadata {
+            return Err(TV_TORRENT_MALFORMED);
+        }
+        write(&destination, &torrent.bytes).map_err(|_| TV_TORRENT_SAVE_FAILED)?;
+        Ok(true)
+    }
+}
+
+fn tv_torrent_parse_error(error: TorrentInspectionError) -> &'static str {
+    match error {
+        TorrentInspectionError::Malformed => TV_TORRENT_MALFORMED,
+        TorrentInspectionError::Unsupported => TV_TORRENT_UNSUPPORTED,
+        _ => TV_TORRENT_MALFORMED,
+    }
 }
 
 fn tmdb_error_code(error: MovieProviderRequestError) -> &'static str {
@@ -73,13 +378,56 @@ fn apibay_error_code(error: MovieProviderRequestError) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn fetch_apibay_tv_releases_with(
     tmdb_tv_id: u64,
     requested_provider_season_id: u64,
     requested_provider_episode_id: u64,
     tmdb_token: &str,
-    mut request: impl FnMut(&str, Option<&str>) -> Result<String, MovieProviderRequestError>,
+    request: impl FnMut(&str, Option<&str>) -> Result<String, MovieProviderRequestError>,
 ) -> Result<Vec<String>, &'static str> {
+    let release_set = trusted_apibay_tv_releases_with(
+        0,
+        tmdb_tv_id,
+        requested_provider_season_id,
+        requested_provider_episode_id,
+        tmdb_token,
+        request,
+    )?;
+    Ok(flatten_releases(
+        &release_set.context,
+        &release_set.releases,
+    ))
+}
+
+pub(crate) fn fetch_apibay_tv_releases_for_state_with(
+    state: &TvReleaseState,
+    generation: u64,
+    tmdb_tv_id: u64,
+    requested_provider_season_id: u64,
+    requested_provider_episode_id: u64,
+    tmdb_token: &str,
+    request: impl FnMut(&str, Option<&str>) -> Result<String, MovieProviderRequestError>,
+) -> Result<Vec<String>, &'static str> {
+    let release_set = trusted_apibay_tv_releases_with(
+        generation,
+        tmdb_tv_id,
+        requested_provider_season_id,
+        requested_provider_episode_id,
+        tmdb_token,
+        request,
+    )?;
+    state.finish_release_lookup(release_set)
+}
+
+fn trusted_apibay_tv_releases_with(
+    generation: u64,
+    tmdb_tv_id: u64,
+    requested_provider_season_id: u64,
+    requested_provider_episode_id: u64,
+    tmdb_token: &str,
+    mut request: impl FnMut(&str, Option<&str>) -> Result<String, MovieProviderRequestError>,
+) -> Result<TrustedTvReleaseSet, &'static str> {
     if tmdb_tv_id == 0
         || requested_provider_season_id == 0
         || requested_provider_episode_id == 0
@@ -135,7 +483,11 @@ pub(crate) fn fetch_apibay_tv_releases_with(
         )?);
     }
 
-    Ok(flatten_releases(&context, &releases))
+    Ok(TrustedTvReleaseSet {
+        generation,
+        context,
+        releases,
+    })
 }
 
 fn trusted_show_season(
@@ -388,7 +740,11 @@ fn percent_encode(value: &str) -> String {
     encoded
 }
 
-fn has_exact_episode_identity(name: &str, season_number: u64, episode_number: u64) -> bool {
+pub(crate) fn has_exact_episode_identity(
+    name: &str,
+    season_number: u64,
+    episode_number: u64,
+) -> bool {
     let bytes = name.as_bytes();
     let mut identities = Vec::new();
     for start in 0..bytes.len() {
@@ -988,5 +1344,203 @@ mod tests {
             });
             assert_eq!(result, Err(expected));
         }
+    }
+
+    fn push_bencoded_bytes(target: &mut Vec<u8>, value: &[u8]) {
+        target.extend_from_slice(value.len().to_string().as_bytes());
+        target.push(b':');
+        target.extend_from_slice(value);
+    }
+
+    fn deterministic_tv_metainfo() -> Vec<u8> {
+        let mut info = b"d5:filesl".to_vec();
+        for (size, components) in [
+            (
+                5_u64,
+                vec![
+                    "Exact  Show — 特別版".as_bytes(),
+                    "第三話  —  Exact Episode.mkv".as_bytes(),
+                ],
+            ),
+            (
+                4_u64,
+                vec!["Exact  Show — 特別版".as_bytes(), "notes.txt".as_bytes()],
+            ),
+        ] {
+            info.extend_from_slice(b"d6:lengthi");
+            info.extend_from_slice(size.to_string().as_bytes());
+            info.extend_from_slice(b"e4:pathl");
+            for component in components {
+                push_bencoded_bytes(&mut info, component);
+            }
+            info.extend_from_slice(b"ee");
+        }
+        info.extend_from_slice(b"e4:name");
+        push_bencoded_bytes(&mut info, "Exact  Show — 特別版 S02E03".as_bytes());
+        info.extend_from_slice(b"12:piece lengthi8e6:pieces40:");
+        info.extend_from_slice(b"aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbb");
+        info.push(b'e');
+        let mut metainfo = b"d4:info".to_vec();
+        metainfo.extend_from_slice(&info);
+        metainfo.push(b'e');
+        metainfo
+    }
+
+    fn state_with_exact_tv_release(
+        metainfo: &[u8],
+    ) -> (TvReleaseState, TvTorrentInspectionRequest) {
+        let infohash = parse_torrent_metadata(metainfo)
+            .expect("fixture metainfo must parse")
+            .infohash;
+        let state = TvReleaseState::default();
+        let generation = state
+            .begin_release_lookup()
+            .expect("release lookup must begin");
+        let row = release(
+            "1001",
+            "Exact  Show — 特別版.S02E03+720p.第三話",
+            "205",
+            "tt0123456",
+            &infohash,
+        );
+        fetch_apibay_tv_releases_for_state_with(
+            &state,
+            generation,
+            701,
+            9001,
+            9103,
+            "fixture-token",
+            |url, _| {
+                if url.ends_with("/tv/701") {
+                    Ok(DETAILS.to_owned())
+                } else if url.ends_with("/season/2") {
+                    Ok(SEASON.to_owned())
+                } else if url.ends_with("/external_ids") {
+                    Ok(EXTERNAL_IDS.to_owned())
+                } else if url.ends_with("cat=205") {
+                    Ok(format!("[{row}]"))
+                } else {
+                    Ok(NO_RESULTS.to_owned())
+                }
+            },
+        )
+        .expect("exact release context must finish");
+        (
+            state,
+            TvTorrentInspectionRequest {
+                tmdb_tv_id: 701,
+                show_name: "Exact  Show — 特別版".to_owned(),
+                provider_season_id: 9001,
+                season_number: 2,
+                provider_episode_id: 9103,
+                episode_number: 3,
+                episode_name: "第三話  —  Exact Episode".to_owned(),
+                imdb_id: "tt0123456".to_owned(),
+                provider_item_id: "1001".to_owned(),
+                provider_category: "205".to_owned(),
+                release_name: "Exact  Show — 特別版.S02E03+720p.第三話".to_owned(),
+                expected_infohash: infohash,
+            },
+        )
+    }
+
+    #[test]
+    fn caches_exact_tv_metainfo_and_revalidates_only_explicit_selected_files() {
+        let metainfo = deterministic_tv_metainfo();
+        let (state, request) = state_with_exact_tv_release(&metainfo);
+        let ticket = state
+            .begin_inspection(request.clone())
+            .expect("trusted TV inspection must begin");
+        assert!(ticket.magnet_url().starts_with(&format!(
+            "magnet:?xt=urn:btih:{}&dn=",
+            request.expected_infohash
+        )));
+        let response = state
+            .finish_inspection(ticket, metainfo.clone())
+            .expect("exact TV metainfo must verify");
+        assert_eq!(response[1], "Exact  Show — 特別版 S02E03");
+        assert_eq!(response[2], request.expected_infohash);
+        assert_eq!(response[3], "9");
+        assert_eq!(response.len(), 8);
+
+        let source = state
+            .verified_download_source(&response[0], &[0])
+            .expect("one selected episode file must revalidate");
+        assert_eq!(source.selected_files.len(), 1);
+        assert_eq!(source.selected_files[0].file_id, 0);
+        assert_eq!(source.bytes, metainfo);
+        assert_eq!(source.tv_identity.as_ref(), Some(&request.identity()));
+        assert!(source.movie_identity.is_none());
+    }
+
+    #[test]
+    fn rejects_fabricated_or_stale_tv_context_and_saves_only_cached_bytes() {
+        let metainfo = deterministic_tv_metainfo();
+        let (state, request) = state_with_exact_tv_release(&metainfo);
+        let mut fabricated = request.clone();
+        fabricated.provider_category = "208".to_owned();
+        assert_eq!(
+            state.begin_inspection(fabricated).err(),
+            Some(TV_TORRENT_CONTEXT_INVALID)
+        );
+
+        let mismatch_ticket = state
+            .begin_inspection(request.clone())
+            .expect("trusted inspection must begin before hash verification");
+        let mut mismatched_metainfo = metainfo.clone();
+        let piece_byte = mismatched_metainfo
+            .iter()
+            .rposition(|byte| *byte == b'b')
+            .expect("fixture piece bytes must exist");
+        mismatched_metainfo[piece_byte] = b'c';
+        assert_eq!(
+            state.finish_inspection(mismatch_ticket, mismatched_metainfo),
+            Err(TV_TORRENT_INFOHASH_MISMATCH)
+        );
+
+        let ticket = state
+            .begin_inspection(request.clone())
+            .expect("current inspection must begin");
+        let response = state
+            .finish_inspection(ticket, metainfo.clone())
+            .expect("metainfo must cache");
+        let mut writes = 0;
+        assert_eq!(
+            state.save_verified_torrent_with(
+                &response[0],
+                |_| None,
+                |_, _| {
+                    writes += 1;
+                    Ok(())
+                }
+            ),
+            Ok(false)
+        );
+        assert_eq!(writes, 0);
+        assert_eq!(
+            state.save_verified_torrent_with(
+                &response[0],
+                |_| Some(PathBuf::from("fixture.torrent")),
+                |path, bytes| {
+                    assert_eq!(path, Path::new("fixture.torrent"));
+                    assert_eq!(bytes, metainfo);
+                    writes += 1;
+                    Ok(())
+                }
+            ),
+            Ok(true)
+        );
+        assert_eq!(writes, 1);
+
+        let stale_ticket = state
+            .begin_inspection(request)
+            .expect("second inspection must begin");
+        state
+            .begin_release_lookup()
+            .expect("new release lookup must invalidate inspection");
+        assert_eq!(
+            state.finish_inspection(stale_ticket, metainfo),
+            Err(TV_TORRENT_STALE)
+        );
     }
 }
