@@ -32,12 +32,12 @@ use tv_library::{
 };
 use vr_download::{
     apply_organization, cancel_download, clear_vr_folder as clear_trusted_vr_folder,
-    configure_adult_download_folder, configured_vr_folder, dismiss_download, dismiss_organization,
-    list_downloads, load_download_limit, load_downloads, load_vr_folder_with, pause_download,
-    preview_organization, resume_download, save_download_limit, set_vr_folder,
-    start_adult_download, start_download, VrDownloadState, VR_DOWNLOAD_FAILED,
-    VR_DOWNLOAD_LIMIT_STORAGE_FAILED, VR_DOWNLOAD_PERSISTENCE_FAILED, VR_FOLDER_STORAGE_FAILED,
-    VR_FOLDER_UNAVAILABLE,
+    configure_adult_download_folder, configure_movie_download_folder, configured_vr_folder,
+    dismiss_download, dismiss_organization, list_downloads, load_download_limit, load_downloads,
+    load_vr_folder_with, pause_download, preview_organization, resume_download,
+    save_download_limit, set_vr_folder, start_adult_download, start_download, start_movie_download,
+    VrDownloadState, VR_DOWNLOAD_FAILED, VR_DOWNLOAD_LIMIT_STORAGE_FAILED,
+    VR_DOWNLOAD_PERSISTENCE_FAILED, VR_FOLDER_STORAGE_FAILED, VR_FOLDER_UNAVAILABLE,
 };
 use vr_library::{
     invalidate_vr_library, open_vr_file_with, reveal_vr_file_with, scan_vr_library_with,
@@ -981,8 +981,11 @@ fn vr_session_folder(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 fn load_movies_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, MoviesLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
 ) -> Result<Option<String>, String> {
     let folder = load_movies_folder_file(&movies_folder_path(&app)?)?;
+    configure_movie_download_folder(download_state.inner(), folder.clone())
+        .map_err(str::to_owned)?;
     let response = folder
         .as_ref()
         .map(|folder| {
@@ -1005,6 +1008,7 @@ fn load_movies_folder(
 async fn choose_movies_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, MoviesLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
 ) -> Result<Option<String>, String> {
     let dialog_app = app.clone();
     let selected_folder = tauri::async_runtime::spawn_blocking(move || {
@@ -1019,9 +1023,11 @@ async fn choose_movies_folder(
     let Some(selected_folder) = selected_folder else {
         return Ok(None);
     };
-    let folder = selected_folder
+    let selected_folder = selected_folder
         .into_path()
         .map_err(|_| MOVIES_FOLDER_UNAVAILABLE.to_owned())?;
+    let folder =
+        fs::canonicalize(selected_folder).map_err(|_| MOVIES_FOLDER_UNAVAILABLE.to_owned())?;
     let metadata = fs::metadata(&folder).map_err(|_| MOVIES_FOLDER_UNAVAILABLE.to_owned())?;
     if !metadata.is_dir() {
         return Err(MOVIES_FOLDER_UNAVAILABLE.to_owned());
@@ -1032,6 +1038,8 @@ async fn choose_movies_folder(
         .ok_or_else(|| MOVIES_FOLDER_UNAVAILABLE.to_owned())?;
 
     save_movies_folder_file(&movies_folder_path(&app)?, &folder)?;
+    configure_movie_download_folder(download_state.inner(), Some(folder.clone()))
+        .map_err(str::to_owned)?;
     let mut library = state
         .0
         .lock()
@@ -1045,8 +1053,10 @@ async fn choose_movies_folder(
 fn clear_movies_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, MoviesLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
 ) -> Result<(), String> {
     clear_movies_folder_file(&movies_folder_path(&app)?)?;
+    configure_movie_download_folder(download_state.inner(), None).map_err(str::to_owned)?;
     let mut library = state
         .0
         .lock()
@@ -1618,6 +1628,26 @@ async fn start_verified_adult_download(
 }
 
 #[tauri::command]
+async fn start_verified_movie_download(
+    app: tauri::AppHandle,
+    inspection_id: String,
+    selected_file_ids: Vec<usize>,
+    download_state: tauri::State<'_, VrDownloadState>,
+    torrent_state: tauri::State<'_, MovieTorrentState>,
+) -> Result<String, String> {
+    start_movie_download(
+        download_state.inner(),
+        torrent_state.inner(),
+        &vr_downloads_path(&app)?,
+        &vr_session_folder(&app)?,
+        &inspection_id,
+        &selected_file_ids,
+    )
+    .await
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn pause_vr_download(
     app: tauri::AppHandle,
     transfer_id: String,
@@ -2047,6 +2077,7 @@ fn main() {
             list_vr_downloads,
             start_verified_vr_download,
             start_verified_adult_download,
+            start_verified_movie_download,
             pause_vr_download,
             resume_vr_download,
             cancel_vr_download,

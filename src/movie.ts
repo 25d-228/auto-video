@@ -280,6 +280,33 @@ export async function saveVerifiedMovieTorrent(inspectionId: string) {
   return saved;
 }
 
+export async function startVerifiedMovieDownload(
+  inspectionId: string,
+  selectedFileIds: number[],
+) {
+  const uniqueIds = new Set(selectedFileIds);
+  if (
+    inspectionId.trim() === "" ||
+    selectedFileIds.length === 0 ||
+    uniqueIds.size !== selectedFileIds.length ||
+    selectedFileIds.some(
+      (fileId) => !Number.isSafeInteger(fileId) || fileId < 0,
+    )
+  ) {
+    throw new Error(
+      "A current Movie inspection and valid file selection are required.",
+    );
+  }
+  const transferId = await window.__TAURI__.core.invoke<unknown>(
+    "start_verified_movie_download",
+    { inspectionId, selectedFileIds },
+  );
+  if (typeof transferId !== "string" || transferId === "") {
+    throw new Error("The native Movie download response was invalid.");
+  }
+  return transferId;
+}
+
 export function invalidateVerifiedMovieTorrent() {
   return window.__TAURI__.core.invoke<void>("invalidate_verified_movie_torrent");
 }

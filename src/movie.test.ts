@@ -6,6 +6,7 @@ import {
   invalidateMovieReleaseContext,
   invalidateVerifiedMovieTorrent,
   saveVerifiedMovieTorrent,
+  startVerifiedMovieDownload,
   type MovieReleaseContext,
   type YtsMovieRelease,
 } from "./movie";
@@ -225,5 +226,26 @@ describe("verified YTS Movie torrent inspection and Save", () => {
       ["invalidate_verified_movie_torrent"],
       ["invalidate_movie_release_context"],
     ]);
+  });
+
+  it("starts only an explicit unique Movie file selection from the current inspection", async () => {
+    invokeMock.mockResolvedValue("movie-transfer-419");
+    await expect(
+      startVerifiedMovieDownload("movie-1-1-hash", [2, 0]),
+    ).resolves.toBe("movie-transfer-419");
+    expect(invokeMock).toHaveBeenCalledWith("start_verified_movie_download", {
+      inspectionId: "movie-1-1-hash",
+      selectedFileIds: [2, 0],
+    });
+
+    for (const selectedFileIds of [[], [0, 0], [-1], [1.5]]) {
+      await expect(
+        startVerifiedMovieDownload("movie-1-1-hash", selectedFileIds),
+      ).rejects.toThrow("current Movie inspection");
+    }
+    await expect(startVerifiedMovieDownload(" ", [0])).rejects.toThrow(
+      "current Movie inspection",
+    );
+    expect(invokeMock).toHaveBeenCalledOnce();
   });
 });

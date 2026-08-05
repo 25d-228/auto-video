@@ -72,8 +72,8 @@ export type VrDownloadState =
 
 export type VrDownload = {
   transferId: string;
-  category: "adult" | "unknown" | "vr";
-  code: string;
+  category: "adult" | "movie" | "unknown" | "vr";
+  identity: string;
   releaseName: string;
   selectedFileCount: number;
   totalBytes: string;
@@ -832,7 +832,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
     const [
       transferId,
       category,
-      code,
+      identity,
       releaseName,
       selectedFileCount,
       totalBytes,
@@ -845,12 +845,19 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       canOrganize,
     ] = value.slice(index, index + 13) as string[];
     const count = Number(selectedFileCount);
-    const canonicalCode = canonicalizeProductCode(code);
+    const canonicalCode = canonicalizeProductCode(identity);
     if (
       transferId === "" ||
       transferIds.has(transferId) ||
-      (category !== "adult" && category !== "unknown" && category !== "vr") ||
-      code.trim() === "" ||
+      !["adult", "movie", "unknown", "vr"].includes(category) ||
+      identity.trim() === "" ||
+      ((category === "adult" || category === "vr") &&
+        canonicalCode !== identity) ||
+      (category === "movie" &&
+        (!/^tt\d{7,10}$/.test(identity) ||
+          organizationStatus !== "none" ||
+          organizationRelativeDirectory !== "" ||
+          canOrganize !== "false")) ||
       (category === "unknown" &&
         (count !== 0 ||
           totalBytes !== "0" ||
@@ -862,7 +869,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
           organizationRelativeDirectory !== "" ||
           canOrganize !== "false")) ||
       ((canOrganize === "true" || organizationStatus !== "none") &&
-        canonicalCode !== code) ||
+        canonicalCode !== identity) ||
       releaseName.trim() === "" ||
       !Number.isSafeInteger(count) ||
       count < 0 ||
@@ -881,7 +888,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
         (organizationRelativeDirectory === "") ||
       (organizationStatus !== "none" &&
         (state !== "completed" ||
-          organizationRelativeDirectory !== `${code}/`)) ||
+          organizationRelativeDirectory !== `${identity}/`)) ||
       (canOrganize !== "true" && canOrganize !== "false") ||
       (canOrganize === "true" &&
         (state !== "completed" ||
@@ -894,7 +901,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
     downloads.push({
       transferId,
       category: category as VrDownload["category"],
-      code,
+      identity,
       releaseName,
       selectedFileCount: count,
       totalBytes,
