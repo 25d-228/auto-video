@@ -904,7 +904,7 @@ describe("trusted VR download boundary", () => {
     expect(invokeMock).toHaveBeenCalledWith("load_vr_downloads");
   });
 
-  it("rejects organization state on Adult transfer rows", async () => {
+  it("accepts native-eligible and recoverable Adult organization rows", async () => {
     invokeMock.mockResolvedValue([
       "adult-transfer-123",
       "adult",
@@ -919,9 +919,36 @@ describe("trusted VR download boundary", () => {
       "none",
       "",
       "true",
+      "adult-recovery-123",
+      "adult",
+      "ADLT-123",
+      "ADLT-123 recoverable",
+      "2",
+      "14",
+      "14",
+      "0",
+      "completed",
+      "true",
+      "attention",
+      "ADLT-123/",
+      "true",
     ]);
 
-    await expect(loadVrDownloads()).rejects.toThrow("invalid data");
+    await expect(loadVrDownloads()).resolves.toEqual([
+      expect.objectContaining({
+        transferId: "adult-transfer-123",
+        category: "adult",
+        organizationStatus: "none",
+        canOrganize: true,
+      }),
+      expect.objectContaining({
+        transferId: "adult-recovery-123",
+        category: "adult",
+        organizationStatus: "attention",
+        organizationRelativeDirectory: "ADLT-123/",
+        canOrganize: true,
+      }),
+    ]);
   });
 
   it("accepts category-unknown persisted transfers only as inert offline rows", async () => {

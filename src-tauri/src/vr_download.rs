@@ -17,9 +17,9 @@ use librqbit::{
 
 use crate::vr_library::is_supported_media;
 use crate::vr_torrent::{
-    hex_sha1, media_name_matches_product_code, revalidate_persisted_download_source,
-    AdultTorrentState, VerifiedDownloadFile, VerifiedDownloadSource, VerifiedDownloadSourceError,
-    VrTorrentState,
+    adult_media_name_matches_product_code, hex_sha1, media_name_matches_product_code,
+    revalidate_persisted_download_source, AdultTorrentState, VerifiedDownloadFile,
+    VerifiedDownloadSource, VerifiedDownloadSourceError, VrTorrentState,
 };
 
 pub const VR_DOWNLOAD_ACTION_INVALID: &str = "vr_download_action_invalid";
@@ -42,7 +42,8 @@ pub const VR_ORGANIZATION_STALE: &str = "vr_organization_stale";
 
 const PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_DOWNLOADS_V2\n";
 const LEGACY_PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_VR_DOWNLOADS_V1\n";
-const ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_VR_ORGANIZATION_V1\n";
+const ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_ORGANIZATION_V2\n";
+const LEGACY_ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_VR_ORGANIZATION_V1\n";
 const ORGANIZATION_RECOVERY_PREFIX: &str = ".auto-video-organization-";
 const ORGANIZATION_RECOVERY_SUFFIX: &str = ".recovery";
 const ORGANIZATION_RECOVERY_SUCCESSOR_SUFFIX: &str = ".recovery.next";
@@ -211,6 +212,7 @@ struct OrganizationPlan {
     plan_id: String,
     generation: u64,
     transfer_id: String,
+    category: TransferCategory,
     code: String,
     entries: Vec<OrganizationEntry>,
 }
@@ -270,6 +272,13 @@ fn invalidate_organization_plan(context: &mut VrDownloadContext) {
     context.organization_plan = None;
 }
 
+fn configured_folder(context: &VrDownloadContext, category: TransferCategory) -> Option<&Path> {
+    match category {
+        TransferCategory::Adult => context.adult_future_folder.as_deref(),
+        TransferCategory::Vr => context.future_folder.as_deref(),
+    }
+}
+
 pub(crate) fn configured_vr_folder(
     state: &VrDownloadState,
 ) -> Result<Option<PathBuf>, &'static str> {
@@ -293,6 +302,7 @@ pub fn configure_adult_download_folder(
     folder: Option<PathBuf>,
 ) -> Result<(), &'static str> {
     let mut context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
+    invalidate_organization_plan(&mut context);
     context.adult_future_folder = folder;
     Ok(())
 }
@@ -1006,8 +1016,7 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
                 .zip(source.selected_files.iter())
                 .any(|(current, selected)| current != &selected.path))
         || (organization_state != OrganizationState::None
-            && (category != TransferCategory::Vr
-                || state != TransferState::Completed
+            && (state != TransferState::Completed
                 || downloaded_bytes != selected_total
                 || fingerprints.len() != source.selected_files.len()))
     {
@@ -1318,12 +1327,18 @@ fn parse_organization_recovery_file(path: &Path) -> Option<TransferRecord> {
         return None;
     }
     let bytes = fs::read(path).ok()?;
-    let line = bytes
-        .strip_prefix(ORGANIZATION_RECOVERY_HEADER)?
-        .strip_suffix(b"\n")?;
-    let record = parse_transfer_line(line, true)?;
+    let (line, legacy_vr) = if let Some(line) = bytes.strip_prefix(ORGANIZATION_RECOVERY_HEADER) {
+        (line, false)
+    } else {
+        (
+            bytes.strip_prefix(LEGACY_ORGANIZATION_RECOVERY_HEADER)?,
+            true,
+        )
+    };
+    let record = parse_transfer_line(line.strip_suffix(b"\n")?, legacy_vr)?;
     if record.organization_state != OrganizationState::Attention
         || record.state != TransferState::Completed
+        || (legacy_vr && record.category != TransferCategory::Vr)
         || (organization_recovery_path(&record) != path
             && organization_recovery_successor_path(&record) != path)
     {
@@ -2115,7 +2130,7 @@ pub async fn load_downloads(
     download_limit_path: &Path,
 ) -> Result<Vec<String>, &'static str> {
     load_download_limit(state, download_limit_path)?;
-    let recovery_destination = {
+    let recovery_destinations = {
         let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
         if context.transfers_loaded {
             return Ok(download_rows(&mut context));
@@ -2124,13 +2139,25 @@ pub async fn load_downloads(
             return Err(VR_DOWNLOAD_ACTION_INVALID);
         }
         context.transfers_loading = true;
-        context.future_folder.clone()
+        [
+            (TransferCategory::Vr, context.future_folder.clone()),
+            (TransferCategory::Adult, context.adult_future_folder.clone()),
+        ]
     };
     let persisted_transfers = read_persisted_transfers(persistence_path);
-    let recoveries = recovery_destination
-        .as_deref()
-        .map(read_organization_recoveries)
-        .unwrap_or_default();
+    let mut recovered_transfer_ids = BTreeSet::new();
+    let recoveries = recovery_destinations
+        .into_iter()
+        .filter_map(|(category, destination)| {
+            destination.map(|destination| (category, destination))
+        })
+        .flat_map(|(category, destination)| {
+            read_organization_recoveries(&destination)
+                .into_iter()
+                .filter(move |record| record.category == category)
+        })
+        .filter(|record| recovered_transfer_ids.insert(record.transfer_id.clone()))
+        .collect::<Vec<_>>();
     let has_durable_recovery = !recoveries.is_empty();
     let mut transfers = match persisted_transfers {
         Ok(transfers) => transfers,
@@ -2226,7 +2253,7 @@ fn selected_progress(record: &TransferRecord, handle: &ManagedTorrentHandle) -> 
     (downloaded.min(record.selected_total()), speed)
 }
 
-fn exact_part_label(file_name: &str) -> Option<String> {
+fn exact_part_label(file_name: &str, category: TransferCategory) -> Option<String> {
     let title = Path::new(file_name).file_stem()?.to_str()?;
     let bytes = title.as_bytes();
     let mut matches = Vec::new();
@@ -2243,7 +2270,9 @@ fn exact_part_label(file_name: &str) -> Option<String> {
         let prefix = std::str::from_utf8(&bytes[label_start..index])
             .ok()?
             .to_ascii_uppercase();
-        if !matches!(prefix.as_str(), "PART" | "PT" | "CD" | "DISC" | "DISK") {
+        if !(matches!(prefix.as_str(), "PART" | "CD" | "DISC" | "DISK")
+            || category == TransferCategory::Vr && prefix == "PT")
+        {
             index = label_start + 1;
             continue;
         }
@@ -2365,7 +2394,13 @@ fn organization_destination_relative(
         .file_stem()
         .and_then(|title| title.to_str())
         .ok_or(VR_ORGANIZATION_STALE)?;
-    if !media_name_matches_product_code(source_title, &record.code) {
+    let identity_matches = match record.category {
+        TransferCategory::Adult => {
+            adult_media_name_matches_product_code(source_title, &record.code)
+        }
+        TransferCategory::Vr => media_name_matches_product_code(source_title, &record.code),
+    };
+    if !identity_matches {
         return Err(VR_ORGANIZATION_INELIGIBLE);
     }
     let extension = Path::new(source_name)
@@ -2374,7 +2409,7 @@ fn organization_destination_relative(
         .ok_or(VR_ORGANIZATION_STALE)?;
     let destination_name = if eligible_media == 1 {
         format!("{}.{}", record.code, extension)
-    } else if let Some(part_label) = exact_part_label(source_name) {
+    } else if let Some(part_label) = exact_part_label(source_name, record.category) {
         format!("{} - {}.{}", record.code, part_label, extension)
     } else {
         source_name.to_owned()
@@ -2388,8 +2423,7 @@ fn organization_entries(
     record: &TransferRecord,
     current_folder: Option<&Path>,
 ) -> Result<Vec<OrganizationEntry>, &'static str> {
-    if record.category != TransferCategory::Vr
-        || record.state != TransferState::Completed
+    if record.state != TransferState::Completed
         || record.handle.is_some()
         || record.pending_action.is_some()
         || record.organization_state == OrganizationState::Organized
@@ -2472,6 +2506,7 @@ fn organization_plan_id(
 ) -> String {
     let mut identity = generation.to_be_bytes().to_vec();
     identity_field(&mut identity, record.transfer_id.as_bytes());
+    identity_field(&mut identity, record.category.as_str().as_bytes());
     for entry in entries {
         identity.extend_from_slice(&(entry.selected_index as u64).to_be_bytes());
         identity_field(&mut identity, entry.kind.as_str().as_bytes());
@@ -2530,11 +2565,12 @@ pub fn preview_organization(
             _ => None,
         })
         .ok_or(VR_ORGANIZATION_STALE)?;
-    let entries = organization_entries(record, context.future_folder.as_deref())?;
+    let entries = organization_entries(record, configured_folder(&context, record.category))?;
     let plan = OrganizationPlan {
         plan_id: organization_plan_id(generation, record, &entries),
         generation,
         transfer_id: record.transfer_id.clone(),
+        category: record.category,
         code: record.code.clone(),
         entries,
     };
@@ -2647,7 +2683,10 @@ fn apply_organization_with_persistence(
         return Err(VR_ORGANIZATION_STALE);
     }
     invalidate_organization_plan(&mut context);
-    let current_folder = context.future_folder.clone();
+    let current_folder = match plan.category {
+        TransferCategory::Adult => context.adult_future_folder.clone(),
+        TransferCategory::Vr => context.future_folder.clone(),
+    };
     let record_index = context
         .transfers
         .iter()
@@ -2660,7 +2699,7 @@ fn apply_organization_with_persistence(
         StoredTransfer::Corrupt(_) => return Err(VR_ORGANIZATION_STALE),
     };
     let entries = organization_entries(record, current_folder.as_deref())?;
-    if plan.code != record.code || plan.entries != entries {
+    if plan.category != record.category || plan.code != record.code || plan.entries != entries {
         return Err(VR_ORGANIZATION_STALE);
     }
     let previous_state = record.organization_state;
@@ -2873,7 +2912,7 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                     } else {
                         format!("{}/", record.code)
                     },
-                    organization_entries(record, current_vr_folder.as_deref())
+                    organization_entries(record, current_folder.as_deref())
                         .is_ok()
                         .to_string(),
                 ]);
@@ -3366,12 +3405,31 @@ mod tests {
         }
     }
 
-    fn completed_organization_record(
+    fn adult_organization_source(files: Vec<(&str, u64)>) -> VerifiedDownloadSource {
+        VerifiedDownloadSource {
+            bytes: b"Adult organization fixture torrent".to_vec(),
+            code: "ADLT-123".to_owned(),
+            infohash: "89abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            release_name: "【Adult】 ADLT-123  Exact — 特別版".to_owned(),
+            selected_files: files
+                .into_iter()
+                .enumerate()
+                .map(|(file_id, (path, size))| VerifiedDownloadFile {
+                    file_id,
+                    path: path.to_owned(),
+                    size,
+                })
+                .collect(),
+        }
+    }
+
+    fn completed_organization_record_for_category(
+        category: TransferCategory,
         destination: &Path,
         source: VerifiedDownloadSource,
     ) -> TransferRecord {
         let mut record = transfer_from_source(
-            TransferCategory::Vr,
+            category,
             source,
             destination.to_owned(),
             TransferState::Completed,
@@ -3388,13 +3446,31 @@ mod tests {
         record
     }
 
+    fn completed_organization_record(
+        destination: &Path,
+        source: VerifiedDownloadSource,
+    ) -> TransferRecord {
+        completed_organization_record_for_category(TransferCategory::Vr, destination, source)
+    }
+
+    fn completed_adult_organization_record(
+        destination: &Path,
+        source: VerifiedDownloadSource,
+    ) -> TransferRecord {
+        completed_organization_record_for_category(TransferCategory::Adult, destination, source)
+    }
+
     fn organization_state(record: TransferRecord) -> (VrDownloadState, String) {
         let transfer_id = record.transfer_id.clone();
         let destination = record.destination.clone();
+        let category = record.category;
         let state = VrDownloadState::default();
         {
             let mut context = state.0.lock().expect("state must lock");
-            context.future_folder = Some(destination);
+            match category {
+                TransferCategory::Adult => context.adult_future_folder = Some(destination),
+                TransferCategory::Vr => context.future_folder = Some(destination),
+            }
             context.transfers_loaded = true;
             context.transfers.push(StoredTransfer::Valid(record));
         }
@@ -3525,6 +3601,57 @@ mod tests {
     }
 
     #[test]
+    fn adult_preview_applies_and_reloads_the_exact_canonical_single_file() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let record =
+            completed_adult_organization_record(&destination, persistable_adult_fixture_source());
+        let release_name = record.release_name.clone();
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(&preview[1..5], &[&transfer_id, "ADLT-123", "1", "1"]);
+        assert_eq!(
+            &preview[5..],
+            &["move", "Movie  A.mp4", "ADLT-123/ADLT-123.mp4"]
+        );
+        apply_organization(&state, &persistence_path, &preview[0])
+            .expect("Adult organization must succeed");
+        let organized_file = destination.join("ADLT-123/ADLT-123.mp4");
+        assert_eq!(
+            fs::read(&organized_file).expect("organized file must remain readable"),
+            vec![b'a'; 5]
+        );
+
+        let restarted = VrDownloadState::default();
+        configure_adult_download_folder(&restarted, Some(destination.clone()))
+            .expect("Adult folder must restore");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("adult-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("organized Adult transfer must reload");
+        assert_eq!(rows[1], "adult");
+        assert_eq!(rows[3], release_name);
+        assert_eq!(
+            &rows[8..13],
+            &["completed", "true", "organized", "ADLT-123/", "false"]
+        );
+        assert!(
+            restarted
+                .0
+                .lock()
+                .expect("state must lock")
+                .session
+                .is_none(),
+            "organized Adult completion restarted a native session"
+        );
+    }
+
+    #[test]
     fn preserves_exact_multipart_labels_ambiguous_basenames_and_non_media_files() {
         let fixture = FilesystemFixture::new();
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
@@ -3571,6 +3698,102 @@ mod tests {
         ] {
             assert!(destination.join(path).exists(), "missing {path:?}");
         }
+    }
+
+    #[test]
+    fn adult_preview_preserves_exact_labels_basenames_extensions_and_non_media_files() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = adult_organization_source(vec![
+            ("Source/ADLT-123 Part  0001 — 映画.MKV", 3),
+            ("Source/ADLT-123 Disc-2 — 特別.mp4", 4),
+            ("Source/ADLT-123 Part 3 Disk 4 — ambiguous.mkv", 5),
+            ("Source/notes  —  exact.txt", 7),
+        ]);
+        let record = completed_adult_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(&preview[3..5], &["3", "4"]);
+        assert_eq!(
+            &preview[5..],
+            &[
+                "move",
+                "Source/ADLT-123 Part  0001 — 映画.MKV",
+                "ADLT-123/ADLT-123 - Part  0001.MKV",
+                "move",
+                "Source/ADLT-123 Disc-2 — 特別.mp4",
+                "ADLT-123/ADLT-123 - Disc-2.mp4",
+                "move",
+                "Source/ADLT-123 Part 3 Disk 4 — ambiguous.mkv",
+                "ADLT-123/ADLT-123 Part 3 Disk 4 — ambiguous.mkv",
+                "non-media-unchanged",
+                "Source/notes  —  exact.txt",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn adult_preview_rejects_every_ambiguous_candidate_identity() {
+        for file_name in [
+            "ADLT-124 wrong item.mp4",
+            "ADLT-1230 neighboring item.mp4",
+            "XADLT-123 embedded item.mp4",
+            "ADLT-123 + XYZ-7 pack.mp4",
+            "ADLT-123 + PT-7 pack.mp4",
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let record = completed_adult_organization_record(
+                &destination,
+                adult_organization_source(vec![(file_name, 3)]),
+            );
+            let (state, transfer_id) = organization_state(record);
+
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE),
+                "{file_name:?} was assigned to ADLT-123",
+            );
+        }
+    }
+
+    #[test]
+    fn adult_folder_change_invalidates_the_plan_before_move_dispatch() {
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("current");
+        let replacement = fixture.path.join("replacement");
+        fs::create_dir(&destination).expect("current Adult folder must exist");
+        fs::create_dir(&replacement).expect("replacement Adult folder must exist");
+        let destination =
+            fs::canonicalize(destination).expect("current Adult folder must canonicalize");
+        let replacement =
+            fs::canonicalize(replacement).expect("replacement Adult folder must canonicalize");
+        let record = completed_adult_organization_record(
+            &destination,
+            adult_organization_source(vec![("Source/ADLT-123.mp4", 3)]),
+        );
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        configure_adult_download_folder(&state, Some(replacement))
+            .expect("Adult folder must change");
+        let mut dispatched = false;
+
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |_, _| {
+                    dispatched = true;
+                    Ok(())
+                },
+            ),
+            Err(VR_ORGANIZATION_STALE)
+        );
+        assert!(!dispatched, "folder-stale Adult plan reached mutation");
     }
 
     #[test]
@@ -4459,6 +4682,178 @@ mod tests {
             fs::read(media_path).expect("reloaded media must remain at its exact path"),
             media_contents
         );
+    }
+
+    #[test]
+    fn adult_persistence_and_rollback_failure_recovers_and_dismisses_without_moving_media_again() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let record =
+            completed_adult_organization_record(&destination, persistable_adult_fixture_source());
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+        {
+            let context = state.0.lock().expect("state must lock");
+            write_persisted_transfers(&persistence_path, &context.transfers)
+                .expect("original Adult paths must persist");
+        }
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let mut move_calls = 0;
+        assert_eq!(
+            apply_organization_with_persistence(
+                &state,
+                &persistence_path,
+                &preview[0],
+                |source, destination| {
+                    move_calls += 1;
+                    if move_calls == 1 {
+                        fs::rename(source, destination)
+                    } else {
+                        Err(io::Error::other("injected Adult rollback failure"))
+                    }
+                },
+                |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+            ),
+            Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+        );
+        assert_eq!(move_calls, 2);
+        let organized_file = destination.join("ADLT-123/ADLT-123.mp4");
+        assert_eq!(
+            fs::read(&organized_file).expect("moved Adult media must remain readable"),
+            vec![b'a'; 5]
+        );
+
+        let restarted = VrDownloadState::default();
+        configure_adult_download_folder(&restarted, Some(destination.clone()))
+            .expect("Adult folder must restore");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("adult-recovery-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("Adult attention recovery must load");
+        assert_eq!(rows[1], "adult");
+        assert_eq!(
+            &rows[8..13],
+            &["completed", "true", "attention", "ADLT-123/", "true"]
+        );
+
+        dismiss_download(&restarted, &persistence_path, &transfer_id)
+            .expect("Adult recovery must dismiss");
+        let dismissed_restart = VrDownloadState::default();
+        configure_adult_download_folder(&dismissed_restart, Some(destination))
+            .expect("Adult folder must restore after dismissal");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &dismissed_restart,
+            &persistence_path,
+            &fixture.path.join("adult-dismissed-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("dismissed Adult recovery must remain absent");
+        assert!(
+            rows.is_empty(),
+            "dismissed Adult recovery recreated its row"
+        );
+        assert_eq!(
+            fs::read(organized_file).expect("dismissed Adult media must remain in place"),
+            vec![b'a'; 5]
+        );
+    }
+
+    #[test]
+    fn organization_recovery_loading_is_category_isolated() {
+        let fixture = FilesystemFixture::new();
+        let adult_destination = fixture.path.join("Adult");
+        let vr_destination = fixture.path.join("VR");
+        fs::create_dir(&adult_destination).expect("Adult destination must exist");
+        fs::create_dir(&vr_destination).expect("VR destination must exist");
+        let adult_destination =
+            fs::canonicalize(adult_destination).expect("Adult destination must canonicalize");
+        let vr_destination =
+            fs::canonicalize(vr_destination).expect("VR destination must canonicalize");
+        let adult_record = completed_adult_organization_record(
+            &adult_destination,
+            persistable_adult_fixture_source(),
+        );
+        let vr_record =
+            completed_organization_record(&vr_destination, persistable_fixture_source());
+        write_organization_recovery(&adult_record, &adult_record.current_paths, None)
+            .expect("Adult recovery must persist");
+        write_organization_recovery(&vr_record, &vr_record.current_paths, None)
+            .expect("VR recovery must persist");
+        let persistence_path = fixture.path.join("downloads");
+
+        let swapped = VrDownloadState::default();
+        {
+            let mut context = swapped.0.lock().expect("state must lock");
+            context.adult_future_folder = Some(vr_destination.clone());
+            context.future_folder = Some(adult_destination.clone());
+        }
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &swapped,
+            &persistence_path,
+            &fixture.path.join("swapped-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("swapped recovery folders must load safely");
+        assert!(rows.is_empty(), "cross-category recovery was loaded");
+
+        let current = VrDownloadState::default();
+        {
+            let mut context = current.0.lock().expect("state must lock");
+            context.adult_future_folder = Some(adult_destination);
+            context.future_folder = Some(vr_destination);
+        }
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &current,
+            &persistence_path,
+            &fixture.path.join("current-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("category-matched recoveries must load");
+        assert_eq!(rows.len(), 26);
+        assert_eq!(rows[1], "vr");
+        assert_eq!(rows[14], "adult");
+    }
+
+    #[test]
+    fn legacy_recovery_header_remains_vr_only() {
+        let fixture = FilesystemFixture::new();
+        let vr_destination = fixture.path.join("VR");
+        let adult_destination = fixture.path.join("Adult");
+        fs::create_dir(&vr_destination).expect("VR destination must exist");
+        fs::create_dir(&adult_destination).expect("Adult destination must exist");
+        let vr_destination =
+            fs::canonicalize(vr_destination).expect("VR destination must canonicalize");
+        let adult_destination =
+            fs::canonicalize(adult_destination).expect("Adult destination must canonicalize");
+        let vr_record =
+            completed_organization_record(&vr_destination, persistable_fixture_source());
+        let adult_record = completed_adult_organization_record(
+            &adult_destination,
+            persistable_adult_fixture_source(),
+        );
+
+        for (record, expected_category) in [
+            (&vr_record, Some(TransferCategory::Vr)),
+            (&adult_record, None),
+        ] {
+            let current = encoded_organization_recovery(record, &record.current_paths)
+                .expect("current recovery must encode");
+            let body = current
+                .strip_prefix(ORGANIZATION_RECOVERY_HEADER)
+                .expect("current header must exist");
+            let mut legacy = LEGACY_ORGANIZATION_RECOVERY_HEADER.to_vec();
+            legacy.extend_from_slice(body);
+            let path = organization_recovery_path(record);
+            fs::write(&path, legacy).expect("legacy recovery must persist");
+
+            assert_eq!(
+                read_organization_recovery_file(&path).map(|record| record.category),
+                expected_category
+            );
+        }
     }
 
     #[test]

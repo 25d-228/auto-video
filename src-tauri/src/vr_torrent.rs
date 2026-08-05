@@ -914,10 +914,14 @@ fn release_matches_product_code(name: &str, requested_code: &str) -> bool {
     identities.len() == 1 && identities.contains(requested_code)
 }
 
-pub(crate) fn media_name_matches_product_code(name: &str, requested_code: &str) -> bool {
+fn media_name_matches_product_code_with_labels(
+    name: &str,
+    requested_code: &str,
+    ignored_labels: &[&str],
+) -> bool {
     let identities = product_code_candidates(name)
         .into_iter()
-        .filter(|(_, prefix)| !matches!(prefix.as_str(), "PART" | "PT" | "CD" | "DISC" | "DISK"))
+        .filter(|(_, prefix)| !ignored_labels.contains(&prefix.as_str()))
         .map(|(code, _)| code)
         .collect::<BTreeSet<_>>();
     if !identities.is_empty() {
@@ -942,6 +946,22 @@ pub(crate) fn media_name_matches_product_code(name: &str, requested_code: &str) 
         let number_end = number_start + number.len();
         number_end <= bytes.len() && bytes[number_start..number_end].eq(number)
     })
+}
+
+pub(crate) fn media_name_matches_product_code(name: &str, requested_code: &str) -> bool {
+    media_name_matches_product_code_with_labels(
+        name,
+        requested_code,
+        &["PART", "PT", "CD", "DISC", "DISK"],
+    )
+}
+
+pub(crate) fn adult_media_name_matches_product_code(name: &str, requested_code: &str) -> bool {
+    media_name_matches_product_code_with_labels(
+        name,
+        requested_code,
+        &["PART", "CD", "DISC", "DISK"],
+    )
 }
 
 fn view_item_id(url: &str) -> Option<String> {
