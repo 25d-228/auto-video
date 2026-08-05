@@ -7579,6 +7579,72 @@ describe("completed download organization", () => {
     expect(listVrDownloadsMock).not.toHaveBeenCalled();
   });
 
+  it("exposes organization only for the native-eligible completed Movie row", async () => {
+    loadVrDownloadsMock.mockResolvedValue([
+      ...vrDownloadFixture({
+        canOrganize: "true",
+        category: "movie",
+        code: "tt0123456",
+        downloadedBytes: "10",
+        releaseName: "Eligible Movie",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "eligible-movie",
+      }),
+      ...vrDownloadFixture({
+        category: "movie",
+        code: "tt0123457",
+        downloadedBytes: "4",
+        releaseName: "Queued Movie",
+        state: "queued",
+        transferId: "queued-movie",
+      }),
+      ...vrDownloadFixture({
+        category: "movie",
+        code: "tt0123458",
+        downloadedBytes: "10",
+        isCurrentFolder: "false",
+        releaseName: "Old-folder Movie",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "old-movie",
+      }),
+      ...vrDownloadFixture({
+        category: "movie",
+        code: "tt0123459",
+        downloadedBytes: "10",
+        organizationRelativeDirectory: "Organized Movie (1999)/",
+        organizationStatus: "organized",
+        releaseName: "Organized Movie",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "organized-movie",
+      }),
+      ...vrDownloadFixture({
+        category: "movie",
+        code: "tt0123460",
+        downloadedBytes: "10",
+        releaseName: "Failed Movie",
+        speedBytesPerSecond: "0",
+        state: "failed",
+        transferId: "failed-movie",
+      }),
+    ]);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+
+    const eligibleCard = (
+      await screen.findByRole("heading", { name: "Eligible Movie" })
+    ).closest("article") as HTMLElement;
+    expect(screen.getAllByRole("button", { name: "Organize files" })).toHaveLength(1);
+    fireEvent.click(
+      within(eligibleCard).getByRole("button", { name: "Organize files" }),
+    );
+    expect(previewVrOrganizationMock).toHaveBeenCalledWith({
+      transferId: "eligible-movie",
+    });
+  });
+
   it("applies one exact plan, refreshes Library and storage once, and dismisses without organizing again", async () => {
     savedVrFolder = "/VR";
     const initialRows = vrDownloadFixture({
@@ -7672,6 +7738,165 @@ describe("completed download organization", () => {
       transferId: "transfer-419",
     });
     expect(applyVrOrganizationMock).toHaveBeenCalledOnce();
+  });
+
+  it("previews the exact Movie name and refreshes only Movies after apply", async () => {
+    savedMoviesFolder = "/Movies";
+    const releaseName = "映画  —  Exact Edition";
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        canOrganize: "true",
+        category: "movie",
+        code: "tt0123456",
+        downloadedBytes: "10",
+        releaseName,
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "movie-transfer-123",
+      }),
+    );
+    listVrDownloadsMock.mockResolvedValueOnce(
+      vrDownloadFixture({
+        category: "movie",
+        code: "tt0123456",
+        downloadedBytes: "10",
+        organizationRelativeDirectory: `${releaseName} (1999)/`,
+        organizationStatus: "organized",
+        releaseName,
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "movie-transfer-123",
+      }),
+    );
+    previewVrOrganizationMock.mockResolvedValueOnce([
+      "movie-plan-123",
+      "movie-transfer-123",
+      "tt0123456",
+      "1",
+      "2",
+      "move",
+      "Source/Provider  —  映画.MKV",
+      `${releaseName} (1999)/${releaseName} (1999).MKV`,
+      "non-media-unchanged",
+      "Source/notes  —  exact.txt",
+      "",
+    ]);
+    render(<App />);
+    await waitFor(() => {
+      expect(scanMoviesMock).toHaveBeenCalledOnce();
+      expect(queryMoviesStorageMock).toHaveBeenCalledOnce();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const releaseHeading = await screen.findByRole("heading", {
+      name: "映画 — Exact Edition",
+    });
+    expect(releaseHeading.textContent).toBe(releaseName);
+    const card = releaseHeading.closest("article") as HTMLElement;
+    fireEvent.click(within(card).getByRole("button", { name: "Organize files" }));
+    const confirmation = await screen.findByRole("alertdialog");
+    expect(
+      within(confirmation).getByText(
+        (_, element) =>
+          element?.tagName === "SPAN" &&
+          element.textContent ===
+            `Move to: ${releaseName} (1999)/${releaseName} (1999).MKV`,
+      ),
+    ).toBeTruthy();
+    expect(within(confirmation).getByText("Unchanged non-media file")).toBeTruthy();
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "Organize 1 file" }),
+    );
+
+    const organizedHeading = await screen.findByRole("heading", {
+      name: "映画 — Exact Edition",
+    });
+    expect(organizedHeading.textContent).toBe(releaseName);
+    const organizedCard = organizedHeading.closest("article") as HTMLElement;
+    expect(within(organizedCard).getByText("Organized")).toBeTruthy();
+    expect(
+      within(organizedCard).getByText(
+        (_, element) =>
+          element?.tagName === "DD" &&
+          element.textContent === `${releaseName} (1999)/`,
+      ),
+    ).toBeTruthy();
+    await waitFor(() => {
+      expect(scanMoviesMock).toHaveBeenCalledTimes(2);
+      expect(queryMoviesStorageMock).toHaveBeenCalledTimes(2);
+    });
+    expect(scanAdultLibraryMock).not.toHaveBeenCalled();
+    expect(queryAdultStorageMock).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+    expect(applyVrOrganizationMock).toHaveBeenCalledWith({
+      planId: "movie-plan-123",
+    });
+  });
+
+  it("reloads Movie attention after apply failure without refreshing Movies", async () => {
+    savedMoviesFolder = "/Movies";
+    const releaseName = "Recoverable Movie";
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        canOrganize: "true",
+        category: "movie",
+        code: "tt0123456",
+        downloadedBytes: "10",
+        releaseName,
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "movie-recovery-123",
+      }),
+    );
+    previewVrOrganizationMock.mockResolvedValueOnce([
+      "movie-recovery-plan",
+      "movie-recovery-123",
+      "tt0123456",
+      "1",
+      "1",
+      "move",
+      "Source/Provider Movie.mp4",
+      `${releaseName} (1999)/${releaseName} (1999).mp4`,
+    ]);
+    applyVrOrganizationMock.mockRejectedValueOnce("vr_organization_failed");
+    listVrDownloadsMock.mockResolvedValueOnce(
+      vrDownloadFixture({
+        canOrganize: "true",
+        category: "movie",
+        code: "tt0123456",
+        downloadedBytes: "10",
+        organizationRelativeDirectory: `${releaseName} (1999)/`,
+        organizationStatus: "attention",
+        releaseName,
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "movie-recovery-123",
+      }),
+    );
+    render(<App />);
+    await waitFor(() => {
+      expect(scanMoviesMock).toHaveBeenCalledOnce();
+      expect(queryMoviesStorageMock).toHaveBeenCalledOnce();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Organize files" }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Organize 1 file",
+      }),
+    );
+
+    const card = (
+      await screen.findByRole("heading", { name: releaseName })
+    ).closest("article") as HTMLElement;
+    expect(within(card).getByText("Organization needs attention")).toBeTruthy();
+    expect(within(card).getByRole("button", { name: "Organize files" })).toBeTruthy();
+    expect(listVrDownloadsMock).toHaveBeenCalledOnce();
+    expect(scanMoviesMock).toHaveBeenCalledOnce();
+    expect(queryMoviesStorageMock).toHaveBeenCalledOnce();
+    expect(scanAdultLibraryMock).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
   });
 
   it("previews Adult paths and refreshes only Adult Library and storage after apply", async () => {
