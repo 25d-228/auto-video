@@ -2292,6 +2292,21 @@ fn exact_part_label(file_name: &str, category: TransferCategory) -> Option<Strin
             index = label_start + 1;
             continue;
         }
+        if category == TransferCategory::Adult {
+            let mut continuation_index = index;
+            while continuation_index < bytes.len()
+                && bytes[continuation_index].is_ascii()
+                && !bytes[continuation_index].is_ascii_alphanumeric()
+            {
+                continuation_index += 1;
+            }
+            if continuation_index > index
+                && continuation_index < bytes.len()
+                && bytes[continuation_index].is_ascii_digit()
+            {
+                return None;
+            }
+        }
         matches.push((
             significant_number.to_owned(),
             title[label_start..index].to_owned(),
@@ -3701,29 +3716,80 @@ mod tests {
     }
 
     #[test]
-    fn adult_preview_preserves_exact_labels_basenames_extensions_and_non_media_files() {
+    fn adult_part_label_parser_rejects_compact_continuations_without_changing_vr_results() {
+        for ambiguous in [
+            "ADLT-123 Part 1-2.mp4",
+            "ADLT-123 CD1+2.mkv",
+            "ADLT-123 Disc 03_04.MKV",
+            "ADLT-123 Disk-4 5.mp4",
+        ] {
+            assert_eq!(
+                exact_part_label(ambiguous, TransferCategory::Adult),
+                None,
+                "{ambiguous:?} was treated as one Adult label",
+            );
+        }
+        for (file_name, label) in [
+            ("ADLT-123 Part 01.mp4", "Part 01"),
+            ("ADLT-123 CD2.mkv", "CD2"),
+            ("ADLT-123 Disc 03.MKV", "Disc 03"),
+            ("ADLT-123 Disk-4.mp4", "Disk-4"),
+        ] {
+            assert_eq!(
+                exact_part_label(file_name, TransferCategory::Adult).as_deref(),
+                Some(label),
+            );
+        }
+        assert_eq!(
+            exact_part_label("MDVR-419 Part 1-2.mp4", TransferCategory::Vr).as_deref(),
+            Some("Part 1")
+        );
+        assert_eq!(
+            exact_part_label("MDVR-419 CD1+2.mkv", TransferCategory::Vr).as_deref(),
+            Some("CD1")
+        );
+    }
+
+    #[test]
+    fn adult_preview_and_apply_preserve_compact_basenames_and_valid_exact_labels() {
         let fixture = FilesystemFixture::new();
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
         let source = adult_organization_source(vec![
-            ("Source/ADLT-123 Part  0001 — 映画.MKV", 3),
-            ("Source/ADLT-123 Disc-2 — 特別.mp4", 4),
-            ("Source/ADLT-123 Part 3 Disk 4 — ambiguous.mkv", 5),
-            ("Source/notes  —  exact.txt", 7),
+            ("Source/ADLT-123 Part 1-2.mp4", 3),
+            ("Source/ADLT-123 CD1+2.mkv", 4),
+            ("Source/ADLT-123 Part 01.MP4", 5),
+            ("Source/ADLT-123 CD2.mkv", 6),
+            ("Source/ADLT-123 Disc 03.MKV", 7),
+            ("Source/ADLT-123 Disk-4.mp4", 8),
+            ("Source/ADLT-123 Part 3 Disk 4 — ambiguous.mkv", 9),
+            ("Source/notes  —  exact.txt", 10),
         ]);
         let record = completed_adult_organization_record(&destination, source);
         let (state, transfer_id) = organization_state(record);
 
         let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
-        assert_eq!(&preview[3..5], &["3", "4"]);
+        assert_eq!(&preview[3..5], &["7", "8"]);
         assert_eq!(
             &preview[5..],
             &[
                 "move",
-                "Source/ADLT-123 Part  0001 — 映画.MKV",
-                "ADLT-123/ADLT-123 - Part  0001.MKV",
+                "Source/ADLT-123 Part 1-2.mp4",
+                "ADLT-123/ADLT-123 Part 1-2.mp4",
                 "move",
-                "Source/ADLT-123 Disc-2 — 特別.mp4",
-                "ADLT-123/ADLT-123 - Disc-2.mp4",
+                "Source/ADLT-123 CD1+2.mkv",
+                "ADLT-123/ADLT-123 CD1+2.mkv",
+                "move",
+                "Source/ADLT-123 Part 01.MP4",
+                "ADLT-123/ADLT-123 - Part 01.MP4",
+                "move",
+                "Source/ADLT-123 CD2.mkv",
+                "ADLT-123/ADLT-123 - CD2.mkv",
+                "move",
+                "Source/ADLT-123 Disc 03.MKV",
+                "ADLT-123/ADLT-123 - Disc 03.MKV",
+                "move",
+                "Source/ADLT-123 Disk-4.mp4",
+                "ADLT-123/ADLT-123 - Disk-4.mp4",
                 "move",
                 "Source/ADLT-123 Part 3 Disk 4 — ambiguous.mkv",
                 "ADLT-123/ADLT-123 Part 3 Disk 4 — ambiguous.mkv",
@@ -3732,6 +3798,29 @@ mod tests {
                 "",
             ]
         );
+        apply_organization(&state, &fixture.path.join("downloads"), &preview[0])
+            .expect("Adult multipart organization must succeed");
+        for path in [
+            "ADLT-123/ADLT-123 Part 1-2.mp4",
+            "ADLT-123/ADLT-123 CD1+2.mkv",
+            "ADLT-123/ADLT-123 - Part 01.MP4",
+            "ADLT-123/ADLT-123 - CD2.mkv",
+            "ADLT-123/ADLT-123 - Disc 03.MKV",
+            "ADLT-123/ADLT-123 - Disk-4.mp4",
+            "ADLT-123/ADLT-123 Part 3 Disk 4 — ambiguous.mkv",
+            "Source/notes  —  exact.txt",
+        ] {
+            assert!(destination.join(path).exists(), "missing {path:?}");
+        }
+        for truncated in [
+            "ADLT-123/ADLT-123 - Part 1.mp4",
+            "ADLT-123/ADLT-123 - CD1.mkv",
+        ] {
+            assert!(
+                !destination.join(truncated).exists(),
+                "invented truncated destination {truncated:?}",
+            );
+        }
     }
 
     #[test]

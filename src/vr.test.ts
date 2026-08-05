@@ -1059,6 +1059,41 @@ describe("trusted VR download boundary", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(3, "dismiss_vr_organization");
   });
 
+  it("preserves compact Adult multipart basenames in native previews", async () => {
+    invokeMock.mockResolvedValueOnce([
+      "adult-plan-123",
+      "adult-transfer-123",
+      "ADLT-123",
+      "2",
+      "2",
+      "move",
+      "Source/ADLT-123 Part 1-2.mp4",
+      "ADLT-123/ADLT-123 Part 1-2.mp4",
+      "move",
+      "Source/ADLT-123 CD1+2.mkv",
+      "ADLT-123/ADLT-123 CD1+2.mkv",
+    ]);
+
+    await expect(previewVrOrganization("adult-transfer-123")).resolves.toEqual({
+      planId: "adult-plan-123",
+      transferId: "adult-transfer-123",
+      code: "ADLT-123",
+      moveCount: 2,
+      entries: [
+        {
+          kind: "move",
+          sourceRelativePath: "Source/ADLT-123 Part 1-2.mp4",
+          destinationRelativePath: "ADLT-123/ADLT-123 Part 1-2.mp4",
+        },
+        {
+          kind: "move",
+          sourceRelativePath: "Source/ADLT-123 CD1+2.mkv",
+          destinationRelativePath: "ADLT-123/ADLT-123 CD1+2.mkv",
+        },
+      ],
+    });
+  });
+
   it("rejects malformed organization identities and paths at the interface boundary", async () => {
     await expect(previewVrOrganization("")).rejects.toThrow("transfer identity");
     expect(() => applyVrOrganization("")).toThrow("current organization plan");

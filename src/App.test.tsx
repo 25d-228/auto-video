@@ -6987,14 +6987,26 @@ describe("completed download organization", () => {
       "adult-plan-123",
       "adult-transfer-123",
       "ADLT-123",
-      "2",
-      "3",
+      "6",
+      "7",
       "move",
-      "Source/ADLT-123 Part  01 — 映画.MKV",
-      "ADLT-123/ADLT-123 - Part  01.MKV",
+      "Source/ADLT-123 Part 1-2.mp4",
+      "ADLT-123/ADLT-123 Part 1-2.mp4",
       "move",
-      "Source/ADLT-123  feature  —  Final.mp4",
-      "ADLT-123/ADLT-123  feature  —  Final.mp4",
+      "Source/ADLT-123 CD1+2.mkv",
+      "ADLT-123/ADLT-123 CD1+2.mkv",
+      "move",
+      "Source/ADLT-123 Part 01.MP4",
+      "ADLT-123/ADLT-123 - Part 01.MP4",
+      "move",
+      "Source/ADLT-123 CD2.mkv",
+      "ADLT-123/ADLT-123 - CD2.mkv",
+      "move",
+      "Source/ADLT-123 Disc 03.MKV",
+      "ADLT-123/ADLT-123 - Disc 03.MKV",
+      "move",
+      "Source/ADLT-123 Disk-4.mp4",
+      "ADLT-123/ADLT-123 - Disk-4.mp4",
       "non-media-unchanged",
       "Source/notes  —  exact.txt",
       "",
@@ -7016,20 +7028,39 @@ describe("completed download organization", () => {
     const confirmation = await screen.findByRole("alertdialog");
     expect(
       within(confirmation).getByText(
-        "Confirm this exact plan. 2 files will move within the current Adult folder.",
+        "Confirm this exact plan. 6 files will move within the current Adult folder.",
       ),
     ).toBeTruthy();
-    expect(
-      within(confirmation).getByText(
-        (_, element) =>
-          element?.tagName === "SPAN" &&
-          element.textContent ===
-            "Move to: ADLT-123/ADLT-123 - Part  01.MKV",
-      ),
-    ).toBeTruthy();
+    for (const destination of [
+      "Move to: ADLT-123/ADLT-123 Part 1-2.mp4",
+      "Move to: ADLT-123/ADLT-123 CD1+2.mkv",
+      "Move to: ADLT-123/ADLT-123 - Part 01.MP4",
+      "Move to: ADLT-123/ADLT-123 - CD2.mkv",
+      "Move to: ADLT-123/ADLT-123 - Disc 03.MKV",
+      "Move to: ADLT-123/ADLT-123 - Disk-4.mp4",
+    ]) {
+      expect(
+        within(confirmation).getByText(
+          (_, element) =>
+            element?.tagName === "SPAN" &&
+            element.textContent === destination,
+        ),
+      ).toBeTruthy();
+    }
+    for (const truncated of [
+      "Move to: ADLT-123/ADLT-123 - Part 1.mp4",
+      "Move to: ADLT-123/ADLT-123 - CD1.mkv",
+    ]) {
+      expect(
+        within(confirmation).queryByText(
+          (_, element) =>
+            element?.tagName === "SPAN" && element.textContent === truncated,
+        ),
+      ).toBeNull();
+    }
 
     fireEvent.click(
-      within(confirmation).getByRole("button", { name: "Organize 2 files" }),
+      within(confirmation).getByRole("button", { name: "Organize 6 files" }),
     );
     const organizedHeading = await screen.findByRole("heading", {
       name: "【Adult】 ADLT-123 Exact — 特別版",
