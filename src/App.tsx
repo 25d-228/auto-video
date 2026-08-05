@@ -3195,7 +3195,7 @@ function VrDownloadCard({
                     <AlertDialog.Description>
                       Confirm this exact plan. {organizationPreview.moveCount}{" "}
                       {organizationPreview.moveCount === 1 ? "file" : "files"}
-                      {" "}will move within the current VR folder.
+                      {" "}will move within the current {categoryLabel} folder.
                     </AlertDialog.Description>
                     <ul
                       aria-label={`Organization plan for ${organizationPreview.code}`}
@@ -5052,6 +5052,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         requestId === adultFolderRequestId.current &&
         selectedFolder !== null
       ) {
+        vrOrganizationRequestId.current += 1;
+        setVrOrganizationPreview(null);
         adultLibraryScanRequestId.current += 1;
         adultStorageRequestId.current += 1;
         setAdultLibraryScanState({ status: "scanning" });
@@ -5069,6 +5071,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
   const clearConfiguredAdultFolder = async () => {
     const requestId = ++adultFolderRequestId.current;
+    vrOrganizationRequestId.current += 1;
+    setVrOrganizationPreview(null);
     setIsRevalidatingAdultFolder(false);
     adultLibraryScanRequestId.current += 1;
     adultStorageRequestId.current += 1;
@@ -5363,12 +5367,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
   };
 
-  const organizationErrorMessage = (error: unknown) => {
+  const organizationErrorMessage = (
+    error: unknown,
+    category: VrDownload["category"],
+  ) => {
     switch (nativeErrorCode(error)) {
       case "vr_organization_conflict":
         return "The complete organization plan conflicts with an existing or duplicate destination.";
       case "vr_organization_ineligible":
-        return "This transfer is no longer eligible for organization in the current VR folder.";
+        return `This transfer is no longer eligible for organization in the current ${category === "adult" ? "Adult" : "VR"} folder.`;
       case "vr_organization_stale":
         return "The organization plan is stale because its transfer, folder, or files changed.";
       default:
@@ -5420,7 +5427,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       if (
         latestDownload?.canOrganize !== true ||
         preview.transferId !== download.transferId ||
-        preview.code !== download.code
+        preview.code !== download.code ||
+        latestDownload.category !== download.category
       ) {
         await dismissVrOrganization();
         throw new Error("vr_organization_stale");
@@ -5430,7 +5438,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       if (requestId === vrOrganizationRequestId.current) {
         setVrDownloadErrors((errors) => ({
           ...errors,
-          [download.transferId]: organizationErrorMessage(error),
+          [download.transferId]: organizationErrorMessage(
+            error,
+            download.category,
+          ),
         }));
       }
     } finally {
@@ -5486,7 +5497,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       }
       setVrOrganizationPreview(null);
       await refreshVrDownloads();
-      refreshVrLibrary();
+      if (currentDownload.category === "adult") {
+        refreshAdultLibrary();
+      } else {
+        refreshVrLibrary();
+      }
       setVrDownloadFocusTarget(`vr-download-dismiss-${preview.transferId}`);
     } catch (error: unknown) {
       if (requestId === vrOrganizationRequestId.current) {
@@ -5494,7 +5509,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         await refreshVrDownloads();
         setVrDownloadErrors((errors) => ({
           ...errors,
-          [preview.transferId]: organizationErrorMessage(error),
+          [preview.transferId]: organizationErrorMessage(
+            error,
+            currentDownload.category,
+          ),
         }));
         setVrDownloadFocusTarget(
           `vr-download-organize-${preview.transferId}`,

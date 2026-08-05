@@ -851,8 +851,6 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       transferIds.has(transferId) ||
       (category !== "adult" && category !== "unknown" && category !== "vr") ||
       code.trim() === "" ||
-      (category === "adult" &&
-        (canOrganize !== "false" || organizationStatus !== "none")) ||
       (category === "unknown" &&
         (count !== 0 ||
           totalBytes !== "0" ||

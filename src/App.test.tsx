@@ -6746,7 +6746,7 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
   });
 });
 
-describe("completed VR download organization", () => {
+describe("completed download organization", () => {
   it("exposes only native-eligible rows and supports cancel, Escape, close, and focus return", async () => {
     Object.defineProperty(window, "innerWidth", {
       configurable: true,
@@ -6953,6 +6953,199 @@ describe("completed VR download organization", () => {
       transferId: "transfer-419",
     });
     expect(applyVrOrganizationMock).toHaveBeenCalledOnce();
+  });
+
+  it("previews Adult paths and refreshes only Adult Library and storage after apply", async () => {
+    savedAdultFolder = "/Adult";
+    const releaseName = "【Adult】 ADLT-123  Exact — 特別版";
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        canOrganize: "true",
+        category: "adult",
+        code: "ADLT-123",
+        downloadedBytes: "10",
+        releaseName,
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "adult-transfer-123",
+      }),
+    );
+    listVrDownloadsMock.mockResolvedValueOnce(
+      vrDownloadFixture({
+        category: "adult",
+        code: "ADLT-123",
+        downloadedBytes: "10",
+        organizationRelativeDirectory: "ADLT-123/",
+        organizationStatus: "organized",
+        releaseName,
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "adult-transfer-123",
+      }),
+    );
+    previewVrOrganizationMock.mockResolvedValueOnce([
+      "adult-plan-123",
+      "adult-transfer-123",
+      "ADLT-123",
+      "6",
+      "7",
+      "move",
+      "Source/ADLT-123 Part 1-2.mp4",
+      "ADLT-123/ADLT-123 Part 1-2.mp4",
+      "move",
+      "Source/ADLT-123 CD1+2.mkv",
+      "ADLT-123/ADLT-123 CD1+2.mkv",
+      "move",
+      "Source/ADLT-123 Part 01.MP4",
+      "ADLT-123/ADLT-123 - Part 01.MP4",
+      "move",
+      "Source/ADLT-123 CD2.mkv",
+      "ADLT-123/ADLT-123 - CD2.mkv",
+      "move",
+      "Source/ADLT-123 Disc 03.MKV",
+      "ADLT-123/ADLT-123 - Disc 03.MKV",
+      "move",
+      "Source/ADLT-123 Disk-4.mp4",
+      "ADLT-123/ADLT-123 - Disk-4.mp4",
+      "non-media-unchanged",
+      "Source/notes  —  exact.txt",
+      "",
+    ]);
+    render(<App />);
+    await waitFor(() => {
+      expect(scanAdultLibraryMock).toHaveBeenCalledOnce();
+      expect(queryAdultStorageMock).toHaveBeenCalledOnce();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const releaseHeading = await screen.findByRole("heading", {
+      name: "【Adult】 ADLT-123 Exact — 特別版",
+    });
+    expect(releaseHeading.textContent).toBe(releaseName);
+    const card = releaseHeading.closest("article") as HTMLElement;
+    expect(within(card).getByText("Adult · ADLT-123")).toBeTruthy();
+    fireEvent.click(within(card).getByRole("button", { name: "Organize files" }));
+    const confirmation = await screen.findByRole("alertdialog");
+    expect(
+      within(confirmation).getByText(
+        "Confirm this exact plan. 6 files will move within the current Adult folder.",
+      ),
+    ).toBeTruthy();
+    for (const destination of [
+      "Move to: ADLT-123/ADLT-123 Part 1-2.mp4",
+      "Move to: ADLT-123/ADLT-123 CD1+2.mkv",
+      "Move to: ADLT-123/ADLT-123 - Part 01.MP4",
+      "Move to: ADLT-123/ADLT-123 - CD2.mkv",
+      "Move to: ADLT-123/ADLT-123 - Disc 03.MKV",
+      "Move to: ADLT-123/ADLT-123 - Disk-4.mp4",
+    ]) {
+      expect(
+        within(confirmation).getByText(
+          (_, element) =>
+            element?.tagName === "SPAN" &&
+            element.textContent === destination,
+        ),
+      ).toBeTruthy();
+    }
+    for (const truncated of [
+      "Move to: ADLT-123/ADLT-123 - Part 1.mp4",
+      "Move to: ADLT-123/ADLT-123 - CD1.mkv",
+    ]) {
+      expect(
+        within(confirmation).queryByText(
+          (_, element) =>
+            element?.tagName === "SPAN" && element.textContent === truncated,
+        ),
+      ).toBeNull();
+    }
+
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "Organize 6 files" }),
+    );
+    const organizedHeading = await screen.findByRole("heading", {
+      name: "【Adult】 ADLT-123 Exact — 特別版",
+    });
+    expect(organizedHeading.textContent).toBe(releaseName);
+    const organizedCard = organizedHeading.closest("article") as HTMLElement;
+    expect(within(organizedCard).getByText("Organized")).toBeTruthy();
+    expect(within(organizedCard).getByText("ADLT-123/")).toBeTruthy();
+    await waitFor(() => {
+      expect(scanAdultLibraryMock).toHaveBeenCalledTimes(2);
+      expect(queryAdultStorageMock).toHaveBeenCalledTimes(2);
+    });
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+    expect(applyVrOrganizationMock).toHaveBeenCalledWith({
+      planId: "adult-plan-123",
+    });
+  });
+
+  it("reloads Adult attention after apply failure without refreshing either Library", async () => {
+    savedAdultFolder = "/Adult";
+    const initialRows = vrDownloadFixture({
+      canOrganize: "true",
+      category: "adult",
+      code: "ADLT-123",
+      downloadedBytes: "10",
+      releaseName: "Recoverable Adult organization",
+      speedBytesPerSecond: "0",
+      state: "completed",
+      transferId: "adult-recovery-123",
+    });
+    loadVrDownloadsMock.mockResolvedValue(initialRows);
+    previewVrOrganizationMock.mockResolvedValueOnce([
+      "adult-recovery-plan",
+      "adult-recovery-123",
+      "ADLT-123",
+      "1",
+      "1",
+      "move",
+      "Source/ADLT-123.mp4",
+      "ADLT-123/ADLT-123.mp4",
+    ]);
+    applyVrOrganizationMock.mockRejectedValueOnce("vr_organization_failed");
+    listVrDownloadsMock.mockResolvedValueOnce(
+      vrDownloadFixture({
+        canOrganize: "true",
+        category: "adult",
+        code: "ADLT-123",
+        downloadedBytes: "10",
+        organizationRelativeDirectory: "ADLT-123/",
+        organizationStatus: "attention",
+        releaseName: "Recoverable Adult organization",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "adult-recovery-123",
+      }),
+    );
+    render(<App />);
+    await waitFor(() => {
+      expect(scanAdultLibraryMock).toHaveBeenCalledOnce();
+      expect(queryAdultStorageMock).toHaveBeenCalledOnce();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Organize files" }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Organize 1 file",
+      }),
+    );
+
+    const card = (
+      await screen.findByRole("heading", {
+        name: "Recoverable Adult organization",
+      })
+    ).closest("article") as HTMLElement;
+    expect(within(card).getByText("Organization needs attention")).toBeTruthy();
+    expect(within(card).getByRole("button", { name: "Organize files" })).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(
+      within(card).getByRole("button", { name: "Organize files" }),
+    ));
+    expect(scanAdultLibraryMock).toHaveBeenCalledOnce();
+    expect(queryAdultStorageMock).toHaveBeenCalledOnce();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
+    expect(listVrDownloadsMock).toHaveBeenCalledOnce();
   });
 
   it("reports preview and apply failures locally without a Library refresh", async () => {
