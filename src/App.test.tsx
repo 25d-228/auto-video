@@ -5394,6 +5394,9 @@ describe("TMDB TV Discover", () => {
       "Exact Show S02E03+E04",
       "Exact Show S02E03+04",
       "Exact Show 2x03+04",
+      "Exact Show S02E03&E04",
+      "Exact Show S02E03,04",
+      "Exact Show 2x03/04",
     ];
     const standardHash = "0123456789abcdef0123456789abcdef01234567";
     const hdHash = "abcdef0123456789abcdef0123456789abcdef01";

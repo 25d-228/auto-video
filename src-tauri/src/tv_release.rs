@@ -255,12 +255,10 @@ fn verified_apibay_releases(
                 if !item_ids.insert(item_id) {
                     return Err(TV_APIBAY_CONFLICTING);
                 }
-                if let Some(infohash) =
-                    json_string(object, "info_hash").and_then(canonical_infohash)
-                {
-                    if !infohashes.insert(infohash) {
-                        return Err(TV_APIBAY_CONFLICTING);
-                    }
+            }
+            if let Some(infohash) = json_string(object, "info_hash").and_then(canonical_infohash) {
+                if !infohashes.insert(infohash) {
+                    return Err(TV_APIBAY_CONFLICTING);
                 }
             }
         }
@@ -455,7 +453,7 @@ fn is_identity_end(bytes: &[u8], end: usize) -> bool {
 fn has_episode_continuation(bytes: &[u8], end: usize) -> bool {
     let mut position = end;
     while bytes.get(position).is_some_and(|character| {
-        character.is_ascii_whitespace() || matches!(character, b'.' | b'_' | b'-' | b'+')
+        character.is_ascii_whitespace() || character.is_ascii_punctuation()
     }) {
         position += 1;
     }
@@ -508,9 +506,12 @@ mod tests {
             "Show S02E03-04",
             "Show S02E03+E04",
             "Show S02E03+04",
+            "Show S02E03&E04",
+            "Show S02E03,04",
             "Show 2x03x04",
             "Show 2x03-04",
             "Show 2x03+04",
+            "Show 2x03/04",
             "Show S02E03 2x03",
             "Show S02E03 S03E03",
         ] {
@@ -538,6 +539,9 @@ mod tests {
             ("15", "Exact Show S02E03+E04", "205", "tt0123456"),
             ("16", "Exact Show S02E03+04", "205", "tt0123456"),
             ("17", "Exact Show 2x03+04", "205", "tt0123456"),
+            ("18", "Exact Show S02E03&E04", "205", "tt0123456"),
+            ("19", "Exact Show S02E03,04", "205", "tt0123456"),
+            ("20", "Exact Show 2x03/04", "205", "tt0123456"),
         ];
         let mut standard_rows = vec![release(
             "1",
@@ -606,6 +610,9 @@ mod tests {
             "Exact Show S02E03+E04",
             "Exact Show S02E03+04",
             "Exact Show 2x03+04",
+            "Exact Show S02E03&E04",
+            "Exact Show S02E03,04",
+            "Exact Show 2x03/04",
         ] {
             assert!(!values.iter().any(|value| value == compact_continuation));
         }
@@ -658,6 +665,14 @@ mod tests {
             );
             conflicting_documents.push(format!("[{exact},{malformed}]"));
         }
+        let missing_item_id = format!(
+            r#"{{"name":"Show S02E04","info_hash":"{shared_hash}","category":"205","imdb":"tt0123456"}}"#
+        );
+        conflicting_documents.push(format!("[{exact},{missing_item_id}]"));
+        let malformed_item_id = format!(
+            r#"{{"id":"invalid","name":"Show S02E04","info_hash":"{shared_hash}","category":"205","imdb":"tt0123456"}}"#
+        );
+        conflicting_documents.push(format!("[{exact},{malformed_item_id}]"));
 
         for standard in conflicting_documents {
             let result = fetch_apibay_tv_releases_with(701, 9001, 9103, "token", |url, _| {
