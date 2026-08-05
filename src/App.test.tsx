@@ -127,6 +127,9 @@ let startVerifiedVrDownloadMock: Mock<
 let startVerifiedAdultDownloadMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string>
 >;
+let startVerifiedMovieDownloadMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string>
+>;
 let pauseVrDownloadMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
@@ -677,6 +680,7 @@ beforeEach(() => {
   listVrDownloadsMock = vi.fn().mockResolvedValue([]);
   startVerifiedVrDownloadMock = vi.fn().mockResolvedValue("transfer-123");
   startVerifiedAdultDownloadMock = vi.fn().mockResolvedValue("adult-transfer-123");
+  startVerifiedMovieDownloadMock = vi.fn().mockResolvedValue("movie-transfer-123");
   pauseVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   resumeVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   cancelVrDownloadMock = vi.fn().mockResolvedValue(undefined);
@@ -831,6 +835,8 @@ beforeEach(() => {
           return startVerifiedVrDownloadMock(parameters);
         case "start_verified_adult_download":
           return startVerifiedAdultDownloadMock(parameters);
+        case "start_verified_movie_download":
+          return startVerifiedMovieDownloadMock(parameters);
         case "pause_vr_download":
           return pauseVrDownloadMock(parameters);
         case "resume_vr_download":
@@ -2282,6 +2288,86 @@ describe("parsed VR Library and Dashboard", () => {
     });
     expect(scanAdultLibraryMock).toHaveBeenCalledTimes(2);
     expect(queryAdultStorageMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes only Movies Library and storage once for a current-folder Movie completion", async () => {
+    vi.useFakeTimers();
+    savedMoviesFolder = "/Movies";
+    savedAdultFolder = "/Adult";
+    savedVrFolder = "/VR";
+    const activeRows = [
+      ...vrDownloadFixture({
+        category: "movie",
+        code: "tt0123456",
+        releaseName: "Current Movie",
+        state: "downloading",
+        transferId: "movie-current",
+      }),
+      ...vrDownloadFixture({
+        category: "movie",
+        code: "tt0765432",
+        isCurrentFolder: "false",
+        releaseName: "Old-folder Movie",
+        state: "downloading",
+        transferId: "movie-old",
+      }),
+    ];
+    const oldFolderCompletedRows = [
+      ...activeRows.slice(0, 13),
+      ...vrDownloadFixture({
+        category: "movie",
+        code: "tt0765432",
+        downloadedBytes: "10",
+        isCurrentFolder: "false",
+        releaseName: "Old-folder Movie",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "movie-old",
+      }),
+    ];
+    const currentFolderCompletedRows = [
+      ...vrDownloadFixture({
+        category: "movie",
+        code: "tt0123456",
+        downloadedBytes: "10",
+        releaseName: "Current Movie",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "movie-current",
+      }),
+      ...oldFolderCompletedRows.slice(13),
+    ];
+    loadVrDownloadsMock.mockResolvedValue(activeRows);
+    listVrDownloadsMock
+      .mockResolvedValueOnce(oldFolderCompletedRows)
+      .mockResolvedValueOnce(currentFolderCompletedRows)
+      .mockResolvedValue(currentFolderCompletedRows);
+
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(scanMoviesMock).toHaveBeenCalledOnce();
+    expect(queryMoviesStorageMock).toHaveBeenCalledOnce();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(scanMoviesMock).toHaveBeenCalledOnce();
+    expect(queryMoviesStorageMock).toHaveBeenCalledOnce();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(scanMoviesMock).toHaveBeenCalledTimes(2);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(2);
+    expect(scanAdultLibraryMock).toHaveBeenCalledOnce();
+    expect(queryAdultStorageMock).toHaveBeenCalledOnce();
+    expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+    expect(queryVrStorageMock).toHaveBeenCalledOnce();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(scanMoviesMock).toHaveBeenCalledTimes(2);
+    expect(queryMoviesStorageMock).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -4235,6 +4321,7 @@ describe("YTS Movie release comparison", () => {
     const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
     const exactTmdbTitle = "Exact  Movie — 特別版";
     const exactProviderTitle = "YTS  Exact — 特別版";
+    savedMoviesFolder = "/Movies";
     loadTmdbTokenMock.mockResolvedValue("fixture-token");
     fetchMock.mockResolvedValue(
       jsonResponse({
@@ -4372,12 +4459,41 @@ describe("YTS Movie release comparison", () => {
     ).toBe("Movie  —  Exact  Torrent");
     expect(screen.getByText(expectedInfohash)).toBeTruthy();
     const fileRows = within(
-      screen.getByRole("list", { name: "Verified Movie torrent files" }),
+      screen.getByRole("list", {
+        name: "Files in verified Movie torrent for Exact Movie — 特別版",
+      }),
     ).getAllByRole("listitem");
     expect(fileRows).toHaveLength(2);
     expect(fileRows[0].textContent).toContain("Folder/Part  1 — 映画.mkv");
     expect(fileRows[1].textContent).toContain("Folder/特別版  B.mp4");
-    expect(screen.queryByRole("button", { name: "Start download" })).toBeNull();
+    const fileSelection = screen.getAllByRole("checkbox");
+    expect(fileSelection).toHaveLength(2);
+    expect(fileSelection.every((checkbox) => !(checkbox as HTMLInputElement).checked)).toBe(
+      true,
+    );
+    const startButton = screen.getByRole("button", { name: "Start download" });
+    expect((startButton as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(fileSelection[1]);
+    expect((startButton as HTMLButtonElement).disabled).toBe(false);
+
+    const startRequest = createDeferred<string>();
+    startVerifiedMovieDownloadMock.mockReturnValue(startRequest.promise);
+    fireEvent.click(startButton);
+    fireEvent.click(startButton);
+    expect(startVerifiedMovieDownloadMock).toHaveBeenCalledOnce();
+    expect(startVerifiedMovieDownloadMock).toHaveBeenCalledWith({
+      inspectionId: "movie-419-700-hash",
+      selectedFileIds: [1],
+    });
+    expect(startVerifiedAdultDownloadMock).not.toHaveBeenCalled();
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+    await act(async () => {
+      startRequest.resolve("movie-transfer-419");
+      await startRequest.promise;
+    });
+    expect(
+      await screen.findByText("Selected Movie files were added to Downloads."),
+    ).toBeTruthy();
 
     const cancelledSave = createDeferred<boolean>();
     saveVerifiedMovieTorrentMock
@@ -7184,6 +7300,14 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
         transferId: "active-b",
       }),
       ...vrDownloadFixture({
+        category: "movie",
+        code: "tt0123456",
+        releaseName: "Exact  Movie — 特別版",
+        speedBytesPerSecond: "1024",
+        state: "downloading",
+        transferId: "active-movie",
+      }),
+      ...vrDownloadFixture({
         releaseName: "Queued",
         speedBytesPerSecond: "8192",
         state: "queued",
@@ -7228,11 +7352,11 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
       "Transfer summary",
     );
     const expectedDashboardValues = [
-      ["Active", "2"],
+      ["Active", "3"],
       ["Paused", "1"],
       ["Completed", "1"],
       ["Needs attention", "2"],
-      ["Download speed", "3.0 KiB/s"],
+      ["Download speed", "4.0 KiB/s"],
       ["Limit", "8 MiB/s"],
     ];
     for (const [label, value] of expectedDashboardValues) {
@@ -7245,9 +7369,15 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
       within(dashboard).getByRole("button", { name: "Open Downloads" }),
     );
     const aggregate = screen.getByLabelText("Downloads aggregate status");
-    expect(within(aggregate).getByText("2", { selector: "dd" })).toBeTruthy();
-    expect(within(aggregate).getByText("3.0 KiB/s")).toBeTruthy();
+    expect(within(aggregate).getByText("3", { selector: "dd" })).toBeTruthy();
+    expect(within(aggregate).getByText("4.0 KiB/s")).toBeTruthy();
     expect(screen.getByText("Adult · ADLT-123")).toBeTruthy();
+    const movieHeading = screen.getByRole("heading", {
+      name: "Exact Movie — 特別版",
+    });
+    const movieCard = movieHeading.closest("article") as HTMLElement;
+    expect(within(movieCard).getByText("Movie · tt0123456")).toBeTruthy();
+    expect(within(movieCard).queryByRole("button", { name: "Organize files" })).toBeNull();
     expect(screen.getAllByText(/VR · MDVR-/).length).toBeGreaterThan(0);
 
     selectSettings();

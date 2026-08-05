@@ -18,7 +18,8 @@ use librqbit::{
 use crate::vr_library::is_supported_media;
 use crate::vr_torrent::{
     adult_media_name_matches_product_code, hex_sha1, media_name_matches_product_code,
-    revalidate_persisted_download_source, AdultTorrentState, VerifiedDownloadFile,
+    revalidate_persisted_download_source, revalidate_persisted_movie_download_source,
+    AdultTorrentState, MovieDownloadIdentity, MovieTorrentState, VerifiedDownloadFile,
     VerifiedDownloadSource, VerifiedDownloadSourceError, VrTorrentState,
 };
 
@@ -59,6 +60,7 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransferCategory {
     Adult,
+    Movie,
     Vr,
 }
 
@@ -66,6 +68,7 @@ impl TransferCategory {
     fn as_str(self) -> &'static str {
         match self {
             Self::Adult => "adult",
+            Self::Movie => "movie",
             Self::Vr => "vr",
         }
     }
@@ -73,6 +76,7 @@ impl TransferCategory {
     fn from_str(value: &str) -> Option<Self> {
         match value {
             "adult" => Some(Self::Adult),
+            "movie" => Some(Self::Movie),
             "vr" => Some(Self::Vr),
             _ => None,
         }
@@ -167,6 +171,7 @@ struct TransferRecord {
     category: TransferCategory,
     code: String,
     release_name: String,
+    movie_identity: Option<Box<MovieDownloadIdentity>>,
     infohash: String,
     metainfo: Vec<u8>,
     selected_files: Vec<VerifiedDownloadFile>,
@@ -254,6 +259,7 @@ enum DownloadLimitState {
 struct VrDownloadContext {
     future_folder: Option<PathBuf>,
     adult_future_folder: Option<PathBuf>,
+    movie_future_folder: Option<PathBuf>,
     session: Option<Arc<Session>>,
     session_starting: bool,
     download_limit: DownloadLimitState,
@@ -275,6 +281,7 @@ fn invalidate_organization_plan(context: &mut VrDownloadContext) {
 fn configured_folder(context: &VrDownloadContext, category: TransferCategory) -> Option<&Path> {
     match category {
         TransferCategory::Adult => context.adult_future_folder.as_deref(),
+        TransferCategory::Movie => context.movie_future_folder.as_deref(),
         TransferCategory::Vr => context.future_folder.as_deref(),
     }
 }
@@ -304,6 +311,15 @@ pub fn configure_adult_download_folder(
     let mut context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
     invalidate_organization_plan(&mut context);
     context.adult_future_folder = folder;
+    Ok(())
+}
+
+pub fn configure_movie_download_folder(
+    state: &VrDownloadState,
+    folder: Option<PathBuf>,
+) -> Result<(), &'static str> {
+    let mut context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
+    context.movie_future_folder = folder;
     Ok(())
 }
 
@@ -640,6 +656,9 @@ fn transfer_identity(
     identity_field(&mut identity, source.release_name.as_bytes());
     identity_field(&mut identity, source.infohash.as_bytes());
     identity_field(&mut identity, &source.bytes);
+    if let Some(movie_identity) = &source.movie_identity {
+        identity_field(&mut identity, &encode_movie_identity(movie_identity));
+    }
     identity_field(&mut identity, destination.to_string_lossy().as_bytes());
     for file in &source.selected_files {
         identity.extend_from_slice(&(file.file_id as u64).to_be_bytes());
@@ -680,6 +699,7 @@ fn transfer_from_source(
         category,
         code: source.code,
         release_name: source.release_name,
+        movie_identity: source.movie_identity.map(Box::new),
         infohash: source.infohash,
         metainfo: source.bytes,
         selected_files: source.selected_files,
@@ -736,6 +756,74 @@ fn decode_text(value: &[u8]) -> Option<String> {
     String::from_utf8(decode_hex(value)?).ok()
 }
 
+fn encode_movie_identity(identity: &MovieDownloadIdentity) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for value in [
+        identity.tmdb_movie_id.to_string(),
+        identity.tmdb_title.clone(),
+        identity.release_date.clone().unwrap_or_default(),
+        identity.imdb_id.clone(),
+        identity.provider_movie_id.to_string(),
+        identity.provider_title.clone().unwrap_or_default(),
+        identity.provider_year.clone().unwrap_or_default(),
+        identity.row_id.clone(),
+        identity.quality.clone().unwrap_or_default(),
+        identity.type_label.clone().unwrap_or_default(),
+        identity.video_codec.clone().unwrap_or_default(),
+        identity.size.clone().unwrap_or_default(),
+        identity.size_bytes.clone().unwrap_or_default(),
+        identity.seeds.clone().unwrap_or_default(),
+        identity.peers.clone().unwrap_or_default(),
+        identity.expected_infohash.clone(),
+        identity.torrent_url.clone(),
+    ] {
+        identity_field(&mut encoded, value.as_bytes());
+    }
+    encoded
+}
+
+fn decode_movie_identity(value: &[u8]) -> Option<MovieDownloadIdentity> {
+    fn next_field<'a>(value: &'a [u8], position: &mut usize) -> Option<&'a [u8]> {
+        let length_end = position.checked_add(8)?;
+        let length = u64::from_be_bytes(value.get(*position..length_end)?.try_into().ok()?);
+        let length = usize::try_from(length).ok()?;
+        let field_end = length_end.checked_add(length)?;
+        let field = value.get(length_end..field_end)?;
+        *position = field_end;
+        Some(field)
+    }
+
+    fn next_text(value: &[u8], position: &mut usize) -> Option<String> {
+        String::from_utf8(next_field(value, position)?.to_vec()).ok()
+    }
+
+    fn optional(value: String) -> Option<String> {
+        (!value.is_empty()).then_some(value)
+    }
+
+    let mut position = 0;
+    let identity = MovieDownloadIdentity {
+        tmdb_movie_id: next_text(value, &mut position)?.parse().ok()?,
+        tmdb_title: next_text(value, &mut position)?,
+        release_date: optional(next_text(value, &mut position)?),
+        imdb_id: next_text(value, &mut position)?,
+        provider_movie_id: next_text(value, &mut position)?.parse().ok()?,
+        provider_title: optional(next_text(value, &mut position)?),
+        provider_year: optional(next_text(value, &mut position)?),
+        row_id: next_text(value, &mut position)?,
+        quality: optional(next_text(value, &mut position)?),
+        type_label: optional(next_text(value, &mut position)?),
+        video_codec: optional(next_text(value, &mut position)?),
+        size: optional(next_text(value, &mut position)?),
+        size_bytes: optional(next_text(value, &mut position)?),
+        seeds: optional(next_text(value, &mut position)?),
+        peers: optional(next_text(value, &mut position)?),
+        expected_infohash: next_text(value, &mut position)?,
+        torrent_url: next_text(value, &mut position)?,
+    };
+    (position == value.len()).then_some(identity)
+}
+
 fn encoded_selected_ids(record: &TransferRecord) -> String {
     record
         .selected_files
@@ -787,7 +875,7 @@ fn encode_transfer_state(
     organization_state: OrganizationState,
     current_paths: &[String],
 ) -> Result<Vec<u8>, &'static str> {
-    Ok([
+    let mut fields = vec![
         encode_hex(record.transfer_id.as_bytes()),
         encode_hex(record.code.as_bytes()),
         encode_hex(record.release_name.as_bytes()),
@@ -802,9 +890,11 @@ fn encode_transfer_state(
         organization_state.as_str().to_owned(),
         encoded_paths(current_paths),
         record.category.as_str().to_owned(),
-    ]
-    .join("\t")
-    .into_bytes())
+    ];
+    if let Some(identity) = &record.movie_identity {
+        fields.push(encode_hex(&encode_movie_identity(identity)));
+    }
+    Ok(fields.join("\t").into_bytes())
 }
 
 fn encode_transfer(record: &TransferRecord) -> Result<Vec<u8>, &'static str> {
@@ -867,97 +957,125 @@ fn parse_boundary_segments(value: &[u8]) -> Option<BTreeMap<usize, Vec<SparseSeg
 
 fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRecord> {
     let fields = line.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-    let (fields, boundary_segments, organization_state, current_paths, category) = match fields
-        .as_slice()
-    {
-        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes]
-            if allow_legacy_vr =>
-        {
-            (
-                [
-                    *transfer_id,
-                    *code,
-                    *release_name,
-                    *infohash,
-                    *destination,
-                    *state,
-                    *metainfo,
-                    *selected_ids,
-                    *fingerprints,
-                    *downloaded_bytes,
-                ],
-                BTreeMap::new(),
-                OrganizationState::None,
-                None,
-                TransferCategory::Vr,
-            )
-        }
-        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments]
-            if allow_legacy_vr =>
-        {
-            (
-                [
-                    *transfer_id,
-                    *code,
-                    *release_name,
-                    *infohash,
-                    *destination,
-                    *state,
-                    *metainfo,
-                    *selected_ids,
-                    *fingerprints,
-                    *downloaded_bytes,
-                ],
-                parse_boundary_segments(boundary_segments)?,
-                OrganizationState::None,
-                None,
-                TransferCategory::Vr,
-            )
-        }
-        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths]
-            if allow_legacy_vr =>
-        {
-            (
-                [
-                    *transfer_id,
-                    *code,
-                    *release_name,
-                    *infohash,
-                    *destination,
-                    *state,
-                    *metainfo,
-                    *selected_ids,
-                    *fingerprints,
-                    *downloaded_bytes,
-                ],
-                parse_boundary_segments(boundary_segments)?,
-                OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
-                Some(parse_current_paths(current_paths)?),
-                TransferCategory::Vr,
-            )
-        }
-        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths, category] => {
-            (
-                [
-                    *transfer_id,
-                    *code,
-                    *release_name,
-                    *infohash,
-                    *destination,
-                    *state,
-                    *metainfo,
-                    *selected_ids,
-                    *fingerprints,
-                    *downloaded_bytes,
-                ],
-                parse_boundary_segments(boundary_segments)?,
-                OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
-                Some(parse_current_paths(current_paths)?),
-                TransferCategory::from_str(std::str::from_utf8(category).ok()?)?,
-            )
-        }
-        _ => return None,
-    };
+    let (fields, boundary_segments, organization_state, current_paths, category, movie_identity) =
+        match fields.as_slice() {
+            [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes]
+                if allow_legacy_vr =>
+            {
+                (
+                    [
+                        *transfer_id,
+                        *code,
+                        *release_name,
+                        *infohash,
+                        *destination,
+                        *state,
+                        *metainfo,
+                        *selected_ids,
+                        *fingerprints,
+                        *downloaded_bytes,
+                    ],
+                    BTreeMap::new(),
+                    OrganizationState::None,
+                    None,
+                    TransferCategory::Vr,
+                    None,
+                )
+            }
+            [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments]
+                if allow_legacy_vr =>
+            {
+                (
+                    [
+                        *transfer_id,
+                        *code,
+                        *release_name,
+                        *infohash,
+                        *destination,
+                        *state,
+                        *metainfo,
+                        *selected_ids,
+                        *fingerprints,
+                        *downloaded_bytes,
+                    ],
+                    parse_boundary_segments(boundary_segments)?,
+                    OrganizationState::None,
+                    None,
+                    TransferCategory::Vr,
+                    None,
+                )
+            }
+            [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths]
+                if allow_legacy_vr =>
+            {
+                (
+                    [
+                        *transfer_id,
+                        *code,
+                        *release_name,
+                        *infohash,
+                        *destination,
+                        *state,
+                        *metainfo,
+                        *selected_ids,
+                        *fingerprints,
+                        *downloaded_bytes,
+                    ],
+                    parse_boundary_segments(boundary_segments)?,
+                    OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
+                    Some(parse_current_paths(current_paths)?),
+                    TransferCategory::Vr,
+                    None,
+                )
+            }
+            [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths, category] => {
+                (
+                    [
+                        *transfer_id,
+                        *code,
+                        *release_name,
+                        *infohash,
+                        *destination,
+                        *state,
+                        *metainfo,
+                        *selected_ids,
+                        *fingerprints,
+                        *downloaded_bytes,
+                    ],
+                    parse_boundary_segments(boundary_segments)?,
+                    OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
+                    Some(parse_current_paths(current_paths)?),
+                    TransferCategory::from_str(std::str::from_utf8(category).ok()?)?,
+                    None,
+                )
+            }
+            [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths, category, movie_identity]
+                if std::str::from_utf8(category).ok()? == TransferCategory::Movie.as_str() =>
+            {
+                (
+                    [
+                        *transfer_id,
+                        *code,
+                        *release_name,
+                        *infohash,
+                        *destination,
+                        *state,
+                        *metainfo,
+                        *selected_ids,
+                        *fingerprints,
+                        *downloaded_bytes,
+                    ],
+                    parse_boundary_segments(boundary_segments)?,
+                    OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
+                    Some(parse_current_paths(current_paths)?),
+                    TransferCategory::Movie,
+                    Some(Box::new(decode_movie_identity(&decode_hex(
+                        movie_identity,
+                    )?)?)),
+                )
+            }
+            _ => return None,
+        };
     let [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes] =
         fields;
     let transfer_id = decode_text(transfer_id)?;
@@ -982,14 +1100,34 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
         return None;
     }
 
-    let source = revalidate_persisted_download_source(
-        &metainfo,
-        &code,
-        &release_name,
-        &infohash,
-        &selected_ids,
-    )
-    .ok()?;
+    let source = match category {
+        TransferCategory::Movie => {
+            let identity = movie_identity.as_ref()?;
+            if !code.is_empty() || release_name != identity.tmdb_title {
+                return None;
+            }
+            revalidate_persisted_movie_download_source(
+                &metainfo,
+                identity,
+                &infohash,
+                &selected_ids,
+            )
+            .ok()?
+        }
+        TransferCategory::Adult | TransferCategory::Vr => {
+            if movie_identity.is_some() {
+                return None;
+            }
+            revalidate_persisted_download_source(
+                &metainfo,
+                &code,
+                &release_name,
+                &infohash,
+                &selected_ids,
+            )
+            .ok()?
+        }
+    };
     let current_paths = current_paths.unwrap_or_else(|| {
         source
             .selected_files
@@ -1002,7 +1140,10 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
     let identity_is_valid = category_identity == transfer_id
         || (category == TransferCategory::Vr
             && legacy_vr_transfer_identity(&source, &destination) == transfer_id);
-    if !identity_is_valid || downloaded_bytes > selected_total {
+    if !identity_is_valid
+        || downloaded_bytes > selected_total
+        || (category == TransferCategory::Movie && organization_state != OrganizationState::None)
+    {
         return None;
     }
     if current_paths.len() != source.selected_files.len()
@@ -1028,6 +1169,7 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
         category,
         code,
         release_name,
+        movie_identity,
         infohash,
         metainfo,
         selected_files: source.selected_files,
@@ -2033,6 +2175,7 @@ async fn restore_record(
             category: record.category,
             code: record.code.clone(),
             release_name: record.release_name.clone(),
+            movie_identity: record.movie_identity.clone(),
             infohash: record.infohash.clone(),
             metainfo: record.metainfo.clone(),
             selected_files: record.selected_files.clone(),
@@ -2413,6 +2556,7 @@ fn organization_destination_relative(
         TransferCategory::Adult => {
             adult_media_name_matches_product_code(source_title, &record.code)
         }
+        TransferCategory::Movie => false,
         TransferCategory::Vr => media_name_matches_product_code(source_title, &record.code),
     };
     if !identity_matches {
@@ -2438,7 +2582,8 @@ fn organization_entries(
     record: &TransferRecord,
     current_folder: Option<&Path>,
 ) -> Result<Vec<OrganizationEntry>, &'static str> {
-    if record.state != TransferState::Completed
+    if record.category == TransferCategory::Movie
+        || record.state != TransferState::Completed
         || record.handle.is_some()
         || record.pending_action.is_some()
         || record.organization_state == OrganizationState::Organized
@@ -2700,6 +2845,7 @@ fn apply_organization_with_persistence(
     invalidate_organization_plan(&mut context);
     let current_folder = match plan.category {
         TransferCategory::Adult => context.adult_future_folder.clone(),
+        TransferCategory::Movie => return Err(VR_ORGANIZATION_INELIGIBLE),
         TransferCategory::Vr => context.future_folder.clone(),
     };
     let record_index = context
@@ -2887,11 +3033,13 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
     let mut rows = Vec::new();
     let current_vr_folder = context.future_folder.clone();
     let current_adult_folder = context.adult_future_folder.clone();
+    let current_movie_folder = context.movie_future_folder.clone();
     for transfer in &mut context.transfers {
         match transfer {
             StoredTransfer::Valid(record) => {
                 let current_folder = match record.category {
                     TransferCategory::Adult => &current_adult_folder,
+                    TransferCategory::Movie => &current_movie_folder,
                     TransferCategory::Vr => &current_vr_folder,
                 };
                 let mut speed = 0;
@@ -2913,7 +3061,11 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                 rows.extend([
                     record.transfer_id.clone(),
                     record.category.as_str().to_owned(),
-                    record.code.clone(),
+                    record
+                        .movie_identity
+                        .as_ref()
+                        .map(|identity| identity.imdb_id.clone())
+                        .unwrap_or_else(|| record.code.clone()),
                     record.release_name.clone(),
                     record.selected_files.len().to_string(),
                     record.selected_total().to_string(),
@@ -2927,9 +3079,9 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                     } else {
                         format!("{}/", record.code)
                     },
-                    organization_entries(record, current_folder.as_deref())
-                        .is_ok()
-                        .to_string(),
+                    (record.category != TransferCategory::Movie
+                        && organization_entries(record, current_folder.as_deref()).is_ok())
+                    .to_string(),
                 ]);
             }
             StoredTransfer::Corrupt(record) => rows.extend([
@@ -2984,7 +3136,9 @@ pub fn list_downloads(
         Ok(()) => {
             for transfer in &context.transfers {
                 if let StoredTransfer::Valid(record) = transfer {
-                    clear_organization_recovery(record);
+                    if record.category != TransferCategory::Movie {
+                        clear_organization_recovery(record);
+                    }
                 }
             }
             Ok(rows)
@@ -3001,6 +3155,19 @@ async fn start_download_source(
     category: TransferCategory,
     source: VerifiedDownloadSource,
 ) -> Result<String, &'static str> {
+    let source_matches_category = match category {
+        TransferCategory::Movie => {
+            source.code.is_empty()
+                && source.movie_identity.as_ref().is_some_and(|identity| {
+                    source.release_name == identity.tmdb_title
+                        && source.infohash == identity.expected_infohash
+                })
+        }
+        TransferCategory::Adult | TransferCategory::Vr => source.movie_identity.is_none(),
+    };
+    if !source_matches_category {
+        return Err(VR_DOWNLOAD_CONTEXT_INVALID);
+    }
     checked_selected_total(&source.selected_files)?;
     let destination = {
         let context = state.0.lock().map_err(|_| VR_DOWNLOAD_FAILED)?;
@@ -3012,6 +3179,7 @@ async fn start_download_source(
         }
         let future_folder = match category {
             TransferCategory::Adult => context.adult_future_folder.as_deref(),
+            TransferCategory::Movie => context.movie_future_folder.as_deref(),
             TransferCategory::Vr => context.future_folder.as_deref(),
         };
         let destination = canonical_destination(future_folder.ok_or(VR_FOLDER_UNAVAILABLE)?)?;
@@ -3057,6 +3225,7 @@ async fn start_download_source(
                         category: record.category,
                         code: record.code.clone(),
                         release_name: record.release_name.clone(),
+                        movie_identity: record.movie_identity.clone(),
                         infohash: record.infohash.clone(),
                         metainfo: record.metainfo.clone(),
                         selected_files: record.selected_files.clone(),
@@ -3165,6 +3334,27 @@ pub async fn start_adult_download(
         persistence_path,
         session_folder,
         TransferCategory::Adult,
+        source,
+    )
+    .await
+}
+
+pub async fn start_movie_download(
+    state: &VrDownloadState,
+    torrent_state: &MovieTorrentState,
+    persistence_path: &Path,
+    session_folder: &Path,
+    inspection_id: &str,
+    selected_file_ids: &[usize],
+) -> Result<String, &'static str> {
+    let source = torrent_state
+        .verified_download_source(inspection_id, selected_file_ids)
+        .map_err(map_source_error)?;
+    start_download_source(
+        state,
+        persistence_path,
+        session_folder,
+        TransferCategory::Movie,
         source,
     )
     .await
@@ -3319,10 +3509,12 @@ pub fn dismiss_download(
         return Err(error);
     }
     if let StoredTransfer::Valid(record) = &dismissed {
-        if let Err(error) = remove_organization_recovery(record) {
-            context.transfers.insert(position, dismissed);
-            let _ = write_persisted_transfers(persistence_path, &context.transfers);
-            return Err(error);
+        if record.category != TransferCategory::Movie {
+            if let Err(error) = remove_organization_recovery(record) {
+                context.transfers.insert(position, dismissed);
+                let _ = write_persisted_transfers(persistence_path, &context.transfers);
+                return Err(error);
+            }
         }
     }
     Ok(())
@@ -3366,6 +3558,7 @@ mod tests {
             code: "MDVR-419".to_owned(),
             infohash: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             release_name: "【VR】 MDVR-419  Exact — 特別版".to_owned(),
+            movie_identity: None,
             selected_files: vec![VerifiedDownloadFile {
                 file_id: 0,
                 path: "Folder/Part  1 — 映画.mkv".to_owned(),
@@ -3380,6 +3573,7 @@ mod tests {
             code: "MDVR-419".to_owned(),
             infohash: "8b16011989123e1d68a8aaf18f5a599e6a4a0bc7".to_owned(),
             release_name: "【VR】 MDVR-419  Exact — 特別版".to_owned(),
+            movie_identity: None,
             selected_files: vec![VerifiedDownloadFile {
                 file_id: 0,
                 path: "Movie  A.mp4".to_owned(),
@@ -3394,6 +3588,7 @@ mod tests {
             code: "ADLT-123".to_owned(),
             infohash: "8b16011989123e1d68a8aaf18f5a599e6a4a0bc7".to_owned(),
             release_name: "【Adult】 ADLT-123  Exact — 特別版".to_owned(),
+            movie_identity: None,
             selected_files: vec![VerifiedDownloadFile {
                 file_id: 0,
                 path: "Movie  A.mp4".to_owned(),
@@ -3408,6 +3603,7 @@ mod tests {
             code: "MDVR-419".to_owned(),
             infohash: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             release_name: "【VR】 MDVR-419  Exact — 特別版".to_owned(),
+            movie_identity: None,
             selected_files: files
                 .into_iter()
                 .enumerate()
@@ -3426,6 +3622,7 @@ mod tests {
             code: "ADLT-123".to_owned(),
             infohash: "89abcdef0123456789abcdef0123456789abcdef".to_owned(),
             release_name: "【Adult】 ADLT-123  Exact — 特別版".to_owned(),
+            movie_identity: None,
             selected_files: files
                 .into_iter()
                 .enumerate()
@@ -3484,6 +3681,7 @@ mod tests {
             let mut context = state.0.lock().expect("state must lock");
             match category {
                 TransferCategory::Adult => context.adult_future_folder = Some(destination),
+                TransferCategory::Movie => context.movie_future_folder = Some(destination),
                 TransferCategory::Vr => context.future_folder = Some(destination),
             }
             context.transfers_loaded = true;
@@ -5781,6 +5979,252 @@ mod tests {
             );
             assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
         }
+    }
+
+    #[test]
+    fn movie_transfer_uses_only_native_identity_folder_and_selected_files_across_restart() {
+        let fixture = FilesystemFixture::new();
+        let movie_destination = fixture.path.join("Movies — 現在");
+        let replacement_destination = fixture.path.join("Movies — replacement");
+        fs::create_dir_all(&movie_destination).expect("Movies destination must exist");
+        fs::create_dir_all(&replacement_destination)
+            .expect("replacement Movies destination must exist");
+        let movie_destination =
+            fs::canonicalize(movie_destination).expect("Movies destination must canonicalize");
+        let replacement_destination = fs::canonicalize(replacement_destination)
+            .expect("replacement Movies destination must canonicalize");
+        let bytes = selected_file_torrent();
+        let infohash = hex_sha1(&bytes[b"d4:info".len()..bytes.len() - 1]);
+        let torrent_url = format!(
+            "https://yts.mx/torrent/download/{}",
+            infohash.to_ascii_uppercase()
+        );
+        let torrent_state = MovieTorrentState::default();
+        let release_generation = torrent_state
+            .begin_release_lookup()
+            .expect("Movie release lookup must begin");
+        torrent_state
+            .finish_release_lookup(
+                release_generation,
+                419,
+                r#"{"id":419,"title":"Exact  Movie — 特別版","release_date":"1999-04-19"}"#,
+                r#"{"id":419,"imdb_id":"tt0123456"}"#,
+                &format!(
+                    r#"{{"status":"ok","data":{{"movies":[{{"id":700,"imdb_code":"tt0123456","title":"Exact  YTS — 特別版","year":1999,"torrents":[{{"quality":"1080p","type":"bluray","video_codec":"x264","size":"12 B","size_bytes":12,"seeds":0,"peers":0,"hash":"{infohash}","url":"{torrent_url}"}}]}}]}}}}"#
+                ),
+            )
+            .expect("exact Movie release identity must be stored");
+        let request = crate::vr_torrent::MovieTorrentInspectionRequest {
+            tmdb_movie_id: 419,
+            tmdb_title: "Exact  Movie — 特別版".to_owned(),
+            release_date: Some("1999-04-19".to_owned()),
+            imdb_id: "tt0123456".to_owned(),
+            provider_movie_id: 700,
+            provider_title: Some("Exact  YTS — 特別版".to_owned()),
+            provider_year: Some("1999".to_owned()),
+            row_id: "700:0".to_owned(),
+            quality: Some("1080p".to_owned()),
+            type_label: Some("bluray".to_owned()),
+            video_codec: Some("x264".to_owned()),
+            size: Some("12 B".to_owned()),
+            size_bytes: Some("12".to_owned()),
+            seeds: Some("0".to_owned()),
+            peers: Some("0".to_owned()),
+            expected_infohash: infohash,
+            torrent_url,
+        };
+        let (release_generation, inspection_generation) = torrent_state
+            .begin_inspection(&request)
+            .expect("exact Movie inspection must begin");
+        let inspection = crate::vr_torrent::inspect_yts_movie_torrent_with(
+            &torrent_state,
+            release_generation,
+            inspection_generation,
+            request,
+            |_| {
+                Ok(crate::vr_torrent::ArtifactResponse {
+                    status: 200,
+                    redirect_url: None,
+                    body: bytes.clone(),
+                })
+            },
+        )
+        .expect("exact Movie torrent must inspect");
+        let persistence_path = fixture.path.join("downloads");
+        let download_limit_path = fixture.path.join("limit");
+        let state = VrDownloadState::default();
+
+        tauri::async_runtime::block_on(async {
+            load_downloads(
+                &state,
+                &persistence_path,
+                &fixture.path.join("session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("empty transfer state must load");
+            configure_movie_download_folder(&state, Some(movie_destination.clone()))
+                .expect("trusted Movies folder must configure");
+            assert_eq!(
+                start_movie_download(
+                    &state,
+                    &torrent_state,
+                    &persistence_path,
+                    &fixture.path.join("session"),
+                    &inspection[0],
+                    &[],
+                )
+                .await,
+                Err(VR_DOWNLOAD_CONTEXT_INVALID)
+            );
+            let transfer_id = start_movie_download(
+                &state,
+                &torrent_state,
+                &persistence_path,
+                &fixture.path.join("session"),
+                &inspection[0],
+                &[1],
+            )
+            .await
+            .expect("Movie transfer must start from the trusted native inspection");
+            assert!(!movie_destination.join("Folder/Part  1 — 映画.mkv").exists());
+            assert!(movie_destination.join("Folder/特別版  B.mp4").is_file());
+            assert_eq!(
+                start_movie_download(
+                    &state,
+                    &torrent_state,
+                    &persistence_path,
+                    &fixture.path.join("session"),
+                    &inspection[0],
+                    &[1],
+                )
+                .await,
+                Err(VR_DOWNLOAD_DUPLICATE)
+            );
+            assert_eq!(
+                start_download(
+                    &state,
+                    &VrTorrentState::default(),
+                    &persistence_path,
+                    &fixture.path.join("session"),
+                    &inspection[0],
+                    &[1],
+                )
+                .await,
+                Err(VR_DOWNLOAD_STALE)
+            );
+            let rows = list_downloads(&state, &persistence_path)
+                .expect("Movie transfer row must remain readable");
+            assert_eq!(rows[0], transfer_id);
+            assert_eq!(rows[1], "movie");
+            assert_eq!(rows[2], "tt0123456");
+            assert_eq!(rows[3], "Exact  Movie — 特別版");
+            assert_eq!(rows[4], "1");
+            assert_eq!(rows[9], "true");
+            assert_eq!(rows[10], "none");
+            assert_eq!(rows[12], "false");
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE)
+            );
+
+            configure_movie_download_folder(&state, Some(replacement_destination))
+                .expect("future Movies folder must change");
+            assert_eq!(
+                list_downloads(&state, &persistence_path)
+                    .expect("old-folder Movie row must remain readable")[9],
+                "false"
+            );
+            pause_download(&state, &persistence_path, &transfer_id)
+                .await
+                .expect("Movie transfer must pause");
+            let (old_session, old_handle) = {
+                let mut context = state.0.lock().expect("state must lock");
+                let session = context.session.clone().expect("session must exist");
+                let record = find_valid_record_mut(&mut context.transfers, &transfer_id)
+                    .expect("paused Movie transfer must exist");
+                record.handle_generation = record.handle_generation.wrapping_add(1);
+                let handle = record.handle.take().expect("paused handle must exist");
+                write_persisted_transfers(&persistence_path, &context.transfers)
+                    .expect("paused Movie transfer must persist");
+                (session, handle)
+            };
+            old_session
+                .delete(old_handle.id().into(), false)
+                .await
+                .expect("fixture session must detach without deleting Movie media");
+            assert!(movie_destination.join("Folder/特別版  B.mp4").is_file());
+
+            let resumed = VrDownloadState::default();
+            configure_movie_download_folder(&resumed, Some(movie_destination.clone()))
+                .expect("current Movies folder must restore");
+            let rows = load_downloads(
+                &resumed,
+                &persistence_path,
+                &fixture.path.join("restart-session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("paused Movie transfer must reload");
+            assert_eq!(rows[0], transfer_id);
+            assert_eq!(rows[1], "movie");
+            assert_eq!(rows[8], "paused");
+            assert_eq!(rows[9], "true");
+            {
+                let context = resumed.0.lock().expect("state must lock");
+                let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                    panic!("persisted Movie transfer must remain valid");
+                };
+                let identity = record
+                    .movie_identity
+                    .as_ref()
+                    .expect("Movie identity must persist");
+                assert_eq!(identity.tmdb_movie_id, 419);
+                assert_eq!(identity.tmdb_title, "Exact  Movie — 特別版");
+                assert_eq!(identity.release_date.as_deref(), Some("1999-04-19"));
+                assert_eq!(identity.imdb_id, "tt0123456");
+                assert_eq!(identity.provider_movie_id, 700);
+                assert_eq!(
+                    identity.provider_title.as_deref(),
+                    Some("Exact  YTS — 特別版")
+                );
+                assert_eq!(identity.row_id, "700:0");
+                assert_eq!(identity.quality.as_deref(), Some("1080p"));
+                assert_eq!(identity.expected_infohash, record.infohash);
+            }
+            resume_download(&resumed, &persistence_path, &transfer_id)
+                .await
+                .expect("restored Movie transfer must resume");
+            cancel_download(&resumed, &persistence_path, &transfer_id)
+                .await
+                .expect("resumed Movie transfer must cancel without deleting media");
+            assert!(movie_destination.join("Folder/特別版  B.mp4").is_file());
+
+            let restarted = VrDownloadState::default();
+            configure_movie_download_folder(&restarted, Some(movie_destination.clone()))
+                .expect("current Movies folder must restore after cancellation");
+            let rows = load_downloads(
+                &restarted,
+                &persistence_path,
+                &fixture.path.join("cancelled-restart-session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("cancelled Movie transfer must reload");
+            assert_eq!(rows[0], transfer_id);
+            assert_eq!(rows[1], "movie");
+            assert_eq!(rows[8], "cancelled");
+            assert_eq!(rows[9], "true");
+            assert!(restarted
+                .0
+                .lock()
+                .expect("state must lock")
+                .session
+                .is_none());
+            dismiss_download(&restarted, &persistence_path, &transfer_id)
+                .expect("terminal Movie row must dismiss");
+            assert!(movie_destination.join("Folder/特別版  B.mp4").is_file());
+        });
     }
 
     #[test]

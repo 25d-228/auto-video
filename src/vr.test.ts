@@ -867,13 +867,26 @@ describe("trusted VR download boundary", () => {
       "none",
       "",
       "false",
+      "movie-transfer-419",
+      "movie",
+      "tt0123456",
+      "Exact  Movie — 特別版",
+      "1",
+      "7",
+      "3",
+      "512",
+      "downloading",
+      "true",
+      "none",
+      "",
+      "false",
     ]);
 
     await expect(loadVrDownloads()).resolves.toEqual([
       {
         transferId: "transfer-123",
         category: "vr",
-        code: "MDVR-419",
+        identity: "MDVR-419",
         releaseName: exactReleaseName,
         selectedFileCount: 2,
         totalBytes: "12",
@@ -888,7 +901,7 @@ describe("trusted VR download boundary", () => {
       {
         transferId: "adult-transfer-123",
         category: "adult",
-        code: "ADLT-123",
+        identity: "ADLT-123",
         releaseName: "【Adult】 ADLT-123  Exact  —  特別版",
         selectedFileCount: 1,
         totalBytes: "7",
@@ -900,8 +913,52 @@ describe("trusted VR download boundary", () => {
         organizationRelativeDirectory: null,
         canOrganize: false,
       },
+      {
+        transferId: "movie-transfer-419",
+        category: "movie",
+        identity: "tt0123456",
+        releaseName: "Exact  Movie — 特別版",
+        selectedFileCount: 1,
+        totalBytes: "7",
+        downloadedBytes: "3",
+        speedBytesPerSecond: "512",
+        state: "downloading",
+        isCurrentFolder: true,
+        organizationStatus: "none",
+        organizationRelativeDirectory: null,
+        canOrganize: false,
+      },
     ]);
     expect(invokeMock).toHaveBeenCalledWith("load_vr_downloads");
+  });
+
+  it("rejects Movie rows with fabricated identity or organization state", async () => {
+    const validMovieRow = [
+      "movie-transfer-419",
+      "movie",
+      "tt0123456",
+      "Exact Movie",
+      "1",
+      "7",
+      "3",
+      "512",
+      "downloading",
+      "true",
+      "none",
+      "",
+      "false",
+    ];
+    for (const [fieldIndex, invalidValue] of [
+      [2, "MDVR-419"],
+      [10, "organized"],
+      [11, "tt0123456/"],
+      [12, "true"],
+    ] as const) {
+      const malformed = [...validMovieRow];
+      malformed[fieldIndex] = invalidValue;
+      invokeMock.mockResolvedValueOnce(malformed);
+      await expect(loadVrDownloads()).rejects.toThrow("invalid data");
+    }
   });
 
   it("accepts native-eligible and recoverable Adult organization rows", async () => {
@@ -972,7 +1029,7 @@ describe("trusted VR download boundary", () => {
       {
         transferId: "corrupt-1",
         category: "unknown",
-        code: "ADLT-123",
+        identity: "ADLT-123",
         releaseName: "【Adult】 ADLT-123 damaged V2 record",
         selectedFileCount: 0,
         totalBytes: "0",

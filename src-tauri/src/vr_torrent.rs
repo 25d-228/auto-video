@@ -149,6 +149,93 @@ impl MovieTorrentInspectionRequest {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovieDownloadIdentity {
+    pub tmdb_movie_id: u64,
+    pub tmdb_title: String,
+    pub release_date: Option<String>,
+    pub imdb_id: String,
+    pub provider_movie_id: u64,
+    pub provider_title: Option<String>,
+    pub provider_year: Option<String>,
+    pub row_id: String,
+    pub quality: Option<String>,
+    pub type_label: Option<String>,
+    pub video_codec: Option<String>,
+    pub size: Option<String>,
+    pub size_bytes: Option<String>,
+    pub seeds: Option<String>,
+    pub peers: Option<String>,
+    pub expected_infohash: String,
+    pub torrent_url: String,
+}
+
+impl From<&MovieTorrentInspectionRequest> for MovieDownloadIdentity {
+    fn from(request: &MovieTorrentInspectionRequest) -> Self {
+        Self {
+            tmdb_movie_id: request.tmdb_movie_id,
+            tmdb_title: request.tmdb_title.clone(),
+            release_date: request.release_date.clone(),
+            imdb_id: request.imdb_id.clone(),
+            provider_movie_id: request.provider_movie_id,
+            provider_title: request.provider_title.clone(),
+            provider_year: request.provider_year.clone(),
+            row_id: request.row_id.clone(),
+            quality: request.quality.clone(),
+            type_label: request.type_label.clone(),
+            video_codec: request.video_codec.clone(),
+            size: request.size.clone(),
+            size_bytes: request.size_bytes.clone(),
+            seeds: request.seeds.clone(),
+            peers: request.peers.clone(),
+            expected_infohash: request.expected_infohash.clone(),
+            torrent_url: request.torrent_url.clone(),
+        }
+    }
+}
+
+impl MovieDownloadIdentity {
+    fn is_valid(&self) -> bool {
+        fn optional_text_is_valid(value: &Option<String>) -> bool {
+            value.as_ref().is_none_or(|value| !value.trim().is_empty())
+        }
+
+        fn optional_number_is_valid(value: &Option<String>, require_positive: bool) -> bool {
+            value.as_ref().is_none_or(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|number| !require_positive || *number > 0)
+                    .is_some_and(|number| number.to_string() == *value)
+            })
+        }
+
+        let row_prefix = format!("{}:", self.provider_movie_id);
+        self.tmdb_movie_id > 0
+            && !self.tmdb_title.trim().is_empty()
+            && self.release_date.as_deref().is_none_or(valid_release_date)
+            && canonical_imdb_id(&self.imdb_id).as_deref() == Some(self.imdb_id.as_str())
+            && self.provider_movie_id > 0
+            && optional_text_is_valid(&self.provider_title)
+            && optional_number_is_valid(&self.provider_year, true)
+            && self.row_id.strip_prefix(&row_prefix).is_some_and(|index| {
+                index
+                    .parse::<usize>()
+                    .ok()
+                    .is_some_and(|number| number.to_string() == index)
+            })
+            && optional_text_is_valid(&self.quality)
+            && optional_text_is_valid(&self.type_label)
+            && optional_text_is_valid(&self.video_codec)
+            && optional_text_is_valid(&self.size)
+            && optional_number_is_valid(&self.size_bytes, false)
+            && optional_number_is_valid(&self.seeds, false)
+            && optional_number_is_valid(&self.peers, false)
+            && canonical_infohash(&self.expected_infohash).as_deref()
+                == Some(self.expected_infohash.as_str())
+    }
+}
+
 impl From<TorrentInspectionRequest> for TrustedArtifact {
     fn from(request: TorrentInspectionRequest) -> Self {
         Self {
@@ -231,6 +318,7 @@ struct CachedMovieTorrent {
     generation: u64,
     inspection_id: String,
     default_file_name: String,
+    identity: MovieDownloadIdentity,
     bytes: Vec<u8>,
     metadata: TorrentMetadata,
 }
@@ -365,10 +453,47 @@ impl MovieTorrentState {
                 "movie-{}-{}.torrent",
                 request.tmdb_movie_id, request.expected_infohash
             ),
+            identity: MovieDownloadIdentity::from(request),
             bytes,
             metadata,
         });
         Ok(inspection_id)
+    }
+
+    pub fn verified_download_source(
+        &self,
+        inspection_id: &str,
+        selected_file_ids: &[usize],
+    ) -> Result<VerifiedDownloadSource, VerifiedDownloadSourceError> {
+        let cached = {
+            let context = self
+                .0
+                .lock()
+                .map_err(|_| VerifiedDownloadSourceError::Context)?;
+            context
+                .cached_torrent
+                .as_ref()
+                .filter(|torrent| {
+                    torrent.inspection_id == inspection_id
+                        && torrent.generation == context.inspection_generation
+                })
+                .map(|torrent| {
+                    (
+                        torrent.identity.clone(),
+                        torrent.bytes.clone(),
+                        torrent.metadata.clone(),
+                    )
+                })
+                .ok_or(VerifiedDownloadSourceError::Context)?
+        };
+
+        let (identity, bytes, cached_metadata) = cached;
+        revalidate_persisted_movie_download_source(
+            &bytes,
+            &identity,
+            &cached_metadata.infohash,
+            selected_file_ids,
+        )
     }
 }
 
@@ -505,6 +630,7 @@ impl TorrentState {
             code: artifact.code,
             infohash: metadata.infohash,
             release_name: artifact.release_name,
+            movie_identity: None,
             selected_files,
         })
     }
@@ -617,6 +743,38 @@ pub fn revalidate_persisted_download_source(
         code: code.to_owned(),
         infohash: metadata.infohash,
         release_name: release_name.to_owned(),
+        movie_identity: None,
+        selected_files,
+    })
+}
+
+pub fn revalidate_persisted_movie_download_source(
+    bytes: &[u8],
+    identity: &MovieDownloadIdentity,
+    expected_infohash: &str,
+    selected_file_ids: &[usize],
+) -> Result<VerifiedDownloadSource, VerifiedDownloadSourceError> {
+    if !identity.is_valid()
+        || expected_infohash != identity.expected_infohash
+        || yts_artifact_infohash(&identity.torrent_url).as_deref()
+            != Some(identity.expected_infohash.as_str())
+    {
+        return Err(VerifiedDownloadSourceError::Context);
+    }
+
+    let metadata =
+        parse_torrent_metadata(bytes).map_err(|_| VerifiedDownloadSourceError::Metainfo)?;
+    if metadata.infohash != expected_infohash {
+        return Err(VerifiedDownloadSourceError::Metainfo);
+    }
+    let selected_files = verified_selected_files(&metadata, selected_file_ids)?;
+
+    Ok(VerifiedDownloadSource {
+        bytes: bytes.to_vec(),
+        code: String::new(),
+        infohash: metadata.infohash,
+        release_name: identity.tmdb_title.clone(),
+        movie_identity: Some(identity.clone()),
         selected_files,
     })
 }
@@ -668,6 +826,7 @@ pub struct VerifiedDownloadSource {
     pub code: String,
     pub infohash: String,
     pub release_name: String,
+    pub movie_identity: Option<MovieDownloadIdentity>,
     pub selected_files: Vec<VerifiedDownloadFile>,
 }
 
@@ -3707,7 +3866,7 @@ mod tests {
             &state,
             release_generation,
             inspection_generation,
-            request,
+            request.clone(),
             |url| {
                 assert_eq!(
                     url,
@@ -3726,6 +3885,28 @@ mod tests {
         .expect("exact YTS artifact must inspect");
         assert_eq!(response[2], infohash);
         assert_eq!(response[4], "Folder/Part  1 — 映画.mkv");
+        let source = state
+            .verified_download_source(&response[0], &[1])
+            .expect("current Movie selection must resolve only from native state");
+        assert!(source.code.is_empty());
+        assert_eq!(source.release_name, request.tmdb_title);
+        assert_eq!(source.infohash, infohash);
+        assert_eq!(
+            source.movie_identity,
+            Some(MovieDownloadIdentity::from(&request))
+        );
+        assert_eq!(
+            source.selected_files,
+            vec![VerifiedDownloadFile {
+                file_id: 1,
+                path: "Folder/特別版  B.mp4".to_owned(),
+                size: 7,
+            }]
+        );
+        assert_eq!(
+            state.verified_download_source("vr-1-1-123", &[1]),
+            Err(VerifiedDownloadSourceError::Context)
+        );
         assert_eq!(
             save_verified_movie_torrent_with(
                 &state,
