@@ -472,9 +472,9 @@ export async function fetchVerifiedAdultSukebeiReleases(
   }
 }
 
-function torrentInspectionErrorStatus(
+export function torrentInspectionErrorStatus(
   error: unknown,
-  category: "adult" | "vr",
+  category: "adult" | "movie" | "vr",
 ): Exclude<TorrentInspectionResult["status"], "ready"> {
   const errorCode =
     typeof error === "string"
@@ -504,7 +504,7 @@ function torrentInspectionErrorStatus(
   }
 }
 
-function parseTorrentInspection(value: unknown): TorrentInspection | null {
+export function parseTorrentInspection(value: unknown): TorrentInspection | null {
   if (
     !Array.isArray(value) ||
     value.length < 6 ||

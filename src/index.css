@@ -1196,6 +1196,10 @@ button {
   grid-template-columns: minmax(0, 1fr) 6.5rem;
 }
 
+.discover-card--movie .media-title-row {
+  grid-template-columns: minmax(0, 1fr) 6.5rem;
+}
+
 .discover-card__releases-action {
   width: 6.5rem;
 }
@@ -1782,6 +1786,10 @@ button {
   padding: 0.75rem;
   border: 1px solid var(--border);
   background: var(--muted);
+}
+
+.movie-torrent__provider-metadata {
+  margin-top: 0.75rem;
 }
 
 .vr-torrent__metadata div {

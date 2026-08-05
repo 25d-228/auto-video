@@ -57,6 +57,16 @@ import {
   type AdultLibraryItem,
 } from "@/adult";
 import {
+  fetchVerifiedYtsMovieReleases,
+  inspectVerifiedYtsMovieTorrent,
+  invalidateMovieReleaseContext,
+  invalidateVerifiedMovieTorrent,
+  saveVerifiedMovieTorrent,
+  type MovieReleaseContext,
+  type MovieReleasesResult,
+  type YtsMovieRelease,
+} from "@/movie";
+import {
   fetchTmdbMovieDetails,
   fetchTmdbMoviesByTitle,
   fetchTmdbTvByTitle,
@@ -250,6 +260,7 @@ type DiscoverState =
 type MovieDetailsState =
   | { status: "loading" }
   | TmdbMovieDetailsResult;
+type MovieReleaseComparisonState = { status: "loading" } | MovieReleasesResult;
 type TvDiscoverState =
   | { status: "loading-credential" }
   | { status: "credential-error" }
@@ -340,6 +351,11 @@ type VrTorrentInspectionContext = {
 type AdultTorrentInspectionContext = {
   item: JavdbCatalogItem;
   release: SukebeiRelease;
+  triggerId: string;
+};
+type MovieTorrentInspectionContext = {
+  context: MovieReleaseContext;
+  release: YtsMovieRelease;
   triggerId: string;
 };
 type GalleryVariant = "discover" | "library";
@@ -890,6 +906,69 @@ const vrReleaseMessages = {
   },
 } as const;
 
+const movieReleaseMessages = {
+  loading: {
+    heading: "Finding verified Movie releases",
+    message: "Resolving the exact TMDB IMDb identity before requesting YTS candidates.",
+    role: "status",
+  },
+  "tmdb-unauthorized": {
+    heading: "TMDB token was not accepted",
+    message: "Update the local TMDB token in Settings before finding Movie releases.",
+    role: "alert",
+  },
+  "tmdb-rate-limited": {
+    heading: "TMDB release lookup is rate-limited",
+    message: "TMDB is temporarily limiting requests. Wait before retrying.",
+    role: "alert",
+  },
+  "tmdb-network-error": {
+    heading: "TMDB could not be reached",
+    message: "The exact Movie identity could not be resolved. Check the network and retry.",
+    role: "alert",
+  },
+  "tmdb-malformed-provider": {
+    heading: "TMDB returned invalid identity data",
+    message: "The response did not verify the selected TMDB Movie and IMDb identity.",
+    role: "alert",
+  },
+  "tmdb-provider-error": {
+    heading: "TMDB could not resolve the Movie identity",
+    message: "TMDB returned an unexpected error. Try again later.",
+    role: "alert",
+  },
+  "no-imdb-identity": {
+    heading: "No IMDb identity is available",
+    message: "TMDB did not provide a valid IMDb identifier for this exact Movie.",
+    role: undefined,
+  },
+  "yts-source-unavailable": {
+    heading: "YTS is unavailable",
+    message: "The Movie release source is not available. Try again later.",
+    role: "alert",
+  },
+  "yts-network-error": {
+    heading: "YTS could not be reached",
+    message: "Check the network connection and retry the exact IMDb lookup.",
+    role: "alert",
+  },
+  "yts-malformed-provider": {
+    heading: "YTS returned invalid release data",
+    message: "The response could not be verified safely for this IMDb identity.",
+    role: "alert",
+  },
+  "yts-conflicting-provider": {
+    heading: "YTS returned conflicting Movie identities",
+    message: "Conflicting provider objects claimed the verified IMDb identity, so no releases were accepted.",
+    role: "alert",
+  },
+  "yts-provider-error": {
+    heading: "YTS could not load Movie releases",
+    message: "The release provider returned an unexpected error. Try again later.",
+    role: "alert",
+  },
+} as const;
+
 const vrTorrentMessages = {
   loading: {
     heading: "Inspecting verified torrent",
@@ -935,6 +1014,15 @@ const vrTorrentMessages = {
     heading: "Torrent inspection could not be completed",
     message: "The verified artifact could not be inspected. Try again.",
     role: "alert",
+  },
+} as const;
+
+const movieTorrentMessages = {
+  ...vrTorrentMessages,
+  loading: {
+    heading: "Inspecting verified Movie torrent",
+    message: "Fetching and verifying the exact selected YTS artifact.",
+    role: "status",
   },
 } as const;
 
@@ -1202,19 +1290,25 @@ function ResizeAwareGallery<Item>({
 
 function DiscoverMovieCard({
   movie,
+  onFindReleases,
   onViewDetails,
   resultIndex,
 }: {
   movie: TmdbMovie;
+  onFindReleases: (movie: TmdbMovie, triggerId: string) => void;
   onViewDetails: (movie: TmdbMovie, triggerId: string) => void;
   resultIndex: number;
 }) {
   const [posterFailed, setPosterFailed] = useState(false);
   const detailsTriggerId = useId();
+  const releasesTriggerId = useId();
   const titleId = `tmdb-movie-${movie.id}-${resultIndex}`;
 
   return (
-    <article aria-labelledby={titleId} className="discover-card">
+    <article
+      aria-labelledby={titleId}
+      className="discover-card discover-card--movie"
+    >
       <div className="discover-card__poster">
         {movie.posterPath !== null && !posterFailed ? (
           <img
@@ -1234,6 +1328,23 @@ function DiscoverMovieCard({
           <h3 id={titleId}>{movie.title}</h3>
           <div className="discover-card__title-actions">
             <CopyTitleAction title={movie.title} />
+            <Button
+              aria-label={`Find releases: ${movie.title}`}
+              className="discover-card__releases-action"
+              id={releasesTriggerId}
+              onClick={(event) => {
+                event.stopPropagation();
+                onFindReleases(movie, releasesTriggerId);
+              }}
+              onKeyDown={(event) => event.stopPropagation()}
+              onPointerDown={(event) => event.stopPropagation()}
+              size="xs"
+              type="button"
+              variant="outline"
+            >
+              <AppIcon name="releases" />
+              Releases
+            </Button>
             <Button
               aria-label={`View details: ${movie.title}`}
               className="discover-card__details-action"
@@ -1404,6 +1515,362 @@ function DiscoverJavdbCard({
         </dl>
       </div>
     </article>
+  );
+}
+
+function MovieReleaseComparison({
+  movie,
+  onInspectRelease,
+  onRetry,
+  onSelectRelease,
+  selectedRelease,
+  state,
+  triggerId,
+}: {
+  movie: TmdbMovie;
+  onInspectRelease: (
+    context: MovieReleaseContext,
+    release: YtsMovieRelease,
+    triggerId: string,
+  ) => void;
+  onRetry: () => void;
+  onSelectRelease: (release: YtsMovieRelease) => void;
+  selectedRelease: YtsMovieRelease | null;
+  state: MovieReleaseComparisonState;
+  triggerId: string;
+}) {
+  const result = state.status === "ready" ? state : null;
+  const releases = result?.releases ?? null;
+  const noVerifiedReleases = releases !== null && releases.length === 0;
+  const currentMessage =
+    state.status === "ready" ? null : movieReleaseMessages[state.status];
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="vr-releases__backdrop" />
+      <Dialog.Viewport className="vr-releases__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading"}
+          className="vr-releases__popup"
+          finalFocus={() => document.getElementById(triggerId)}
+        >
+          <div className="vr-releases__heading">
+            <div>
+              <p className="card-eyebrow">Verified YTS release comparison</p>
+              <Dialog.Title>{result?.context.tmdbTitle ?? movie.title}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="vr-releases__description">
+            Only torrent rows from the YTS Movie whose IMDb identity exactly matches
+            the selected TMDB Movie are shown.
+          </Dialog.Description>
+
+          {releases === null || noVerifiedReleases ? (
+            <div
+              className="vr-releases__state"
+              role={noVerifiedReleases ? undefined : currentMessage?.role}
+            >
+              <span className="empty-state__icon">
+                <AppIcon name="releases" />
+              </span>
+              <div>
+                <h3>
+                  {noVerifiedReleases
+                    ? "No verified YTS releases found"
+                    : currentMessage?.heading}
+                </h3>
+                <p>
+                  {noVerifiedReleases
+                    ? `YTS returned no torrent rows for ${result?.context.imdbId}.`
+                    : currentMessage?.message}
+                </p>
+                {state.status === "loading" ? null : (
+                  <Button onClick={onRetry} type="button" variant="outline">
+                    <AppIcon name="refresh" />
+                    Retry
+                  </Button>
+                )}
+              </div>
+            </div>
+          ) : result === null ? null : (
+            <div className="vr-releases__content">
+              <div
+                aria-label="Verified Movie release totals"
+                className="vr-releases__totals"
+              >
+                <p>
+                  <strong>{releases.length}</strong> verified torrents
+                </p>
+                <p>
+                  IMDb <strong>{result.context.imdbId}</strong>
+                </p>
+                <Button onClick={onRetry} size="sm" type="button" variant="outline">
+                  <AppIcon name="refresh" />
+                  Retry
+                </Button>
+              </div>
+              <dl className="vr-torrent__metadata">
+                <div>
+                  <dt>TMDB Movie</dt>
+                  <dd>{result.context.tmdbTitle}</dd>
+                </div>
+                <div>
+                  <dt>Release date</dt>
+                  <dd>{result.context.releaseDate ?? "Unavailable"}</dd>
+                </div>
+                <div>
+                  <dt>YTS Movie</dt>
+                  <dd>{result.context.providerTitle ?? "Unavailable"}</dd>
+                </div>
+                <div>
+                  <dt>YTS year</dt>
+                  <dd>{result.context.providerYear ?? "Unavailable"}</dd>
+                </div>
+              </dl>
+              <ul aria-label={`Verified YTS torrents for ${result.context.tmdbTitle}`}>
+                {releases.map((release) => (
+                  <li key={release.rowId}>
+                    <button
+                      aria-pressed={selectedRelease === release}
+                      onClick={() => onSelectRelease(release)}
+                      type="button"
+                    >
+                      <span className="vr-releases__release-name">
+                        {release.quality ?? "Quality unavailable"}
+                      </span>
+                      <span className="vr-releases__release-metadata">
+                        <span>Source {release.source}</span>
+                        <span>Type {release.typeLabel ?? "Unavailable"}</span>
+                        <span>Codec {release.videoCodec ?? "Unavailable"}</span>
+                        <span>Size {release.size ?? "Unavailable"}</span>
+                        <span>Seeds {release.seeds ?? "Unavailable"}</span>
+                        <span>Peers {release.peers ?? "Unavailable"}</span>
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {selectedRelease === null ? (
+                <p className="vr-releases__selection-prompt">
+                  Select one verified torrent row to inspect its metadata.
+                </p>
+              ) : (
+                <section
+                  aria-labelledby="selected-movie-release-heading"
+                  className="vr-releases__selection"
+                >
+                  <h3 id="selected-movie-release-heading">Selected torrent</h3>
+                  <dl>
+                    <div>
+                      <dt>TMDB title</dt>
+                      <dd>{result.context.tmdbTitle}</dd>
+                    </div>
+                    <div>
+                      <dt>IMDb identity</dt>
+                      <dd>{result.context.imdbId}</dd>
+                    </div>
+                    <div>
+                      <dt>Provider title</dt>
+                      <dd>{result.context.providerTitle ?? "Unavailable"}</dd>
+                    </div>
+                    <div>
+                      <dt>Quality</dt>
+                      <dd>{selectedRelease.quality ?? "Unavailable"}</dd>
+                    </div>
+                    <div>
+                      <dt>Type / codec</dt>
+                      <dd>
+                        {selectedRelease.typeLabel ?? "Unavailable"} / {selectedRelease.videoCodec ?? "Unavailable"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Size</dt>
+                      <dd>{selectedRelease.size ?? "Unavailable"}</dd>
+                    </div>
+                  </dl>
+                  {selectedRelease.artifact === undefined ? (
+                    <p className="vr-releases__artifact-unavailable">
+                      Torrent inspection is unavailable because this row has no
+                      complete safe YTS artifact identity.
+                    </p>
+                  ) : (
+                    <Button
+                      id={`inspect-movie-torrent-${selectedRelease.rowId.replaceAll(":", "-")}`}
+                      onClick={(event) =>
+                        onInspectRelease(
+                          result.context,
+                          selectedRelease,
+                          event.currentTarget.id,
+                        )
+                      }
+                      type="button"
+                    >
+                      <AppIcon name="details" />
+                      Inspect torrent
+                    </Button>
+                  )}
+                </section>
+              )}
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
+  );
+}
+
+function MovieTorrentInspectionDialog({
+  context,
+  onRetry,
+  onSave,
+  saveState,
+  state,
+}: {
+  context: MovieTorrentInspectionContext;
+  onRetry: () => void;
+  onSave: () => void;
+  saveState: TorrentSaveState;
+  state: TorrentInspectionState;
+}) {
+  const currentMessage =
+    movieTorrentMessages[state.status === "ready" ? "loading" : state.status];
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="vr-torrent__backdrop" />
+      <Dialog.Viewport className="vr-torrent__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading" || saveState === "saving"}
+          className="vr-torrent__popup"
+          finalFocus={() => document.getElementById(context.triggerId)}
+        >
+          <div className="vr-torrent__heading">
+            <div>
+              <p className="card-eyebrow">Verified YTS torrent</p>
+              <Dialog.Title>{context.context.tmdbTitle}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="vr-torrent__description">
+            <span>IMDb {context.context.imdbId}</span>
+            <span>
+              YTS {context.context.providerTitle ?? "title unavailable"} · {context.release.quality ?? "quality unavailable"}
+            </span>
+          </Dialog.Description>
+          <dl
+            aria-label="Selected YTS torrent metadata"
+            className="vr-torrent__metadata movie-torrent__provider-metadata"
+          >
+            <div>
+              <dt>Source</dt>
+              <dd>{context.release.source}</dd>
+            </div>
+            <div>
+              <dt>Quality</dt>
+              <dd>{context.release.quality ?? "Unavailable"}</dd>
+            </div>
+            <div>
+              <dt>Type</dt>
+              <dd>{context.release.typeLabel ?? "Unavailable"}</dd>
+            </div>
+            <div>
+              <dt>Codec</dt>
+              <dd>{context.release.videoCodec ?? "Unavailable"}</dd>
+            </div>
+            <div>
+              <dt>Provider size</dt>
+              <dd>{context.release.size ?? "Unavailable"}</dd>
+            </div>
+            <div>
+              <dt>Seeds</dt>
+              <dd>{context.release.seeds ?? "Unavailable"}</dd>
+            </div>
+            <div>
+              <dt>Peers</dt>
+              <dd>{context.release.peers ?? "Unavailable"}</dd>
+            </div>
+          </dl>
+          {state.status === "ready" ? (
+            <div className="vr-torrent__content">
+              <dl className="vr-torrent__metadata">
+                <div>
+                  <dt>Torrent name</dt>
+                  <dd>{state.inspection.displayName}</dd>
+                </div>
+                <div>
+                  <dt>Verified infohash</dt>
+                  <dd>{state.inspection.infohash}</dd>
+                </div>
+                <div>
+                  <dt>Total size</dt>
+                  <dd>
+                    {formatStorageBytes(BigInt(state.inspection.totalBytes))} ({state.inspection.totalBytes} bytes)
+                  </dd>
+                </div>
+                <div>
+                  <dt>Files</dt>
+                  <dd>{state.inspection.files.length}</dd>
+                </div>
+              </dl>
+              <h3>Complete file list</h3>
+              <ul aria-label="Verified Movie torrent files" className="vr-torrent__files">
+                {state.inspection.files.map((file) => (
+                  <li key={file.path}>
+                    <span>{file.path}</span>
+                    <span>{formatStorageBytes(BigInt(file.sizeBytes))} ({file.sizeBytes} bytes)</span>
+                  </li>
+                ))}
+              </ul>
+              <div className="vr-torrent__save">
+                <Button
+                  disabled={saveState === "saving"}
+                  onClick={onSave}
+                  type="button"
+                >
+                  <AppIcon name="downloads" />
+                  {saveState === "saving" ? "Saving…" : "Save `.torrent`"}
+                </Button>
+                {saveState === "success" ? (
+                  <p role="status">Verified Movie torrent file saved.</p>
+                ) : saveState === "error" ? (
+                  <p role="alert">The verified Movie torrent file could not be saved.</p>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <div className="vr-torrent__state" role={currentMessage.role}>
+              <span className="empty-state__icon">
+                <AppIcon name="releases" />
+              </span>
+              <div>
+                <h3>{currentMessage.heading}</h3>
+                <p>{currentMessage.message}</p>
+                {state.status === "loading" ? null : (
+                  <Button onClick={onRetry} type="button" variant="outline">
+                    <AppIcon name="refresh" />
+                    Retry inspection
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
   );
 }
 
@@ -2164,14 +2631,17 @@ function AdultTorrentInspectionDialog({
 
 function DiscoverMovieDetails({
   movie,
+  onFindReleases,
   state,
   triggerId,
 }: {
   movie: TmdbMovie;
+  onFindReleases: (movie: TmdbMovie, triggerId: string) => void;
   state: MovieDetailsState;
   triggerId: string;
 }) {
   const [failedPosterPath, setFailedPosterPath] = useState<string | null>(null);
+  const releasesTriggerId = useId();
   const details = state.status === "ready" ? state.details : null;
   const displayedTitle = details?.title ?? movie.title;
   const currentMessage =
@@ -2263,6 +2733,24 @@ function DiscoverMovieDetails({
                   <h3>Overview</h3>
                   <p>{details.overview ?? "Unavailable"}</p>
                 </div>
+                <Button
+                  id={releasesTriggerId}
+                  onClick={() =>
+                    onFindReleases(
+                      {
+                        id: details.id,
+                        title: details.title,
+                        posterPath: details.posterPath,
+                        releaseDate: details.releaseDate,
+                      },
+                      releasesTriggerId,
+                    )
+                  }
+                  type="button"
+                >
+                  <AppIcon name="releases" />
+                  Find releases
+                </Button>
               </div>
             </div>
           )}
@@ -3607,6 +4095,26 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   >(null);
   const [movieDetailsRequestVersion, setMovieDetailsRequestVersion] =
     useState(0);
+  const [movieReleaseComparisonMovie, setMovieReleaseComparisonMovie] =
+    useState<TmdbMovie | null>(null);
+  const [movieReleaseComparisonState, setMovieReleaseComparisonState] =
+    useState<MovieReleaseComparisonState | null>(null);
+  const [movieReleaseComparisonTriggerId, setMovieReleaseComparisonTriggerId] =
+    useState<string | null>(null);
+  const [isMovieReleaseComparisonOpen, setIsMovieReleaseComparisonOpen] =
+    useState(false);
+  const [selectedMovieRelease, setSelectedMovieRelease] =
+    useState<YtsMovieRelease | null>(null);
+  const [movieReleaseRequestVersion, setMovieReleaseRequestVersion] =
+    useState(0);
+  const [movieTorrentInspectionContext, setMovieTorrentInspectionContext] =
+    useState<MovieTorrentInspectionContext | null>(null);
+  const [movieTorrentInspectionState, setMovieTorrentInspectionState] =
+    useState<TorrentInspectionState | null>(null);
+  const [movieTorrentInspectionRequestVersion, setMovieTorrentInspectionRequestVersion] =
+    useState(0);
+  const [movieTorrentSaveState, setMovieTorrentSaveState] =
+    useState<TorrentSaveState>("idle");
   const [tvDiscoverState, setTvDiscoverState] = useState<TvDiscoverState>({
     status: "loading-credential",
   });
@@ -3732,6 +4240,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const storageRequestId = useRef(0);
   const discoverRequestId = useRef(0);
   const movieDetailsRequestId = useRef(0);
+  const movieReleaseRequestId = useRef(0);
+  const movieTorrentInspectionRequestId = useRef(0);
+  const movieTorrentSaveRequestId = useRef(0);
   const tvDiscoverRequestId = useRef(0);
   const tvDetailsRequestId = useRef(0);
   const adultCatalogRequestId = useRef(0);
@@ -3758,6 +4269,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const adultLibraryScanRequestId = useRef(0);
   const adultStorageRequestId = useRef(0);
   const torrentSavePending = useRef(false);
+  const movieTorrentSavePending = useRef(false);
   const adultTorrentSavePending = useRef(false);
   const adultTorrentStartPending = useRef(false);
   const torrentStartPending = useRef(false);
@@ -4592,6 +5104,45 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   ]);
 
   useEffect(() => {
+    const requestId = ++movieReleaseRequestId.current;
+    if (movieReleaseComparisonMovie === null) {
+      return;
+    }
+    setMovieReleaseComparisonState({ status: "loading" });
+    void fetchVerifiedYtsMovieReleases(movieReleaseComparisonMovie.id).then(
+      (result) => {
+        if (requestId === movieReleaseRequestId.current) {
+          setMovieReleaseComparisonState(result);
+        }
+      },
+    );
+    return () => {
+      movieReleaseRequestId.current += 1;
+    };
+  }, [movieReleaseComparisonMovie, movieReleaseRequestVersion]);
+
+  useEffect(() => {
+    const requestId = ++movieTorrentInspectionRequestId.current;
+    if (movieTorrentInspectionContext === null) {
+      return;
+    }
+    setMovieTorrentInspectionState({ status: "loading" });
+    setMovieTorrentSaveState("idle");
+    void inspectVerifiedYtsMovieTorrent(
+      movieTorrentInspectionContext.context,
+      movieTorrentInspectionContext.release,
+    ).then((result) => {
+      if (requestId === movieTorrentInspectionRequestId.current) {
+        setMovieTorrentInspectionState(result);
+      }
+    });
+    return () => {
+      movieTorrentInspectionRequestId.current += 1;
+      void invalidateVerifiedMovieTorrent().catch(() => undefined);
+    };
+  }, [movieTorrentInspectionContext, movieTorrentInspectionRequestVersion]);
+
+  useEffect(() => {
     const requestId = ++tvDiscoverRequestId.current;
 
     if (!isTvDiscoverActivated || discoverCategory !== "tv") {
@@ -4843,6 +5394,39 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     navigationItems.current[nextIndex]?.focus();
   };
 
+  const closeMovieTorrentInspection = () => {
+    const hadCurrentInspection = movieTorrentInspectionContext !== null;
+    movieTorrentInspectionRequestId.current += 1;
+    movieTorrentSaveRequestId.current += 1;
+    setMovieTorrentInspectionContext(null);
+    setMovieTorrentInspectionState(null);
+    setMovieTorrentSaveState("idle");
+    if (hadCurrentInspection) {
+      void invalidateVerifiedMovieTorrent().catch(() => undefined);
+    }
+  };
+
+  const closeMovieReleaseComparison = () => {
+    closeMovieTorrentInspection();
+    setIsMovieReleaseComparisonOpen(false);
+    movieReleaseRequestId.current += 1;
+    if (movieReleaseComparisonState?.status === "loading") {
+      setMovieReleaseComparisonState(null);
+      setSelectedMovieRelease(null);
+      void invalidateMovieReleaseContext().catch(() => undefined);
+    }
+  };
+
+  const resetMovieReleaseComparison = () => {
+    closeMovieTorrentInspection();
+    setIsMovieReleaseComparisonOpen(false);
+    movieReleaseRequestId.current += 1;
+    setMovieReleaseComparisonMovie(null);
+    setMovieReleaseComparisonState(null);
+    setSelectedMovieRelease(null);
+    void invalidateMovieReleaseContext().catch(() => undefined);
+  };
+
   const closeAdultTorrentInspection = () => {
     const hadCurrentInspection = adultTorrentInspectionContext !== null;
     adultTorrentInspectionRequestId.current += 1;
@@ -4889,6 +5473,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           : currentState,
       );
       closeAdultReleaseComparison();
+      closeMovieReleaseComparison();
     }
     setActiveDestination(destination);
     if (workspace.current !== null) {
@@ -5665,6 +6250,107 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setMovieDetailsState(null);
   };
 
+  const openMovieReleaseComparison = (
+    movie: TmdbMovie,
+    triggerId: string,
+  ) => {
+    setMovieReleaseComparisonTriggerId(triggerId);
+    setIsMovieReleaseComparisonOpen(true);
+    if (
+      movieReleaseComparisonMovie?.id === movie.id &&
+      movieReleaseComparisonState !== null
+    ) {
+      return;
+    }
+    closeMovieTorrentInspection();
+    movieReleaseRequestId.current += 1;
+    setMovieReleaseComparisonMovie(movie);
+    setMovieReleaseComparisonState({ status: "loading" });
+    setSelectedMovieRelease(null);
+    setMovieReleaseRequestVersion((version) => version + 1);
+  };
+
+  const retryMovieReleaseComparison = () => {
+    if (movieReleaseComparisonMovie === null) {
+      return;
+    }
+    closeMovieTorrentInspection();
+    movieReleaseRequestId.current += 1;
+    setMovieReleaseComparisonState({ status: "loading" });
+    setSelectedMovieRelease(null);
+    setMovieReleaseRequestVersion((version) => version + 1);
+  };
+
+  const selectMovieRelease = (release: YtsMovieRelease) => {
+    if (
+      movieReleaseComparisonState?.status === "ready" &&
+      movieReleaseComparisonState.releases.includes(release)
+    ) {
+      if (selectedMovieRelease !== release) {
+        closeMovieTorrentInspection();
+      }
+      setSelectedMovieRelease(release);
+    }
+  };
+
+  const openMovieTorrentInspection = (
+    context: MovieReleaseContext,
+    release: YtsMovieRelease,
+    triggerId: string,
+  ) => {
+    if (
+      release.artifact === undefined ||
+      movieReleaseComparisonState?.status !== "ready" ||
+      movieReleaseComparisonState.context !== context ||
+      selectedMovieRelease !== release
+    ) {
+      return;
+    }
+    movieTorrentInspectionRequestId.current += 1;
+    movieTorrentSaveRequestId.current += 1;
+    setMovieTorrentInspectionContext({ context, release, triggerId });
+    setMovieTorrentInspectionState({ status: "loading" });
+    setMovieTorrentSaveState("idle");
+    setMovieTorrentInspectionRequestVersion((version) => version + 1);
+  };
+
+  const retryMovieTorrentInspection = () => {
+    if (movieTorrentInspectionContext === null) {
+      return;
+    }
+    movieTorrentInspectionRequestId.current += 1;
+    movieTorrentSaveRequestId.current += 1;
+    setMovieTorrentInspectionState({ status: "loading" });
+    setMovieTorrentSaveState("idle");
+    setMovieTorrentInspectionRequestVersion((version) => version + 1);
+  };
+
+  const saveMovieTorrent = async () => {
+    if (
+      movieTorrentSavePending.current ||
+      movieTorrentInspectionState?.status !== "ready"
+    ) {
+      return;
+    }
+    movieTorrentSavePending.current = true;
+    const requestId = ++movieTorrentSaveRequestId.current;
+    setMovieTorrentSaveState("saving");
+    try {
+      const saved = await saveVerifiedMovieTorrent(
+        movieTorrentInspectionState.inspection.inspectionId,
+      );
+      if (requestId === movieTorrentSaveRequestId.current) {
+        setMovieTorrentSaveState(saved ? "success" : "idle");
+      }
+    } catch {
+      if (requestId === movieTorrentSaveRequestId.current) {
+        setMovieTorrentSaveState("error");
+      }
+    } finally {
+      movieTorrentSavePending.current = false;
+    }
+  };
+
   const openDiscoverTvDetails = (show: TmdbTvShow, triggerId: string) => {
     tvDetailsRequestId.current += 1;
     setSelectedDiscoverTvShow(show);
@@ -5706,6 +6392,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     closeDiscoverMovieDetails();
     closeDiscoverTvDetails();
+    closeMovieReleaseComparison();
     closeAdultReleaseComparison();
     closeVrReleaseComparison();
     if (discoverCategory === "adult") {
@@ -6168,6 +6855,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
 
     const previousToken = tmdbToken;
+    resetMovieReleaseComparison();
     closeDiscoverMovieDetails();
     closeDiscoverTvDetails();
     discoverRequestId.current += 1;
@@ -6206,6 +6894,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
   const clearTmdbToken = async () => {
     const tokenToRestore = tmdbToken;
+    resetMovieReleaseComparison();
     closeDiscoverMovieDetails();
     closeDiscoverTvDetails();
     discoverRequestId.current += 1;
@@ -7756,6 +8445,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     renderItem={(movie, resultIndex) => (
                       <DiscoverMovieCard
                         movie={movie}
+                        onFindReleases={openMovieReleaseComparison}
                         onViewDetails={openDiscoverMovieDetails}
                         resultIndex={resultIndex}
                       />
@@ -9124,8 +9814,50 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           <DiscoverMovieDetails
             key={selectedDiscoverMovie.id}
             movie={selectedDiscoverMovie}
+            onFindReleases={openMovieReleaseComparison}
             state={movieDetailsState}
             triggerId={movieDetailsTriggerId}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open && movieTorrentInspectionContext === null) {
+            closeMovieReleaseComparison();
+          }
+        }}
+        open={isMovieReleaseComparisonOpen}
+      >
+        {movieReleaseComparisonMovie === null ||
+        movieReleaseComparisonState === null ||
+        movieReleaseComparisonTriggerId === null ? null : (
+          <MovieReleaseComparison
+            movie={movieReleaseComparisonMovie}
+            onInspectRelease={openMovieTorrentInspection}
+            onRetry={retryMovieReleaseComparison}
+            onSelectRelease={selectMovieRelease}
+            selectedRelease={selectedMovieRelease}
+            state={movieReleaseComparisonState}
+            triggerId={movieReleaseComparisonTriggerId}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeMovieTorrentInspection();
+          }
+        }}
+        open={movieTorrentInspectionContext !== null}
+      >
+        {movieTorrentInspectionContext === null ||
+        movieTorrentInspectionState === null ? null : (
+          <MovieTorrentInspectionDialog
+            context={movieTorrentInspectionContext}
+            onRetry={retryMovieTorrentInspection}
+            onSave={() => void saveMovieTorrent()}
+            saveState={movieTorrentSaveState}
+            state={movieTorrentInspectionState}
           />
         )}
       </Dialog.Root>

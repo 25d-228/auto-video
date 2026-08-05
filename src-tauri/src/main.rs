@@ -45,9 +45,12 @@ use vr_library::{
 };
 use vr_torrent::{
     fetch_artifact_response, inspect_sukebei_adult_torrent_with, inspect_sukebei_torrent_with,
-    save_verified_adult_torrent_with, save_verified_torrent_with, write_new_torrent_file,
-    AdultTorrentState, TorrentInspectionRequest, VrTorrentState, ADULT_TORRENT_PROVIDER_ERROR,
-    ADULT_TORRENT_SAVE_FAILED, VR_TORRENT_PROVIDER_ERROR, VR_TORRENT_SAVE_FAILED,
+    inspect_yts_movie_torrent_with, save_verified_adult_torrent_with,
+    save_verified_movie_torrent_with, save_verified_torrent_with, verified_movie_imdb_id,
+    write_new_torrent_file, AdultTorrentState, MovieTorrentInspectionRequest, MovieTorrentState,
+    TorrentInspectionRequest, VrTorrentState, ADULT_TORRENT_PROVIDER_ERROR,
+    ADULT_TORRENT_SAVE_FAILED, MOVIE_TMDB_MALFORMED, MOVIE_TORRENT_PROVIDER_ERROR,
+    MOVIE_TORRENT_SAVE_FAILED, VR_TORRENT_PROVIDER_ERROR, VR_TORRENT_SAVE_FAILED,
 };
 
 const MOVIES_FOLDER_FILE_NAME: &str = ".movies-folder";
@@ -89,6 +92,13 @@ const MOVIE_TRASH_UNSUPPORTED: &str = "movie_trash_unsupported";
 const TMDB_TOKEN_FILE_NAME: &str = ".tmdb-api-read-access-token";
 const TMDB_TOKEN_INVALID: &str = "tmdb_token_invalid";
 const TMDB_TOKEN_STORAGE_FAILED: &str = "tmdb_token_storage_failed";
+const MOVIE_TMDB_NETWORK_ERROR: &str = "movie_tmdb_network_error";
+const MOVIE_TMDB_PROVIDER_ERROR: &str = "movie_tmdb_provider_error";
+const MOVIE_TMDB_RATE_LIMITED: &str = "movie_tmdb_rate_limited";
+const MOVIE_TMDB_UNAUTHORIZED: &str = "movie_tmdb_unauthorized";
+const MOVIE_YTS_NETWORK_ERROR: &str = "movie_yts_network_error";
+const MOVIE_YTS_PROVIDER_ERROR: &str = "movie_yts_provider_error";
+const MOVIE_YTS_SOURCE_UNAVAILABLE: &str = "movie_yts_source_unavailable";
 const ADULT_NETWORK_ERROR: &str = "adult_network_error";
 const ADULT_PROVIDER_ERROR: &str = "adult_provider_error";
 const ADULT_SOURCE_UNAVAILABLE: &str = "adult_source_unavailable";
@@ -104,6 +114,8 @@ const PROVIDER_HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
 const PROVIDER_HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_code}";
 const JAVDB_CATALOG_URL: &str = "https://javdb.com/search?q=";
 const SUKEBEI_RELEASES_URL: &str = "https://sukebei.nyaa.si/?page=rss&q=%22";
+const TMDB_MOVIE_URL: &str = "https://api.themoviedb.org/3/movie/";
+const YTS_MOVIES_URL: &str = "https://yts.mx/api/v2/list_movies.json?limit=50&query_term=";
 
 #[derive(Default)]
 struct MoviesLibraryContext {
@@ -122,6 +134,15 @@ struct TrashMovieRequest {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ProviderRequestError {
+    SourceUnavailable,
+    Network,
+    Provider,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MovieProviderRequestError {
+    Unauthorized,
+    RateLimited,
     SourceUnavailable,
     Network,
     Provider,
@@ -705,6 +726,154 @@ try {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn fetch_provider_document(_url: &str) -> Result<String, ProviderRequestError> {
     Err(ProviderRequestError::Network)
+}
+
+fn parse_movie_provider_response(output: &[u8]) -> Result<String, MovieProviderRequestError> {
+    let output = std::str::from_utf8(output).map_err(|_| MovieProviderRequestError::Provider)?;
+    let (document, status) = output
+        .rsplit_once(PROVIDER_HTTP_STATUS_MARKER)
+        .ok_or(MovieProviderRequestError::Provider)?;
+    let status = status
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| MovieProviderRequestError::Provider)?;
+    match status {
+        200..=299 if document.len() <= PROVIDER_RESPONSE_MAX_BYTES => Ok(document.to_owned()),
+        401 | 403 => Err(MovieProviderRequestError::Unauthorized),
+        404 | 410 | 451 => Err(MovieProviderRequestError::SourceUnavailable),
+        429 => Err(MovieProviderRequestError::RateLimited),
+        0 => Err(MovieProviderRequestError::Network),
+        _ => Err(MovieProviderRequestError::Provider),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fetch_movie_provider_document(
+    url: &str,
+    tmdb_token: Option<&str>,
+) -> Result<String, MovieProviderRequestError> {
+    let mut command = Command::new("/usr/bin/curl");
+    command.args([
+        "--silent",
+        "--show-error",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "20",
+        "--user-agent",
+        "Auto-Video/0.1",
+        "--header",
+        "Accept: application/json",
+        "--write-out",
+        PROVIDER_HTTP_STATUS_WRITE_OUT,
+    ]);
+    if let Some(token) = tmdb_token {
+        command
+            .arg("--header")
+            .arg(format!("Authorization: Bearer {token}"));
+    } else {
+        command.args(["--location", "--max-redirs", "3"]);
+    }
+    let output = command
+        .arg(url)
+        .output()
+        .map_err(|_| MovieProviderRequestError::Network)?;
+    if !output.status.success() {
+        return Err(MovieProviderRequestError::Network);
+    }
+    parse_movie_provider_response(&output.stdout)
+}
+
+#[cfg(target_os = "windows")]
+fn fetch_movie_provider_document(
+    url: &str,
+    tmdb_token: Option<&str>,
+) -> Result<String, MovieProviderRequestError> {
+    const MOVIE_PROVIDER_URL_ENV: &str = "AUTO_VIDEO_MOVIE_PROVIDER_URL";
+    const TMDB_TOKEN_ENV: &str = "AUTO_VIDEO_TMDB_TOKEN";
+    const WINDOWS_MOVIE_PROVIDER_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  $headers = @{ Accept = 'application/json'; 'User-Agent' = 'Auto-Video/0.1' }
+  if (-not [string]::IsNullOrEmpty($env:AUTO_VIDEO_TMDB_TOKEN)) {
+    $headers.Authorization = 'Bearer ' + $env:AUTO_VIDEO_TMDB_TOKEN
+  }
+  $response = Invoke-WebRequest -UseBasicParsing -Uri $env:AUTO_VIDEO_MOVIE_PROVIDER_URL -Headers $headers -MaximumRedirection 0 -TimeoutSec 20
+  [Console]::Out.Write($response.Content)
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + [int]$response.StatusCode)
+} catch {
+  $status = if ($null -eq $_.Exception.Response) { 0 } else { [int]$_.Exception.Response.StatusCode }
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + $status)
+}"#;
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(WINDOWS_MOVIE_PROVIDER_SCRIPT)
+        .env(MOVIE_PROVIDER_URL_ENV, url);
+    if let Some(token) = tmdb_token {
+        command.env(TMDB_TOKEN_ENV, token);
+    } else {
+        command.env_remove(TMDB_TOKEN_ENV);
+    }
+    let output = command
+        .output()
+        .map_err(|_| MovieProviderRequestError::Network)?;
+    if !output.status.success() {
+        return Err(MovieProviderRequestError::Network);
+    }
+    parse_movie_provider_response(&output.stdout)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn fetch_movie_provider_document(
+    _url: &str,
+    _tmdb_token: Option<&str>,
+) -> Result<String, MovieProviderRequestError> {
+    Err(MovieProviderRequestError::Network)
+}
+
+fn tmdb_movie_provider_error_code(error: MovieProviderRequestError) -> &'static str {
+    match error {
+        MovieProviderRequestError::Unauthorized => MOVIE_TMDB_UNAUTHORIZED,
+        MovieProviderRequestError::RateLimited => MOVIE_TMDB_RATE_LIMITED,
+        MovieProviderRequestError::Network => MOVIE_TMDB_NETWORK_ERROR,
+        MovieProviderRequestError::SourceUnavailable | MovieProviderRequestError::Provider => {
+            MOVIE_TMDB_PROVIDER_ERROR
+        }
+    }
+}
+
+fn yts_movie_provider_error_code(error: MovieProviderRequestError) -> &'static str {
+    match error {
+        MovieProviderRequestError::SourceUnavailable => MOVIE_YTS_SOURCE_UNAVAILABLE,
+        MovieProviderRequestError::Network => MOVIE_YTS_NETWORK_ERROR,
+        MovieProviderRequestError::Unauthorized
+        | MovieProviderRequestError::RateLimited
+        | MovieProviderRequestError::Provider => MOVIE_YTS_PROVIDER_ERROR,
+    }
+}
+
+fn fetch_yts_movie_releases_with(
+    state: &MovieTorrentState,
+    generation: u64,
+    tmdb_movie_id: u64,
+    tmdb_token: &str,
+    mut request: impl FnMut(&str, Option<&str>) -> Result<String, MovieProviderRequestError>,
+) -> Result<Vec<String>, &'static str> {
+    if tmdb_movie_id == 0 || !is_valid_tmdb_token(tmdb_token) {
+        return Err(MOVIE_TMDB_MALFORMED);
+    }
+    let details_url = format!("{TMDB_MOVIE_URL}{tmdb_movie_id}");
+    let details =
+        request(&details_url, Some(tmdb_token)).map_err(tmdb_movie_provider_error_code)?;
+    let external_ids_url = format!("{details_url}/external_ids");
+    let external_ids =
+        request(&external_ids_url, Some(tmdb_token)).map_err(tmdb_movie_provider_error_code)?;
+    let imdb_id = verified_movie_imdb_id(tmdb_movie_id, &details, &external_ids)?;
+    let yts = request(&format!("{YTS_MOVIES_URL}{imdb_id}"), None)
+        .map_err(yts_movie_provider_error_code)?;
+    state.finish_release_lookup(generation, tmdb_movie_id, &details, &external_ids, &yts)
 }
 
 fn fetch_javdb_vr_catalog_with(
@@ -1580,6 +1749,31 @@ async fn fetch_sukebei_vr_releases(
 }
 
 #[tauri::command]
+async fn fetch_yts_movie_releases(
+    app: tauri::AppHandle,
+    tmdb_movie_id: u64,
+    state: tauri::State<'_, MovieTorrentState>,
+) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    let generation = state.begin_release_lookup().map_err(str::to_owned)?;
+    let token = load_tmdb_token_file(&tmdb_token_path(&app)?)
+        .map_err(str::to_owned)?
+        .ok_or_else(|| MOVIE_TMDB_UNAUTHORIZED.to_owned())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_yts_movie_releases_with(
+            &state,
+            generation,
+            tmdb_movie_id,
+            &token,
+            fetch_movie_provider_document,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| MOVIE_YTS_PROVIDER_ERROR.to_owned())?
+}
+
+#[tauri::command]
 async fn inspect_sukebei_vr_torrent(
     code: String,
     release_name: String,
@@ -1636,6 +1830,64 @@ async fn inspect_sukebei_adult_torrent(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn inspect_yts_movie_torrent(
+    tmdb_movie_id: u64,
+    tmdb_title: String,
+    release_date: Option<String>,
+    imdb_id: String,
+    provider_movie_id: u64,
+    provider_title: Option<String>,
+    provider_year: Option<String>,
+    row_id: String,
+    quality: Option<String>,
+    type_label: Option<String>,
+    video_codec: Option<String>,
+    size: Option<String>,
+    size_bytes: Option<String>,
+    seeds: Option<String>,
+    peers: Option<String>,
+    expected_infohash: String,
+    torrent_url: String,
+    state: tauri::State<'_, MovieTorrentState>,
+) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    let request = MovieTorrentInspectionRequest {
+        tmdb_movie_id,
+        tmdb_title,
+        release_date,
+        imdb_id,
+        provider_movie_id,
+        provider_title,
+        provider_year,
+        row_id,
+        quality,
+        type_label,
+        video_codec,
+        size,
+        size_bytes,
+        seeds,
+        peers,
+        expected_infohash,
+        torrent_url,
+    };
+    let (release_generation, inspection_generation) =
+        state.begin_inspection(&request).map_err(str::to_owned)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        inspect_yts_movie_torrent_with(
+            &state,
+            release_generation,
+            inspection_generation,
+            request,
+            fetch_artifact_response,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| MOVIE_TORRENT_PROVIDER_ERROR.to_owned())?
+}
+
+#[tauri::command]
 fn invalidate_verified_vr_torrent(state: tauri::State<'_, VrTorrentState>) -> Result<(), String> {
     state.invalidate_inspection().map_err(str::to_owned)
 }
@@ -1645,6 +1897,20 @@ fn invalidate_verified_adult_torrent(
     state: tauri::State<'_, AdultTorrentState>,
 ) -> Result<(), String> {
     state.invalidate_inspection().map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn invalidate_verified_movie_torrent(
+    state: tauri::State<'_, MovieTorrentState>,
+) -> Result<(), String> {
+    state.invalidate_inspection().map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn invalidate_movie_release_context(
+    state: tauri::State<'_, MovieTorrentState>,
+) -> Result<(), String> {
+    state.invalidate_release_context().map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -1703,10 +1969,39 @@ async fn save_verified_adult_torrent(
     .map_err(|_| ADULT_TORRENT_SAVE_FAILED.to_owned())?
 }
 
+#[tauri::command]
+async fn save_verified_movie_torrent(
+    app: tauri::AppHandle,
+    inspection_id: String,
+    state: tauri::State<'_, MovieTorrentState>,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        save_verified_movie_torrent_with(
+            &state,
+            &inspection_id,
+            |default_file_name| {
+                app.dialog()
+                    .file()
+                    .set_title("Save verified Movie torrent")
+                    .add_filter("Torrent", &["torrent"])
+                    .set_file_name(default_file_name)
+                    .blocking_save_file()
+                    .and_then(|path| path.into_path().ok())
+            },
+            write_new_torrent_file,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| MOVIE_TORRENT_SAVE_FAILED.to_owned())?
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(MoviesLibraryState::default())
+        .manage(MovieTorrentState::default())
         .manage(AdultLibraryState::default())
         .manage(AdultTorrentState::default())
         .manage(TvLibraryState::default())
@@ -1763,12 +2058,17 @@ fn main() {
             fetch_javdb_adult_catalog,
             fetch_sukebei_adult_releases,
             fetch_sukebei_vr_releases,
+            fetch_yts_movie_releases,
             inspect_sukebei_adult_torrent,
             inspect_sukebei_vr_torrent,
+            inspect_yts_movie_torrent,
             invalidate_verified_adult_torrent,
             invalidate_verified_vr_torrent,
+            invalidate_verified_movie_torrent,
+            invalidate_movie_release_context,
             save_verified_adult_torrent,
-            save_verified_vr_torrent
+            save_verified_vr_torrent,
+            save_verified_movie_torrent
         ])
         .run(tauri::generate_context!())
         .expect("failed to run the Auto-Video desktop application");
@@ -1790,17 +2090,19 @@ mod tests {
     use super::{
         clear_movies_folder_file, clear_tmdb_token_file, fetch_javdb_adult_catalog_with,
         fetch_javdb_vr_catalog_with, fetch_sukebei_adult_releases_with,
-        fetch_sukebei_vr_releases_with, load_movies_folder_file, load_tmdb_token_file,
-        movie_metadata_error, open_movie_path_with, parse_provider_response,
-        query_movies_volume_storage_with, reveal_movie_path_with, save_movies_folder_file,
-        save_tmdb_token_file, scan_movie_paths, trash_movie_path_with, trash_movie_request_with,
-        MoviePathValidationError, MoviesLibraryContext, MoviesVolumeStorageQueryError,
-        ProviderRequestError, TrashMovieRequest, ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE,
-        MOVIES_STORAGE_FAILED, MOVIES_STORAGE_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE,
-        MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED,
-        MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE,
-        MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED, MOVIE_TRASH_FOLDER_UNAVAILABLE,
-        MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND, MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE,
+        fetch_sukebei_vr_releases_with, fetch_yts_movie_releases_with, load_movies_folder_file,
+        load_tmdb_token_file, movie_metadata_error, open_movie_path_with,
+        parse_movie_provider_response, parse_provider_response, query_movies_volume_storage_with,
+        reveal_movie_path_with, save_movies_folder_file, save_tmdb_token_file, scan_movie_paths,
+        trash_movie_path_with, trash_movie_request_with, MoviePathValidationError,
+        MovieProviderRequestError, MovieTorrentState, MoviesLibraryContext,
+        MoviesVolumeStorageQueryError, ProviderRequestError, TrashMovieRequest,
+        ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
+        MOVIES_STORAGE_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND,
+        MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE,
+        MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED,
+        MOVIE_TRASH_FAILED, MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE,
+        MOVIE_TRASH_NOT_FOUND, MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE,
         MOVIE_TRASH_UNAVAILABLE, MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID, VR_PROVIDER_ERROR,
     };
 
@@ -1899,6 +2201,81 @@ mod tests {
             sukebei_url.into_inner().as_deref(),
             Some("https://sukebei.nyaa.si/?page=rss&q=%22ADLT-123%22&c=0_0&f=0")
         );
+    }
+
+    #[test]
+    fn resolves_tmdb_identity_before_the_literal_imdb_yts_request() {
+        let state = MovieTorrentState::default();
+        let generation = state
+            .begin_release_lookup()
+            .expect("Movie release lookup must begin");
+        let requests = RefCell::new(Vec::new());
+        let response = fetch_yts_movie_releases_with(
+            &state,
+            generation,
+            419,
+            "fixture-token",
+            |url, token| {
+                requests
+                    .borrow_mut()
+                    .push((url.to_owned(), token.map(str::to_owned)));
+                match url {
+                    "https://api.themoviedb.org/3/movie/419" => Ok(
+                        r#"{"id":419,"title":"Exact Movie","release_date":"1999-04-19"}"#
+                            .to_owned(),
+                    ),
+                    "https://api.themoviedb.org/3/movie/419/external_ids" => {
+                        Ok(r#"{"id":419,"imdb_id":"tt0123456"}"#.to_owned())
+                    }
+                    "https://yts.mx/api/v2/list_movies.json?limit=50&query_term=tt0123456" => {
+                        Ok(r#"{"status":"ok","data":{"movies":null}}"#.to_owned())
+                    }
+                    _ => unreachable!("only exact native-built provider URLs are allowed"),
+                }
+            },
+        )
+        .expect("exact Movie identity lookup must succeed");
+
+        assert_eq!(response[0], "419");
+        assert_eq!(response[1], "Exact Movie");
+        assert_eq!(response[3], "tt0123456");
+        assert_eq!(response[7], "0");
+        assert_eq!(
+            requests.into_inner(),
+            vec![
+                (
+                    "https://api.themoviedb.org/3/movie/419".to_owned(),
+                    Some("fixture-token".to_owned()),
+                ),
+                (
+                    "https://api.themoviedb.org/3/movie/419/external_ids".to_owned(),
+                    Some("fixture-token".to_owned()),
+                ),
+                (
+                    "https://yts.mx/api/v2/list_movies.json?limit=50&query_term=tt0123456"
+                        .to_owned(),
+                    None,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_movie_provider_http_failures_without_exposing_response_text() {
+        for (status, error) in [
+            (401, MovieProviderRequestError::Unauthorized),
+            (429, MovieProviderRequestError::RateLimited),
+            (404, MovieProviderRequestError::SourceUnavailable),
+            (500, MovieProviderRequestError::Provider),
+            (0, MovieProviderRequestError::Network),
+        ] {
+            assert_eq!(
+                parse_movie_provider_response(
+                    format!("secret response\nAUTO_VIDEO_HTTP_STATUS:{status}").as_bytes(),
+                ),
+                Err(error)
+            );
+        }
     }
 
     #[test]

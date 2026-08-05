@@ -74,6 +74,17 @@ let saveTmdbTokenMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
 let clearTmdbTokenMock: Mock<() => Promise<void>>;
+let fetchYtsMovieReleasesMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let inspectYtsMovieTorrentMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let invalidateVerifiedMovieTorrentMock: Mock<() => Promise<void>>;
+let invalidateMovieReleaseContextMock: Mock<() => Promise<void>>;
+let saveVerifiedMovieTorrentMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<boolean>
+>;
 let fetchJavdbCatalogMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string>
 >;
@@ -358,6 +369,56 @@ function sukebeiReleaseFixture(
   </rss>`;
 }
 
+function ytsMovieReleaseFixture({
+  providerMovieId = "700",
+  providerTitle = "YTS  Exact — 特別版",
+  providerYear = "1999",
+  releases,
+  tmdbMovieId = "419",
+  tmdbTitle = "Exact  Movie — 特別版",
+}: {
+  providerMovieId?: string;
+  providerTitle?: string;
+  providerYear?: string;
+  releases: Array<{
+    expectedInfohash?: string;
+    peers?: string;
+    quality?: string;
+    rowId: string;
+    seeds?: string;
+    size?: string;
+    sizeBytes?: string;
+    torrentUrl?: string;
+    typeLabel?: string;
+    videoCodec?: string;
+  }>;
+  tmdbMovieId?: string;
+  tmdbTitle?: string;
+}) {
+  return [
+    tmdbMovieId,
+    tmdbTitle,
+    "1999-04-19",
+    "tt0123456",
+    providerMovieId,
+    providerTitle,
+    providerYear,
+    String(releases.length),
+    ...releases.flatMap((release) => [
+      release.rowId,
+      release.quality ?? "",
+      release.typeLabel ?? "",
+      release.videoCodec ?? "",
+      release.size ?? "",
+      release.sizeBytes ?? "",
+      release.seeds ?? "",
+      release.peers ?? "",
+      release.expectedInfohash ?? "",
+      release.torrentUrl ?? "",
+    ]),
+  ];
+}
+
 function vrDownloadFixture({
   canOrganize = "false",
   category = "vr",
@@ -558,6 +619,27 @@ beforeEach(() => {
   ]);
   invalidateVerifiedAdultTorrentMock = vi.fn().mockResolvedValue(undefined);
   saveVerifiedAdultTorrentMock = vi.fn().mockResolvedValue(true);
+  fetchYtsMovieReleasesMock = vi.fn().mockResolvedValue([
+    "419",
+    "Exact Movie",
+    "1999-04-19",
+    "tt0123456",
+    "700",
+    "Exact YTS Movie",
+    "1999",
+    "0",
+  ]);
+  inspectYtsMovieTorrentMock = vi.fn().mockResolvedValue([
+    "movie-1-1-hash",
+    "Verified Movie torrent",
+    "0123456789abcdef0123456789abcdef01234567",
+    "5",
+    "Verified Movie.mp4",
+    "5",
+  ]);
+  invalidateVerifiedMovieTorrentMock = vi.fn().mockResolvedValue(undefined);
+  invalidateMovieReleaseContextMock = vi.fn().mockResolvedValue(undefined);
+  saveVerifiedMovieTorrentMock = vi.fn().mockResolvedValue(true);
   inspectSukebeiVrTorrentMock = vi.fn().mockResolvedValue([
     "inspection-123",
     "Verified torrent",
@@ -687,6 +769,16 @@ beforeEach(() => {
           return saveTmdbTokenMock(parameters);
         case "clear_tmdb_token":
           return clearTmdbTokenMock();
+        case "fetch_yts_movie_releases":
+          return fetchYtsMovieReleasesMock(parameters);
+        case "inspect_yts_movie_torrent":
+          return inspectYtsMovieTorrentMock(parameters);
+        case "invalidate_verified_movie_torrent":
+          return invalidateVerifiedMovieTorrentMock();
+        case "invalidate_movie_release_context":
+          return invalidateMovieReleaseContextMock();
+        case "save_verified_movie_torrent":
+          return saveVerifiedMovieTorrentMock(parameters);
         case "fetch_javdb_vr_catalog":
         case "fetch_javdb_adult_catalog":
           return fetchJavdbCatalogMock(parameters);
@@ -3559,6 +3651,37 @@ describe("TMDB Discover", () => {
     expect((poster as HTMLImageElement).getAttribute("src")).toBe(
       "https://image.tmdb.org/t/p/w500/verified-details.jpg",
     );
+    expect(fetchYtsMovieReleasesMock).not.toHaveBeenCalled();
+    fetchYtsMovieReleasesMock.mockResolvedValue(
+      ytsMovieReleaseFixture({
+        providerMovieId: "0",
+        providerTitle: "",
+        providerYear: "",
+        releases: [],
+        tmdbMovieId: "201",
+        tmdbTitle: providerTitle,
+      }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Find releases" }),
+    );
+    expect(
+      await screen.findByRole("heading", {
+        name: "No verified YTS releases found",
+      }),
+    ).toBeTruthy();
+    expect(fetchYtsMovieReleasesMock).toHaveBeenCalledWith({
+      tmdbMovieId: 201,
+    });
+    expect(screen.queryByRole("button", { name: "Inspect torrent" })).toBeNull();
+    const releaseDialog = screen
+      .getByText("Verified YTS release comparison")
+      .closest('[role="dialog"]');
+    fireEvent.click(
+      within(releaseDialog as HTMLElement).getByRole("button", {
+        name: "Close",
+      }),
+    );
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -4104,6 +4227,472 @@ describe("TMDB Discover", () => {
       }),
     ).toBeTruthy();
     expect(screen.queryByText("Cleared token result")).toBeNull();
+  });
+});
+
+describe("YTS Movie release comparison", () => {
+  it("requires explicit selection and inspects and saves only the exact verified artifact", async () => {
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    const exactTmdbTitle = "Exact  Movie — 特別版";
+    const exactProviderTitle = "YTS  Exact — 特別版";
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        results: [
+          {
+            id: 419,
+            poster_path: null,
+            release_date: "1999-04-19",
+            title: exactTmdbTitle,
+          },
+        ],
+      }),
+    );
+    fetchYtsMovieReleasesMock.mockResolvedValue(
+      ytsMovieReleaseFixture({
+        providerTitle: exactProviderTitle,
+        releases: [
+          {
+            peers: "",
+            quality: "720p",
+            rowId: "700:incomplete",
+            seeds: "",
+            size: "Unavailable artifact",
+            typeLabel: "web",
+            videoCodec: "x264",
+          },
+          {
+            expectedInfohash,
+            peers: "11",
+            quality: "1080p",
+            rowId: "700:complete",
+            seeds: "42",
+            size: "1.25 GiB",
+            sizeBytes: "1342177280",
+            torrentUrl: `https://yts.mx/torrent/download/${expectedInfohash.toUpperCase()}`,
+            typeLabel: "bluray",
+            videoCodec: "x265",
+          },
+        ],
+      }),
+    );
+    const inspectionResult = createDeferred<string[]>();
+    inspectYtsMovieTorrentMock.mockReturnValue(inspectionResult.promise);
+
+    render(<App />);
+    selectDiscover();
+    const releasesTrigger = await screen.findByRole("button", {
+      name: "Find releases: Exact Movie — 特別版",
+    });
+    expect(fetchYtsMovieReleasesMock).not.toHaveBeenCalled();
+    fireEvent.click(releasesTrigger);
+
+    const releaseList = await screen.findByRole("list", {
+      name: "Verified YTS torrents for Exact Movie — 特別版",
+    });
+    expect(fetchYtsMovieReleasesMock).toHaveBeenCalledWith({
+      tmdbMovieId: 419,
+    });
+    expect(within(releaseList).getAllByRole("button")).toHaveLength(2);
+    expect(screen.getByLabelText("Verified Movie release totals").textContent).toBe(
+      "2 verified torrentsIMDb tt0123456Retry",
+    );
+    expect(
+      screen.getByText("YTS Movie").parentElement?.querySelector("dd")
+        ?.textContent,
+    ).toBe(exactProviderTitle);
+    expect(
+      screen.getByText("Select one verified torrent row to inspect its metadata."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Inspect torrent" })).toBeNull();
+
+    const incompleteRelease = within(releaseList).getByRole("button", {
+      name: /720p/,
+    });
+    fireEvent.click(incompleteRelease);
+    expect(
+      screen.getByText(/no complete safe YTS artifact identity/),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Inspect torrent" })).toBeNull();
+
+    const completeRelease = within(releaseList).getByRole("button", {
+      name: /1080p/,
+    });
+    fireEvent.click(completeRelease);
+    const inspectButton = screen.getByRole("button", {
+      name: "Inspect torrent",
+    });
+    fireEvent.click(inspectButton);
+    expect(
+      await screen.findByRole("heading", {
+        name: "Inspecting verified Movie torrent",
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Save `.torrent`" })).toBeNull();
+    expect(screen.getByLabelText("Selected YTS torrent metadata").textContent).toBe(
+      "SourceYTSQuality1080pTypeblurayCodecx265Provider size1.25 GiBSeeds42Peers11",
+    );
+    expect(inspectYtsMovieTorrentMock).toHaveBeenCalledWith({
+      expectedInfohash,
+      imdbId: "tt0123456",
+      peers: "11",
+      providerMovieId: 700,
+      providerTitle: exactProviderTitle,
+      providerYear: "1999",
+      quality: "1080p",
+      releaseDate: "1999-04-19",
+      rowId: "700:complete",
+      seeds: "42",
+      size: "1.25 GiB",
+      sizeBytes: "1342177280",
+      tmdbMovieId: 419,
+      tmdbTitle: exactTmdbTitle,
+      torrentUrl: `https://yts.mx/torrent/download/${expectedInfohash.toUpperCase()}`,
+      typeLabel: "bluray",
+      videoCodec: "x265",
+    });
+
+    await act(async () => {
+      inspectionResult.resolve([
+        "movie-419-700-hash",
+        "Movie  —  Exact  Torrent",
+        expectedInfohash,
+        "12",
+        "Folder/Part  1 — 映画.mkv",
+        "5",
+        "Folder/特別版  B.mp4",
+        "7",
+      ]);
+      await inspectionResult.promise;
+    });
+
+    expect(
+      screen.getByText("Torrent name").parentElement?.querySelector("dd")
+        ?.textContent,
+    ).toBe("Movie  —  Exact  Torrent");
+    expect(screen.getByText(expectedInfohash)).toBeTruthy();
+    const fileRows = within(
+      screen.getByRole("list", { name: "Verified Movie torrent files" }),
+    ).getAllByRole("listitem");
+    expect(fileRows).toHaveLength(2);
+    expect(fileRows[0].textContent).toContain("Folder/Part  1 — 映画.mkv");
+    expect(fileRows[1].textContent).toContain("Folder/特別版  B.mp4");
+    expect(screen.queryByRole("button", { name: "Start download" })).toBeNull();
+
+    const cancelledSave = createDeferred<boolean>();
+    saveVerifiedMovieTorrentMock
+      .mockReturnValueOnce(cancelledSave.promise)
+      .mockResolvedValueOnce(true);
+    const saveButton = screen.getByRole("button", { name: "Save `.torrent`" });
+    fireEvent.click(saveButton);
+    fireEvent.click(saveButton);
+    expect(saveVerifiedMovieTorrentMock).toHaveBeenCalledOnce();
+    await act(async () => {
+      cancelledSave.resolve(false);
+      await cancelledSave.promise;
+    });
+    expect(screen.queryByText("Verified Movie torrent file saved.")).toBeNull();
+    fireEvent.click(saveButton);
+    expect(
+      await screen.findByText("Verified Movie torrent file saved."),
+    ).toBeTruthy();
+    expect(saveVerifiedMovieTorrentMock).toHaveBeenLastCalledWith({
+      inspectionId: "movie-419-700-hash",
+    });
+
+    const inspectionDialog = screen
+      .getByText("Verified YTS torrent")
+      .closest('[role="dialog"]');
+    fireEvent.click(
+      within(inspectionDialog as HTMLElement).getByRole("button", {
+        name: "Close",
+      }),
+    );
+    await waitFor(() => expect(document.activeElement).toBe(inspectButton));
+    expect(fetchSukebeiAdultReleasesMock).not.toHaveBeenCalled();
+    expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
+    expect(startVerifiedAdultDownloadMock).not.toHaveBeenCalled();
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores late Movie inspection and Save results after dismissal", async () => {
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockResolvedValue(
+      jsonResponse({ results: [{ id: 419, title: "Exact Movie" }] }),
+    );
+    fetchYtsMovieReleasesMock.mockResolvedValue(
+      ytsMovieReleaseFixture({
+        releases: [
+          {
+            expectedInfohash,
+            quality: "1080p",
+            rowId: "700:complete",
+            torrentUrl: `https://yts.mx/torrent/download/${expectedInfohash}`,
+          },
+        ],
+        tmdbTitle: "Exact Movie",
+      }),
+    );
+    const lateInspection = createDeferred<string[]>();
+    inspectYtsMovieTorrentMock
+      .mockReturnValueOnce(lateInspection.promise)
+      .mockResolvedValueOnce([
+        "movie-current",
+        "Current torrent",
+        expectedInfohash,
+        "5",
+        "Current file.mp4",
+        "5",
+      ]);
+
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Find releases: Exact Movie",
+      }),
+    );
+    const releaseList = await screen.findByRole("list", {
+      name: "Verified YTS torrents for Exact Movie",
+    });
+    fireEvent.click(within(releaseList).getByRole("button"));
+    const inspectButton = screen.getByRole("button", {
+      name: "Inspect torrent",
+    });
+    fireEvent.click(inspectButton);
+    await screen.findByRole("heading", {
+      name: "Inspecting verified Movie torrent",
+    });
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(inspectButton));
+
+    await act(async () => {
+      lateInspection.resolve([
+        "movie-late",
+        "Late closed torrent",
+        expectedInfohash,
+        "5",
+        "Late closed file.mp4",
+        "5",
+      ]);
+      await lateInspection.promise;
+    });
+    expect(screen.queryByText("Late closed torrent")).toBeNull();
+    expect(screen.queryByText("Late closed file.mp4")).toBeNull();
+
+    fireEvent.click(inspectButton);
+    expect(await screen.findByText("Current torrent")).toBeTruthy();
+    const lateSave = createDeferred<boolean>();
+    saveVerifiedMovieTorrentMock.mockReturnValue(lateSave.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Save `.torrent`" }));
+    const inspectionDialog = screen
+      .getByText("Verified YTS torrent")
+      .closest('[role="dialog"]');
+    fireEvent.click(
+      within(inspectionDialog as HTMLElement).getByRole("button", {
+        name: "Close",
+      }),
+    );
+    await act(async () => {
+      lateSave.resolve(true);
+      await lateSave.promise;
+    });
+    expect(screen.queryByText("Verified Movie torrent file saved.")).toBeNull();
+    expect(invalidateVerifiedMovieTorrentMock).toHaveBeenCalled();
+  });
+
+  it("keeps every Movie inspection failure local, distinct, and retryable", async () => {
+    const expectedInfohash = "0123456789abcdef0123456789abcdef01234567";
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockResolvedValue(
+      jsonResponse({ results: [{ id: 419, title: "Exact Movie" }] }),
+    );
+    fetchYtsMovieReleasesMock.mockResolvedValue(
+      ytsMovieReleaseFixture({
+        releases: [
+          {
+            expectedInfohash,
+            quality: "1080p",
+            rowId: "700:complete",
+            torrentUrl: `https://yts.mx/torrent/download/${expectedInfohash}`,
+          },
+        ],
+        tmdbTitle: "Exact Movie",
+      }),
+    );
+    for (const error of [
+      "movie_torrent_source_unavailable",
+      "movie_torrent_network_error",
+      "movie_torrent_provider_error",
+      "movie_torrent_malformed",
+      "movie_torrent_unsupported",
+      "movie_torrent_infohash_mismatch",
+      "movie_torrent_context_invalid",
+      "unexpected_error",
+    ]) {
+      inspectYtsMovieTorrentMock.mockRejectedValueOnce(error);
+    }
+
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Find releases: Exact Movie",
+      }),
+    );
+    const releaseList = await screen.findByRole("list", {
+      name: "Verified YTS torrents for Exact Movie",
+    });
+    fireEvent.click(within(releaseList).getByRole("button"));
+    fireEvent.click(screen.getByRole("button", { name: "Inspect torrent" }));
+
+    for (const heading of [
+      "Torrent artifact is unavailable",
+      "Torrent artifact could not be reached",
+      "Torrent provider rejected the request",
+      "Torrent artifact is malformed",
+      "Torrent artifact is unsupported",
+      "Torrent identity did not match",
+      "Torrent inspection is no longer current",
+      "Torrent inspection could not be completed",
+    ]) {
+      expect(await screen.findByRole("heading", { name: heading })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Save `.torrent`" })).toBeNull();
+      if (heading !== "Torrent inspection could not be completed") {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Retry inspection" }),
+        );
+      }
+    }
+    expect(within(releaseList).getByText("1080p")).toBeTruthy();
+  });
+
+  it("ignores a dismissed late Movie result and restores the current completed selection", async () => {
+    const staleResult = createDeferred<string[]>();
+    const currentTitle = "Current  Movie — B";
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        results: [
+          { id: 419, title: "Stale Movie A", release_date: "1999-04-19" },
+          { id: 420, title: currentTitle, release_date: "1999-04-19" },
+        ],
+      }),
+    );
+    fetchYtsMovieReleasesMock.mockImplementation((parameters) =>
+      parameters?.tmdbMovieId === 419
+        ? staleResult.promise
+        : Promise.resolve(
+            ytsMovieReleaseFixture({
+              providerTitle: "Current YTS Movie B",
+              releases: [{ quality: "1080p", rowId: "701:current" }],
+              tmdbMovieId: "420",
+              tmdbTitle: currentTitle,
+            }),
+          ),
+    );
+
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Find releases: Stale Movie A",
+      }),
+    );
+    const loadingDialog = screen
+      .getByRole("heading", { name: "Finding verified Movie releases" })
+      .closest('[role="dialog"]');
+    fireEvent.click(
+      within(loadingDialog as HTMLElement).getByRole("button", { name: "Close" }),
+    );
+    expect(invalidateMovieReleaseContextMock).toHaveBeenCalledOnce();
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Find releases: Current Movie — B",
+      }),
+    );
+    let currentList = await screen.findByRole("list", {
+      name: "Verified YTS torrents for Current Movie — B",
+    });
+    const selectedRow = within(currentList).getByRole("button", {
+      name: /1080p/,
+    });
+    fireEvent.click(selectedRow);
+    expect(selectedRow.getAttribute("aria-pressed")).toBe("true");
+
+    await act(async () => {
+      staleResult.resolve(
+        ytsMovieReleaseFixture({
+          providerTitle: "Stale provider response",
+          releases: [{ quality: "2160p", rowId: "700:stale" }],
+        }),
+      );
+      await staleResult.promise;
+    });
+    expect(screen.queryByText("Stale provider response")).toBeNull();
+    expect(screen.getAllByText("Current YTS Movie B")).toHaveLength(2);
+
+    const comparisonDialog = screen
+      .getByText("Verified YTS release comparison")
+      .closest('[role="dialog"]');
+    fireEvent.click(
+      within(comparisonDialog as HTMLElement).getByRole("button", {
+        name: "Close",
+      }),
+    );
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectDashboard();
+    selectDiscover();
+    resizeGallery("discover", 1088, 956);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Find releases: Current Movie — B",
+      }),
+    );
+    currentList = await screen.findByRole("list", {
+      name: "Verified YTS torrents for Current Movie — B",
+    });
+    expect(within(currentList).getByRole("button").getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    expect(fetchYtsMovieReleasesMock).toHaveBeenCalledTimes(2);
+    expect(invalidateMovieReleaseContextMock).toHaveBeenCalledOnce();
+    expect(document.documentElement.dataset.theme).toBe("dark");
+  });
+
+  it.each([
+    ["movie_tmdb_unauthorized", "TMDB token was not accepted"],
+    ["movie_tmdb_rate_limited", "TMDB release lookup is rate-limited"],
+    ["movie_tmdb_network_error", "TMDB could not be reached"],
+    ["movie_tmdb_malformed", "TMDB returned invalid identity data"],
+    ["movie_no_imdb_identity", "No IMDb identity is available"],
+    ["movie_yts_source_unavailable", "YTS is unavailable"],
+    ["movie_yts_network_error", "YTS could not be reached"],
+    ["movie_yts_malformed", "YTS returned invalid release data"],
+    ["movie_yts_conflicting_provider", "YTS returned conflicting Movie identities"],
+    ["movie_yts_provider_error", "YTS could not load Movie releases"],
+    ["unexpected_error", "TMDB could not resolve the Movie identity"],
+  ])("shows %s as the distinct retryable state %s", async (error, heading) => {
+    loadTmdbTokenMock.mockResolvedValue("fixture-token");
+    fetchMock.mockResolvedValue(
+      jsonResponse({ results: [{ id: 419, title: "Exact Movie" }] }),
+    );
+    fetchYtsMovieReleasesMock.mockRejectedValue(error);
+
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Find releases: Exact Movie",
+      }),
+    );
+
+    expect(await screen.findByRole("heading", { name: heading })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Inspect torrent" })).toBeNull();
   });
 });
 
