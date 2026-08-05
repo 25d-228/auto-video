@@ -2,6 +2,7 @@
 
 mod adult_library;
 mod tv_library;
+mod tv_release;
 mod vr_download;
 mod vr_library;
 mod vr_torrent;
@@ -29,6 +30,10 @@ use tv_library::{
     open_tv_file_with, reveal_tv_file_with, scan_tv_library_with, set_tv_folder, TvLibraryState,
     TV_FILE_OPEN_FAILED, TV_FILE_REVEAL_FAILED, TV_FOLDER_STORAGE_FAILED, TV_FOLDER_UNAVAILABLE,
     TV_LIBRARY_SCAN_FAILED,
+};
+use tv_release::{
+    fetch_apibay_tv_releases_with, TV_APIBAY_PROVIDER_ERROR, TV_TMDB_MALFORMED,
+    TV_TMDB_UNAUTHORIZED,
 };
 use vr_download::{
     apply_organization, cancel_download, clear_vr_folder as clear_trusted_vr_folder,
@@ -140,7 +145,7 @@ enum ProviderRequestError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum MovieProviderRequestError {
+pub(crate) enum MovieProviderRequestError {
     Unauthorized,
     RateLimited,
     SourceUnavailable,
@@ -557,7 +562,7 @@ fn move_to_os_trash(_path: &Path) -> Result<(), ()> {
     Err(())
 }
 
-fn is_valid_tmdb_token(token: &str) -> bool {
+pub(crate) fn is_valid_tmdb_token(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= TMDB_TOKEN_MAX_LENGTH
         && token.trim() == token
@@ -1804,6 +1809,36 @@ async fn fetch_yts_movie_releases(
 }
 
 #[tauri::command]
+async fn fetch_apibay_tv_releases(
+    app: tauri::AppHandle,
+    tmdb_tv_id: u64,
+    provider_season_id: u64,
+    provider_episode_id: u64,
+) -> Result<Vec<String>, String> {
+    if tmdb_tv_id == 0 || provider_season_id == 0 || provider_episode_id == 0 {
+        return Err(TV_TMDB_MALFORMED.to_owned());
+    }
+    let token = load_tmdb_token_file(&tmdb_token_path(&app)?)
+        .map_err(str::to_owned)?
+        .ok_or_else(|| TV_TMDB_UNAUTHORIZED.to_owned())?;
+    if !is_valid_tmdb_token(&token) {
+        return Err(TV_TMDB_MALFORMED.to_owned());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_apibay_tv_releases_with(
+            tmdb_tv_id,
+            provider_season_id,
+            provider_episode_id,
+            &token,
+            fetch_movie_provider_document,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| TV_APIBAY_PROVIDER_ERROR.to_owned())?
+}
+
+#[tauri::command]
 async fn inspect_sukebei_vr_torrent(
     code: String,
     release_name: String,
@@ -2090,6 +2125,7 @@ fn main() {
             fetch_sukebei_adult_releases,
             fetch_sukebei_vr_releases,
             fetch_yts_movie_releases,
+            fetch_apibay_tv_releases,
             inspect_sukebei_adult_torrent,
             inspect_sukebei_vr_torrent,
             inspect_yts_movie_torrent,

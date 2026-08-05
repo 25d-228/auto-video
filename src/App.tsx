@@ -79,12 +79,18 @@ import {
   type TmdbMovieDetailsResult,
   type TmdbMoviesResult,
   type TmdbTvDetailsResult,
+  type TmdbTvEpisode,
   type TmdbTvSeasonEpisodesResult,
   type TmdbTvSeasonSummary,
   type TmdbTvShow,
   type TmdbTvShowsResult,
   tmdbPosterUrl,
 } from "@/tmdb";
+import {
+  fetchVerifiedApiBayTvReleases,
+  type ApiBayTvRelease,
+  type TvEpisodeReleasesResult,
+} from "@/tv-release";
 import {
   chooseTvFolder,
   clearTvFolder,
@@ -275,6 +281,16 @@ type TvDetailsState = { status: "loading" } | TmdbTvDetailsResult;
 type TvSeasonEpisodesState =
   | { status: "loading" }
   | TmdbTvSeasonEpisodesResult;
+type TvEpisodeReleaseSelection = {
+  tmdbTvId: number;
+  showName: string;
+  providerSeasonId: number;
+  seasonNumber: number;
+  episode: TmdbTvEpisode;
+};
+type TvReleaseComparisonState =
+  | { status: "loading" }
+  | TvEpisodeReleasesResult;
 type CredentialMessage = {
   role: "alert" | "status";
   text: string;
@@ -1005,6 +1021,75 @@ const movieReleaseMessages = {
   },
   "yts-provider-error": {
     heading: "YTS could not load Movie releases",
+    message: "The release provider returned an unexpected error. Try again later.",
+    role: "alert",
+  },
+} as const;
+
+const tvReleaseMessages = {
+  loading: {
+    heading: "Finding verified TV releases",
+    message:
+      "Resolving the exact TMDB series identity before requesting API Bay candidates.",
+    role: "status",
+  },
+  "tmdb-unauthorized": {
+    heading: "TMDB token was not accepted",
+    message:
+      "Update the local TMDB token in Settings before finding TV releases.",
+    role: "alert",
+  },
+  "tmdb-rate-limited": {
+    heading: "TMDB release lookup is rate-limited",
+    message: "TMDB is temporarily limiting requests. Wait before retrying.",
+    role: "alert",
+  },
+  "tmdb-network-error": {
+    heading: "TMDB could not be reached",
+    message:
+      "The exact series identity could not be resolved. Check the network and retry.",
+    role: "alert",
+  },
+  "tmdb-malformed-provider": {
+    heading: "TMDB returned invalid episode identity data",
+    message:
+      "The response did not verify the selected show, season, and episode.",
+    role: "alert",
+  },
+  "tmdb-provider-error": {
+    heading: "TMDB could not resolve the TV identity",
+    message: "TMDB returned an unexpected error. Try again later.",
+    role: "alert",
+  },
+  "no-imdb-identity": {
+    heading: "No IMDb series identity is available",
+    message:
+      "TMDB did not provide a valid IMDb identifier for this exact TV show.",
+    role: undefined,
+  },
+  "apibay-source-unavailable": {
+    heading: "API Bay is unavailable",
+    message: "The TV release source is not available. Try again later.",
+    role: "alert",
+  },
+  "apibay-network-error": {
+    heading: "API Bay could not be reached",
+    message: "Check the network connection and retry this exact episode.",
+    role: "alert",
+  },
+  "apibay-malformed-provider": {
+    heading: "API Bay returned invalid release data",
+    message: "The response could not be verified safely for this episode.",
+    role: "alert",
+  },
+  "apibay-conflicting-provider": {
+    heading: "API Bay returned conflicting release identities",
+    message:
+      "Conflicting items claimed the verified episode identity, so no releases were accepted.",
+    role: "alert",
+  },
+  "apibay-provider-error": {
+    heading: "API Bay could not load TV releases",
     message: "The release provider returned an unexpected error. Try again later.",
     role: "alert",
   },
@@ -1758,6 +1843,259 @@ function MovieReleaseComparison({
                       Inspect torrent
                     </Button>
                   )}
+                </section>
+              )}
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
+  );
+}
+
+function TvEpisodeReleaseComparison({
+  onRetry,
+  onScrollTopChange,
+  onSelectRelease,
+  scrollTop,
+  selectedRelease,
+  selection,
+  state,
+  triggerId,
+}: {
+  onRetry: () => void;
+  onScrollTopChange: (scrollTop: number) => void;
+  onSelectRelease: (release: ApiBayTvRelease) => void;
+  scrollTop: number;
+  selectedRelease: ApiBayTvRelease | null;
+  selection: TvEpisodeReleaseSelection;
+  state: TvReleaseComparisonState;
+  triggerId: string;
+}) {
+  const result = state.status === "ready" ? state : null;
+  const releases = result?.releases ?? null;
+  const noVerifiedReleases = releases !== null && releases.length === 0;
+  const currentMessage =
+    state.status === "ready" ? null : tvReleaseMessages[state.status];
+  const standardCount =
+    releases?.filter((release) => release.category === "205").length ?? 0;
+  const hdCount =
+    releases?.filter((release) => release.category === "208").length ?? 0;
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="vr-releases__backdrop" />
+      <Dialog.Viewport className="vr-releases__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading"}
+          className="vr-releases__popup"
+          finalFocus={() => document.getElementById(triggerId)}
+          onScroll={(event) => onScrollTopChange(event.currentTarget.scrollTop)}
+          ref={(element) => {
+            if (element !== null && element.scrollTop !== scrollTop) {
+              element.scrollTop = scrollTop;
+            }
+          }}
+        >
+          <div className="vr-releases__heading">
+            <div>
+              <p className="card-eyebrow">Verified API Bay TV releases</p>
+              <Dialog.Title>
+                {result?.context.showName ?? selection.showName}
+              </Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="vr-releases__description">
+            Metadata-only comparison for the exact selected episode. No release
+            is selected automatically.
+          </Dialog.Description>
+
+          {releases === null || noVerifiedReleases ? (
+            <div
+              className="vr-releases__state"
+              role={noVerifiedReleases ? undefined : currentMessage?.role}
+            >
+              <span className="empty-state__icon">
+                <AppIcon name="releases" />
+              </span>
+              <div>
+                <h3>
+                  {noVerifiedReleases
+                    ? "No verified API Bay releases found"
+                    : currentMessage?.heading}
+                </h3>
+                <p>
+                  {noVerifiedReleases
+                    ? `API Bay returned no exact releases for Season ${result?.context.seasonNumber}, Episode ${result?.context.episodeNumber}.`
+                    : currentMessage?.message}
+                </p>
+                {state.status === "loading" ? null : (
+                  <Button onClick={onRetry} type="button" variant="outline">
+                    <AppIcon name="refresh" />
+                    Retry
+                  </Button>
+                )}
+              </div>
+            </div>
+          ) : result === null ? null : (
+            <div className="vr-releases__content">
+              <div
+                aria-label="Verified TV release totals"
+                className="vr-releases__totals tv-releases__totals"
+              >
+                <p>
+                  <strong>{releases.length}</strong> verified releases
+                </p>
+                <p>
+                  <strong>{standardCount}</strong> TV Shows
+                </p>
+                <p>
+                  <strong>{hdCount}</strong> HD TV Shows
+                </p>
+                <Button onClick={onRetry} size="sm" type="button" variant="outline">
+                  <AppIcon name="refresh" />
+                  Retry
+                </Button>
+              </div>
+              <dl
+                aria-label="Verified TV episode identity"
+                className="vr-torrent__metadata"
+              >
+                <div>
+                  <dt>Show</dt>
+                  <dd>{result.context.showName}</dd>
+                </div>
+                <div>
+                  <dt>IMDb series</dt>
+                  <dd>{result.context.imdbId}</dd>
+                </div>
+                <div>
+                  <dt>Season</dt>
+                  <dd>
+                    {result.context.seasonNumber} · provider ID {result.context.providerSeasonId}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Episode</dt>
+                  <dd>
+                    {result.context.episodeNumber} · {result.context.episodeName}
+                  </dd>
+                </div>
+              </dl>
+              <ul
+                aria-label={`Verified API Bay releases for ${result.context.showName} Season ${result.context.seasonNumber} Episode ${result.context.episodeNumber}`}
+              >
+                {releases.map((release) => (
+                  <li key={release.providerItemId}>
+                    <button
+                      aria-pressed={selectedRelease === release}
+                      onClick={() => onSelectRelease(release)}
+                      type="button"
+                    >
+                      <span className="vr-releases__release-name">
+                        {release.name}
+                      </span>
+                      <span className="vr-releases__release-metadata">
+                        <span>
+                          {release.category === "205"
+                            ? "TV Shows"
+                            : "HD TV Shows"}
+                        </span>
+                        <span>Source {release.source}</span>
+                        <span>
+                          Size {release.sizeBytes === null
+                            ? "Unavailable"
+                            : formatStorageBytes(BigInt(release.sizeBytes))}
+                        </span>
+                        <span>Seeders {release.seeders ?? "Unavailable"}</span>
+                        <span>Leechers {release.leechers ?? "Unavailable"}</span>
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {selectedRelease === null ? (
+                <p className="vr-releases__selection-prompt">
+                  Select one verified release to compare its metadata.
+                </p>
+              ) : (
+                <section
+                  aria-labelledby="selected-tv-release-heading"
+                  className="vr-releases__selection"
+                >
+                  <h3 id="selected-tv-release-heading">Selected release</h3>
+                  <dl>
+                    <div>
+                      <dt>Show identity</dt>
+                      <dd>
+                        {result.context.showName} · TMDB {result.context.tmdbTvId} · {result.context.imdbId}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Episode identity</dt>
+                      <dd>
+                        Season {result.context.seasonNumber}, Episode {result.context.episodeNumber} · {result.context.episodeName} · provider episode ID {result.context.providerEpisodeId}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Release name</dt>
+                      <dd className="vr-releases__release-name">
+                        {selectedRelease.name}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Provider item</dt>
+                      <dd>{selectedRelease.providerItemId}</dd>
+                    </div>
+                    <div>
+                      <dt>Category</dt>
+                      <dd>
+                        {selectedRelease.category === "205"
+                          ? "TV Shows (205)"
+                          : "HD TV Shows (208)"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Infohash</dt>
+                      <dd>{selectedRelease.infohash}</dd>
+                    </div>
+                    <div>
+                      <dt>Size</dt>
+                      <dd>
+                        {selectedRelease.sizeBytes === null
+                          ? "Unavailable"
+                          : `${formatStorageBytes(BigInt(selectedRelease.sizeBytes))} (${selectedRelease.sizeBytes} bytes)`}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Peers</dt>
+                      <dd>
+                        {selectedRelease.seeders ?? "Unavailable"} seeders · {selectedRelease.leechers ?? "Unavailable"} leechers
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Uploader / status</dt>
+                      <dd>
+                        {selectedRelease.uploader ?? "Unavailable"} / {selectedRelease.providerStatus ?? "Unavailable"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Added</dt>
+                      <dd>{selectedRelease.added ?? "Unavailable"}</dd>
+                    </div>
+                    <div>
+                      <dt>Source</dt>
+                      <dd>{selectedRelease.source}</dd>
+                    </div>
+                  </dl>
                 </section>
               )}
             </div>
@@ -2895,6 +3233,7 @@ function DiscoverMovieDetails({
 
 function DiscoverTvDetails({
   isSeasonGuideVisible,
+  onFindEpisodeReleases,
   onRetryDetails,
   onRetrySeason,
   onSelectSeason,
@@ -2908,6 +3247,7 @@ function DiscoverTvDetails({
   triggerId,
 }: {
   isSeasonGuideVisible: boolean;
+  onFindEpisodeReleases: (episode: TmdbTvEpisode, triggerId: string) => void;
   onRetryDetails: () => void;
   onRetrySeason: () => void;
   onSelectSeason: (season: TmdbTvSeasonSummary) => void;
@@ -3203,6 +3543,21 @@ function DiscoverTvDetails({
                                 </div>
                               </dl>
                               <p>{episode.overview ?? "Overview unavailable"}</p>
+                              <Button
+                                id={`find-tv-releases-${episode.providerEpisodeId}`}
+                                onClick={(event) =>
+                                  onFindEpisodeReleases(
+                                    episode,
+                                    event.currentTarget.id,
+                                  )
+                                }
+                                size="sm"
+                                type="button"
+                                variant="outline"
+                              >
+                                <AppIcon name="releases" />
+                                Find releases
+                              </Button>
                             </div>
                           </li>
                         ))}
@@ -4525,6 +4880,18 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     useState<TvSeasonEpisodesState | null>(null);
   const [tvSeasonEpisodesRequestVersion, setTvSeasonEpisodesRequestVersion] =
     useState(0);
+  const [tvReleaseSelection, setTvReleaseSelection] =
+    useState<TvEpisodeReleaseSelection | null>(null);
+  const [tvReleaseComparisonState, setTvReleaseComparisonState] =
+    useState<TvReleaseComparisonState | null>(null);
+  const [tvReleaseComparisonTriggerId, setTvReleaseComparisonTriggerId] =
+    useState<string | null>(null);
+  const [isTvReleaseComparisonOpen, setIsTvReleaseComparisonOpen] =
+    useState(false);
+  const [selectedTvRelease, setSelectedTvRelease] =
+    useState<ApiBayTvRelease | null>(null);
+  const [tvReleaseScrollTop, setTvReleaseScrollTop] = useState(0);
+  const [tvReleaseRequestVersion, setTvReleaseRequestVersion] = useState(0);
   const [adultSearchInput, setAdultSearchInput] = useState("");
   const [adultSearchInputError, setAdultSearchInputError] = useState<
     string | null
@@ -4636,6 +5003,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const tvDiscoverRequestId = useRef(0);
   const tvDetailsRequestId = useRef(0);
   const tvSeasonEpisodesRequestId = useRef(0);
+  const tvReleaseRequestId = useRef(0);
   const adultCatalogRequestId = useRef(0);
   const adultReleaseRequestId = useRef(0);
   const adultTorrentInspectionRequestId = useRef(0);
@@ -5710,6 +6078,26 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   ]);
 
   useEffect(() => {
+    const requestId = ++tvReleaseRequestId.current;
+    if (tvReleaseSelection === null) {
+      return;
+    }
+    setTvReleaseComparisonState({ status: "loading" });
+    void fetchVerifiedApiBayTvReleases(
+      tvReleaseSelection.tmdbTvId,
+      tvReleaseSelection.providerSeasonId,
+      tvReleaseSelection.episode.providerEpisodeId,
+    ).then((result) => {
+      if (requestId === tvReleaseRequestId.current) {
+        setTvReleaseComparisonState(result);
+      }
+    });
+    return () => {
+      tvReleaseRequestId.current += 1;
+    };
+  }, [tvReleaseRequestVersion, tvReleaseSelection]);
+
+  useEffect(() => {
     const requestId = ++adultCatalogRequestId.current;
     if (submittedAdultCode === null) {
       return;
@@ -5942,6 +6330,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       );
       closeAdultReleaseComparison();
       closeMovieReleaseComparison();
+      closeTvReleaseComparison();
     }
     setActiveDestination(destination);
     if (workspace.current !== null) {
@@ -6900,6 +7289,100 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
   };
 
+  const closeTvReleaseComparison = () => {
+    setIsTvReleaseComparisonOpen(false);
+    tvReleaseRequestId.current += 1;
+    if (tvReleaseComparisonState?.status === "loading") {
+      setTvReleaseComparisonState(null);
+      setSelectedTvRelease(null);
+      setTvReleaseScrollTop(0);
+    }
+  };
+
+  const resetTvReleaseComparison = () => {
+    setIsTvReleaseComparisonOpen(false);
+    tvReleaseRequestId.current += 1;
+    setTvReleaseSelection(null);
+    setTvReleaseComparisonState(null);
+    setTvReleaseComparisonTriggerId(null);
+    setSelectedTvRelease(null);
+    setTvReleaseScrollTop(0);
+  };
+
+  const openTvEpisodeReleaseComparison = (
+    episode: TmdbTvEpisode,
+    triggerId: string,
+  ) => {
+    if (
+      selectedDiscoverTvShow === null ||
+      tvDetailsState?.status !== "ready" ||
+      selectedTvSeason === null ||
+      tvSeasonEpisodesState?.status !== "ready" ||
+      tvSeasonEpisodesState.season.providerSeasonId !==
+        selectedTvSeason.providerSeasonId ||
+      tvSeasonEpisodesState.season.seasonNumber !==
+        selectedTvSeason.seasonNumber
+    ) {
+      return;
+    }
+    const acceptedEpisode = tvSeasonEpisodesState.season.episodes.find(
+      (candidate) =>
+        candidate.providerEpisodeId === episode.providerEpisodeId &&
+        candidate.episodeNumber === episode.episodeNumber,
+    );
+    if (acceptedEpisode === undefined) {
+      return;
+    }
+
+    setTvReleaseComparisonTriggerId(triggerId);
+    setIsTvReleaseComparisonOpen(true);
+    if (
+      tvReleaseSelection?.tmdbTvId === selectedDiscoverTvShow.id &&
+      tvReleaseSelection.providerSeasonId ===
+        selectedTvSeason.providerSeasonId &&
+      tvReleaseSelection.episode.providerEpisodeId ===
+        acceptedEpisode.providerEpisodeId &&
+      tvReleaseComparisonState !== null
+    ) {
+      return;
+    }
+    tvReleaseRequestId.current += 1;
+    setTvReleaseSelection({
+      tmdbTvId: selectedDiscoverTvShow.id,
+      showName: tvDetailsState.details.name,
+      providerSeasonId: selectedTvSeason.providerSeasonId,
+      seasonNumber: selectedTvSeason.seasonNumber,
+      episode: acceptedEpisode,
+    });
+    setTvReleaseComparisonState({ status: "loading" });
+    setSelectedTvRelease(null);
+    setTvReleaseScrollTop(0);
+    setTvReleaseRequestVersion((version) => version + 1);
+  };
+
+  const retryTvEpisodeReleaseComparison = () => {
+    if (
+      tvReleaseSelection === null ||
+      tvReleaseComparisonState?.status === "loading"
+    ) {
+      return;
+    }
+    tvReleaseRequestId.current += 1;
+    setTvReleaseComparisonState({ status: "loading" });
+    setSelectedTvRelease(null);
+    setTvReleaseScrollTop(0);
+    setTvReleaseRequestVersion((version) => version + 1);
+  };
+
+  const selectTvRelease = (release: ApiBayTvRelease) => {
+    if (
+      tvReleaseComparisonState?.status === "ready" &&
+      tvReleaseComparisonState.releases.includes(release)
+    ) {
+      setSelectedTvRelease(release);
+    }
+  };
+
   const openDiscoverTvDetails = (show: TmdbTvShow, triggerId: string) => {
     setTvDetailsTriggerId(triggerId);
     setIsTvDetailsOpen(true);
@@ -6907,6 +7390,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       return;
     }
 
+    resetTvReleaseComparison();
     tvDetailsRequestId.current += 1;
     tvSeasonEpisodesRequestId.current += 1;
     setSelectedDiscoverTvShow(show);
@@ -6931,6 +7415,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   };
 
   const resetDiscoverTvDetails = () => {
+    resetTvReleaseComparison();
     tvDetailsRequestId.current += 1;
     tvSeasonEpisodesRequestId.current += 1;
     setIsTvDetailsOpen(false);
@@ -6950,6 +7435,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       return;
     }
 
+    resetTvReleaseComparison();
     tvDetailsRequestId.current += 1;
     tvSeasonEpisodesRequestId.current += 1;
     setTvDetailsState({ status: "loading" });
@@ -6978,6 +7464,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       return;
     }
 
+    resetTvReleaseComparison();
     tvSeasonEpisodesRequestId.current += 1;
     setSelectedTvSeason(currentSeason);
     setTvSeasonEpisodesState({ status: "loading" });
@@ -6992,6 +7479,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       return;
     }
 
+    resetTvReleaseComparison();
     tvSeasonEpisodesRequestId.current += 1;
     setTvSeasonEpisodesState({ status: "loading" });
     setTvSeasonEpisodesRequestVersion((version) => version + 1);
@@ -7024,6 +7512,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     closeDiscoverMovieDetails();
     closeDiscoverTvDetails();
+    closeTvReleaseComparison();
     closeMovieReleaseComparison();
     closeAdultReleaseComparison();
     closeVrReleaseComparison();
@@ -10522,6 +11011,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         tvDetailsTriggerId === null ? null : (
           <DiscoverTvDetails
             isSeasonGuideVisible={isTvSeasonGuideVisible}
+            onFindEpisodeReleases={openTvEpisodeReleaseComparison}
             onRetryDetails={retryDiscoverTvDetails}
             onRetrySeason={retryTvSeasonEpisodes}
             onScrollTopChange={setTvDetailsScrollTop}
@@ -10533,6 +11023,29 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
             show={selectedDiscoverTvShow}
             state={tvDetailsState}
             triggerId={tvDetailsTriggerId}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeTvReleaseComparison();
+          }
+        }}
+        open={isTvReleaseComparisonOpen}
+      >
+        {tvReleaseSelection === null ||
+        tvReleaseComparisonState === null ||
+        tvReleaseComparisonTriggerId === null ? null : (
+          <TvEpisodeReleaseComparison
+            onRetry={retryTvEpisodeReleaseComparison}
+            onScrollTopChange={setTvReleaseScrollTop}
+            onSelectRelease={selectTvRelease}
+            scrollTop={tvReleaseScrollTop}
+            selectedRelease={selectedTvRelease}
+            selection={tvReleaseSelection}
+            state={tvReleaseComparisonState}
+            triggerId={tvReleaseComparisonTriggerId}
           />
         )}
       </Dialog.Root>

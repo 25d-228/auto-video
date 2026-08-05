@@ -77,6 +77,9 @@ let clearTmdbTokenMock: Mock<() => Promise<void>>;
 let fetchYtsMovieReleasesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
+let fetchApiBayTvReleasesMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
 let inspectYtsMovieTorrentMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
@@ -632,6 +635,17 @@ beforeEach(() => {
     "1999",
     "0",
   ]);
+  fetchApiBayTvReleasesMock = vi.fn().mockResolvedValue([
+    "701",
+    "Exact  Show — 特別版",
+    "9001",
+    "2",
+    "9103",
+    "3",
+    "第三話  —  Exact Episode",
+    "tt0123456",
+    "0",
+  ]);
   inspectYtsMovieTorrentMock = vi.fn().mockResolvedValue([
     "movie-1-1-hash",
     "Verified Movie torrent",
@@ -775,6 +789,8 @@ beforeEach(() => {
           return clearTmdbTokenMock();
         case "fetch_yts_movie_releases":
           return fetchYtsMovieReleasesMock(parameters);
+        case "fetch_apibay_tv_releases":
+          return fetchApiBayTvReleasesMock(parameters);
         case "inspect_yts_movie_torrent":
           return inspectYtsMovieTorrentMock(parameters);
         case "invalidate_verified_movie_torrent":
@@ -5366,6 +5382,401 @@ describe("TMDB TV Discover", () => {
     expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
     expect(startVerifiedAdultDownloadMock).not.toHaveBeenCalled();
     expect(startVerifiedMovieDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it("compares exact API Bay episode rows only after explicit action and preserves manual state", async () => {
+    const showName = "Exact  Show — 特別版";
+    const episodeName = "第三話  —  Exact Episode";
+    const standardReleaseName =
+      "Exact  Show — 特別版.S02E03.第三話  —  1080p";
+    const hdReleaseName = "Exact Show - 2x03 - 2160p";
+    const standardHash = "0123456789abcdef0123456789abcdef01234567";
+    const hdHash = "abcdef0123456789abcdef0123456789abcdef01";
+    loadTmdbTokenMock.mockResolvedValue("episode-release-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 701, name: showName }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 701,
+          name: showName,
+          seasons: [
+            { id: 9001, season_number: 2, name: "Season 2" },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 9001,
+          season_number: 2,
+          episodes: [
+            {
+              id: 9103,
+              season_number: 2,
+              episode_number: 3,
+              name: episodeName,
+            },
+          ],
+        }),
+      );
+    fetchApiBayTvReleasesMock.mockResolvedValue([
+      "701",
+      showName,
+      "9001",
+      "2",
+      "9103",
+      "3",
+      episodeName,
+      "tt0123456",
+      "2",
+      "1001",
+      standardReleaseName,
+      "205",
+      "419000000",
+      "12",
+      "4",
+      "Exact  Uploader",
+      "vip",
+      "1710000000",
+      standardHash,
+      "API Bay",
+      "1002",
+      hdReleaseName,
+      "208",
+      "",
+      "2",
+      "0",
+      "",
+      "",
+      "",
+      hdHash,
+      "API Bay",
+    ]);
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /View details: Exact Show — 特別版/,
+      }),
+    );
+    let detailsDialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      await within(detailsDialog).findByRole("button", {
+        name: "View seasons",
+      }),
+    );
+    fireEvent.click(
+      within(detailsDialog).getByRole("button", { name: "Select Season 2" }),
+    );
+    const findReleasesButton = await within(detailsDialog).findByRole(
+      "button",
+      { name: "Find releases" },
+    );
+    expect(fetchApiBayTvReleasesMock).not.toHaveBeenCalled();
+    findReleasesButton.focus();
+    fireEvent.click(findReleasesButton);
+
+    const comparisonDescription = await screen.findByText(
+      /Metadata-only comparison for the exact selected episode/,
+    );
+    let comparisonDialog = comparisonDescription.closest(
+      '[role="dialog"]',
+    ) as HTMLElement;
+    await within(comparisonDialog).findByLabelText("Verified TV release totals");
+    expect(fetchApiBayTvReleasesMock).toHaveBeenCalledWith({
+      tmdbTvId: 701,
+      providerSeasonId: 9001,
+      providerEpisodeId: 9103,
+    });
+    expect(fetchApiBayTvReleasesMock).toHaveBeenCalledTimes(1);
+    const totals = within(comparisonDialog).getByLabelText(
+      "Verified TV release totals",
+    );
+    expect(totals.textContent).toContain("2 verified releases");
+    expect(totals.textContent).toContain("1 TV Shows");
+    expect(totals.textContent).toContain("1 HD TV Shows");
+    const standardReleaseLabel = [
+      ...comparisonDialog.querySelectorAll(".vr-releases__release-name"),
+    ].find((element) => element.textContent === standardReleaseName);
+    expect(standardReleaseLabel?.textContent).toBe(standardReleaseName);
+    expect(within(comparisonDialog).getByText(hdReleaseName)).toBeTruthy();
+    expect(
+      within(comparisonDialog).getByText("Select one verified release to compare its metadata."),
+    ).toBeTruthy();
+    expect(within(comparisonDialog).queryByText("Selected release")).toBeNull();
+    expect(within(comparisonDialog).queryByRole("button", { name: "Inspect torrent" })).toBeNull();
+    expect(within(comparisonDialog).queryByRole("button", { name: /download/i })).toBeNull();
+
+    fireEvent.click(standardReleaseLabel!.closest("button")!);
+    const selection = within(comparisonDialog)
+      .getByRole("heading", { name: "Selected release" })
+      .closest("section") as HTMLElement;
+    expect(
+      selection.querySelector(".vr-releases__release-name")?.textContent,
+    ).toBe(standardReleaseName);
+    expect(within(selection).getByText(standardHash)).toBeTruthy();
+    expect(within(selection).getByText(/Season 2, Episode 3/).textContent).toContain(
+      episodeName,
+    );
+    comparisonDialog.scrollTop = 140;
+    fireEvent.scroll(comparisonDialog);
+
+    fireEvent.click(
+      within(comparisonDialog).getByRole("button", { name: "Close" }),
+    );
+    await waitFor(() => expect(document.activeElement).toBe(findReleasesButton));
+    fireEvent.click(
+      within(detailsDialog).getByRole("button", { name: "Close" }),
+    );
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    fireEvent(window, new Event("resize"));
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+    selectTvDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /View details: Exact Show — 特別版/,
+      }),
+    );
+    detailsDialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      within(detailsDialog).getByRole("button", { name: "Find releases" }),
+    );
+    comparisonDialog = (
+      await screen.findByText(
+        /Metadata-only comparison for the exact selected episode/,
+      )
+    ).closest('[role="dialog"]') as HTMLElement;
+    expect(within(comparisonDialog).getByText("Selected release")).toBeTruthy();
+    expect(
+      [...comparisonDialog.querySelectorAll(".vr-releases__release-name")].some(
+        (element) => element.textContent === standardReleaseName,
+      ),
+    ).toBe(true);
+    expect(comparisonDialog.scrollTop).toBe(140);
+    expect(fetchApiBayTvReleasesMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(document.documentElement.dataset.theme).toBe("dark");
+  });
+
+  it("invalidates a dismissed API Bay request and keeps its late rows out of a newer episode", async () => {
+    const lateRelease = createDeferred<string[]>();
+    loadTmdbTokenMock.mockResolvedValue("episode-release-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 701, name: "Exact Show" }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 701,
+          name: "Exact Show",
+          seasons: [{ id: 9001, season_number: 2, name: "Season 2" }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 9001,
+          season_number: 2,
+          episodes: [
+            { id: 9103, season_number: 2, episode_number: 3, name: "Episode 3" },
+            { id: 9104, season_number: 2, episode_number: 4, name: "Episode 4" },
+          ],
+        }),
+      );
+    fetchApiBayTvReleasesMock
+      .mockReturnValueOnce(lateRelease.promise)
+      .mockResolvedValueOnce([
+        "701",
+        "Exact Show",
+        "9001",
+        "2",
+        "9104",
+        "4",
+        "Episode 4",
+        "tt0123456",
+        "0",
+      ]);
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "View details: Exact Show" }),
+    );
+    const detailsDialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      await within(detailsDialog).findByRole("button", { name: "View seasons" }),
+    );
+    fireEvent.click(
+      within(detailsDialog).getByRole("button", { name: "Select Season 2" }),
+    );
+    const findButtons = await within(detailsDialog).findAllByRole("button", {
+      name: "Find releases",
+    });
+    fireEvent.click(findButtons[0]);
+    const loadingDialog = (
+      await screen.findByText("Finding verified TV releases")
+    ).closest('[role="dialog"]') as HTMLElement;
+    fireEvent.keyDown(loadingDialog, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByText("Finding verified TV releases")).toBeNull(),
+    );
+
+    fireEvent.click(findButtons[1]);
+    const currentDialog = (
+      await screen.findByText(
+        /Metadata-only comparison for the exact selected episode/,
+      )
+    ).closest('[role="dialog"]') as HTMLElement;
+    expect(
+      await within(currentDialog).findByText(
+        "API Bay returned no exact releases for Season 2, Episode 4.",
+      ),
+    ).toBeTruthy();
+    expect(fetchApiBayTvReleasesMock.mock.calls).toEqual([
+      [{ tmdbTvId: 701, providerSeasonId: 9001, providerEpisodeId: 9103 }],
+      [{ tmdbTvId: 701, providerSeasonId: 9001, providerEpisodeId: 9104 }],
+    ]);
+
+    await act(async () => {
+      lateRelease.resolve([
+        "701",
+        "Exact Show",
+        "9001",
+        "2",
+        "9103",
+        "3",
+        "Episode 3",
+        "tt0123456",
+        "1",
+        "1003",
+        "Late Exact Show S02E03",
+        "205",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "0123456789abcdef0123456789abcdef01234567",
+        "API Bay",
+      ]);
+      await lateRelease.promise;
+    });
+    expect(within(currentDialog).queryByText("Late Exact Show S02E03")).toBeNull();
+    expect(within(currentDialog).getByText(/Episode 4/)).toBeTruthy();
+  });
+
+  it("keeps every TV release failure local and retries the exact current episode", async () => {
+    loadTmdbTokenMock.mockResolvedValue("episode-release-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 701, name: "Retry Show" }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 701,
+          name: "Retry Show",
+          seasons: [{ id: 9001, season_number: 2, name: "Season 2" }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 9001,
+          season_number: 2,
+          episodes: [
+            {
+              id: 9103,
+              season_number: 2,
+              episode_number: 3,
+              name: "Retry Episode",
+            },
+          ],
+        }),
+      );
+    const outcomes = [
+      ["tv_release_tmdb_unauthorized", "TMDB token was not accepted"],
+      ["tv_release_tmdb_rate_limited", "TMDB release lookup is rate-limited"],
+      ["tv_release_tmdb_network_error", "TMDB could not be reached"],
+      ["tv_release_tmdb_malformed", "TMDB returned invalid episode identity data"],
+      ["unexpected", "TMDB could not resolve the TV identity"],
+      ["tv_release_no_imdb_identity", "No IMDb series identity is available"],
+      ["tv_release_apibay_source_unavailable", "API Bay is unavailable"],
+      ["tv_release_apibay_network_error", "API Bay could not be reached"],
+      ["tv_release_apibay_malformed", "API Bay returned invalid release data"],
+      ["tv_release_apibay_conflicting", "API Bay returned conflicting release identities"],
+      ["tv_release_apibay_provider_error", "API Bay could not load TV releases"],
+    ] as const;
+    for (const [error] of outcomes) {
+      fetchApiBayTvReleasesMock.mockRejectedValueOnce(error);
+    }
+    fetchApiBayTvReleasesMock.mockResolvedValueOnce([
+      "701",
+      "Retry Show",
+      "9001",
+      "2",
+      "9103",
+      "3",
+      "Retry Episode",
+      "tt0123456",
+      "0",
+    ]);
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "View details: Retry Show" }),
+    );
+    const detailsDialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      await within(detailsDialog).findByRole("button", { name: "View seasons" }),
+    );
+    fireEvent.click(
+      within(detailsDialog).getByRole("button", { name: "Select Season 2" }),
+    );
+    fireEvent.click(
+      await within(detailsDialog).findByRole("button", {
+        name: "Find releases",
+      }),
+    );
+    const comparisonDialog = (
+      await screen.findByText(
+        /Metadata-only comparison for the exact selected episode/,
+      )
+    ).closest('[role="dialog"]') as HTMLElement;
+
+    for (const [, heading] of outcomes) {
+      expect(
+        await within(comparisonDialog).findByRole("heading", { name: heading }),
+      ).toBeTruthy();
+      fireEvent.click(
+        within(comparisonDialog).getByRole("button", { name: "Retry" }),
+      );
+    }
+    expect(
+      await within(comparisonDialog).findByText(
+        "API Bay returned no exact releases for Season 2, Episode 3.",
+      ),
+    ).toBeTruthy();
+    expect(fetchApiBayTvReleasesMock).toHaveBeenCalledTimes(12);
+    for (const [parameters] of fetchApiBayTvReleasesMock.mock.calls) {
+      expect(parameters).toEqual({
+        tmdbTvId: 701,
+        providerSeasonId: 9001,
+        providerEpisodeId: 9103,
+      });
+    }
   });
 
   it("accepts only the newest exact season context and blocks a dismissed pending guide", async () => {

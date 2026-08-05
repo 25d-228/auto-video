@@ -1605,6 +1605,10 @@ button {
   white-space: pre-wrap;
 }
 
+.tv-season-guide__episode-information > [data-slot="button"] {
+  margin-top: 0.75rem;
+}
+
 .tv-season-guide__state {
   min-height: 8rem;
 }
@@ -1727,6 +1731,7 @@ button {
 
 .vr-releases__totals {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 1rem;
   padding-bottom: 0.75rem;
