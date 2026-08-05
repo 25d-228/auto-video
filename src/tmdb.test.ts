@@ -5,6 +5,7 @@ import {
   fetchTmdbMoviesByTitle,
   fetchTmdbTvByTitle,
   fetchTmdbTvDetails,
+  fetchTmdbTvSeasonEpisodes,
   fetchWeeklyTrendingMovies,
   fetchWeeklyTrendingTv,
   tmdbPosterUrl,
@@ -512,6 +513,19 @@ describe("TMDB TV details request", () => {
         number_of_episodes: 37,
         genres: [{ name: "ドラマ" }, { name: "Mystery" }],
         overview: "Exact  provider overview.",
+        seasons: [
+          {
+            id: 9000,
+            season_number: 1,
+            name: "Season One",
+            air_date: "2025-01-01",
+            poster_path: "/season-one.jpg",
+            episode_count: 12,
+          },
+          { id: 9001, season_number: 2, name: "第二期  —  特別編" },
+          { id: 8999, season_number: 0, name: "Specials" },
+          { id: 0, season_number: 3, name: "Missing identity" },
+        ],
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
@@ -528,6 +542,24 @@ describe("TMDB TV details request", () => {
         episodeCount: 37,
         genres: ["ドラマ", "Mystery"],
         overview: "Exact  provider overview.",
+        seasons: [
+          {
+            providerSeasonId: 9000,
+            seasonNumber: 1,
+            name: "Season One",
+            airDate: "2025-01-01",
+            posterPath: "/season-one.jpg",
+            episodeCount: 12,
+          },
+          {
+            providerSeasonId: 9001,
+            seasonNumber: 2,
+            name: "第二期  —  特別編",
+            airDate: null,
+            posterPath: null,
+            episodeCount: null,
+          },
+        ],
       },
     });
     expect(fetchMock).toHaveBeenCalledWith(
@@ -572,7 +604,36 @@ describe("TMDB TV details request", () => {
         episodeCount: null,
         genres: [],
         overview: null,
+        seasons: [],
       },
+    });
+  });
+
+  it.each([
+    [
+      "season number",
+      [
+        { id: 9001, season_number: 2 },
+        { id: 9002, season_number: 2 },
+      ],
+    ],
+    [
+      "provider season ID",
+      [
+        { id: 9001, season_number: 1 },
+        { id: 9001, season_number: 2 },
+      ],
+    ],
+  ])("rejects a conflicting accepted %s", async (_identity, seasons) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        jsonResponse({ id: 701, name: "Exact  Show — 特別版", seasons }),
+      ),
+    );
+
+    await expect(fetchTmdbTvDetails(testToken, 701)).resolves.toEqual({
+      status: "malformed-provider",
     });
   });
 
@@ -640,6 +701,205 @@ describe("TMDB TV details request", () => {
       expect(() => fetchTmdbTvDetails(testToken, tvId)).toThrow(
         "A valid TMDB TV ID is required.",
       );
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe("TMDB exact TV season request", () => {
+  it("binds the request to the exact show and season identities and preserves provider episode text", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        id: 9001,
+        season_number: 2,
+        episodes: [
+          {
+            id: 9101,
+            season_number: 2,
+            episode_number: 1,
+            name: "第一話  —  The  Beginning!",
+            air_date: "2026-01-02",
+            runtime: 47,
+            overview: "Exact  episode overview.",
+            still_path: "/episode-one.jpg",
+          },
+          {
+            id: 9102,
+            season_number: 2,
+            episode_number: 2,
+            name: "第二話: CAPS & punctuation",
+            air_date: "unknown",
+            runtime: 0,
+            overview: "   ",
+            still_path: "invalid",
+          },
+        ],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      fetchTmdbTvSeasonEpisodes(testToken, 701, 9001, 2),
+    ).resolves.toEqual({
+      status: "ready",
+      season: {
+        providerSeasonId: 9001,
+        seasonNumber: 2,
+        episodes: [
+          {
+            providerEpisodeId: 9101,
+            episodeNumber: 1,
+            name: "第一話  —  The  Beginning!",
+            airDate: "2026-01-02",
+            runtimeMinutes: 47,
+            overview: "Exact  episode overview.",
+            stillPath: "/episode-one.jpg",
+          },
+          {
+            providerEpisodeId: 9102,
+            episodeNumber: 2,
+            name: "第二話: CAPS & punctuation",
+            airDate: null,
+            runtimeMinutes: null,
+            overview: null,
+            stillPath: null,
+          },
+        ],
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.themoviedb.org/3/tv/701/season/2",
+      {
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${testToken}`,
+        },
+        signal: undefined,
+      },
+    );
+  });
+
+  it("reports an empty guide without inventing episodes", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        jsonResponse({ id: 9001, season_number: 2, episodes: [] }),
+      ),
+    );
+
+    await expect(
+      fetchTmdbTvSeasonEpisodes(testToken, 701, 9001, 2),
+    ).resolves.toEqual({ status: "empty" });
+  });
+
+  it.each([
+    ["wrong provider season ID", { id: 9002, season_number: 2, episodes: [] }],
+    ["wrong season number", { id: 9001, season_number: 3, episodes: [] }],
+    [
+      "wrong episode season",
+      {
+        id: 9001,
+        season_number: 2,
+        episodes: [
+          { id: 9101, season_number: 1, episode_number: 1, name: "Wrong" },
+        ],
+      },
+    ],
+    [
+      "duplicate episode number",
+      {
+        id: 9001,
+        season_number: 2,
+        episodes: [
+          { id: 9101, season_number: 2, episode_number: 1, name: "One" },
+          { id: 9102, season_number: 2, episode_number: 1, name: "Again" },
+        ],
+      },
+    ],
+    [
+      "duplicate provider episode ID",
+      {
+        id: 9001,
+        season_number: 2,
+        episodes: [
+          { id: 9101, season_number: 2, episode_number: 1, name: "One" },
+          { id: 9101, season_number: 2, episode_number: 2, name: "Two" },
+        ],
+      },
+    ],
+    [
+      "missing episode identity",
+      {
+        id: 9001,
+        season_number: 2,
+        episodes: [{ season_number: 2, episode_number: 1, name: "Missing" }],
+      },
+    ],
+    [
+      "whitespace-only episode name",
+      {
+        id: 9001,
+        season_number: 2,
+        episodes: [
+          { id: 9101, season_number: 2, episode_number: 1, name: "  " },
+        ],
+      },
+    ],
+  ])("rejects a %s response", async (_caseName, body) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(body)));
+
+    await expect(
+      fetchTmdbTvSeasonEpisodes(testToken, 701, 9001, 2),
+    ).resolves.toEqual({ status: "malformed-provider" });
+  });
+
+  it.each([
+    [401, "unauthorized"],
+    [403, "unauthorized"],
+    [429, "rate-limited"],
+    [500, "provider-error"],
+  ] as const)("maps season HTTP %i to %s", async (status, expectedStatus) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({}, status)));
+
+    await expect(
+      fetchTmdbTvSeasonEpisodes(testToken, 701, 9001, 2),
+    ).resolves.toEqual({ status: expectedStatus });
+  });
+
+  it("distinguishes malformed season JSON from a network error", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("not json", { status: 200 }))
+      .mockRejectedValueOnce(new TypeError("offline"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      fetchTmdbTvSeasonEpisodes(testToken, 701, 9001, 2),
+    ).resolves.toEqual({ status: "malformed-provider" });
+    await expect(
+      fetchTmdbTvSeasonEpisodes(testToken, 701, 9001, 2),
+    ).resolves.toEqual({ status: "network-error" });
+  });
+
+  it.each([
+    [0, 9001, 2, "A valid TMDB TV ID is required."],
+    [701, 0, 2, "A valid TMDB TV season ID is required."],
+    [701, 9001, 0, "A valid TMDB TV season number is required."],
+    [701, 9001, 1.5, "A valid TMDB TV season number is required."],
+  ])(
+    "rejects invalid request context before dispatch",
+    (tvId, providerSeasonId, seasonNumber, message) => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+
+      expect(() =>
+        fetchTmdbTvSeasonEpisodes(
+          testToken,
+          tvId,
+          providerSeasonId,
+          seasonNumber,
+        ),
+      ).toThrow(message);
       expect(fetchMock).not.toHaveBeenCalled();
     },
   );

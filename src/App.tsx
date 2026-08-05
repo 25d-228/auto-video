@@ -72,12 +72,15 @@ import {
   fetchTmdbMoviesByTitle,
   fetchTmdbTvByTitle,
   fetchTmdbTvDetails,
+  fetchTmdbTvSeasonEpisodes,
   fetchWeeklyTrendingMovies,
   fetchWeeklyTrendingTv,
   type TmdbMovie,
   type TmdbMovieDetailsResult,
   type TmdbMoviesResult,
   type TmdbTvDetailsResult,
+  type TmdbTvSeasonEpisodesResult,
+  type TmdbTvSeasonSummary,
   type TmdbTvShow,
   type TmdbTvShowsResult,
   tmdbPosterUrl,
@@ -269,6 +272,9 @@ type TvDiscoverState =
   | { status: "loading" }
   | TmdbTvShowsResult;
 type TvDetailsState = { status: "loading" } | TmdbTvDetailsResult;
+type TvSeasonEpisodesState =
+  | { status: "loading" }
+  | TmdbTvSeasonEpisodesResult;
 type CredentialMessage = {
   role: "alert" | "status";
   text: string;
@@ -815,6 +821,40 @@ const tvDetailsMessages = {
   "provider-error": {
     heading: "TMDB could not load TV details",
     message: "TMDB returned an unexpected error. Try again later.",
+    role: "alert",
+  },
+} as const;
+
+const tvSeasonEpisodesMessages = {
+  loading: {
+    heading: "Loading season episodes",
+    message: "Requesting the exact selected season from TMDB.",
+    role: "status",
+  },
+  empty: {
+    heading: "No episodes returned",
+    message: "TMDB returned no verified episodes for this exact season.",
+    role: undefined,
+  },
+  unauthorized: movieDetailsMessages.unauthorized,
+  "rate-limited": {
+    heading: "TMDB season rate limit reached",
+    message: "TMDB is temporarily limiting requests. Wait before retrying.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "TMDB season guide could not be reached",
+    message: "Check the network connection and retry this exact season.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "TMDB returned an invalid season guide",
+    message: "The response did not verify the selected season and episodes.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "TMDB could not load the season guide",
+    message: "TMDB returned an unexpected error. Retry this exact season later.",
     role: "alert",
   },
 } as const;
@@ -2854,30 +2894,65 @@ function DiscoverMovieDetails({
 }
 
 function DiscoverTvDetails({
+  isSeasonGuideVisible,
+  onRetryDetails,
+  onRetrySeason,
+  onSelectSeason,
+  onScrollTopChange,
+  onViewSeasons,
+  seasonState,
+  selectedSeason,
   show,
   state,
+  scrollTop,
   triggerId,
 }: {
+  isSeasonGuideVisible: boolean;
+  onRetryDetails: () => void;
+  onRetrySeason: () => void;
+  onSelectSeason: (season: TmdbTvSeasonSummary) => void;
+  onScrollTopChange: (scrollTop: number) => void;
+  onViewSeasons: () => void;
+  seasonState: TvSeasonEpisodesState | null;
+  selectedSeason: TmdbTvSeasonSummary | null;
   show: TmdbTvShow;
   state: TvDetailsState;
+  scrollTop: number;
   triggerId: string;
 }) {
-  const [failedPosterPath, setFailedPosterPath] = useState<string | null>(null);
+  const [failedImagePaths, setFailedImagePaths] = useState<Set<string>>(
+    new Set(),
+  );
   const details = state.status === "ready" ? state.details : null;
   const displayedName = details?.name ?? show.name;
   const currentMessage =
     state.status === "ready" ? null : tvDetailsMessages[state.status];
+  const seasonMessage =
+    seasonState === null || seasonState.status === "ready"
+      ? null
+      : tvSeasonEpisodesMessages[seasonState.status];
+  const markImageFailed = (path: string) => {
+    setFailedImagePaths((paths) => new Set(paths).add(path));
+  };
 
   return (
     <Dialog.Portal>
       <Dialog.Backdrop className="movie-details__backdrop" />
       <Dialog.Viewport className="movie-details__viewport">
         <Dialog.Popup
-          aria-busy={state.status === "loading"}
+          aria-busy={
+            state.status === "loading" || seasonState?.status === "loading"
+          }
           className="movie-details__popup"
           finalFocus={() => document.getElementById(triggerId)}
           onClick={(event) => event.stopPropagation()}
           onPointerDown={(event) => event.stopPropagation()}
+          onScroll={(event) => onScrollTopChange(event.currentTarget.scrollTop)}
+          ref={(element) => {
+            if (element !== null && element.scrollTop !== scrollTop) {
+              element.scrollTop = scrollTop;
+            }
+          }}
         >
           <div className="movie-details__heading">
             <div>
@@ -2898,65 +2973,269 @@ function DiscoverTvDetails({
           </Dialog.Description>
 
           {details === null ? (
-            <div className="movie-details__state" role={currentMessage?.role}>
-              <span className="empty-state__icon">
-                <AppIcon name="details" />
-              </span>
-              <div>
-                <h3>{currentMessage?.heading}</h3>
-                <p>{currentMessage?.message}</p>
-              </div>
-            </div>
-          ) : (
-            <div className="movie-details__content">
-              <div className="movie-details__poster">
-                {details.posterPath !== null &&
-                failedPosterPath !== details.posterPath ? (
-                  <img
-                    alt=""
-                    onError={() => setFailedPosterPath(details.posterPath)}
-                    src={tmdbPosterUrl(details.posterPath)}
-                  />
-                ) : (
-                  <div className="discover-card__poster-fallback">
-                    <AppIcon name="poster" />
-                    <span>Poster unavailable</span>
-                  </div>
-                )}
-              </div>
-              <div className="movie-details__information">
-                <dl>
-                  <div>
-                    <dt>First air date</dt>
-                    <dd>{details.firstAirDate ?? "Unavailable"}</dd>
-                  </div>
-                  <div>
-                    <dt>Status</dt>
-                    <dd>{details.providerStatus ?? "Unavailable"}</dd>
-                  </div>
-                  <div>
-                    <dt>Seasons</dt>
-                    <dd>{details.seasonCount ?? "Unavailable"}</dd>
-                  </div>
-                  <div>
-                    <dt>Episodes</dt>
-                    <dd>{details.episodeCount ?? "Unavailable"}</dd>
-                  </div>
-                  <div>
-                    <dt>Genres</dt>
-                    <dd>
-                      {details.genres.length === 0
-                        ? "Unavailable"
-                        : details.genres.join(", ")}
-                    </dd>
-                  </div>
-                </dl>
-                <div className="movie-details__overview">
-                  <h3>Overview</h3>
-                  <p>{details.overview ?? "Unavailable"}</p>
+            <div>
+              <div className="movie-details__state" role={currentMessage?.role}>
+                <span className="empty-state__icon">
+                  <AppIcon name="details" />
+                </span>
+                <div>
+                  <h3>{currentMessage?.heading}</h3>
+                  <p>{currentMessage?.message}</p>
                 </div>
               </div>
+              {state.status === "loading" ? null : (
+                <div className="tv-season-guide__actions">
+                  <Button
+                    onClick={onRetryDetails}
+                    type="button"
+                    variant="outline"
+                  >
+                    <AppIcon name="refresh" />
+                    Retry
+                  </Button>
+                </div>
+              )}
             </div>
+          ) : (
+            <>
+              <div className="movie-details__content">
+                <div className="movie-details__poster">
+                  {details.posterPath !== null &&
+                  !failedImagePaths.has(details.posterPath) ? (
+                    <img
+                      alt=""
+                      onError={() => markImageFailed(details.posterPath!)}
+                      src={tmdbPosterUrl(details.posterPath)}
+                    />
+                  ) : (
+                    <div className="discover-card__poster-fallback">
+                      <AppIcon name="poster" />
+                      <span>Poster unavailable</span>
+                    </div>
+                  )}
+                </div>
+                <div className="movie-details__information">
+                  <dl>
+                    <div>
+                      <dt>First air date</dt>
+                      <dd>{details.firstAirDate ?? "Unavailable"}</dd>
+                    </div>
+                    <div>
+                      <dt>Status</dt>
+                      <dd>{details.providerStatus ?? "Unavailable"}</dd>
+                    </div>
+                    <div>
+                      <dt>Seasons</dt>
+                      <dd>{details.seasonCount ?? "Unavailable"}</dd>
+                    </div>
+                    <div>
+                      <dt>Episodes</dt>
+                      <dd>{details.episodeCount ?? "Unavailable"}</dd>
+                    </div>
+                    <div>
+                      <dt>Genres</dt>
+                      <dd>
+                        {details.genres.length === 0
+                          ? "Unavailable"
+                          : details.genres.join(", ")}
+                      </dd>
+                    </div>
+                  </dl>
+                  <div className="movie-details__overview">
+                    <h3>Overview</h3>
+                    <p>{details.overview ?? "Unavailable"}</p>
+                  </div>
+                  <div className="tv-season-guide__detail-actions">
+                    <Button onClick={onViewSeasons} type="button">
+                      <AppIcon name="tv" />
+                      View seasons
+                    </Button>
+                    <Button
+                      onClick={onRetryDetails}
+                      type="button"
+                      variant="outline"
+                    >
+                      <AppIcon name="refresh" />
+                      Retry details
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              {isSeasonGuideVisible ? (
+                <section
+                  aria-labelledby="tv-season-guide-heading"
+                  className="tv-season-guide"
+                >
+                  <div className="tv-season-guide__heading">
+                    <div>
+                      <h3 id="tv-season-guide-heading">Season guide</h3>
+                      <p>
+                        {details.seasons.length === 1
+                          ? "1 verified season"
+                          : `${details.seasons.length} verified seasons`}
+                      </p>
+                    </div>
+                  </div>
+
+                  {details.seasons.length === 0 ? (
+                    <div className="tv-season-guide__empty">
+                      <h4>No verified seasons returned</h4>
+                      <p>TMDB did not provide a positive season identity.</p>
+                    </div>
+                  ) : (
+                    <ul
+                      aria-label="Verified TV seasons"
+                      className="tv-season-guide__seasons"
+                    >
+                      {details.seasons.map((season) => {
+                        const isSelected =
+                          selectedSeason?.providerSeasonId ===
+                            season.providerSeasonId &&
+                          selectedSeason.seasonNumber === season.seasonNumber;
+
+                        return (
+                          <li key={season.providerSeasonId}>
+                            <div className="tv-season-guide__season-poster">
+                              {season.posterPath !== null &&
+                              !failedImagePaths.has(season.posterPath) ? (
+                                <img
+                                  alt=""
+                                  onError={() =>
+                                    markImageFailed(season.posterPath!)
+                                  }
+                                  src={tmdbPosterUrl(season.posterPath)}
+                                />
+                              ) : (
+                                <span>Poster unavailable</span>
+                              )}
+                            </div>
+                            <div className="tv-season-guide__season-information">
+                              <h4>
+                                {season.name ?? `Season ${season.seasonNumber}`}
+                              </h4>
+                              <dl>
+                                <div>
+                                  <dt>Season</dt>
+                                  <dd>{season.seasonNumber}</dd>
+                                </div>
+                                <div>
+                                  <dt>Air date</dt>
+                                  <dd>{season.airDate ?? "Unavailable"}</dd>
+                                </div>
+                                <div>
+                                  <dt>Episodes</dt>
+                                  <dd>{season.episodeCount ?? "Unavailable"}</dd>
+                                </div>
+                              </dl>
+                              <Button
+                                aria-pressed={isSelected}
+                                onClick={() => onSelectSeason(season)}
+                                size="sm"
+                                type="button"
+                                variant={isSelected ? "default" : "outline"}
+                              >
+                                Select Season {season.seasonNumber}
+                              </Button>
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+
+                  {selectedSeason === null ? (
+                    <p className="tv-season-guide__prompt">
+                      Select one verified season to request its episodes.
+                    </p>
+                  ) : seasonState === null ? (
+                    <p className="tv-season-guide__prompt">
+                      Select Season {selectedSeason.seasonNumber} again to load
+                      its episodes.
+                    </p>
+                  ) : seasonState.status === "ready" ? (
+                    <div className="tv-season-guide__episodes">
+                      <div className="tv-season-guide__episode-heading">
+                        <h4>Season {seasonState.season.seasonNumber} episodes</h4>
+                        <p>
+                          {seasonState.season.episodes.length === 1
+                            ? "1 verified episode"
+                            : `${seasonState.season.episodes.length} verified episodes`}
+                        </p>
+                      </div>
+                      <ol
+                        aria-label={`Season ${seasonState.season.seasonNumber} episodes`}
+                      >
+                        {seasonState.season.episodes.map((episode) => (
+                          <li key={episode.providerEpisodeId}>
+                            <div className="tv-season-guide__still">
+                              {episode.stillPath !== null &&
+                              !failedImagePaths.has(episode.stillPath) ? (
+                                <img
+                                  alt=""
+                                  onError={() =>
+                                    markImageFailed(episode.stillPath!)
+                                  }
+                                  src={tmdbPosterUrl(episode.stillPath)}
+                                />
+                              ) : (
+                                <span>Still unavailable</span>
+                              )}
+                            </div>
+                            <div className="tv-season-guide__episode-information">
+                              <h5>{episode.name}</h5>
+                              <dl>
+                                <div>
+                                  <dt>Episode</dt>
+                                  <dd>{episode.episodeNumber}</dd>
+                                </div>
+                                <div>
+                                  <dt>Air date</dt>
+                                  <dd>{episode.airDate ?? "Unavailable"}</dd>
+                                </div>
+                                <div>
+                                  <dt>Runtime</dt>
+                                  <dd>
+                                    {episode.runtimeMinutes === null
+                                      ? "Unavailable"
+                                      : `${episode.runtimeMinutes} minutes`}
+                                  </dd>
+                                </div>
+                              </dl>
+                              <p>{episode.overview ?? "Overview unavailable"}</p>
+                            </div>
+                          </li>
+                        ))}
+                      </ol>
+                    </div>
+                  ) : (
+                    <div
+                      className="movie-details__state tv-season-guide__state"
+                      role={seasonMessage?.role}
+                    >
+                      <span className="empty-state__icon">
+                        <AppIcon name="tv" />
+                      </span>
+                      <div>
+                        <h4>{seasonMessage?.heading}</h4>
+                        <p>{seasonMessage?.message}</p>
+                        {seasonState.status === "loading" ? null : (
+                          <Button
+                            onClick={onRetrySeason}
+                            size="sm"
+                            type="button"
+                            variant="outline"
+                          >
+                            <AppIcon name="refresh" />
+                            Retry Season {selectedSeason.seasonNumber}
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </section>
+              ) : null}
+            </>
           )}
         </Dialog.Popup>
       </Dialog.Viewport>
@@ -4236,7 +4515,16 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [tvDetailsTriggerId, setTvDetailsTriggerId] = useState<string | null>(
     null,
   );
+  const [isTvDetailsOpen, setIsTvDetailsOpen] = useState(false);
+  const [tvDetailsScrollTop, setTvDetailsScrollTop] = useState(0);
   const [tvDetailsRequestVersion, setTvDetailsRequestVersion] = useState(0);
+  const [isTvSeasonGuideVisible, setIsTvSeasonGuideVisible] = useState(false);
+  const [selectedTvSeason, setSelectedTvSeason] =
+    useState<TmdbTvSeasonSummary | null>(null);
+  const [tvSeasonEpisodesState, setTvSeasonEpisodesState] =
+    useState<TvSeasonEpisodesState | null>(null);
+  const [tvSeasonEpisodesRequestVersion, setTvSeasonEpisodesRequestVersion] =
+    useState(0);
   const [adultSearchInput, setAdultSearchInput] = useState("");
   const [adultSearchInputError, setAdultSearchInputError] = useState<
     string | null
@@ -4347,6 +4635,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const movieTorrentStartRequestId = useRef(0);
   const tvDiscoverRequestId = useRef(0);
   const tvDetailsRequestId = useRef(0);
+  const tvSeasonEpisodesRequestId = useRef(0);
   const adultCatalogRequestId = useRef(0);
   const adultReleaseRequestId = useRef(0);
   const adultTorrentInspectionRequestId = useRef(0);
@@ -5356,6 +5645,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     if (selectedDiscoverTvShow === null) {
       return;
     }
+    tvSeasonEpisodesRequestId.current += 1;
+    setIsTvSeasonGuideVisible(false);
+    setSelectedTvSeason(null);
+    setTvSeasonEpisodesState(null);
     if (tmdbToken === null) {
       setTvDetailsState({ status: "unauthorized" });
       return;
@@ -5363,6 +5656,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     const abortController = new AbortController();
     setTvDetailsState({ status: "loading" });
+    setTvDetailsScrollTop(0);
     void fetchTmdbTvDetails(
       tmdbToken,
       selectedDiscoverTvShow.id,
@@ -5378,6 +5672,42 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       abortController.abort();
     };
   }, [selectedDiscoverTvShow, tmdbToken, tvDetailsRequestVersion]);
+
+  useEffect(() => {
+    const requestId = ++tvSeasonEpisodesRequestId.current;
+
+    if (selectedDiscoverTvShow === null || selectedTvSeason === null) {
+      return;
+    }
+    if (tmdbToken === null) {
+      setTvSeasonEpisodesState({ status: "unauthorized" });
+      return;
+    }
+
+    const abortController = new AbortController();
+    setTvSeasonEpisodesState({ status: "loading" });
+    void fetchTmdbTvSeasonEpisodes(
+      tmdbToken,
+      selectedDiscoverTvShow.id,
+      selectedTvSeason.providerSeasonId,
+      selectedTvSeason.seasonNumber,
+      abortController.signal,
+    ).then((result) => {
+      if (requestId === tvSeasonEpisodesRequestId.current) {
+        setTvSeasonEpisodesState(result);
+      }
+    });
+
+    return () => {
+      tvSeasonEpisodesRequestId.current += 1;
+      abortController.abort();
+    };
+  }, [
+    selectedDiscoverTvShow,
+    selectedTvSeason,
+    tmdbToken,
+    tvSeasonEpisodesRequestVersion,
+  ]);
 
   useEffect(() => {
     const requestId = ++adultCatalogRequestId.current;
@@ -6571,17 +6901,100 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   };
 
   const openDiscoverTvDetails = (show: TmdbTvShow, triggerId: string) => {
+    setTvDetailsTriggerId(triggerId);
+    setIsTvDetailsOpen(true);
+    if (selectedDiscoverTvShow?.id === show.id && tvDetailsState !== null) {
+      return;
+    }
+
     tvDetailsRequestId.current += 1;
+    tvSeasonEpisodesRequestId.current += 1;
     setSelectedDiscoverTvShow(show);
     setTvDetailsState({ status: "loading" });
-    setTvDetailsTriggerId(triggerId);
+    setTvDetailsScrollTop(0);
+    setIsTvSeasonGuideVisible(false);
+    setSelectedTvSeason(null);
+    setTvSeasonEpisodesState(null);
     setTvDetailsRequestVersion((version) => version + 1);
   };
 
   const closeDiscoverTvDetails = () => {
     tvDetailsRequestId.current += 1;
+    tvSeasonEpisodesRequestId.current += 1;
+    setIsTvDetailsOpen(false);
+    if (tvDetailsState?.status === "loading") {
+      setTvDetailsState(null);
+    }
+    if (tvSeasonEpisodesState?.status === "loading") {
+      setTvSeasonEpisodesState(null);
+    }
+  };
+
+  const resetDiscoverTvDetails = () => {
+    tvDetailsRequestId.current += 1;
+    tvSeasonEpisodesRequestId.current += 1;
+    setIsTvDetailsOpen(false);
+    setTvDetailsScrollTop(0);
     setSelectedDiscoverTvShow(null);
     setTvDetailsState(null);
+    setIsTvSeasonGuideVisible(false);
+    setSelectedTvSeason(null);
+    setTvSeasonEpisodesState(null);
+  };
+
+  const retryDiscoverTvDetails = () => {
+    if (
+      selectedDiscoverTvShow === null ||
+      tvDetailsState?.status === "loading"
+    ) {
+      return;
+    }
+
+    tvDetailsRequestId.current += 1;
+    tvSeasonEpisodesRequestId.current += 1;
+    setTvDetailsState({ status: "loading" });
+    setTvDetailsScrollTop(0);
+    setIsTvSeasonGuideVisible(false);
+    setSelectedTvSeason(null);
+    setTvSeasonEpisodesState(null);
+    setTvDetailsRequestVersion((version) => version + 1);
+  };
+
+  const selectTvSeason = (season: TmdbTvSeasonSummary) => {
+    if (tvDetailsState?.status !== "ready") {
+      return;
+    }
+    const currentSeason = tvDetailsState.details.seasons.find(
+      (candidate) =>
+        candidate.providerSeasonId === season.providerSeasonId &&
+        candidate.seasonNumber === season.seasonNumber,
+    );
+    if (
+      currentSeason === undefined ||
+      (selectedTvSeason?.providerSeasonId === currentSeason.providerSeasonId &&
+        selectedTvSeason.seasonNumber === currentSeason.seasonNumber &&
+        tvSeasonEpisodesState !== null)
+    ) {
+      return;
+    }
+
+    tvSeasonEpisodesRequestId.current += 1;
+    setSelectedTvSeason(currentSeason);
+    setTvSeasonEpisodesState({ status: "loading" });
+    setTvSeasonEpisodesRequestVersion((version) => version + 1);
+  };
+
+  const retryTvSeasonEpisodes = () => {
+    if (
+      selectedTvSeason === null ||
+      tvSeasonEpisodesState?.status === "loading"
+    ) {
+      return;
+    }
+
+    tvSeasonEpisodesRequestId.current += 1;
+    setTvSeasonEpisodesState({ status: "loading" });
+    setTvSeasonEpisodesRequestVersion((version) => version + 1);
   };
 
   const closeVrTorrentInspection = () => {
@@ -7078,7 +7491,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     const previousToken = tmdbToken;
     resetMovieReleaseComparison();
     closeDiscoverMovieDetails();
-    closeDiscoverTvDetails();
+    resetDiscoverTvDetails();
     discoverRequestId.current += 1;
     tvDiscoverRequestId.current += 1;
     trendingDiscoverResult.current = null;
@@ -7117,7 +7530,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     const tokenToRestore = tmdbToken;
     resetMovieReleaseComparison();
     closeDiscoverMovieDetails();
-    closeDiscoverTvDetails();
+    resetDiscoverTvDetails();
     discoverRequestId.current += 1;
     tvDiscoverRequestId.current += 1;
     trendingDiscoverResult.current = null;
@@ -10102,13 +10515,21 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
             closeDiscoverTvDetails();
           }
         }}
-        open={selectedDiscoverTvShow !== null}
+        open={isTvDetailsOpen}
       >
         {selectedDiscoverTvShow === null ||
         tvDetailsState === null ||
         tvDetailsTriggerId === null ? null : (
           <DiscoverTvDetails
-            key={selectedDiscoverTvShow.id}
+            isSeasonGuideVisible={isTvSeasonGuideVisible}
+            onRetryDetails={retryDiscoverTvDetails}
+            onRetrySeason={retryTvSeasonEpisodes}
+            onScrollTopChange={setTvDetailsScrollTop}
+            onSelectSeason={selectTvSeason}
+            onViewSeasons={() => setIsTvSeasonGuideVisible(true)}
+            seasonState={tvSeasonEpisodesState}
+            scrollTop={tvDetailsScrollTop}
+            selectedSeason={selectedTvSeason}
             show={selectedDiscoverTvShow}
             state={tvDetailsState}
             triggerId={tvDetailsTriggerId}

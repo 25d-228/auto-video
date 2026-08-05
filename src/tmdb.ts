@@ -58,7 +58,42 @@ export type TmdbTvDetails = {
   episodeCount: number | null;
   genres: string[];
   overview: string | null;
+  seasons: TmdbTvSeasonSummary[];
 };
+
+export type TmdbTvSeasonSummary = {
+  providerSeasonId: number;
+  seasonNumber: number;
+  name: string | null;
+  airDate: string | null;
+  posterPath: string | null;
+  episodeCount: number | null;
+};
+
+export type TmdbTvEpisode = {
+  providerEpisodeId: number;
+  episodeNumber: number;
+  name: string;
+  airDate: string | null;
+  runtimeMinutes: number | null;
+  overview: string | null;
+  stillPath: string | null;
+};
+
+export type TmdbTvSeasonEpisodes = {
+  providerSeasonId: number;
+  seasonNumber: number;
+  episodes: TmdbTvEpisode[];
+};
+
+export type TmdbTvSeasonEpisodesResult =
+  | { status: "ready"; season: TmdbTvSeasonEpisodes }
+  | { status: "empty" }
+  | { status: "unauthorized" }
+  | { status: "rate-limited" }
+  | { status: "network-error" }
+  | { status: "malformed-provider" }
+  | { status: "provider-error" };
 
 export type TmdbTvDetailsResult =
   | { status: "ready"; details: TmdbTvDetails }
@@ -265,6 +300,64 @@ function parseTvDetailsResponse(
           : [],
       )
     : [];
+  const seasons: TmdbTvSeasonSummary[] = [];
+  const seasonNumbers = new Set<number>();
+  const providerSeasonIds = new Set<number>();
+
+  if (value.seasons !== undefined && !Array.isArray(value.seasons)) {
+    return { status: "malformed-provider" };
+  }
+  for (const seasonValue of value.seasons ?? []) {
+    if (!isRecord(seasonValue)) {
+      continue;
+    }
+
+    const providerSeasonId = seasonValue.id;
+    const seasonNumber = seasonValue.season_number;
+    if (
+      typeof providerSeasonId !== "number" ||
+      !Number.isInteger(providerSeasonId) ||
+      providerSeasonId <= 0 ||
+      typeof seasonNumber !== "number" ||
+      !Number.isInteger(seasonNumber) ||
+      seasonNumber <= 0
+    ) {
+      continue;
+    }
+    if (
+      seasonNumbers.has(seasonNumber) ||
+      providerSeasonIds.has(providerSeasonId)
+    ) {
+      return { status: "malformed-provider" };
+    }
+
+    seasonNumbers.add(seasonNumber);
+    providerSeasonIds.add(providerSeasonId);
+    seasons.push({
+      providerSeasonId,
+      seasonNumber,
+      name:
+        typeof seasonValue.name === "string" && seasonValue.name.trim() !== ""
+          ? seasonValue.name
+          : null,
+      airDate:
+        typeof seasonValue.air_date === "string" &&
+        releaseDatePattern.test(seasonValue.air_date)
+          ? seasonValue.air_date
+          : null,
+      posterPath:
+        typeof seasonValue.poster_path === "string" &&
+        seasonValue.poster_path.startsWith("/")
+          ? seasonValue.poster_path
+          : null,
+      episodeCount:
+        typeof seasonValue.episode_count === "number" &&
+        Number.isInteger(seasonValue.episode_count) &&
+        seasonValue.episode_count >= 0
+          ? seasonValue.episode_count
+          : null,
+    });
+  }
 
   return {
     status: "ready",
@@ -302,8 +395,87 @@ function parseTvDetailsResponse(
         typeof value.overview === "string" && value.overview.trim() !== ""
           ? value.overview
           : null,
+      seasons,
     },
   };
+}
+
+function parseTvSeasonEpisodesResponse(
+  value: unknown,
+  providerSeasonId: number,
+  seasonNumber: number,
+): TmdbTvSeasonEpisodesResult {
+  if (
+    !isRecord(value) ||
+    value.id !== providerSeasonId ||
+    value.season_number !== seasonNumber ||
+    !Array.isArray(value.episodes)
+  ) {
+    return { status: "malformed-provider" };
+  }
+
+  const episodes: TmdbTvEpisode[] = [];
+  const episodeNumbers = new Set<number>();
+  const providerEpisodeIds = new Set<number>();
+  for (const episodeValue of value.episodes) {
+    if (!isRecord(episodeValue)) {
+      return { status: "malformed-provider" };
+    }
+
+    const providerEpisodeId = episodeValue.id;
+    const episodeNumber = episodeValue.episode_number;
+    if (
+      typeof providerEpisodeId !== "number" ||
+      !Number.isInteger(providerEpisodeId) ||
+      providerEpisodeId <= 0 ||
+      typeof episodeNumber !== "number" ||
+      !Number.isInteger(episodeNumber) ||
+      episodeNumber <= 0 ||
+      episodeValue.season_number !== seasonNumber ||
+      typeof episodeValue.name !== "string" ||
+      episodeValue.name.trim() === "" ||
+      episodeNumbers.has(episodeNumber) ||
+      providerEpisodeIds.has(providerEpisodeId)
+    ) {
+      return { status: "malformed-provider" };
+    }
+
+    episodeNumbers.add(episodeNumber);
+    providerEpisodeIds.add(providerEpisodeId);
+    episodes.push({
+      providerEpisodeId,
+      episodeNumber,
+      name: episodeValue.name,
+      airDate:
+        typeof episodeValue.air_date === "string" &&
+        releaseDatePattern.test(episodeValue.air_date)
+          ? episodeValue.air_date
+          : null,
+      runtimeMinutes:
+        typeof episodeValue.runtime === "number" &&
+        Number.isInteger(episodeValue.runtime) &&
+        episodeValue.runtime > 0
+          ? episodeValue.runtime
+          : null,
+      overview:
+        typeof episodeValue.overview === "string" &&
+        episodeValue.overview.trim() !== ""
+          ? episodeValue.overview
+          : null,
+      stillPath:
+        typeof episodeValue.still_path === "string" &&
+        episodeValue.still_path.startsWith("/")
+          ? episodeValue.still_path
+          : null,
+    });
+  }
+
+  return episodes.length === 0
+    ? { status: "empty" }
+    : {
+        status: "ready",
+        season: { providerSeasonId, seasonNumber, episodes },
+      };
 }
 
 export function tmdbPosterUrl(posterPath: string) {
@@ -452,6 +624,33 @@ export function fetchTmdbTvDetails(
     `${tvDetailsBaseUrl}/${tvId}`,
     token,
     (value) => parseTvDetailsResponse(value, tvId),
+    "malformed-provider",
+    signal,
+  );
+}
+
+export function fetchTmdbTvSeasonEpisodes(
+  token: string,
+  tvId: number,
+  providerSeasonId: number,
+  seasonNumber: number,
+  signal?: AbortSignal,
+): Promise<TmdbTvSeasonEpisodesResult> {
+  if (!Number.isInteger(tvId) || tvId <= 0) {
+    throw new Error("A valid TMDB TV ID is required.");
+  }
+  if (!Number.isInteger(providerSeasonId) || providerSeasonId <= 0) {
+    throw new Error("A valid TMDB TV season ID is required.");
+  }
+  if (!Number.isInteger(seasonNumber) || seasonNumber <= 0) {
+    throw new Error("A valid TMDB TV season number is required.");
+  }
+
+  return fetchTmdbResource(
+    `${tvDetailsBaseUrl}/${tvId}/season/${seasonNumber}`,
+    token,
+    (value) =>
+      parseTvSeasonEpisodesResponse(value, providerSeasonId, seasonNumber),
     "malformed-provider",
     signal,
   );
