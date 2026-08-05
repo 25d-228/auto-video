@@ -5384,12 +5384,17 @@ describe("TMDB TV Discover", () => {
     expect(startVerifiedMovieDownloadMock).not.toHaveBeenCalled();
   });
 
-  it("compares exact API Bay episode rows only after explicit action and preserves manual state", async () => {
+  it("compares exact API Bay episode rows, excludes compact continuations, and preserves manual state", async () => {
     const showName = "Exact  Show — 特別版";
     const episodeName = "第三話  —  Exact Episode";
     const standardReleaseName =
       "Exact  Show — 特別版.S02E03.第三話  —  1080p";
     const hdReleaseName = "Exact Show - 2x03 - 2160p";
+    const compactContinuationNames = [
+      "Exact Show S02E03+E04",
+      "Exact Show S02E03+04",
+      "Exact Show 2x03+04",
+    ];
     const standardHash = "0123456789abcdef0123456789abcdef01234567";
     const hdHash = "abcdef0123456789abcdef0123456789abcdef01";
     loadTmdbTokenMock.mockResolvedValue("episode-release-token");
@@ -5500,6 +5505,13 @@ describe("TMDB TV Discover", () => {
     expect(totals.textContent).toContain("2 verified releases");
     expect(totals.textContent).toContain("1 TV Shows");
     expect(totals.textContent).toContain("1 HD TV Shows");
+    const releaseList = within(comparisonDialog).getByRole("list", {
+      name: /Verified API Bay releases for Exact Show — 特別版 Season 2 Episode 3/,
+    });
+    expect(within(releaseList).getAllByRole("button")).toHaveLength(2);
+    for (const name of compactContinuationNames) {
+      expect(within(comparisonDialog).queryByText(name)).toBeNull();
+    }
     const standardReleaseLabel = [
       ...comparisonDialog.querySelectorAll(".vr-releases__release-name"),
     ].find((element) => element.textContent === standardReleaseName);
@@ -5519,6 +5531,9 @@ describe("TMDB TV Discover", () => {
     expect(
       selection.querySelector(".vr-releases__release-name")?.textContent,
     ).toBe(standardReleaseName);
+    for (const name of compactContinuationNames) {
+      expect(within(selection).queryByText(name)).toBeNull();
+    }
     expect(within(selection).getByText(standardHash)).toBeTruthy();
     expect(within(selection).getByText(/Season 2, Episode 3/).textContent).toContain(
       episodeName,
@@ -5756,10 +5771,27 @@ describe("TMDB TV Discover", () => {
       )
     ).closest('[role="dialog"]') as HTMLElement;
 
-    for (const [, heading] of outcomes) {
+    for (const [error, heading] of outcomes) {
       expect(
         await within(comparisonDialog).findByRole("heading", { name: heading }),
       ).toBeTruthy();
+      if (error === "tv_release_apibay_conflicting") {
+        expect(
+          within(comparisonDialog).queryByLabelText(
+            "Verified TV release totals",
+          ),
+        ).toBeNull();
+        expect(
+          within(comparisonDialog).queryByRole("heading", {
+            name: "Selected release",
+          }),
+        ).toBeNull();
+        expect(
+          within(comparisonDialog).queryByRole("list", {
+            name: /Verified API Bay releases/,
+          }),
+        ).toBeNull();
+      }
       fireEvent.click(
         within(comparisonDialog).getByRole("button", { name: "Retry" }),
       );

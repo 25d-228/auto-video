@@ -119,19 +119,18 @@ pub(crate) fn fetch_apibay_tv_releases_with(
         context.show_name, context.season_number, context.episode_number
     ));
     let mut releases = Vec::new();
+    let mut item_ids = BTreeSet::new();
+    let mut infohashes = BTreeSet::new();
     for category in TV_CATEGORIES {
         let document = request(&format!("{API_BAY_QUERY_URL}{query}&cat={category}"), None)
             .map_err(apibay_error_code)?;
-        releases.extend(verified_apibay_releases(&document, category, &context)?);
-    }
-
-    let mut item_ids = BTreeSet::new();
-    let mut infohashes = BTreeSet::new();
-    if releases.iter().any(|release| {
-        !item_ids.insert(release.provider_item_id.clone())
-            || !infohashes.insert(release.infohash.clone())
-    }) {
-        return Err(TV_APIBAY_CONFLICTING);
+        releases.extend(verified_apibay_releases(
+            &document,
+            category,
+            &context,
+            &mut item_ids,
+            &mut infohashes,
+        )?);
     }
 
     Ok(flatten_releases(&context, &releases))
@@ -239,6 +238,8 @@ fn verified_apibay_releases(
     document: &str,
     requested_category: u64,
     context: &TrustedEpisodeContext,
+    item_ids: &mut BTreeSet<String>,
+    infohashes: &mut BTreeSet<String>,
 ) -> Result<Vec<ApiBayRelease>, &'static str> {
     let value = JsonParser::new(document)
         .parse()
@@ -247,10 +248,27 @@ fn verified_apibay_releases(
     if rows.len() > MAX_PROVIDER_ROWS {
         return Err(TV_APIBAY_MALFORMED);
     }
-    Ok(rows
-        .iter()
-        .filter_map(|row| verified_apibay_release(row, requested_category, context))
-        .collect())
+    let mut releases = Vec::new();
+    for row in rows {
+        if let Some(object) = json_object(row) {
+            if let Some(item_id) = canonical_positive_string(object, "id") {
+                if !item_ids.insert(item_id) {
+                    return Err(TV_APIBAY_CONFLICTING);
+                }
+                if let Some(infohash) =
+                    json_string(object, "info_hash").and_then(canonical_infohash)
+                {
+                    if !infohashes.insert(infohash) {
+                        return Err(TV_APIBAY_CONFLICTING);
+                    }
+                }
+            }
+        }
+        if let Some(release) = verified_apibay_release(row, requested_category, context) {
+            releases.push(release);
+        }
+    }
+    Ok(releases)
 }
 
 fn verified_apibay_release(
@@ -435,7 +453,12 @@ fn is_identity_end(bytes: &[u8], end: usize) -> bool {
 }
 
 fn has_episode_continuation(bytes: &[u8], end: usize) -> bool {
-    let position = skip_separators(bytes, end);
+    let mut position = end;
+    while bytes.get(position).is_some_and(|character| {
+        character.is_ascii_whitespace() || matches!(character, b'.' | b'_' | b'-' | b'+')
+    }) {
+        position += 1;
+    }
     let position = if bytes
         .get(position)
         .is_some_and(|character| character.eq_ignore_ascii_case(&b'e'))
@@ -469,6 +492,8 @@ mod tests {
             "Show s-2.e-003 720p",
             "Show 2x03 WEB",
             "Show 002 x 003",
+            "Show S02E03+720p",
+            "Show 2x03+10bit",
         ] {
             assert!(has_exact_episode_identity(name, 2, 3), "{name}");
         }
@@ -481,8 +506,11 @@ mod tests {
             "Show S02E03E04",
             "Show S02E03-E04",
             "Show S02E03-04",
+            "Show S02E03+E04",
+            "Show S02E03+04",
             "Show 2x03x04",
             "Show 2x03-04",
+            "Show 2x03+04",
             "Show S02E03 2x03",
             "Show S02E03 S03E03",
         ] {
@@ -507,6 +535,9 @@ mod tests {
             ("12", "Exact Show S02E03 S03E03", "205", "tt0123456"),
             ("13", "Exact Show S02E03", "208", "tt0123456"),
             ("14", "Exact Show S02E03", "205", "tt9999999"),
+            ("15", "Exact Show S02E03+E04", "205", "tt0123456"),
+            ("16", "Exact Show S02E03+04", "205", "tt0123456"),
+            ("17", "Exact Show 2x03+04", "205", "tt0123456"),
         ];
         let mut standard_rows = vec![release(
             "1",
@@ -571,6 +602,13 @@ mod tests {
         assert_eq!(values[21], "Exact Show - 02x003 - 2160p");
         assert_eq!(values[29], hash_b);
         assert_eq!(values[30], "API Bay");
+        for compact_continuation in [
+            "Exact Show S02E03+E04",
+            "Exact Show S02E03+04",
+            "Exact Show 2x03+04",
+        ] {
+            assert!(!values.iter().any(|value| value == compact_continuation));
+        }
         let requests = requests.into_inner();
         assert_eq!(requests.len(), 5);
         assert_eq!(requests[0].1.as_deref(), Some("fixture-token"));
@@ -583,20 +621,45 @@ mod tests {
     }
 
     #[test]
-    fn rejects_conflicting_verified_rows() {
+    fn rejects_duplicate_provider_claims_before_release_identity_filtering() {
         let shared_hash = "a".repeat(40);
-        for standard in [
+        let other_hash = "b".repeat(40);
+        let exact = release("1", "Show S02E03", "205", "tt0123456", &shared_hash);
+        let mut conflicting_documents = vec![
             format!(
                 "[{},{}]",
-                release("1", "Show S02E03", "205", "tt0123456", &shared_hash),
-                release("1", "Show 2x03", "205", "tt0123456", &"b".repeat(40))
+                exact,
+                release("1", "Show 2x03", "205", "tt0123456", &other_hash)
             ),
             format!(
                 "[{},{}]",
-                release("1", "Show S02E03", "205", "tt0123456", &shared_hash),
+                exact,
                 release("2", "Show 2x03", "205", "tt0123456", &shared_hash)
             ),
+        ];
+
+        for (name, category, imdb) in [
+            ("Show S02E04", "205", "tt0123456"),
+            ("Show S02E03", "208", "tt0123456"),
+            ("Show S02E03", "205", "tt9999999"),
         ] {
+            for (item_id, infohash) in [("1", &other_hash), ("2", &shared_hash)] {
+                conflicting_documents.push(format!(
+                    "[{},{}]",
+                    exact,
+                    release(item_id, name, category, imdb, infohash)
+                ));
+            }
+        }
+
+        for (item_id, infohash) in [("1", &other_hash), ("2", &shared_hash)] {
+            let malformed = format!(
+                r#"{{"id":"{item_id}","name":7,"info_hash":"{infohash}","category":"205","imdb":"tt0123456"}}"#
+            );
+            conflicting_documents.push(format!("[{exact},{malformed}]"));
+        }
+
+        for standard in conflicting_documents {
             let result = fetch_apibay_tv_releases_with(701, 9001, 9103, "token", |url, _| {
                 if url.ends_with("/tv/701") {
                     Ok(DETAILS.to_owned())
