@@ -2495,6 +2495,41 @@ describe("parsed VR Library and Dashboard", () => {
     expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
     expect(queryTvStorageMock).toHaveBeenCalledTimes(2);
   });
+
+  it("does not refresh TV Library or storage when completion persistence leaves a failed row", async () => {
+    vi.useFakeTimers();
+    savedTvFolder = "/TV";
+    const activeRows = vrDownloadFixture({
+      category: "tv",
+      code: "Exact Show S02E03",
+      releaseName: "Exact Show S02E03 current",
+      state: "downloading",
+      transferId: "tv-current",
+    });
+    const failedRows = vrDownloadFixture({
+      category: "tv",
+      code: "Exact Show S02E03",
+      downloadedBytes: "10",
+      releaseName: "Exact Show S02E03 current",
+      speedBytesPerSecond: "0",
+      state: "failed",
+      transferId: "tv-current",
+    });
+    loadVrDownloadsMock.mockResolvedValue(activeRows);
+    listVrDownloadsMock.mockResolvedValue(failedRows);
+
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledOnce();
+    expect(queryTvStorageMock).toHaveBeenCalledOnce();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4000);
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledOnce();
+    expect(queryTvStorageMock).toHaveBeenCalledOnce();
+  });
 });
 
 describe("Mira visual preset", () => {
