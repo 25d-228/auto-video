@@ -88,8 +88,15 @@ import {
 } from "@/tmdb";
 import {
   fetchVerifiedApiBayTvReleases,
+  inspectVerifiedApiBayTvTorrent,
+  invalidateTvReleaseContext,
+  invalidateVerifiedTvTorrent,
+  saveVerifiedTvTorrent,
+  startVerifiedTvDownload,
   type ApiBayTvRelease,
+  type TvEpisodeReleaseContext,
   type TvEpisodeReleasesResult,
+  type TvTorrentInspectionResult,
 } from "@/tv-release";
 import {
   chooseTvFolder,
@@ -157,7 +164,7 @@ const destinations = [
   {
     id: "dashboard",
     label: "Dashboard",
-    description: "Current status for local libraries and Movie, Adult, and VR transfers.",
+    description: "Current status for local libraries and Movie, TV, Adult, and VR transfers.",
     emptyHeading: "Dashboard data is not available yet",
     emptyMessage:
       "Metrics and storage details will appear here only after their data sources are implemented.",
@@ -181,7 +188,7 @@ const destinations = [
   {
     id: "downloads",
     label: "Downloads",
-    description: "Review and manage selected-file Movie, Adult, and VR transfers.",
+    description: "Review and manage selected-file Movie, TV, Adult, and VR transfers.",
     emptyHeading: "No downloads",
     emptyMessage: "Start a selected-file transfer from a verified torrent inspection.",
   },
@@ -324,6 +331,9 @@ type AppProps = {
 type TorrentInspectionState =
   | { status: "loading" }
   | TorrentInspectionResult;
+type TvTorrentInspectionState =
+  | { status: "loading" }
+  | TvTorrentInspectionResult;
 type TorrentSaveState = "idle" | "saving" | "success" | "error";
 type TorrentStartState =
   | { status: "idle" }
@@ -379,6 +389,11 @@ type AdultTorrentInspectionContext = {
 type MovieTorrentInspectionContext = {
   context: MovieReleaseContext;
   release: YtsMovieRelease;
+  triggerId: string;
+};
+type TvTorrentInspectionContext = {
+  context: TvEpisodeReleaseContext;
+  release: ApiBayTvRelease;
   triggerId: string;
 };
 type GalleryVariant = "discover" | "library";
@@ -1152,6 +1167,25 @@ const movieTorrentMessages = {
   },
 } as const;
 
+const tvTorrentMessages = {
+  ...vrTorrentMessages,
+  loading: {
+    heading: "Inspecting verified TV torrent",
+    message: "Acquiring and verifying metainfo for the exact selected API Bay infohash.",
+    role: "status",
+  },
+  timeout: {
+    heading: "TV torrent inspection timed out",
+    message: "Metainfo was not available within the bounded inspection window. Try again.",
+    role: "alert",
+  },
+  "no-peers": {
+    heading: "No TV torrent metadata peers were available",
+    message: "No peer supplied the exact selected metainfo. Try again later.",
+    role: "alert",
+  },
+} as const;
+
 function AppIcon({ name }: { name: IconName }) {
   const IconComponent = appIcons[name];
 
@@ -1854,6 +1888,7 @@ function MovieReleaseComparison({
 }
 
 function TvEpisodeReleaseComparison({
+  onInspectRelease,
   onRetry,
   onScrollTopChange,
   onSelectRelease,
@@ -1863,6 +1898,7 @@ function TvEpisodeReleaseComparison({
   state,
   triggerId,
 }: {
+  onInspectRelease: (release: ApiBayTvRelease, triggerId: string) => void;
   onRetry: () => void;
   onScrollTopChange: (scrollTop: number) => void;
   onSelectRelease: (release: ApiBayTvRelease) => void;
@@ -2096,8 +2132,226 @@ function TvEpisodeReleaseComparison({
                       <dd>{selectedRelease.source}</dd>
                     </div>
                   </dl>
+                  <Button
+                    id={`inspect-tv-torrent-${selectedRelease.providerItemId}`}
+                    onClick={(event) =>
+                      onInspectRelease(selectedRelease, event.currentTarget.id)
+                    }
+                    type="button"
+                  >
+                    <AppIcon name="details" />
+                    Inspect torrent
+                  </Button>
                 </section>
               )}
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
+  );
+}
+
+function TvTorrentInspectionDialog({
+  context,
+  downloadsReady,
+  folderState,
+  onOpenDownloads,
+  onOpenSettings,
+  onRetry,
+  onSave,
+  onStart,
+  onToggleFile,
+  saveState,
+  selectedFileIds,
+  startState,
+  state,
+}: {
+  context: TvTorrentInspectionContext;
+  downloadsReady: boolean;
+  folderState: TvFolderUiState;
+  onOpenDownloads: () => void;
+  onOpenSettings: () => void;
+  onRetry: () => void;
+  onSave: () => void;
+  onStart: () => void;
+  onToggleFile: (fileId: number) => void;
+  saveState: TorrentSaveState;
+  selectedFileIds: Set<number>;
+  startState: TorrentStartState;
+  state: TvTorrentInspectionState;
+}) {
+  const currentMessage =
+    tvTorrentMessages[state.status === "ready" ? "loading" : state.status];
+  const isFolderReady = folderState.status === "ready";
+  const folderMessage =
+    folderState.status === "loading"
+      ? "Loading the configured TV folder…"
+      : folderState.status === "ready"
+        ? `Selected files will download to ${folderState.path}.`
+        : folderState.status === "unavailable"
+          ? "The configured TV folder is unavailable. Change or clear it in Settings."
+          : folderState.status === "unconfigured"
+            ? "Choose a TV folder in Settings before starting a download."
+            : "The TV folder configuration could not be loaded.";
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="vr-torrent__backdrop" />
+      <Dialog.Viewport className="vr-torrent__viewport">
+        <Dialog.Popup
+          aria-busy={
+            state.status === "loading" ||
+            saveState === "saving" ||
+            startState.status === "starting"
+          }
+          className="vr-torrent__popup"
+          finalFocus={() => document.getElementById(context.triggerId)}
+        >
+          <div className="vr-torrent__heading">
+            <div>
+              <p className="card-eyebrow">Verified API Bay TV torrent</p>
+              <Dialog.Title>
+                {context.context.showName} · S
+                {String(context.context.seasonNumber).padStart(2, "0")}E
+                {String(context.context.episodeNumber).padStart(2, "0")}
+              </Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="vr-torrent__description">
+            <span>Exact selected release</span>
+            <span className="vr-torrent__release-name">
+              {context.release.name}
+            </span>
+          </Dialog.Description>
+
+          {state.status === "ready" ? (
+            <div className="vr-torrent__content">
+              <dl className="vr-torrent__metadata">
+                <div>
+                  <dt>Torrent name</dt>
+                  <dd>{state.inspection.displayName}</dd>
+                </div>
+                <div>
+                  <dt>Verified infohash</dt>
+                  <dd>{state.inspection.infohash}</dd>
+                </div>
+                <div>
+                  <dt>Total size</dt>
+                  <dd>
+                    {formatStorageBytes(BigInt(state.inspection.totalBytes))} (
+                    {state.inspection.totalBytes} bytes)
+                  </dd>
+                </div>
+                <div>
+                  <dt>Files</dt>
+                  <dd>{state.inspection.files.length}</dd>
+                </div>
+              </dl>
+              <h3>Complete file list</h3>
+              <fieldset className="vr-torrent__file-selection">
+                <legend className="sr-only">TV files to download</legend>
+                <p>Select the files to download. No files are selected initially.</p>
+                <ul
+                  aria-label={`Files in verified TV torrent for ${context.context.showName} Season ${context.context.seasonNumber} Episode ${context.context.episodeNumber}`}
+                >
+                  {state.inspection.files.map((file, fileId) => (
+                    <li key={file.path}>
+                      <label>
+                        <input
+                          checked={selectedFileIds.has(fileId)}
+                          disabled={
+                            startState.status === "starting" ||
+                            startState.status === "success"
+                          }
+                          onChange={() => onToggleFile(fileId)}
+                          type="checkbox"
+                        />
+                        <span>{file.path}</span>
+                        <span>
+                          {formatStorageBytes(BigInt(file.sizeBytes))} (
+                          {file.sizeBytes} bytes)
+                        </span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              </fieldset>
+              <div className="vr-torrent__destination">
+                <p>{folderMessage}</p>
+                {!isFolderReady ? (
+                  <Button onClick={onOpenSettings} type="button" variant="outline">
+                    <AppIcon name="settings" />
+                    Open Settings
+                  </Button>
+                ) : null}
+              </div>
+              <div className="vr-torrent__actions">
+                <Button
+                  disabled={
+                    selectedFileIds.size === 0 ||
+                    startState.status === "starting" ||
+                    startState.status === "success" ||
+                    !isFolderReady ||
+                    !downloadsReady
+                  }
+                  onClick={onStart}
+                  type="button"
+                >
+                  <AppIcon name="downloads" />
+                  {startState.status === "starting" ? "Starting…" : "Start download"}
+                </Button>
+                <Button
+                  disabled={
+                    saveState === "saving" || startState.status === "starting"
+                  }
+                  onClick={onSave}
+                  type="button"
+                  variant="outline"
+                >
+                  <AppIcon name="downloads" />
+                  {saveState === "saving" ? "Saving…" : "Save `.torrent`"}
+                </Button>
+                {saveState === "success" ? (
+                  <p role="status">Verified TV torrent file saved.</p>
+                ) : saveState === "error" ? (
+                  <p role="alert">The verified TV torrent file could not be saved.</p>
+                ) : null}
+                {startState.status === "success" ? (
+                  <div className="vr-torrent__start-result" role="status">
+                    <p>Selected TV files were added to Downloads.</p>
+                    <Button onClick={onOpenDownloads} type="button" variant="outline">
+                      View Downloads
+                    </Button>
+                  </div>
+                ) : startState.status === "error" ? (
+                  <p role="alert">{startState.message}</p>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <div className="vr-torrent__state" role={currentMessage.role}>
+              <span className="empty-state__icon">
+                <AppIcon name="releases" />
+              </span>
+              <div>
+                <h3>{currentMessage.heading}</h3>
+                <p>{currentMessage.message}</p>
+                {state.status === "loading" ? null : (
+                  <Button onClick={onRetry} type="button" variant="outline">
+                    <AppIcon name="refresh" />
+                    Retry inspection
+                  </Button>
+                )}
+              </div>
             </div>
           )}
         </Dialog.Popup>
@@ -4254,6 +4508,8 @@ function VrDownloadCard({
       ? "Adult"
       : download.category === "movie"
         ? "Movie"
+      : download.category === "tv"
+        ? "TV"
       : download.category === "vr"
         ? "VR"
         : "Category unavailable";
@@ -4262,6 +4518,8 @@ function VrDownloadCard({
       ? "accepted Adult folder"
       : download.category === "movie"
         ? "accepted Movies folder"
+      : download.category === "tv"
+        ? "accepted TV folder"
       : download.category === "vr"
         ? "accepted VR folder"
         : "accepted download folder";
@@ -4690,7 +4948,7 @@ function nativeErrorCode(error: unknown) {
       : "";
 }
 
-function downloadStartError(error: unknown, category: "Adult" | "Movie" | "VR") {
+function downloadStartError(error: unknown, category: "Adult" | "Movie" | "TV" | "VR") {
   switch (nativeErrorCode(error)) {
     case "vr_download_destination_conflict":
       return `A selected file already exists in the ${category} folder. Nothing was overwritten.`;
@@ -4892,6 +5150,18 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     useState<ApiBayTvRelease | null>(null);
   const [tvReleaseScrollTop, setTvReleaseScrollTop] = useState(0);
   const [tvReleaseRequestVersion, setTvReleaseRequestVersion] = useState(0);
+  const [tvTorrentInspectionContext, setTvTorrentInspectionContext] =
+    useState<TvTorrentInspectionContext | null>(null);
+  const [tvTorrentInspectionState, setTvTorrentInspectionState] =
+    useState<TvTorrentInspectionState | null>(null);
+  const [tvTorrentInspectionRequestVersion, setTvTorrentInspectionRequestVersion] =
+    useState(0);
+  const [tvTorrentSaveState, setTvTorrentSaveState] =
+    useState<TorrentSaveState>("idle");
+  const [tvTorrentStartState, setTvTorrentStartState] =
+    useState<TorrentStartState>({ status: "idle" });
+  const [selectedTvTorrentFileIds, setSelectedTvTorrentFileIds] =
+    useState<Set<number>>(new Set());
   const [adultSearchInput, setAdultSearchInput] = useState("");
   const [adultSearchInputError, setAdultSearchInputError] = useState<
     string | null
@@ -5004,6 +5274,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const tvDetailsRequestId = useRef(0);
   const tvSeasonEpisodesRequestId = useRef(0);
   const tvReleaseRequestId = useRef(0);
+  const tvTorrentInspectionRequestId = useRef(0);
+  const tvTorrentSaveRequestId = useRef(0);
+  const tvTorrentStartRequestId = useRef(0);
   const adultCatalogRequestId = useRef(0);
   const adultReleaseRequestId = useRef(0);
   const adultTorrentInspectionRequestId = useRef(0);
@@ -5032,6 +5305,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const movieTorrentStartPending = useRef(false);
   const adultTorrentSavePending = useRef(false);
   const adultTorrentStartPending = useRef(false);
+  const tvTorrentSavePending = useRef(false);
+  const tvTorrentStartPending = useRef(false);
   const torrentStartPending = useRef(false);
   const vrDownloadsRefreshPending = useRef(false);
   const vrDownloadLimitSavePending = useRef(false);
@@ -5054,6 +5329,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const hasObservedDownloads = useRef(false);
   const pendingCompletedAdultRefresh = useRef(false);
   const pendingCompletedMovieRefresh = useRef(false);
+  const pendingCompletedTvRefresh = useRef(false);
   const pendingCompletedVrRefresh = useRef(false);
   // Late Trash responses read current state so an old card cannot modify replacement results.
   currentMoviesFolder.current = moviesFolder;
@@ -5274,6 +5550,16 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           previousDownloadStates.current.get(download.transferId) !==
             "completed",
       );
+    const completedTvTransferAppeared =
+      hasObservedDownloads.current &&
+      vrDownloadsState.downloads.some(
+        (download) =>
+          download.category === "tv" &&
+          download.state === "completed" &&
+          download.isCurrentFolder &&
+          previousDownloadStates.current.get(download.transferId) !==
+            "completed",
+      );
     previousDownloadStates.current = nextStates;
     hasObservedDownloads.current = true;
     if (completedAdultTransferAppeared) {
@@ -5284,6 +5570,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
     if (completedVrTransferAppeared) {
       pendingCompletedVrRefresh.current = true;
+    }
+    if (completedTvTransferAppeared) {
+      pendingCompletedTvRefresh.current = true;
     }
     if (
       pendingCompletedAdultRefresh.current &&
@@ -5310,10 +5599,19 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       setMovieRefreshVersion((version) => version + 1);
       setMovieStorageRefreshVersion((version) => version + 1);
     }
+    if (
+      pendingCompletedTvRefresh.current &&
+      tvFolderState.status === "ready"
+    ) {
+      pendingCompletedTvRefresh.current = false;
+      setTvLibraryRefreshVersion((version) => version + 1);
+      setTvStorageRefreshVersion((version) => version + 1);
+    }
   }, [
     adultFolderState.status,
     isMoviesFolderLoaded,
     moviesFolder,
+    tvFolderState.status,
     vrDownloadsState,
     vrFolderState.status,
   ]);
@@ -6096,6 +6394,27 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       tvReleaseRequestId.current += 1;
     };
   }, [tvReleaseRequestVersion, tvReleaseSelection]);
+
+  useEffect(() => {
+    const requestId = ++tvTorrentInspectionRequestId.current;
+    if (tvTorrentInspectionContext === null) {
+      return;
+    }
+    setTvTorrentInspectionState({ status: "loading" });
+    setTvTorrentSaveState("idle");
+    void inspectVerifiedApiBayTvTorrent(
+      tvTorrentInspectionContext.context,
+      tvTorrentInspectionContext.release,
+    ).then((result) => {
+      if (requestId === tvTorrentInspectionRequestId.current) {
+        setTvTorrentInspectionState(result);
+      }
+    });
+    return () => {
+      tvTorrentInspectionRequestId.current += 1;
+      void invalidateVerifiedTvTorrent().catch(() => undefined);
+    };
+  }, [tvTorrentInspectionContext, tvTorrentInspectionRequestVersion]);
 
   useEffect(() => {
     const requestId = ++adultCatalogRequestId.current;
@@ -7289,17 +7608,35 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
   };
 
+  const closeTvTorrentInspection = () => {
+    const hadCurrentInspection = tvTorrentInspectionContext !== null;
+    tvTorrentInspectionRequestId.current += 1;
+    tvTorrentSaveRequestId.current += 1;
+    tvTorrentStartRequestId.current += 1;
+    setTvTorrentInspectionContext(null);
+    setTvTorrentInspectionState(null);
+    setTvTorrentSaveState("idle");
+    setTvTorrentStartState({ status: "idle" });
+    setSelectedTvTorrentFileIds(new Set());
+    if (hadCurrentInspection) {
+      void invalidateVerifiedTvTorrent().catch(() => undefined);
+    }
+  };
+
   const closeTvReleaseComparison = () => {
+    closeTvTorrentInspection();
     setIsTvReleaseComparisonOpen(false);
     tvReleaseRequestId.current += 1;
     if (tvReleaseComparisonState?.status === "loading") {
       setTvReleaseComparisonState(null);
       setSelectedTvRelease(null);
       setTvReleaseScrollTop(0);
+      void invalidateTvReleaseContext().catch(() => undefined);
     }
   };
 
   const resetTvReleaseComparison = () => {
+    closeTvTorrentInspection();
     setIsTvReleaseComparisonOpen(false);
     tvReleaseRequestId.current += 1;
     setTvReleaseSelection(null);
@@ -7307,6 +7644,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setTvReleaseComparisonTriggerId(null);
     setSelectedTvRelease(null);
     setTvReleaseScrollTop(0);
+    void invalidateTvReleaseContext().catch(() => undefined);
   };
 
   const openTvEpisodeReleaseComparison = (
@@ -7367,6 +7705,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     ) {
       return;
     }
+    closeTvTorrentInspection();
     tvReleaseRequestId.current += 1;
     setTvReleaseComparisonState({ status: "loading" });
     setSelectedTvRelease(null);
@@ -7379,7 +7718,135 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       tvReleaseComparisonState?.status === "ready" &&
       tvReleaseComparisonState.releases.includes(release)
     ) {
+      if (selectedTvRelease !== release) {
+        closeTvTorrentInspection();
+      }
       setSelectedTvRelease(release);
+    }
+  };
+
+  const openTvTorrentInspection = (
+    release: ApiBayTvRelease,
+    triggerId: string,
+  ) => {
+    if (
+      tvReleaseComparisonState?.status !== "ready" ||
+      selectedTvRelease !== release ||
+      !tvReleaseComparisonState.releases.includes(release)
+    ) {
+      return;
+    }
+    tvTorrentInspectionRequestId.current += 1;
+    tvTorrentSaveRequestId.current += 1;
+    tvTorrentStartRequestId.current += 1;
+    setTvTorrentInspectionContext({
+      context: tvReleaseComparisonState.context,
+      release,
+      triggerId,
+    });
+    setTvTorrentInspectionState({ status: "loading" });
+    setTvTorrentSaveState("idle");
+    setTvTorrentStartState({ status: "idle" });
+    setSelectedTvTorrentFileIds(new Set());
+    setTvTorrentInspectionRequestVersion((version) => version + 1);
+  };
+
+  const retryTvTorrentInspection = () => {
+    if (tvTorrentInspectionContext === null) {
+      return;
+    }
+    tvTorrentInspectionRequestId.current += 1;
+    tvTorrentSaveRequestId.current += 1;
+    tvTorrentStartRequestId.current += 1;
+    setTvTorrentInspectionState({ status: "loading" });
+    setTvTorrentSaveState("idle");
+    setTvTorrentStartState({ status: "idle" });
+    setSelectedTvTorrentFileIds(new Set());
+    setTvTorrentInspectionRequestVersion((version) => version + 1);
+  };
+
+  const saveTvTorrent = async () => {
+    if (
+      tvTorrentSavePending.current ||
+      tvTorrentInspectionState?.status !== "ready"
+    ) {
+      return;
+    }
+    tvTorrentSavePending.current = true;
+    const requestId = ++tvTorrentSaveRequestId.current;
+    setTvTorrentSaveState("saving");
+    try {
+      const saved = await saveVerifiedTvTorrent(
+        tvTorrentInspectionState.inspection.inspectionId,
+      );
+      if (requestId === tvTorrentSaveRequestId.current) {
+        setTvTorrentSaveState(saved ? "success" : "idle");
+      }
+    } catch {
+      if (requestId === tvTorrentSaveRequestId.current) {
+        setTvTorrentSaveState("error");
+      }
+    } finally {
+      tvTorrentSavePending.current = false;
+    }
+  };
+
+  const toggleTvTorrentFile = (fileId: number) => {
+    if (
+      tvTorrentStartState.status === "starting" ||
+      tvTorrentStartState.status === "success" ||
+      tvTorrentInspectionState?.status !== "ready" ||
+      fileId < 0 ||
+      fileId >= tvTorrentInspectionState.inspection.files.length
+    ) {
+      return;
+    }
+    setTvTorrentStartState({ status: "idle" });
+    setSelectedTvTorrentFileIds((selectedFileIds) => {
+      const nextSelection = new Set(selectedFileIds);
+      if (nextSelection.has(fileId)) {
+        nextSelection.delete(fileId);
+      } else {
+        nextSelection.add(fileId);
+      }
+      return nextSelection;
+    });
+  };
+
+  const startTvDownload = async () => {
+    if (
+      tvTorrentStartPending.current ||
+      tvTorrentInspectionState?.status !== "ready" ||
+      selectedTvTorrentFileIds.size === 0 ||
+      tvFolderState.status !== "ready" ||
+      vrDownloadsState.status !== "ready"
+    ) {
+      return;
+    }
+    tvTorrentStartPending.current = true;
+    const requestId = ++tvTorrentStartRequestId.current;
+    const selectedFileIds = [...selectedTvTorrentFileIds].sort(
+      (left, right) => left - right,
+    );
+    setTvTorrentStartState({ status: "starting" });
+    try {
+      await startVerifiedTvDownload(
+        tvTorrentInspectionState.inspection.inspectionId,
+        selectedFileIds,
+      );
+      await refreshVrDownloads();
+      if (requestId === tvTorrentStartRequestId.current) {
+        setTvTorrentStartState({ status: "success" });
+      }
+    } catch (error: unknown) {
+      if (requestId === tvTorrentStartRequestId.current) {
+        setTvTorrentStartState({
+          status: "error",
+          message: downloadStartError(error, "TV"),
+        });
+      }
+    } finally {
+      tvTorrentStartPending.current = false;
     }
   };
 
@@ -7938,12 +8405,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
   const openDownloadDestinationFromInspection = (
     destination: typeof settingsDestination | typeof downloadsDestination,
-    category: "adult" | "movie" | "vr",
+    category: "adult" | "movie" | "tv" | "vr",
   ) => {
     if (category === "adult") {
       closeAdultReleaseComparison();
     } else if (category === "movie") {
       closeMovieReleaseComparison();
+    } else if (category === "tv") {
+      closeTvReleaseComparison();
     } else {
       closeVrReleaseComparison();
     }
@@ -10224,7 +10693,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
               <div className="library-toolbar">
                 <div>
                   <p className="card-eyebrow">Selected-file transfers</p>
-                  <h2 id="vr-downloads-heading">Movie, Adult, and VR downloads</h2>
+                  <h2 id="vr-downloads-heading">Movie, TV, Adult, and VR downloads</h2>
                   <p>
                     Each row is managed independently. Cancelling keeps all
                     downloaded files and partial data.
@@ -10491,7 +10960,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     <h2 id="tv-folder-heading">TV folder</h2>
                     <p>
                       Choose one local folder to scan recursively for supported
-                      TV episode files. Auto-Video never renames or moves them.
+                      TV episode files and receive TV downloads. Auto-Video never
+                      renames or moves them.
                     </p>
                   </div>
                 </div>
@@ -10764,7 +11234,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     <h2 id="vr-download-limit-heading">Aggregate download limit</h2>
                     <p>
                       Set one aggregate limit for all current and future Movie,
-                      Adult, and VR downloads. Limits use whole MiB per second.
+                      TV, Adult, and VR downloads. Limits use whole MiB per second.
                     </p>
                   </div>
                 </div>
@@ -11038,6 +11508,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         tvReleaseComparisonState === null ||
         tvReleaseComparisonTriggerId === null ? null : (
           <TvEpisodeReleaseComparison
+            onInspectRelease={openTvTorrentInspection}
             onRetry={retryTvEpisodeReleaseComparison}
             onScrollTopChange={setTvReleaseScrollTop}
             onSelectRelease={selectTvRelease}
@@ -11046,6 +11517,37 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
             selection={tvReleaseSelection}
             state={tvReleaseComparisonState}
             triggerId={tvReleaseComparisonTriggerId}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeTvTorrentInspection();
+          }
+        }}
+        open={tvTorrentInspectionContext !== null}
+      >
+        {tvTorrentInspectionContext === null ||
+        tvTorrentInspectionState === null ? null : (
+          <TvTorrentInspectionDialog
+            context={tvTorrentInspectionContext}
+            downloadsReady={vrDownloadsState.status === "ready"}
+            folderState={tvFolderState}
+            onOpenDownloads={() =>
+              openDownloadDestinationFromInspection(downloadsDestination, "tv")
+            }
+            onOpenSettings={() =>
+              openDownloadDestinationFromInspection(settingsDestination, "tv")
+            }
+            onRetry={retryTvTorrentInspection}
+            onSave={() => void saveTvTorrent()}
+            onStart={() => void startTvDownload()}
+            onToggleFile={toggleTvTorrentFile}
+            saveState={tvTorrentSaveState}
+            selectedFileIds={selectedTvTorrentFileIds}
+            startState={tvTorrentStartState}
+            state={tvTorrentInspectionState}
           />
         )}
       </Dialog.Root>

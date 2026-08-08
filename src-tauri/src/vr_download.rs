@@ -4,7 +4,8 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context};
@@ -15,12 +16,17 @@ use librqbit::{
     TorrentStatsState,
 };
 
+use crate::tv_release::{
+    TvInspectionTicket, TvReleaseState, TvTorrentInspectionRequest, TV_TORRENT_NETWORK_ERROR,
+    TV_TORRENT_NO_PEERS, TV_TORRENT_SOURCE_UNAVAILABLE, TV_TORRENT_TIMEOUT,
+};
 use crate::vr_library::is_supported_media;
 use crate::vr_torrent::{
     adult_media_name_matches_product_code, hex_sha1, media_name_matches_product_code,
     revalidate_persisted_download_source, revalidate_persisted_movie_download_source,
-    AdultTorrentState, MovieDownloadIdentity, MovieTorrentState, VerifiedDownloadFile,
-    VerifiedDownloadSource, VerifiedDownloadSourceError, VrTorrentState,
+    revalidate_persisted_tv_download_source, AdultTorrentState, MovieDownloadIdentity,
+    MovieTorrentState, TvDownloadIdentity, VerifiedDownloadFile, VerifiedDownloadSource,
+    VerifiedDownloadSourceError, VrTorrentState,
 };
 
 pub const VR_DOWNLOAD_ACTION_INVALID: &str = "vr_download_action_invalid";
@@ -45,15 +51,25 @@ const PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_DOWNLOADS_V2\n";
 const LEGACY_PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_VR_DOWNLOADS_V1\n";
 const ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_ORGANIZATION_V2\n";
 const LEGACY_ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_VR_ORGANIZATION_V1\n";
+const TV_COMPLETION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_TV_COMPLETION_V1\n";
 const ORGANIZATION_RECOVERY_PREFIX: &str = ".auto-video-organization-";
 const ORGANIZATION_RECOVERY_SUFFIX: &str = ".recovery";
 const ORGANIZATION_RECOVERY_SUCCESSOR_SUFFIX: &str = ".recovery.next";
+const TV_COMPLETION_RECOVERY_PREFIX: &str = ".auto-video-tv-completion-";
+const TV_COMPLETION_RECOVERY_SUFFIX: &str = ".recovery";
 const MAX_PERSISTENCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PERSISTED_TRANSFERS: usize = 100;
 const MAX_SELECTED_FILES: usize = 100_000;
 const BYTES_PER_MIB: u32 = 1024 * 1024;
 const MAX_DOWNLOAD_LIMIT_MIB_PER_SECOND: u32 = u32::MAX / BYTES_PER_MIB;
 const DOWNLOAD_LIMIT_UNLIMITED: &str = "unlimited\n";
+// Metadata lookup is user-triggered; the bound prevents an unavailable swarm from hanging the dialog.
+const TV_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+const TV_METADATA_TRACKERS: [&str; 3] = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "https://tracker.gbitt.info/announce",
+];
 
 type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
@@ -61,6 +77,7 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 enum TransferCategory {
     Adult,
     Movie,
+    Tv,
     Vr,
 }
 
@@ -69,6 +86,7 @@ impl TransferCategory {
         match self {
             Self::Adult => "adult",
             Self::Movie => "movie",
+            Self::Tv => "tv",
             Self::Vr => "vr",
         }
     }
@@ -77,6 +95,7 @@ impl TransferCategory {
         match value {
             "adult" => Some(Self::Adult),
             "movie" => Some(Self::Movie),
+            "tv" => Some(Self::Tv),
             "vr" => Some(Self::Vr),
             _ => None,
         }
@@ -172,6 +191,7 @@ struct TransferRecord {
     code: String,
     release_name: String,
     movie_identity: Option<Box<MovieDownloadIdentity>>,
+    tv_identity: Option<Box<TvDownloadIdentity>>,
     infohash: String,
     metainfo: Vec<u8>,
     selected_files: Vec<VerifiedDownloadFile>,
@@ -260,6 +280,7 @@ struct VrDownloadContext {
     future_folder: Option<PathBuf>,
     adult_future_folder: Option<PathBuf>,
     movie_future_folder: Option<PathBuf>,
+    tv_future_folder: Option<PathBuf>,
     session: Option<Arc<Session>>,
     session_starting: bool,
     download_limit: DownloadLimitState,
@@ -282,6 +303,7 @@ fn configured_folder(context: &VrDownloadContext, category: TransferCategory) ->
     match category {
         TransferCategory::Adult => context.adult_future_folder.as_deref(),
         TransferCategory::Movie => context.movie_future_folder.as_deref(),
+        TransferCategory::Tv => context.tv_future_folder.as_deref(),
         TransferCategory::Vr => context.future_folder.as_deref(),
     }
 }
@@ -321,6 +343,16 @@ pub fn configure_movie_download_folder(
     let mut context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
     invalidate_organization_plan(&mut context);
     context.movie_future_folder = folder;
+    Ok(())
+}
+
+pub fn configure_tv_download_folder(
+    state: &VrDownloadState,
+    folder: Option<PathBuf>,
+) -> Result<(), &'static str> {
+    let mut context = state.0.lock().map_err(|_| VR_FOLDER_STORAGE_FAILED)?;
+    invalidate_organization_plan(&mut context);
+    context.tv_future_folder = folder;
     Ok(())
 }
 
@@ -660,6 +692,9 @@ fn transfer_identity(
     if let Some(movie_identity) = &source.movie_identity {
         identity_field(&mut identity, &encode_movie_identity(movie_identity));
     }
+    if let Some(tv_identity) = &source.tv_identity {
+        identity_field(&mut identity, &encode_tv_identity(tv_identity));
+    }
     identity_field(&mut identity, destination.to_string_lossy().as_bytes());
     for file in &source.selected_files {
         identity.extend_from_slice(&(file.file_id as u64).to_be_bytes());
@@ -701,6 +736,7 @@ fn transfer_from_source(
         code: source.code,
         release_name: source.release_name,
         movie_identity: source.movie_identity.map(Box::new),
+        tv_identity: source.tv_identity.map(Box::new),
         infohash: source.infohash,
         metainfo: source.bytes,
         selected_files: source.selected_files,
@@ -825,6 +861,60 @@ fn decode_movie_identity(value: &[u8]) -> Option<MovieDownloadIdentity> {
     (position == value.len()).then_some(identity)
 }
 
+fn encode_tv_identity(identity: &TvDownloadIdentity) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for value in [
+        identity.tmdb_tv_id.to_string(),
+        identity.show_name.clone(),
+        identity.provider_season_id.to_string(),
+        identity.season_number.to_string(),
+        identity.provider_episode_id.to_string(),
+        identity.episode_number.to_string(),
+        identity.episode_name.clone(),
+        identity.imdb_id.clone(),
+        identity.provider_item_id.clone(),
+        identity.provider_category.clone(),
+        identity.release_name.clone(),
+        identity.expected_infohash.clone(),
+    ] {
+        identity_field(&mut encoded, value.as_bytes());
+    }
+    encoded
+}
+
+fn decode_tv_identity(value: &[u8]) -> Option<TvDownloadIdentity> {
+    fn next_field<'a>(value: &'a [u8], position: &mut usize) -> Option<&'a [u8]> {
+        let length_end = position.checked_add(8)?;
+        let length = u64::from_be_bytes(value.get(*position..length_end)?.try_into().ok()?);
+        let length = usize::try_from(length).ok()?;
+        let field_end = length_end.checked_add(length)?;
+        let field = value.get(length_end..field_end)?;
+        *position = field_end;
+        Some(field)
+    }
+
+    fn next_text(value: &[u8], position: &mut usize) -> Option<String> {
+        String::from_utf8(next_field(value, position)?.to_vec()).ok()
+    }
+
+    let mut position = 0;
+    let identity = TvDownloadIdentity {
+        tmdb_tv_id: next_text(value, &mut position)?.parse().ok()?,
+        show_name: next_text(value, &mut position)?,
+        provider_season_id: next_text(value, &mut position)?.parse().ok()?,
+        season_number: next_text(value, &mut position)?.parse().ok()?,
+        provider_episode_id: next_text(value, &mut position)?.parse().ok()?,
+        episode_number: next_text(value, &mut position)?.parse().ok()?,
+        episode_name: next_text(value, &mut position)?,
+        imdb_id: next_text(value, &mut position)?,
+        provider_item_id: next_text(value, &mut position)?,
+        provider_category: next_text(value, &mut position)?,
+        release_name: next_text(value, &mut position)?,
+        expected_infohash: next_text(value, &mut position)?,
+    };
+    (position == value.len()).then_some(identity)
+}
+
 fn encoded_selected_ids(record: &TransferRecord) -> String {
     record
         .selected_files
@@ -894,6 +984,8 @@ fn encode_transfer_state(
     ];
     if let Some(identity) = &record.movie_identity {
         fields.push(encode_hex(&encode_movie_identity(identity)));
+    } else if let Some(identity) = &record.tv_identity {
+        fields.push(encode_hex(&encode_tv_identity(identity)));
     }
     Ok(fields.join("\t").into_bytes())
 }
@@ -958,125 +1050,161 @@ fn parse_boundary_segments(value: &[u8]) -> Option<BTreeMap<usize, Vec<SparseSeg
 
 fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRecord> {
     let fields = line.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-    let (fields, boundary_segments, organization_state, current_paths, category, movie_identity) =
-        match fields.as_slice() {
-            [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes]
-                if allow_legacy_vr =>
-            {
-                (
-                    [
-                        *transfer_id,
-                        *code,
-                        *release_name,
-                        *infohash,
-                        *destination,
-                        *state,
-                        *metainfo,
-                        *selected_ids,
-                        *fingerprints,
-                        *downloaded_bytes,
-                    ],
-                    BTreeMap::new(),
-                    OrganizationState::None,
-                    None,
-                    TransferCategory::Vr,
-                    None,
-                )
-            }
-            [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments]
-                if allow_legacy_vr =>
-            {
-                (
-                    [
-                        *transfer_id,
-                        *code,
-                        *release_name,
-                        *infohash,
-                        *destination,
-                        *state,
-                        *metainfo,
-                        *selected_ids,
-                        *fingerprints,
-                        *downloaded_bytes,
-                    ],
-                    parse_boundary_segments(boundary_segments)?,
-                    OrganizationState::None,
-                    None,
-                    TransferCategory::Vr,
-                    None,
-                )
-            }
-            [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths]
-                if allow_legacy_vr =>
-            {
-                (
-                    [
-                        *transfer_id,
-                        *code,
-                        *release_name,
-                        *infohash,
-                        *destination,
-                        *state,
-                        *metainfo,
-                        *selected_ids,
-                        *fingerprints,
-                        *downloaded_bytes,
-                    ],
-                    parse_boundary_segments(boundary_segments)?,
-                    OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
-                    Some(parse_current_paths(current_paths)?),
-                    TransferCategory::Vr,
-                    None,
-                )
-            }
-            [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths, category] => {
-                (
-                    [
-                        *transfer_id,
-                        *code,
-                        *release_name,
-                        *infohash,
-                        *destination,
-                        *state,
-                        *metainfo,
-                        *selected_ids,
-                        *fingerprints,
-                        *downloaded_bytes,
-                    ],
-                    parse_boundary_segments(boundary_segments)?,
-                    OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
-                    Some(parse_current_paths(current_paths)?),
-                    TransferCategory::from_str(std::str::from_utf8(category).ok()?)?,
-                    None,
-                )
-            }
-            [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths, category, movie_identity]
-                if std::str::from_utf8(category).ok()? == TransferCategory::Movie.as_str() =>
-            {
-                (
-                    [
-                        *transfer_id,
-                        *code,
-                        *release_name,
-                        *infohash,
-                        *destination,
-                        *state,
-                        *metainfo,
-                        *selected_ids,
-                        *fingerprints,
-                        *downloaded_bytes,
-                    ],
-                    parse_boundary_segments(boundary_segments)?,
-                    OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
-                    Some(parse_current_paths(current_paths)?),
-                    TransferCategory::Movie,
-                    Some(Box::new(decode_movie_identity(&decode_hex(
-                        movie_identity,
-                    )?)?)),
-                )
-            }
-            _ => return None,
-        };
+    let (
+        fields,
+        boundary_segments,
+        organization_state,
+        current_paths,
+        category,
+        movie_identity,
+        tv_identity,
+    ) = match fields.as_slice() {
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes]
+            if allow_legacy_vr =>
+        {
+            (
+                [
+                    *transfer_id,
+                    *code,
+                    *release_name,
+                    *infohash,
+                    *destination,
+                    *state,
+                    *metainfo,
+                    *selected_ids,
+                    *fingerprints,
+                    *downloaded_bytes,
+                ],
+                BTreeMap::new(),
+                OrganizationState::None,
+                None,
+                TransferCategory::Vr,
+                None,
+                None,
+            )
+        }
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments]
+            if allow_legacy_vr =>
+        {
+            (
+                [
+                    *transfer_id,
+                    *code,
+                    *release_name,
+                    *infohash,
+                    *destination,
+                    *state,
+                    *metainfo,
+                    *selected_ids,
+                    *fingerprints,
+                    *downloaded_bytes,
+                ],
+                parse_boundary_segments(boundary_segments)?,
+                OrganizationState::None,
+                None,
+                TransferCategory::Vr,
+                None,
+                None,
+            )
+        }
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths]
+            if allow_legacy_vr =>
+        {
+            (
+                [
+                    *transfer_id,
+                    *code,
+                    *release_name,
+                    *infohash,
+                    *destination,
+                    *state,
+                    *metainfo,
+                    *selected_ids,
+                    *fingerprints,
+                    *downloaded_bytes,
+                ],
+                parse_boundary_segments(boundary_segments)?,
+                OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
+                Some(parse_current_paths(current_paths)?),
+                TransferCategory::Vr,
+                None,
+                None,
+            )
+        }
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths, category] => {
+            (
+                [
+                    *transfer_id,
+                    *code,
+                    *release_name,
+                    *infohash,
+                    *destination,
+                    *state,
+                    *metainfo,
+                    *selected_ids,
+                    *fingerprints,
+                    *downloaded_bytes,
+                ],
+                parse_boundary_segments(boundary_segments)?,
+                OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
+                Some(parse_current_paths(current_paths)?),
+                TransferCategory::from_str(std::str::from_utf8(category).ok()?)?,
+                None,
+                None,
+            )
+        }
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths, category, movie_identity]
+            if std::str::from_utf8(category).ok()? == TransferCategory::Movie.as_str() =>
+        {
+            (
+                [
+                    *transfer_id,
+                    *code,
+                    *release_name,
+                    *infohash,
+                    *destination,
+                    *state,
+                    *metainfo,
+                    *selected_ids,
+                    *fingerprints,
+                    *downloaded_bytes,
+                ],
+                parse_boundary_segments(boundary_segments)?,
+                OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
+                Some(parse_current_paths(current_paths)?),
+                TransferCategory::Movie,
+                Some(Box::new(decode_movie_identity(&decode_hex(
+                    movie_identity,
+                )?)?)),
+                None,
+            )
+        }
+        [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes, boundary_segments, organization_state, current_paths, category, tv_identity]
+            if std::str::from_utf8(category).ok()? == TransferCategory::Tv.as_str() =>
+        {
+            (
+                [
+                    *transfer_id,
+                    *code,
+                    *release_name,
+                    *infohash,
+                    *destination,
+                    *state,
+                    *metainfo,
+                    *selected_ids,
+                    *fingerprints,
+                    *downloaded_bytes,
+                ],
+                parse_boundary_segments(boundary_segments)?,
+                OrganizationState::from_str(std::str::from_utf8(organization_state).ok()?)?,
+                Some(parse_current_paths(current_paths)?),
+                TransferCategory::Tv,
+                None,
+                Some(Box::new(decode_tv_identity(&decode_hex(tv_identity)?)?)),
+            )
+        }
+        _ => return None,
+    };
     let [transfer_id, code, release_name, infohash, destination, state, metainfo, selected_ids, fingerprints, downloaded_bytes] =
         fields;
     let transfer_id = decode_text(transfer_id)?;
@@ -1104,7 +1232,7 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
     let source = match category {
         TransferCategory::Movie => {
             let identity = movie_identity.as_ref()?;
-            if !code.is_empty() || release_name != identity.tmdb_title {
+            if tv_identity.is_some() || !code.is_empty() || release_name != identity.tmdb_title {
                 return None;
             }
             revalidate_persisted_movie_download_source(
@@ -1115,8 +1243,17 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
             )
             .ok()?
         }
+        TransferCategory::Tv => {
+            let identity = tv_identity.as_ref()?;
+            if movie_identity.is_some() || !code.is_empty() || release_name != identity.release_name
+            {
+                return None;
+            }
+            revalidate_persisted_tv_download_source(&metainfo, identity, &infohash, &selected_ids)
+                .ok()?
+        }
         TransferCategory::Adult | TransferCategory::Vr => {
-            if movie_identity.is_some() {
+            if movie_identity.is_some() || tv_identity.is_some() {
                 return None;
             }
             revalidate_persisted_download_source(
@@ -1158,6 +1295,7 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
             && (state != TransferState::Completed
                 || downloaded_bytes != selected_total
                 || fingerprints.len() != source.selected_files.len()))
+        || (category == TransferCategory::Tv && organization_state != OrganizationState::None)
     {
         return None;
     }
@@ -1168,6 +1306,7 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
         code,
         release_name,
         movie_identity,
+        tv_identity,
         infohash,
         metainfo,
         selected_files: source.selected_files,
@@ -1314,6 +1453,128 @@ fn write_persisted_transfers(
         return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
     }
     fs::write(path, bytes).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)
+}
+
+fn tv_completion_recovery_path(record: &TransferRecord) -> PathBuf {
+    record.destination.join(format!(
+        "{TV_COMPLETION_RECOVERY_PREFIX}{}{TV_COMPLETION_RECOVERY_SUFFIX}",
+        record.transfer_id
+    ))
+}
+
+fn encoded_tv_completion_recovery(record: &TransferRecord) -> Result<Vec<u8>, &'static str> {
+    if record.category != TransferCategory::Tv
+        || record.state != TransferState::Failed
+        || record.organization_state != OrganizationState::None
+    {
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+    }
+    let mut bytes = TV_COMPLETION_RECOVERY_HEADER.to_vec();
+    bytes.extend_from_slice(&encode_transfer(record)?);
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_PERSISTENCE_BYTES {
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+    }
+    Ok(bytes)
+}
+
+fn write_tv_completion_recovery(record: &TransferRecord) -> Result<(), &'static str> {
+    let path = tv_completion_recovery_path(record);
+    let bytes = encoded_tv_completion_recovery(record)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || fs::canonicalize(&path).ok().as_deref() != Some(path.as_path())
+                || fs::read(&path).ok().as_deref() != Some(bytes.as_slice())
+            {
+                return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)
+        }
+        Err(_) => Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+    }
+}
+
+fn remove_tv_completion_recovery(record: &TransferRecord) -> Result<(), &'static str> {
+    if record.category != TransferCategory::Tv {
+        return Ok(());
+    }
+    let path = tv_completion_recovery_path(record);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let recovered = parse_tv_completion_recovery(&path)
+                .filter(|recovered| recovered.transfer_id == record.transfer_id)
+                .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+            if recovered.destination != record.destination {
+                return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+    }
+}
+
+fn parse_tv_completion_recovery(path: &Path) -> Option<TransferRecord> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PERSISTENCE_BYTES
+    {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let line = bytes
+        .strip_prefix(TV_COMPLETION_RECOVERY_HEADER)?
+        .strip_suffix(b"\n")?;
+    let record = parse_transfer_line(line, false)?;
+    if record.category != TransferCategory::Tv
+        || record.state != TransferState::Failed
+        || record.organization_state != OrganizationState::None
+        || tv_completion_recovery_path(&record) != path
+    {
+        return None;
+    }
+    Some(record)
+}
+
+fn read_tv_completion_recoveries(destination: &Path) -> Vec<TransferRecord> {
+    let Ok(entries) = fs::read_dir(destination) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let transfer_id = name
+                .strip_prefix(TV_COMPLETION_RECOVERY_PREFIX)?
+                .strip_suffix(TV_COMPLETION_RECOVERY_SUFFIX)?;
+            (transfer_id.len() == 40 && transfer_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then_some(entry.path())
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.truncate(MAX_PERSISTED_TRANSFERS);
+    paths
+        .into_iter()
+        .filter_map(|path| parse_tv_completion_recovery(&path))
+        .collect()
 }
 
 fn organization_recovery_path(record: &TransferRecord) -> PathBuf {
@@ -1604,6 +1865,77 @@ fn session_options(download_limit: Option<NonZeroU32>) -> SessionOptions {
         },
         ..Default::default()
     }
+}
+
+fn tv_metadata_error(error: &anyhow::Error) -> &'static str {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if message.contains("no peer") || message.contains("no known way to resolve peers") {
+        TV_TORRENT_NO_PEERS
+    } else if message.contains("metadata not found") || message.contains("source unavailable") {
+        TV_TORRENT_SOURCE_UNAVAILABLE
+    } else {
+        TV_TORRENT_NETWORK_ERROR
+    }
+}
+
+async fn acquire_tv_metainfo(
+    session: Arc<Session>,
+    ticket: &TvInspectionTicket,
+) -> Result<Vec<u8>, &'static str> {
+    let magnet_url = ticket.magnet_url();
+    let trackers = TV_METADATA_TRACKERS
+        .iter()
+        .map(|tracker| (*tracker).to_owned())
+        .collect();
+    let (sender, receiver) = mpsc::channel();
+    let acquisition_session = session.clone();
+    let acquisition = tauri::async_runtime::spawn(async move {
+        let response = acquisition_session
+            .add_torrent(
+                AddTorrent::from_url(magnet_url),
+                Some(AddTorrentOptions {
+                    list_only: true,
+                    trackers: Some(trackers),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let _ = sender.send(response);
+    });
+    let received =
+        tauri::async_runtime::spawn_blocking(move || receiver.recv_timeout(TV_METADATA_TIMEOUT))
+            .await
+            .map_err(|_| TV_TORRENT_NETWORK_ERROR)?;
+    let response = match received {
+        Ok(response) => response.map_err(|error| tv_metadata_error(&error))?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            acquisition.abort();
+            return Err(TV_TORRENT_TIMEOUT);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => return Err(TV_TORRENT_NETWORK_ERROR),
+    };
+    match response {
+        AddTorrentResponse::ListOnly(metadata) => Ok(metadata.torrent_bytes.to_vec()),
+        AddTorrentResponse::Added(_, handle) => {
+            let _ = session.delete(handle.id().into(), false).await;
+            Err(TV_TORRENT_NETWORK_ERROR)
+        }
+        AddTorrentResponse::AlreadyManaged(_, _) => Err(TV_TORRENT_NETWORK_ERROR),
+    }
+}
+
+pub async fn inspect_tv_torrent(
+    download_state: &VrDownloadState,
+    torrent_state: &TvReleaseState,
+    session_folder: &Path,
+    request: TvTorrentInspectionRequest,
+) -> Result<Vec<String>, &'static str> {
+    let ticket = torrent_state.begin_inspection(request)?;
+    let session = session_for(download_state, session_folder)
+        .await
+        .map_err(|_| TV_TORRENT_NETWORK_ERROR)?;
+    let bytes = acquire_tv_metainfo(session, &ticket).await?;
+    torrent_state.finish_inspection(ticket, bytes)
 }
 
 #[derive(Clone)]
@@ -2130,6 +2462,66 @@ fn has_active_duplicate(transfers: &[StoredTransfer], infohash: &str, destinatio
     })
 }
 
+fn finalize_monitored_transfer_with(
+    context: &mut VrDownloadContext,
+    transfer_id: &str,
+    handle_generation: u64,
+    completed: bool,
+    persistence_path: &Path,
+    mut persist: impl FnMut(&Path, &[StoredTransfer]) -> Result<(), &'static str>,
+) -> bool {
+    let mut tv_recovery_saved = false;
+    {
+        let Some(record) = find_valid_record_mut(&mut context.transfers, transfer_id) else {
+            return false;
+        };
+        if record.handle_generation != handle_generation || !record.state.is_active() {
+            return false;
+        }
+        record.handle = None;
+        record.pending_action = None;
+        if completed {
+            record.downloaded_bytes = record.selected_total();
+            if record.category == TransferCategory::Tv {
+                record.state = TransferState::Failed;
+                tv_recovery_saved = write_tv_completion_recovery(record).is_ok();
+            }
+            record.state = TransferState::Completed;
+        } else {
+            record.state = TransferState::Failed;
+        }
+    }
+
+    let terminal_state_persisted = persist(persistence_path, &context.transfers).is_ok();
+    if completed && terminal_state_persisted {
+        let recovery_removed = !tv_recovery_saved
+            || find_valid_record_mut(&mut context.transfers, transfer_id)
+                .is_some_and(|record| remove_tv_completion_recovery(record).is_ok());
+        if recovery_removed {
+            return true;
+        }
+    }
+
+    if completed {
+        if let Some(record) = find_valid_record_mut(&mut context.transfers, transfer_id) {
+            record.state = TransferState::Failed;
+            if record.category == TransferCategory::Tv && !tv_recovery_saved {
+                tv_recovery_saved = write_tv_completion_recovery(record).is_ok();
+            }
+        }
+        if persist(persistence_path, &context.transfers).is_ok() && tv_recovery_saved {
+            if let Some(record) = find_valid_record_mut(&mut context.transfers, transfer_id) {
+                let _ = remove_tv_completion_recovery(record);
+            }
+        }
+    } else if !terminal_state_persisted {
+        if let Some(record) = find_valid_record_mut(&mut context.transfers, transfer_id) {
+            let _ = write_tv_completion_recovery(record);
+        }
+    }
+    true
+}
+
 fn spawn_completion_monitor(
     state: VrDownloadState,
     session: Arc<Session>,
@@ -2140,28 +2532,23 @@ fn spawn_completion_monitor(
 ) {
     tauri::async_runtime::spawn(async move {
         let result = handle.wait_until_completed().await;
-        {
+        let should_remove_handle = {
             let mut context = match state.0.lock() {
                 Ok(context) => context,
                 Err(_) => return,
             };
-            let Some(record) = find_valid_record_mut(&mut context.transfers, &transfer_id) else {
-                return;
-            };
-            if record.handle_generation != handle_generation || !record.state.is_active() {
-                return;
-            }
-            record.handle = None;
-            record.pending_action = None;
-            if result.is_ok() {
-                record.state = TransferState::Completed;
-                record.downloaded_bytes = record.selected_total();
-            } else {
-                record.state = TransferState::Failed;
-            }
-            let _ = write_persisted_transfers(&persistence_path, &context.transfers);
+            finalize_monitored_transfer_with(
+                &mut context,
+                &transfer_id,
+                handle_generation,
+                result.is_ok(),
+                &persistence_path,
+                write_persisted_transfers,
+            )
+        };
+        if should_remove_handle {
+            let _ = session.delete(handle.id().into(), false).await;
         }
-        let _ = session.delete(handle.id().into(), false).await;
     });
 }
 
@@ -2203,6 +2590,7 @@ async fn restore_record(
             code: record.code.clone(),
             release_name: record.release_name.clone(),
             movie_identity: record.movie_identity.clone(),
+            tv_identity: record.tv_identity.clone(),
             infohash: record.infohash.clone(),
             metainfo: record.metainfo.clone(),
             selected_files: record.selected_files.clone(),
@@ -2300,7 +2688,7 @@ pub async fn load_downloads(
     download_limit_path: &Path,
 ) -> Result<Vec<String>, &'static str> {
     load_download_limit(state, download_limit_path)?;
-    let recovery_destinations = {
+    let (organization_recovery_destinations, current_tv_destination) = {
         let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
         if context.transfers_loaded {
             return Ok(download_rows(&mut context));
@@ -2309,15 +2697,18 @@ pub async fn load_downloads(
             return Err(VR_DOWNLOAD_ACTION_INVALID);
         }
         context.transfers_loading = true;
-        [
-            (TransferCategory::Vr, context.future_folder.clone()),
-            (TransferCategory::Adult, context.adult_future_folder.clone()),
-            (TransferCategory::Movie, context.movie_future_folder.clone()),
-        ]
+        (
+            [
+                (TransferCategory::Vr, context.future_folder.clone()),
+                (TransferCategory::Adult, context.adult_future_folder.clone()),
+                (TransferCategory::Movie, context.movie_future_folder.clone()),
+            ],
+            context.tv_future_folder.clone(),
+        )
     };
     let persisted_transfers = read_persisted_transfers(persistence_path);
     let mut recovered_transfer_ids = BTreeSet::new();
-    let recoveries = recovery_destinations
+    let recoveries = organization_recovery_destinations
         .into_iter()
         .filter_map(|(category, destination)| {
             destination.map(|destination| (category, destination))
@@ -2329,7 +2720,23 @@ pub async fn load_downloads(
         })
         .filter(|record| recovered_transfer_ids.insert(record.transfer_id.clone()))
         .collect::<Vec<_>>();
-    let has_durable_recovery = !recoveries.is_empty();
+    let mut tv_completion_destinations =
+        current_tv_destination.into_iter().collect::<BTreeSet<_>>();
+    if let Ok(transfers) = &persisted_transfers {
+        tv_completion_destinations.extend(transfers.iter().filter_map(|transfer| match transfer {
+            StoredTransfer::Valid(record) if record.category == TransferCategory::Tv => {
+                Some(record.destination.clone())
+            }
+            _ => None,
+        }));
+    }
+    let mut recovered_tv_transfer_ids = BTreeSet::new();
+    let tv_completion_recoveries = tv_completion_destinations
+        .into_iter()
+        .flat_map(|destination| read_tv_completion_recoveries(&destination))
+        .filter(|record| recovered_tv_transfer_ids.insert(record.transfer_id.clone()))
+        .collect::<Vec<_>>();
+    let has_durable_recovery = !recoveries.is_empty() || !tv_completion_recoveries.is_empty();
     let mut transfers = match persisted_transfers {
         Ok(transfers) => transfers,
         Err(_) if has_durable_recovery => Vec::new(),
@@ -2355,6 +2762,18 @@ pub async fn load_downloads(
                     transfers[index] = StoredTransfer::Valid(recovered);
                 }
             }
+            None if transfers.len() < MAX_PERSISTED_TRANSFERS => {
+                transfers.push(StoredTransfer::Valid(recovered));
+            }
+            None => {}
+        }
+    }
+    for recovered in tv_completion_recoveries {
+        let existing = transfers.iter().position(|transfer| {
+            matches!(transfer, StoredTransfer::Valid(record) if record.transfer_id == recovered.transfer_id)
+        });
+        match existing {
+            Some(index) => transfers[index] = StoredTransfer::Valid(recovered),
             None if transfers.len() < MAX_PERSISTED_TRANSFERS => {
                 transfers.push(StoredTransfer::Valid(recovered));
             }
@@ -2637,6 +3056,7 @@ fn organization_identity(record: &TransferRecord) -> Result<String, &'static str
             .as_ref()
             .map(|identity| identity.imdb_id.clone())
             .ok_or(VR_ORGANIZATION_INELIGIBLE),
+        TransferCategory::Tv => Err(VR_ORGANIZATION_INELIGIBLE),
     }
 }
 
@@ -2649,6 +3069,7 @@ fn organization_directory_name(record: &TransferRecord) -> Result<String, &'stat
                 .as_deref()
                 .ok_or(VR_ORGANIZATION_INELIGIBLE)?,
         ),
+        TransferCategory::Tv => Err(VR_ORGANIZATION_INELIGIBLE),
     }
 }
 
@@ -2740,6 +3161,7 @@ fn organization_destination_relative(
                 }
                 TransferCategory::Vr => media_name_matches_product_code(source_title, &record.code),
                 TransferCategory::Movie => unreachable!(),
+                TransferCategory::Tv => unreachable!(),
             };
             if !identity_matches {
                 return Err(VR_ORGANIZATION_INELIGIBLE);
@@ -2752,6 +3174,7 @@ fn organization_destination_relative(
                 source_name.to_owned()
             }
         }
+        TransferCategory::Tv => return Err(VR_ORGANIZATION_INELIGIBLE),
     };
     let destination_relative = format!("{directory_name}/{destination_name}");
     relative_file_path(&destination_relative).map_err(|_| VR_ORGANIZATION_CONFLICT)?;
@@ -2762,7 +3185,8 @@ fn organization_entries(
     record: &TransferRecord,
     current_folder: Option<&Path>,
 ) -> Result<Vec<OrganizationEntry>, &'static str> {
-    if record.state != TransferState::Completed
+    if record.category == TransferCategory::Tv
+        || record.state != TransferState::Completed
         || record.handle.is_some()
         || record.pending_action.is_some()
         || record.organization_state == OrganizationState::Organized
@@ -3029,6 +3453,7 @@ fn apply_organization_with_persistence(
     let current_folder = match plan.category {
         TransferCategory::Adult => context.adult_future_folder.clone(),
         TransferCategory::Movie => context.movie_future_folder.clone(),
+        TransferCategory::Tv => None,
         TransferCategory::Vr => context.future_folder.clone(),
     };
     let record_index = context
@@ -3221,12 +3646,14 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
     let current_vr_folder = context.future_folder.clone();
     let current_adult_folder = context.adult_future_folder.clone();
     let current_movie_folder = context.movie_future_folder.clone();
+    let current_tv_folder = context.tv_future_folder.clone();
     for transfer in &mut context.transfers {
         match transfer {
             StoredTransfer::Valid(record) => {
                 let current_folder = match record.category {
                     TransferCategory::Adult => &current_adult_folder,
                     TransferCategory::Movie => &current_movie_folder,
+                    TransferCategory::Tv => &current_tv_folder,
                     TransferCategory::Vr => &current_vr_folder,
                 };
                 let mut speed = 0;
@@ -3260,6 +3687,16 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                         .movie_identity
                         .as_ref()
                         .map(|identity| identity.imdb_id.clone())
+                        .or_else(|| {
+                            record.tv_identity.as_ref().map(|identity| {
+                                format!(
+                                    "{} S{:02}E{:02}",
+                                    identity.show_name,
+                                    identity.season_number,
+                                    identity.episode_number
+                                )
+                            })
+                        })
                         .unwrap_or_else(|| record.code.clone()),
                     record.release_name.clone(),
                     record.selected_files.len().to_string(),
@@ -3328,6 +3765,7 @@ pub fn list_downloads(
             for transfer in &context.transfers {
                 if let StoredTransfer::Valid(record) = transfer {
                     clear_organization_recovery(record);
+                    let _ = remove_tv_completion_recovery(record);
                 }
             }
             Ok(rows)
@@ -3347,12 +3785,23 @@ async fn start_download_source(
     let source_matches_category = match category {
         TransferCategory::Movie => {
             source.code.is_empty()
+                && source.tv_identity.is_none()
                 && source.movie_identity.as_ref().is_some_and(|identity| {
                     source.release_name == identity.tmdb_title
                         && source.infohash == identity.expected_infohash
                 })
         }
-        TransferCategory::Adult | TransferCategory::Vr => source.movie_identity.is_none(),
+        TransferCategory::Tv => {
+            source.code.is_empty()
+                && source.movie_identity.is_none()
+                && source.tv_identity.as_ref().is_some_and(|identity| {
+                    source.release_name == identity.release_name
+                        && source.infohash == identity.expected_infohash
+                })
+        }
+        TransferCategory::Adult | TransferCategory::Vr => {
+            source.movie_identity.is_none() && source.tv_identity.is_none()
+        }
     };
     if !source_matches_category {
         return Err(VR_DOWNLOAD_CONTEXT_INVALID);
@@ -3369,6 +3818,7 @@ async fn start_download_source(
         let future_folder = match category {
             TransferCategory::Adult => context.adult_future_folder.as_deref(),
             TransferCategory::Movie => context.movie_future_folder.as_deref(),
+            TransferCategory::Tv => context.tv_future_folder.as_deref(),
             TransferCategory::Vr => context.future_folder.as_deref(),
         };
         let destination = canonical_destination(future_folder.ok_or(VR_FOLDER_UNAVAILABLE)?)?;
@@ -3415,6 +3865,7 @@ async fn start_download_source(
                         code: record.code.clone(),
                         release_name: record.release_name.clone(),
                         movie_identity: record.movie_identity.clone(),
+                        tv_identity: record.tv_identity.clone(),
                         infohash: record.infohash.clone(),
                         metainfo: record.metainfo.clone(),
                         selected_files: record.selected_files.clone(),
@@ -3544,6 +3995,27 @@ pub async fn start_movie_download(
         persistence_path,
         session_folder,
         TransferCategory::Movie,
+        source,
+    )
+    .await
+}
+
+pub async fn start_tv_download(
+    state: &VrDownloadState,
+    torrent_state: &TvReleaseState,
+    persistence_path: &Path,
+    session_folder: &Path,
+    inspection_id: &str,
+    selected_file_ids: &[usize],
+) -> Result<String, &'static str> {
+    let source = torrent_state
+        .verified_download_source(inspection_id, selected_file_ids)
+        .map_err(map_source_error)?;
+    start_download_source(
+        state,
+        persistence_path,
+        session_folder,
+        TransferCategory::Tv,
         source,
     )
     .await
@@ -3698,7 +4170,9 @@ pub fn dismiss_download(
         return Err(error);
     }
     if let StoredTransfer::Valid(record) = &dismissed {
-        if let Err(error) = remove_organization_recovery(record) {
+        if let Err(error) = remove_tv_completion_recovery(record)
+            .and_then(|()| remove_organization_recovery(record))
+        {
             context.transfers.insert(position, dismissed);
             let _ = write_persisted_transfers(persistence_path, &context.transfers);
             return Err(error);
@@ -3746,6 +4220,7 @@ mod tests {
             infohash: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             release_name: "【VR】 MDVR-419  Exact — 特別版".to_owned(),
             movie_identity: None,
+            tv_identity: None,
             selected_files: vec![VerifiedDownloadFile {
                 file_id: 0,
                 path: "Folder/Part  1 — 映画.mkv".to_owned(),
@@ -3761,6 +4236,7 @@ mod tests {
             infohash: "8b16011989123e1d68a8aaf18f5a599e6a4a0bc7".to_owned(),
             release_name: "【VR】 MDVR-419  Exact — 特別版".to_owned(),
             movie_identity: None,
+            tv_identity: None,
             selected_files: vec![VerifiedDownloadFile {
                 file_id: 0,
                 path: "Movie  A.mp4".to_owned(),
@@ -3776,6 +4252,37 @@ mod tests {
             infohash: "8b16011989123e1d68a8aaf18f5a599e6a4a0bc7".to_owned(),
             release_name: "【Adult】 ADLT-123  Exact — 特別版".to_owned(),
             movie_identity: None,
+            tv_identity: None,
+            selected_files: vec![VerifiedDownloadFile {
+                file_id: 0,
+                path: "Movie  A.mp4".to_owned(),
+                size: 5,
+            }],
+        }
+    }
+
+    fn persistable_tv_fixture_source() -> VerifiedDownloadSource {
+        let infohash = "8b16011989123e1d68a8aaf18f5a599e6a4a0bc7".to_owned();
+        VerifiedDownloadSource {
+            bytes: b"d4:infod6:lengthi5e4:name12:Movie  A.mp412:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec(),
+            code: String::new(),
+            infohash: infohash.clone(),
+            release_name: "Exact  Show — 特別版.S02E03+720p.第三話".to_owned(),
+            movie_identity: None,
+            tv_identity: Some(TvDownloadIdentity {
+                tmdb_tv_id: 701,
+                show_name: "Exact  Show — 特別版".to_owned(),
+                provider_season_id: 9001,
+                season_number: 2,
+                provider_episode_id: 9103,
+                episode_number: 3,
+                episode_name: "第三話  —  Exact Episode".to_owned(),
+                imdb_id: "tt0123456".to_owned(),
+                provider_item_id: "1001".to_owned(),
+                provider_category: "205".to_owned(),
+                release_name: "Exact  Show — 特別版.S02E03+720p.第三話".to_owned(),
+                expected_infohash: infohash,
+            }),
             selected_files: vec![VerifiedDownloadFile {
                 file_id: 0,
                 path: "Movie  A.mp4".to_owned(),
@@ -3791,6 +4298,7 @@ mod tests {
             infohash: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             release_name: "【VR】 MDVR-419  Exact — 特別版".to_owned(),
             movie_identity: None,
+            tv_identity: None,
             selected_files: files
                 .into_iter()
                 .enumerate()
@@ -3810,6 +4318,7 @@ mod tests {
             infohash: "89abcdef0123456789abcdef0123456789abcdef".to_owned(),
             release_name: "【Adult】 ADLT-123  Exact — 特別版".to_owned(),
             movie_identity: None,
+            tv_identity: None,
             selected_files: files
                 .into_iter()
                 .enumerate()
@@ -3938,6 +4447,7 @@ mod tests {
             match category {
                 TransferCategory::Adult => context.adult_future_folder = Some(destination),
                 TransferCategory::Movie => context.movie_future_folder = Some(destination),
+                TransferCategory::Tv => context.tv_future_folder = Some(destination),
                 TransferCategory::Vr => context.future_folder = Some(destination),
             }
             context.transfers_loaded = true;
@@ -6272,6 +6782,110 @@ mod tests {
         encoded
     }
 
+    fn tv_boundary_fixture_source() -> VerifiedDownloadSource {
+        let metainfo = selected_file_torrent();
+        let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+        let identity = TvDownloadIdentity {
+            tmdb_tv_id: 701,
+            show_name: "Exact  Show — 特別版".to_owned(),
+            provider_season_id: 9001,
+            season_number: 2,
+            provider_episode_id: 9103,
+            episode_number: 3,
+            episode_name: "第三話  —  Exact Episode".to_owned(),
+            imdb_id: "tt0123456".to_owned(),
+            provider_item_id: "1001".to_owned(),
+            provider_category: "205".to_owned(),
+            release_name: "Exact  Show — 特別版.S02E03+720p.第三話".to_owned(),
+            expected_infohash: infohash.clone(),
+        };
+        revalidate_persisted_tv_download_source(&metainfo, &identity, &infohash, &[1])
+            .expect("TV boundary fixture must revalidate")
+    }
+
+    fn cache_tv_boundary_inspection(state: &TvReleaseState, metainfo: Vec<u8>) -> String {
+        let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+        let generation = state
+            .begin_release_lookup()
+            .expect("TV release lookup must start");
+        crate::tv_release::fetch_apibay_tv_releases_for_state_with(
+            state,
+            generation,
+            701,
+            9001,
+            9103,
+            "test-token",
+            |url, _| {
+                if url.ends_with("/tv/701") {
+                    Ok(r#"{"id":701,"name":"Exact  Show — 特別版","seasons":[{"id":9001,"season_number":2}]}"#.to_owned())
+                } else if url.ends_with("/tv/701/season/2") {
+                    Ok(r#"{"id":9001,"season_number":2,"episodes":[{"id":9103,"episode_number":3,"season_number":2,"name":"第三話  —  Exact Episode"}]}"#.to_owned())
+                } else if url.ends_with("/tv/701/external_ids") {
+                    Ok(r#"{"id":701,"imdb_id":"tt0123456"}"#.to_owned())
+                } else if url.contains("cat=205") {
+                    Ok(format!(
+                        r#"[{{"id":"1001","name":"Exact  Show — 特別版.S02E03+720p.第三話","category":"205","imdb":"tt0123456","info_hash":"{infohash}"}}]"#
+                    ))
+                } else if url.contains("cat=208") {
+                    Ok("[]".to_owned())
+                } else {
+                    panic!("unexpected TV provider request: {url}")
+                }
+            },
+        )
+        .expect("trusted TV release must load");
+        let ticket = state
+            .begin_inspection(TvTorrentInspectionRequest {
+                tmdb_tv_id: 701,
+                show_name: "Exact  Show — 特別版".to_owned(),
+                provider_season_id: 9001,
+                season_number: 2,
+                provider_episode_id: 9103,
+                episode_number: 3,
+                episode_name: "第三話  —  Exact Episode".to_owned(),
+                imdb_id: "tt0123456".to_owned(),
+                provider_item_id: "1001".to_owned(),
+                provider_category: "205".to_owned(),
+                release_name: "Exact  Show — 特別版.S02E03+720p.第三話".to_owned(),
+                expected_infohash: infohash,
+            })
+            .expect("trusted TV inspection must start");
+        state
+            .finish_inspection(ticket, metainfo)
+            .expect("trusted TV inspection must finish")[0]
+            .clone()
+    }
+
+    fn locally_completed_tv_boundary_record(
+        fixture: &FilesystemFixture,
+        directory_name: &str,
+    ) -> TransferRecord {
+        let destination = fixture.path.join(directory_name);
+        fs::create_dir_all(destination.join("Folder")).expect("TV selected file parent must exist");
+        let destination = fs::canonicalize(destination).expect("TV destination must canonicalize");
+        let mut record = transfer_from_source(
+            TransferCategory::Tv,
+            tv_boundary_fixture_source(),
+            destination,
+            TransferState::Downloading,
+        );
+        fs::write(record.destination.join("Folder/特別版  B.mp4"), b"1234567")
+            .expect("completed selected TV media must exist");
+        record.fingerprints =
+            capture_fingerprints(&record).expect("TV media fingerprint must resolve");
+        let storage = SelectedFileStorage {
+            destination: record.destination.clone(),
+            selected_files: Arc::new(BTreeMap::new()),
+            boundary_segments: record.boundary_segments.clone(),
+            resume: true,
+            slots: vec![SelectedStorageSlot::new(None)],
+        };
+        storage
+            .pwrite_all(0, 0, b"abc")
+            .expect("deselected TV boundary bytes must remain retained");
+        record
+    }
+
     fn completed_file_torrent(contents: &[u8]) -> Vec<u8> {
         let mut encoded = b"d4:infod6:lengthi".to_vec();
         encoded.extend_from_slice(contents.len().to_string().as_bytes());
@@ -6713,6 +7327,172 @@ mod tests {
             .expect("state must lock")
             .session
             .is_none());
+    }
+
+    #[test]
+    fn tv_completion_persistence_failure_reloads_failed_and_preserves_all_media() {
+        let fixture = FilesystemFixture::new();
+        let record = locally_completed_tv_boundary_record(&fixture, "TV — failed completion");
+        let transfer_id = record.transfer_id.clone();
+        let destination = record.destination.clone();
+        let persistence_path = fixture.path.join("downloads");
+        write_persisted_transfers(&persistence_path, &[StoredTransfer::Valid(record)])
+            .expect("active TV state must persist before completion");
+        let state = VrDownloadState::default();
+        configure_tv_download_folder(&state, Some(destination.clone()))
+            .expect("TV folder must configure");
+        {
+            let mut context = state.0.lock().expect("state must lock");
+            context.transfers_loaded = true;
+            context.transfers = read_persisted_transfers(&persistence_path)
+                .expect("active TV state must reload for completion");
+            let mut persistence_attempts = 0;
+            assert!(finalize_monitored_transfer_with(
+                &mut context,
+                &transfer_id,
+                0,
+                true,
+                &persistence_path,
+                |_path, transfers| {
+                    persistence_attempts += 1;
+                    if persistence_attempts == 1 {
+                        assert!(matches!(
+                            &transfers[0],
+                            StoredTransfer::Valid(record)
+                                if record.state == TransferState::Completed
+                        ));
+                    } else {
+                        assert!(matches!(
+                            &transfers[0],
+                            StoredTransfer::Valid(record)
+                                if record.state == TransferState::Failed
+                        ));
+                    }
+                    Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+                },
+            ));
+            assert_eq!(persistence_attempts, 2);
+            assert_eq!(download_rows(&mut context)[8], "failed");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("failed TV completion must remain valid");
+            };
+            assert!(tv_completion_recovery_path(record).is_file());
+        }
+
+        let restarted = VrDownloadState::default();
+        configure_tv_download_folder(&restarted, Some(destination.clone()))
+            .expect("restarted TV folder must configure");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("failed-completion-session"),
+            &fixture.path.join("download-limit"),
+        ))
+        .expect("failed completion must remain restart recoverable");
+        assert_eq!(rows[0], transfer_id);
+        assert_eq!(rows[1], "tv");
+        assert_eq!(rows[6], "7");
+        assert_eq!(rows[8], "failed");
+        assert_eq!(rows[10], "none");
+        assert_eq!(rows[12], "false");
+        assert!(restarted
+            .0
+            .lock()
+            .expect("state must lock")
+            .session
+            .is_none());
+        assert!(!destination
+            .join(format!(
+                "{TV_COMPLETION_RECOVERY_PREFIX}{transfer_id}{TV_COMPLETION_RECOVERY_SUFFIX}"
+            ))
+            .exists());
+        assert_eq!(
+            preview_organization(&restarted, &transfer_id),
+            Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+        {
+            let context = restarted.0.lock().expect("state must lock");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("failed TV completion must remain valid");
+            };
+            let boundary_segments = record
+                .boundary_segments
+                .lock()
+                .expect("boundary state must lock");
+            assert_eq!(boundary_segments[&0][0].bytes, b"abc");
+        }
+        assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
+        assert_eq!(
+            fs::read(destination.join("Folder/特別版  B.mp4"))
+                .expect("selected TV media must remain"),
+            b"1234567"
+        );
+        dismiss_download(&restarted, &persistence_path, &transfer_id)
+            .expect("failed TV completion must remain dismissible");
+        assert_eq!(
+            fs::read(destination.join("Folder/特別版  B.mp4"))
+                .expect("dismiss must retain selected TV media"),
+            b"1234567"
+        );
+    }
+
+    #[test]
+    fn persisted_tv_completion_reloads_completed_and_non_running() {
+        let fixture = FilesystemFixture::new();
+        let record = locally_completed_tv_boundary_record(&fixture, "TV — saved completion");
+        let transfer_id = record.transfer_id.clone();
+        let destination = record.destination.clone();
+        let persistence_path = fixture.path.join("downloads");
+        let state = VrDownloadState::default();
+        configure_tv_download_folder(&state, Some(destination.clone()))
+            .expect("TV folder must configure");
+        {
+            let mut context = state.0.lock().expect("state must lock");
+            context.transfers_loaded = true;
+            context.transfers.push(StoredTransfer::Valid(record));
+            assert!(finalize_monitored_transfer_with(
+                &mut context,
+                &transfer_id,
+                0,
+                true,
+                &persistence_path,
+                write_persisted_transfers,
+            ));
+        }
+
+        let restarted = VrDownloadState::default();
+        configure_tv_download_folder(&restarted, Some(destination.clone()))
+            .expect("restarted TV folder must configure");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("completed-session"),
+            &fixture.path.join("download-limit"),
+        ))
+        .expect("persisted TV completion must reload");
+        assert_eq!(rows[0], transfer_id);
+        assert_eq!(rows[1], "tv");
+        assert_eq!(rows[6], "7");
+        assert_eq!(rows[8], "completed");
+        assert_eq!(rows[10], "none");
+        assert_eq!(rows[12], "false");
+        assert!(restarted
+            .0
+            .lock()
+            .expect("state must lock")
+            .session
+            .is_none());
+        assert!(!destination
+            .join(format!(
+                "{TV_COMPLETION_RECOVERY_PREFIX}{transfer_id}{TV_COMPLETION_RECOVERY_SUFFIX}"
+            ))
+            .exists());
+        assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
+        assert_eq!(
+            fs::read(destination.join("Folder/特別版  B.mp4"))
+                .expect("completed TV media must remain"),
+            b"1234567"
+        );
     }
 
     #[test]
@@ -7359,5 +8139,272 @@ mod tests {
                 .expect("cancelled local transfer must dismiss");
             assert!(destination.join("Folder/特別版  B.mp4").is_file());
         });
+    }
+
+    #[test]
+    fn active_tv_start_restarts_resumes_cancels_restarts_and_dismisses_without_data_loss() {
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("TV — acquisition");
+        fs::create_dir(&destination).expect("TV destination must exist");
+        let destination = fs::canonicalize(destination).expect("TV destination must canonicalize");
+        let persistence_path = fixture.path.join("downloads");
+        let download_limit_path = fixture.path.join("download-limit");
+        fs::write(&download_limit_path, b"2\n").expect("aggregate limit must persist");
+        let metainfo = selected_file_torrent();
+        let metadata = crate::vr_torrent::parse_torrent_metadata(&metainfo)
+            .expect("TV boundary metainfo must parse");
+        assert_eq!(metadata.files.len(), 2);
+        assert_eq!(metadata.total_size, 10);
+        let torrent_state = TvReleaseState::default();
+        let inspection_id = cache_tv_boundary_inspection(&torrent_state, metainfo);
+        let state = VrDownloadState::default();
+        configure_tv_download_folder(&state, Some(destination.clone()))
+            .expect("TV folder must configure");
+
+        tauri::async_runtime::block_on(async {
+            load_downloads(
+                &state,
+                &persistence_path,
+                &fixture.path.join("initial-session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("empty TV download state must load");
+            let transfer_id = start_tv_download(
+                &state,
+                &torrent_state,
+                &persistence_path,
+                &fixture.path.join("initial-session"),
+                &inspection_id,
+                &[1],
+            )
+            .await
+            .expect("verified selected TV file must start");
+            let rows = list_downloads(&state, &persistence_path)
+                .expect("started TV transfer must remain readable");
+            assert_eq!(rows[0], transfer_id);
+            assert_eq!(rows[1], "tv");
+            assert_eq!(rows[4], "1");
+            assert_eq!(rows[5], "7");
+            assert_eq!(rows[8], "downloading");
+            assert_eq!(rows[10], "none");
+            assert_eq!(rows[12], "false");
+            assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
+            assert!(destination.join("Folder/特別版  B.mp4").is_file());
+            assert_eq!(
+                state.0.lock().expect("state must lock").download_limit,
+                DownloadLimitState::Loaded(NonZeroU32::new(2))
+            );
+
+            pause_download(&state, &persistence_path, &transfer_id)
+                .await
+                .expect("active TV transfer must pause before restart");
+            let (old_session, old_handle) = {
+                let mut context = state.0.lock().expect("state must lock");
+                let session = context.session.clone().expect("session must exist");
+                let record = find_valid_record_mut(&mut context.transfers, &transfer_id)
+                    .expect("paused TV transfer must exist");
+                record.handle_generation = record.handle_generation.wrapping_add(1);
+                let handle = record.handle.take().expect("paused TV handle must exist");
+                write_persisted_transfers(&persistence_path, &context.transfers)
+                    .expect("paused TV transfer must persist");
+                (session, handle)
+            };
+            old_session
+                .delete(old_handle.id().into(), false)
+                .await
+                .expect("old TV session must detach without deleting files");
+
+            let resumed = VrDownloadState::default();
+            configure_tv_download_folder(&resumed, Some(destination.clone()))
+                .expect("restarted TV folder must configure");
+            let resumed_rows = load_downloads(
+                &resumed,
+                &persistence_path,
+                &fixture.path.join("resumed-session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("paused TV transfer must restore");
+            assert_eq!(resumed_rows[0], transfer_id);
+            assert_eq!(resumed_rows[1], "tv");
+            assert_eq!(resumed_rows[8], "paused");
+            assert_eq!(resumed_rows[10], "none");
+            assert_eq!(resumed_rows[12], "false");
+            assert_eq!(
+                resumed.0.lock().expect("state must lock").download_limit,
+                DownloadLimitState::Loaded(NonZeroU32::new(2))
+            );
+            assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
+            resume_download(&resumed, &persistence_path, &transfer_id)
+                .await
+                .expect("restarted TV transfer must resume");
+            fs::write(destination.join("Folder/特別版  B.mp4"), b"partial")
+                .expect("partial selected TV media must remain writable");
+            cancel_download(&resumed, &persistence_path, &transfer_id)
+                .await
+                .expect("resumed TV transfer must cancel without deleting files");
+            assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
+            assert_eq!(
+                fs::read(destination.join("Folder/特別版  B.mp4"))
+                    .expect("cancelled TV media must remain"),
+                b"partial"
+            );
+
+            let cancelled = VrDownloadState::default();
+            configure_tv_download_folder(&cancelled, Some(destination.clone()))
+                .expect("cancelled restart TV folder must configure");
+            let cancelled_rows = load_downloads(
+                &cancelled,
+                &persistence_path,
+                &fixture.path.join("cancelled-session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("cancelled TV transfer must reload");
+            assert_eq!(cancelled_rows[0], transfer_id);
+            assert_eq!(cancelled_rows[1], "tv");
+            assert_eq!(cancelled_rows[8], "cancelled");
+            assert_eq!(cancelled_rows[10], "none");
+            assert_eq!(cancelled_rows[12], "false");
+            assert!(cancelled
+                .0
+                .lock()
+                .expect("state must lock")
+                .session
+                .is_none());
+            assert_eq!(
+                preview_organization(&cancelled, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE)
+            );
+            dismiss_download(&cancelled, &persistence_path, &transfer_id)
+                .expect("cancelled TV row must dismiss");
+
+            let dismissed = VrDownloadState::default();
+            configure_tv_download_folder(&dismissed, Some(destination.clone()))
+                .expect("dismissed restart TV folder must configure");
+            let dismissed_rows = load_downloads(
+                &dismissed,
+                &persistence_path,
+                &fixture.path.join("dismissed-session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("dismissed TV state must reload");
+            assert!(dismissed_rows.is_empty());
+            assert!(dismissed
+                .0
+                .lock()
+                .expect("state must lock")
+                .session
+                .is_none());
+            assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
+            assert_eq!(
+                fs::read(destination.join("Folder/特別版  B.mp4"))
+                    .expect("dismissed TV media must remain"),
+                b"partial"
+            );
+        });
+    }
+
+    #[test]
+    fn cancelled_tv_transfer_reloads_and_dismisses_without_moving_or_deleting_media() {
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("TV");
+        fs::create_dir(&destination).expect("TV destination must exist");
+        let destination = fs::canonicalize(destination).expect("TV destination must canonicalize");
+        let media_path = destination.join("Movie  A.mp4");
+        fs::write(&media_path, b"media").expect("selected TV media must exist");
+        let source = persistable_tv_fixture_source();
+        let mut record = transfer_from_source(
+            TransferCategory::Tv,
+            source,
+            destination.clone(),
+            TransferState::Cancelled,
+        );
+        record.fingerprints =
+            capture_fingerprints(&record).expect("exact TV media fingerprints must be captured");
+        let transfer_id = record.transfer_id.clone();
+        let persistence_path = fixture.path.join("downloads");
+        write_persisted_transfers(&persistence_path, &[StoredTransfer::Valid(record)])
+            .expect("TV transfer must persist");
+
+        let restarted = VrDownloadState::default();
+        configure_tv_download_folder(&restarted, Some(destination.clone()))
+            .expect("TV folder must configure");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("cancelled TV transfer must reload without a session");
+        assert_eq!(rows.len(), 13);
+        assert_eq!(rows[0], transfer_id);
+        assert_eq!(rows[1], "tv");
+        assert_eq!(rows[2], "Exact  Show — 特別版 S02E03");
+        assert_eq!(rows[3], "Exact  Show — 特別版.S02E03+720p.第三話");
+        assert_eq!(rows[8], "cancelled");
+        assert_eq!(rows[9], "true");
+        assert_eq!(rows[10], "none");
+        assert_eq!(rows[12], "false");
+        assert_eq!(
+            preview_organization(&restarted, &transfer_id),
+            Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+
+        dismiss_download(&restarted, &persistence_path, &transfer_id)
+            .expect("terminal TV transfer must dismiss");
+        assert_eq!(
+            fs::read(&media_path).expect("dismiss must retain TV media"),
+            b"media"
+        );
+        let dismissed_restart = VrDownloadState::default();
+        configure_tv_download_folder(&dismissed_restart, Some(destination))
+            .expect("TV folder must configure after dismissal");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &dismissed_restart,
+            &persistence_path,
+            &fixture.path.join("dismissed-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("dismissed TV state must reload");
+        assert!(rows.is_empty());
+        assert_eq!(
+            fs::read(media_path).expect("restart must retain TV media"),
+            b"media"
+        );
+    }
+
+    #[test]
+    fn tv_start_rejects_a_cross_category_verified_source_before_dispatch() {
+        let fixture = FilesystemFixture::new();
+        let state = VrDownloadState::default();
+        let result = tauri::async_runtime::block_on(start_download_source(
+            &state,
+            &fixture.path.join("downloads"),
+            &fixture.path.join("session"),
+            TransferCategory::Tv,
+            persistable_fixture_source(),
+        ));
+        assert_eq!(result, Err(VR_DOWNLOAD_CONTEXT_INVALID));
+        assert!(!fixture.path.join("downloads").exists());
+        assert!(!fixture.path.join("session").exists());
+    }
+
+    #[test]
+    fn tv_metadata_failures_keep_source_peer_and_network_states_distinct() {
+        assert_eq!(
+            tv_metadata_error(&anyhow!("metadata not found")),
+            TV_TORRENT_SOURCE_UNAVAILABLE
+        );
+        assert_eq!(
+            tv_metadata_error(&anyhow!("no peers responded")),
+            TV_TORRENT_NO_PEERS
+        );
+        assert_eq!(
+            tv_metadata_error(&anyhow!("tracker connection failed")),
+            TV_TORRENT_NETWORK_ERROR
+        );
     }
 }

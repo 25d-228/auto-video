@@ -170,6 +170,46 @@ pub struct MovieDownloadIdentity {
     pub torrent_url: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TvDownloadIdentity {
+    pub tmdb_tv_id: u64,
+    pub show_name: String,
+    pub provider_season_id: u64,
+    pub season_number: u64,
+    pub provider_episode_id: u64,
+    pub episode_number: u64,
+    pub episode_name: String,
+    pub imdb_id: String,
+    pub provider_item_id: String,
+    pub provider_category: String,
+    pub release_name: String,
+    pub expected_infohash: String,
+}
+
+impl TvDownloadIdentity {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.tmdb_tv_id > 0
+            && !self.show_name.trim().is_empty()
+            && self.provider_season_id > 0
+            && self.season_number > 0
+            && self.provider_episode_id > 0
+            && self.episode_number > 0
+            && !self.episode_name.trim().is_empty()
+            && canonical_imdb_id(&self.imdb_id).as_deref() == Some(self.imdb_id.as_str())
+            && provider_item_id(&self.provider_item_id).as_deref()
+                == Some(self.provider_item_id.as_str())
+            && matches!(self.provider_category.as_str(), "205" | "208")
+            && !self.release_name.trim().is_empty()
+            && crate::tv_release::has_exact_episode_identity(
+                &self.release_name,
+                self.season_number,
+                self.episode_number,
+            )
+            && canonical_infohash(&self.expected_infohash).as_deref()
+                == Some(self.expected_infohash.as_str())
+    }
+}
+
 impl From<&MovieTorrentInspectionRequest> for MovieDownloadIdentity {
     fn from(request: &MovieTorrentInspectionRequest) -> Self {
         Self {
@@ -631,6 +671,7 @@ impl TorrentState {
             infohash: metadata.infohash,
             release_name: artifact.release_name,
             movie_identity: None,
+            tv_identity: None,
             selected_files,
         })
     }
@@ -744,6 +785,7 @@ pub fn revalidate_persisted_download_source(
         infohash: metadata.infohash,
         release_name: release_name.to_owned(),
         movie_identity: None,
+        tv_identity: None,
         selected_files,
     })
 }
@@ -775,6 +817,33 @@ pub fn revalidate_persisted_movie_download_source(
         infohash: metadata.infohash,
         release_name: identity.tmdb_title.clone(),
         movie_identity: Some(identity.clone()),
+        tv_identity: None,
+        selected_files,
+    })
+}
+
+pub fn revalidate_persisted_tv_download_source(
+    bytes: &[u8],
+    identity: &TvDownloadIdentity,
+    expected_infohash: &str,
+    selected_file_ids: &[usize],
+) -> Result<VerifiedDownloadSource, VerifiedDownloadSourceError> {
+    if !identity.is_valid() || expected_infohash != identity.expected_infohash {
+        return Err(VerifiedDownloadSourceError::Context);
+    }
+    let metadata =
+        parse_torrent_metadata(bytes).map_err(|_| VerifiedDownloadSourceError::Metainfo)?;
+    if metadata.infohash != expected_infohash {
+        return Err(VerifiedDownloadSourceError::Metainfo);
+    }
+    let selected_files = verified_selected_files(&metadata, selected_file_ids)?;
+    Ok(VerifiedDownloadSource {
+        bytes: bytes.to_vec(),
+        code: String::new(),
+        infohash: metadata.infohash,
+        release_name: identity.release_name.clone(),
+        movie_identity: None,
+        tv_identity: Some(identity.clone()),
         selected_files,
     })
 }
@@ -827,6 +896,7 @@ pub struct VerifiedDownloadSource {
     pub infohash: String,
     pub release_name: String,
     pub movie_identity: Option<MovieDownloadIdentity>,
+    pub tv_identity: Option<TvDownloadIdentity>,
     pub selected_files: Vec<VerifiedDownloadFile>,
 }
 
@@ -844,7 +914,7 @@ pub struct ArtifactResponse {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TorrentInspectionError {
+pub(crate) enum TorrentInspectionError {
     SourceUnavailable,
     Network,
     Provider,
@@ -865,17 +935,17 @@ impl TorrentInspectionError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct TorrentFile {
-    path: String,
-    size: u64,
+pub(crate) struct TorrentFile {
+    pub(crate) path: String,
+    pub(crate) size: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct TorrentMetadata {
-    display_name: String,
-    infohash: String,
-    total_size: u64,
-    files: Vec<TorrentFile>,
+pub(crate) struct TorrentMetadata {
+    pub(crate) display_name: String,
+    pub(crate) infohash: String,
+    pub(crate) total_size: u64,
+    pub(crate) files: Vec<TorrentFile>,
 }
 
 pub fn inspect_sukebei_torrent_with(
@@ -1127,7 +1197,10 @@ fn fetch_yts_torrent_artifact(
     Err(TorrentInspectionError::Provider)
 }
 
-fn encode_torrent_inspection(inspection_id: String, metadata: TorrentMetadata) -> Vec<String> {
+pub(crate) fn encode_torrent_inspection(
+    inspection_id: String,
+    metadata: TorrentMetadata,
+) -> Vec<String> {
     let mut response = vec![
         inspection_id,
         metadata.display_name,
@@ -2189,7 +2262,12 @@ impl<'a> BencodeParser<'a> {
     }
 }
 
-fn parse_torrent_metadata(bytes: &[u8]) -> Result<TorrentMetadata, TorrentInspectionError> {
+pub(crate) fn parse_torrent_metadata(
+    bytes: &[u8],
+) -> Result<TorrentMetadata, TorrentInspectionError> {
+    if bytes.is_empty() || bytes.len() > TORRENT_MAX_BYTES {
+        return Err(TorrentInspectionError::Malformed);
+    }
     let root = BencodeParser::new(bytes).parse()?;
     let root_dictionary = dictionary(&root)?;
     let info =
