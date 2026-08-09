@@ -3201,11 +3201,11 @@ describe("parsed VR Library and Dashboard", () => {
     ["vr_file_trash_not_file", "This item is not an eligible video file."],
     [
       "vr_file_trash_owned",
-      "This file belongs to a current VR transfer or organization recovery and cannot be moved.",
+      "This file belongs to a current transfer or organization recovery and cannot be moved.",
     ],
     [
       "vr_file_trash_ownership_unavailable",
-      "Auto-Video could not safely verify that no current VR transfer or recovery owns this file.",
+      "Auto-Video could not safely verify that no current transfer or recovery owns this file.",
     ],
     [
       "vr_file_trash_unsupported",

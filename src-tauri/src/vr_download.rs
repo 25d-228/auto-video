@@ -341,17 +341,14 @@ pub(crate) fn with_unowned_vr_library_path<T>(
     }
     for transfer in &context.transfers {
         match transfer {
-            StoredTransfer::Valid(record) if record.category == TransferCategory::Vr => {
+            StoredTransfer::Valid(record) => {
                 if transfer_record_owns_path(record, requested_path)? {
                     return Err(VrLibraryTrashOwnershipError::Owned);
                 }
             }
-            StoredTransfer::Corrupt(record)
-                if record.category.is_none() || record.category == Some(TransferCategory::Vr) =>
-            {
+            StoredTransfer::Corrupt(_) => {
                 return Err(VrLibraryTrashOwnershipError::Unavailable);
             }
-            StoredTransfer::Valid(_) | StoredTransfer::Corrupt(_) => {}
         }
     }
     if organization_plan_owns_path(&context, requested_path)? {
@@ -360,7 +357,7 @@ pub(crate) fn with_unowned_vr_library_path<T>(
     if let Some(folder) = context.future_folder.as_deref() {
         let folder_is_available = fs::canonicalize(folder).ok().as_deref() == Some(folder)
             && fs::metadata(folder).is_ok_and(|metadata| metadata.is_dir());
-        if folder_is_available && durable_vr_recovery_owns_path(folder, requested_path)? {
+        if folder_is_available && durable_recovery_owns_path(folder, requested_path)? {
             return Err(VrLibraryTrashOwnershipError::Owned);
         }
     }
@@ -1652,11 +1649,7 @@ fn organization_plan_owns_path(
     context: &VrDownloadContext,
     requested_path: &Path,
 ) -> Result<bool, VrLibraryTrashOwnershipError> {
-    let Some(plan) = context
-        .organization_plan
-        .as_ref()
-        .filter(|plan| plan.category == TransferCategory::Vr)
-    else {
+    let Some(plan) = context.organization_plan.as_ref() else {
         return Ok(false);
     };
     let record = context
@@ -1666,7 +1659,7 @@ fn organization_plan_owns_path(
             StoredTransfer::Valid(record) if record.transfer_id == plan.transfer_id => Some(record),
             StoredTransfer::Valid(_) | StoredTransfer::Corrupt(_) => None,
         })
-        .filter(|record| record.category == TransferCategory::Vr)
+        .filter(|record| record.category == plan.category)
         .ok_or(VrLibraryTrashOwnershipError::Unavailable)?;
     if plan.generation != context.organization_generation
         || plan.entries.len() != record.selected_files.len()
@@ -1707,7 +1700,7 @@ fn organization_plan_owns_path(
     Ok(false)
 }
 
-fn durable_vr_recovery_owns_path(
+fn durable_recovery_owns_path(
     destination: &Path,
     requested_path: &Path,
 ) -> Result<bool, VrLibraryTrashOwnershipError> {
@@ -1732,9 +1725,7 @@ fn durable_vr_recovery_owns_path(
         }
         let record = parse_organization_recovery_file(&entry.path())
             .ok_or(VrLibraryTrashOwnershipError::Unavailable)?;
-        if record.category == TransferCategory::Vr
-            && transfer_record_owns_path(&record, requested_path)?
-        {
+        if transfer_record_owns_path(&record, requested_path)? {
             return Ok(true);
         }
     }
@@ -4328,6 +4319,291 @@ mod tests {
 
     fn transfer_rows(state: &VrDownloadState) -> Vec<String> {
         download_rows(&mut state.0.lock().expect("state must lock"))
+    }
+
+    fn shared_category_source(category: TransferCategory) -> VerifiedDownloadSource {
+        match category {
+            TransferCategory::Adult => persistable_adult_fixture_source(),
+            TransferCategory::Movie => movie_organization_source(
+                "Exact Movie",
+                Some("1999-04-19"),
+                "Exact Provider Movie",
+                &[("Provider/Feature.mp4", 5)],
+                &[0],
+            ),
+            TransferCategory::Vr => panic!("shared-category coverage requires a non-VR record"),
+        }
+    }
+
+    fn assert_shared_category_vr_trash_ownership(category: TransferCategory) {
+        let fixture = FilesystemFixture::new();
+        let shared_destination = fixture
+            .path
+            .join(format!("VR + {} — transfer", category.as_str()));
+        fs::create_dir_all(&shared_destination).expect("shared destination must exist");
+        let shared_destination =
+            fs::canonicalize(shared_destination).expect("shared destination must canonicalize");
+        let record = completed_organization_record_for_category(
+            category,
+            &shared_destination,
+            shared_category_source(category),
+        );
+        let selected_path = shared_destination.join(&record.current_paths[0]);
+        let selected_bytes = fs::read(&selected_path).expect("selected media must be readable");
+        let (state, transfer_id) = organization_state(record);
+        {
+            let mut context = state.0.lock().expect("state must lock");
+            context.future_folder = Some(shared_destination.clone());
+            assert_eq!(
+                configured_folder(&context, category),
+                Some(shared_destination.as_path())
+            );
+        }
+        let library_state = VrLibraryState::default();
+        let scan = scan_vr_library_with(&state, &library_state)
+            .expect("shared transfer scan must succeed");
+        let generation = scan[0]
+            .parse()
+            .expect("shared transfer generation must be valid");
+        let dispatch_count = Cell::new(0);
+        let transfer_snapshot = transfer_snapshots(&state);
+        let transfer_row_snapshot = transfer_rows(&state);
+        assert_eq!(
+            trash_vr_file_with(&selected_path, generation, &state, &library_state, |_| {
+                dispatch_count.set(dispatch_count.get() + 1);
+                Ok(())
+            },),
+            Err(VR_FILE_TRASH_OWNED)
+        );
+        assert_eq!(
+            fs::read(&selected_path).expect("selected media must remain readable"),
+            selected_bytes
+        );
+        assert_eq!(transfer_snapshots(&state), transfer_snapshot);
+        assert_eq!(transfer_rows(&state), transfer_row_snapshot);
+        assert!(state
+            .0
+            .lock()
+            .expect("state must lock")
+            .organization_plan
+            .is_none());
+
+        let preview =
+            preview_organization(&state, &transfer_id).expect("organization must preview");
+        let planned_path = shared_destination.join(&preview[7]);
+        fs::create_dir_all(
+            planned_path
+                .parent()
+                .expect("planned path must have a parent"),
+        )
+        .expect("planned parent must exist");
+        fs::write(&planned_path, b"reserved").expect("planned target fixture must exist");
+        let plan_scan =
+            scan_vr_library_with(&state, &library_state).expect("planned path scan must succeed");
+        let plan_generation = plan_scan[0]
+            .parse()
+            .expect("planned path generation must be valid");
+        let plan_snapshot = {
+            let context = state.0.lock().expect("state must lock");
+            organization_plan_response(
+                context
+                    .organization_plan
+                    .as_ref()
+                    .expect("organization plan must remain current"),
+            )
+        };
+        let planned_transfer_snapshot = transfer_snapshots(&state);
+        let planned_row_snapshot = transfer_rows(&state);
+        assert_eq!(
+            trash_vr_file_with(
+                &planned_path,
+                plan_generation,
+                &state,
+                &library_state,
+                |_| {
+                    dispatch_count.set(dispatch_count.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(VR_FILE_TRASH_OWNED)
+        );
+        assert_eq!(
+            fs::read(&planned_path).expect("planned media must remain readable"),
+            b"reserved"
+        );
+        assert_eq!(transfer_snapshots(&state), planned_transfer_snapshot);
+        assert_eq!(transfer_rows(&state), planned_row_snapshot);
+        assert_eq!(
+            organization_plan_response(
+                state
+                    .0
+                    .lock()
+                    .expect("state must lock")
+                    .organization_plan
+                    .as_ref()
+                    .expect("organization plan must remain current"),
+            ),
+            plan_snapshot
+        );
+
+        fs::remove_file(&planned_path).expect("planned fixture must be removed before Apply");
+        let persistence_path = fixture
+            .path
+            .join(format!("{}-downloads", category.as_str()));
+        apply_organization(&state, &persistence_path, &preview[0])
+            .expect("organization must apply");
+        let organized_snapshot = transfer_snapshots(&state);
+        let organized_row_snapshot = transfer_rows(&state);
+        let organized_scan =
+            scan_vr_library_with(&state, &library_state).expect("organized path scan must succeed");
+        let organized_generation = organized_scan[0]
+            .parse()
+            .expect("organized path generation must be valid");
+        assert_eq!(
+            trash_vr_file_with(
+                &planned_path,
+                organized_generation,
+                &state,
+                &library_state,
+                |_| {
+                    dispatch_count.set(dispatch_count.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(VR_FILE_TRASH_OWNED)
+        );
+        assert_eq!(
+            fs::read(&planned_path).expect("organized media must remain readable"),
+            selected_bytes
+        );
+        assert_eq!(transfer_snapshots(&state), organized_snapshot);
+        assert_eq!(transfer_rows(&state), organized_row_snapshot);
+
+        let recovery_destination = fixture
+            .path
+            .join(format!("VR + {} — recovery", category.as_str()));
+        let holding = fixture
+            .path
+            .join(format!("{} recovery Trash fixture", category.as_str()));
+        fs::create_dir_all(&recovery_destination).expect("recovery destination must exist");
+        fs::create_dir_all(&holding).expect("recovery Trash fixture must exist");
+        let recovery_destination =
+            fs::canonicalize(recovery_destination).expect("recovery destination must canonicalize");
+        let mut recovery_record = completed_organization_record_for_category(
+            category,
+            &recovery_destination,
+            shared_category_source(category),
+        );
+        recovery_record.organization_state = OrganizationState::Attention;
+        let recovery_transfer_id = recovery_record.transfer_id.clone();
+        let recovered_media = recovery_destination.join(&recovery_record.current_paths[0]);
+        let recovered_bytes = fs::read(&recovered_media).expect("recovered media must be readable");
+        let recovery_path = organization_recovery_path(&recovery_record);
+        write_organization_recovery(&recovery_record, &recovery_record.current_paths, None)
+            .expect("shared-category recovery must persist");
+        let recovery_bytes =
+            fs::read(&recovery_path).expect("shared-category recovery must be readable");
+        let recovery_state = VrDownloadState::default();
+        {
+            let mut context = recovery_state.0.lock().expect("recovery state must lock");
+            context.future_folder = Some(recovery_destination.clone());
+            match category {
+                TransferCategory::Adult => {
+                    context.adult_future_folder = Some(recovery_destination.clone())
+                }
+                TransferCategory::Movie => {
+                    context.movie_future_folder = Some(recovery_destination.clone())
+                }
+                TransferCategory::Vr => unreachable!(),
+            }
+            context.transfers_loaded = true;
+        }
+        let recovery_library_state = VrLibraryState::default();
+        let recovery_scan = scan_vr_library_with(&recovery_state, &recovery_library_state)
+            .expect("shared-category recovery scan must succeed");
+        let recovery_generation = recovery_scan[0]
+            .parse()
+            .expect("shared-category recovery generation must be valid");
+        assert_eq!(
+            trash_vr_file_with(
+                &recovered_media,
+                recovery_generation,
+                &recovery_state,
+                &recovery_library_state,
+                |_| {
+                    dispatch_count.set(dispatch_count.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(VR_FILE_TRASH_OWNED)
+        );
+        assert_eq!(
+            fs::read(&recovered_media).expect("recovery-owned media must remain readable"),
+            recovered_bytes
+        );
+        assert_eq!(
+            fs::read(&recovery_path).expect("recovery metadata must remain readable"),
+            recovery_bytes
+        );
+        {
+            let context = recovery_state.0.lock().expect("recovery state must lock");
+            assert!(context.transfers.is_empty());
+            assert!(context.organization_plan.is_none());
+        }
+        assert_eq!(dispatch_count.get(), 0);
+
+        recovery_state
+            .0
+            .lock()
+            .expect("recovery state must lock")
+            .transfers
+            .push(StoredTransfer::Valid(recovery_record));
+        let dismissal_persistence = fixture
+            .path
+            .join(format!("{}-recovery-downloads", category.as_str()));
+        dismiss_download(
+            &recovery_state,
+            &dismissal_persistence,
+            &recovery_transfer_id,
+        )
+        .expect("shared-category recovery row must dismiss durably");
+        assert!(read_persisted_transfers(&dismissal_persistence)
+            .expect("dismissed persistence must remain valid")
+            .is_empty());
+        assert!(!recovery_path.exists());
+        assert_eq!(
+            fs::read(&recovered_media).expect("dismissal must retain recovery-owned media"),
+            recovered_bytes
+        );
+
+        let fresh_scan = scan_vr_library_with(&recovery_state, &recovery_library_state)
+            .expect("fresh post-dismissal scan must succeed");
+        let fresh_generation = fresh_scan[0]
+            .parse()
+            .expect("fresh post-dismissal generation must be valid");
+        let moved_media = holding.join(
+            recovered_media
+                .file_name()
+                .expect("recovered media must have a basename"),
+        );
+        trash_vr_file_with(
+            &recovered_media,
+            fresh_generation,
+            &recovery_state,
+            &recovery_library_state,
+            |path| {
+                assert!(matches!(
+                    recovery_state.0.try_lock(),
+                    Err(TryLockError::WouldBlock)
+                ));
+                fs::rename(path, &moved_media).map_err(|_| ())
+            },
+        )
+        .expect("fresh scan must authorize shared-category post-dismissal Trash");
+        assert_eq!(
+            fs::read(moved_media).expect("moved media must remain readable"),
+            recovered_bytes
+        );
     }
 
     #[test]
@@ -7961,6 +8237,16 @@ mod tests {
     }
 
     #[test]
+    fn vr_library_trash_rejects_shared_adult_transfer_organization_and_recovery_paths() {
+        assert_shared_category_vr_trash_ownership(TransferCategory::Adult);
+    }
+
+    #[test]
+    fn vr_library_trash_rejects_shared_movie_transfer_organization_and_recovery_paths() {
+        assert_shared_category_vr_trash_ownership(TransferCategory::Movie);
+    }
+
+    #[test]
     fn vr_library_trash_fails_closed_for_unavailable_transfer_or_recovery_ownership() {
         let fixture = FilesystemFixture::new();
         let destination = fixture.path.join("VR — unavailable ownership");
@@ -8015,7 +8301,7 @@ mod tests {
             b"media"
         );
         assert_eq!(
-            fs::read(corrupt_recovery).expect("corrupt recovery must remain unchanged"),
+            fs::read(&corrupt_recovery).expect("corrupt recovery must remain unchanged"),
             b"corrupt recovery"
         );
         assert!(state
@@ -8024,6 +8310,40 @@ mod tests {
             .expect("state must lock")
             .transfers
             .is_empty());
+
+        fs::remove_file(&corrupt_recovery).expect("corrupt recovery fixture must be removed");
+        for category in [TransferCategory::Adult, TransferCategory::Movie] {
+            let corrupt = corrupt_transfer(
+                format!("corrupt {} transfer", category.as_str()).as_bytes(),
+                0,
+                Some(category),
+            );
+            {
+                let mut context = state.0.lock().expect("state must lock");
+                context.transfers = vec![StoredTransfer::Corrupt(corrupt)];
+            }
+            let corrupt_snapshot = transfer_snapshots(&state);
+            let corrupt_rows = transfer_rows(&state);
+            let corrupt_scan = scan_vr_library_with(&state, &library_state)
+                .expect("corrupt shared-category scan must succeed");
+            let corrupt_generation = corrupt_scan[0]
+                .parse()
+                .expect("corrupt shared-category generation must be valid");
+            assert_eq!(
+                trash_vr_file_with(&media, corrupt_generation, &state, &library_state, |_| {
+                    dispatched.set(true);
+                    Ok(())
+                },),
+                Err(VR_FILE_TRASH_OWNERSHIP_UNAVAILABLE)
+            );
+            assert_eq!(
+                fs::read(&media).expect("media must remain after corrupt transfer ownership"),
+                b"media"
+            );
+            assert_eq!(transfer_snapshots(&state), corrupt_snapshot);
+            assert_eq!(transfer_rows(&state), corrupt_rows);
+        }
+        assert!(!dispatched.get());
     }
 
     #[test]
