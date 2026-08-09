@@ -81,6 +81,17 @@ let fetchYtsMovieReleasesMock: Mock<
 let fetchApiBayTvReleasesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
+let selectApiBayTvReleaseMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let inspectApiBayTvTorrentMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let invalidateVerifiedTvTorrentMock: Mock<() => Promise<void>>;
+let invalidateTvReleaseContextMock: Mock<() => Promise<void>>;
+let saveVerifiedTvTorrentMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<boolean>
+>;
 let inspectYtsMovieTorrentMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
@@ -648,6 +659,18 @@ beforeEach(() => {
     "tt0123456",
     "0",
   ]);
+  selectApiBayTvReleaseMock = vi.fn().mockResolvedValue(undefined);
+  inspectApiBayTvTorrentMock = vi.fn().mockResolvedValue([
+    "tv-1-1-1001",
+    "Exact  Show — 特別版 S02E03",
+    "0123456789abcdef0123456789abcdef01234567",
+    "5",
+    "Exact  Show — 特別版/第三話  —  Exact Episode.mkv",
+    "5",
+  ]);
+  invalidateVerifiedTvTorrentMock = vi.fn().mockResolvedValue(undefined);
+  invalidateTvReleaseContextMock = vi.fn().mockResolvedValue(undefined);
+  saveVerifiedTvTorrentMock = vi.fn().mockResolvedValue(true);
   inspectYtsMovieTorrentMock = vi.fn().mockResolvedValue([
     "movie-1-1-hash",
     "Verified Movie torrent",
@@ -795,6 +818,16 @@ beforeEach(() => {
           return fetchYtsMovieReleasesMock(parameters);
         case "fetch_apibay_tv_releases":
           return fetchApiBayTvReleasesMock(parameters);
+        case "select_apibay_tv_release":
+          return selectApiBayTvReleaseMock(parameters);
+        case "inspect_apibay_tv_torrent":
+          return inspectApiBayTvTorrentMock(parameters);
+        case "invalidate_verified_tv_torrent":
+          return invalidateVerifiedTvTorrentMock();
+        case "invalidate_tv_release_context":
+          return invalidateTvReleaseContextMock();
+        case "save_verified_tv_torrent":
+          return saveVerifiedTvTorrentMock(parameters);
         case "inspect_yts_movie_torrent":
           return inspectYtsMovieTorrentMock(parameters);
         case "invalidate_verified_movie_torrent":
@@ -5925,9 +5958,11 @@ describe("TMDB TV Discover", () => {
     expect(within(comparisonDialog).queryByRole("button", { name: /download/i })).toBeNull();
 
     fireEvent.click(standardReleaseLabel!.closest("button")!);
-    const selection = within(comparisonDialog)
-      .getByRole("heading", { name: "Selected release" })
-      .closest("section") as HTMLElement;
+    const selectedReleaseHeading = await within(comparisonDialog).findByRole(
+      "heading",
+      { name: "Selected release" },
+    );
+    const selection = selectedReleaseHeading.closest("section") as HTMLElement;
     expect(
       selection.querySelector(".vr-releases__release-name")?.textContent,
     ).toBe(standardReleaseName);
@@ -5938,6 +5973,114 @@ describe("TMDB TV Discover", () => {
     expect(within(selection).getByText(/Season 2, Episode 3/).textContent).toContain(
       episodeName,
     );
+    const inspectButton = within(selection).getByRole("button", {
+      name: "Inspect torrent",
+    });
+    const pendingInspection = createDeferred<string[]>();
+    inspectApiBayTvTorrentMock.mockReturnValueOnce(pendingInspection.promise);
+    inspectButton.focus();
+    fireEvent.click(inspectButton);
+    const loadingInspectionDialog = (
+      await screen.findByText("Retrieving exact-infohash metadata")
+    ).closest('[role="dialog"]') as HTMLElement;
+    expect(loadingInspectionDialog.getAttribute("aria-busy")).toBe("true");
+    expect(inspectApiBayTvTorrentMock).toHaveBeenCalledWith({
+      tmdbTvId: 701,
+      providerSeasonId: 9001,
+      providerEpisodeId: 9103,
+      providerItemId: "1001",
+    });
+    expect(inspectApiBayTvTorrentMock.mock.calls[0][0]).not.toHaveProperty(
+      "infohash",
+    );
+    expect(inspectApiBayTvTorrentMock.mock.calls[0][0]).not.toHaveProperty(
+      "trackers",
+    );
+    await act(async () => {
+      pendingInspection.resolve([
+        "tv-1-1-1001",
+        "Exact  Torrent — 特別版",
+        standardHash,
+        "12",
+        "Exact  Show — 特別版/第三話  —  Exact Episode.mkv",
+        "5",
+        "Extras/予告  編.mp4",
+        "7",
+      ]);
+      await pendingInspection.promise;
+    });
+    const inspectionDialog = screen
+      .getByText("Generated verified TV metainfo")
+      .closest('[role="dialog"]') as HTMLElement;
+    expect(
+      within(inspectionDialog)
+        .getByText("Torrent name")
+        .parentElement?.querySelector("dd")?.textContent,
+    ).toBe("Exact  Torrent — 特別版");
+    const exactFiles = within(inspectionDialog).getByRole("list", {
+      name: /Files in generated verified TV metainfo for Exact Show/,
+    });
+    expect(within(exactFiles).getAllByRole("listitem")).toHaveLength(2);
+    expect(exactFiles.textContent).toContain(
+      "Exact  Show — 特別版/第三話  —  Exact Episode.mkv",
+    );
+    expect(within(inspectionDialog).queryByRole("checkbox")).toBeNull();
+    expect(
+      within(inspectionDialog).queryByRole("button", { name: /start/i }),
+    ).toBeNull();
+    saveVerifiedTvTorrentMock
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const saveButton = within(inspectionDialog).getByRole("button", {
+      name: "Save generated metainfo",
+    });
+    fireEvent.click(saveButton);
+    expect(
+      await within(inspectionDialog).findByText(
+        "Destination selection cancelled. No file was written.",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(saveButton);
+    expect(
+      await within(inspectionDialog).findByText(
+        "Generated verified TV metainfo saved.",
+      ),
+    ).toBeTruthy();
+    expect(saveVerifiedTvTorrentMock).toHaveBeenLastCalledWith({
+      inspectionId: "tv-1-1-1001",
+    });
+    fireEvent.click(
+      within(inspectionDialog).getByRole("button", { name: "Close" }),
+    );
+    await waitFor(() => expect(document.activeElement).toBe(inspectButton));
+    expect(within(comparisonDialog).getByText("Selected release")).toBeTruthy();
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+    expect(startVerifiedAdultDownloadMock).not.toHaveBeenCalled();
+    expect(startVerifiedMovieDownloadMock).not.toHaveBeenCalled();
+    const lateInspection = createDeferred<string[]>();
+    inspectApiBayTvTorrentMock.mockReturnValueOnce(lateInspection.promise);
+    fireEvent.click(inspectButton);
+    const dismissedInspectionDialog = (
+      await screen.findByText("Retrieving exact-infohash metadata")
+    ).closest('[role="dialog"]') as HTMLElement;
+    fireEvent.keyDown(dismissedInspectionDialog, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByText("Retrieving exact-infohash metadata")).toBeNull(),
+    );
+    expect(invalidateVerifiedTvTorrentMock).toHaveBeenCalled();
+    await act(async () => {
+      lateInspection.resolve([
+        "tv-stale",
+        "Stale TV torrent",
+        standardHash,
+        "5",
+        "Stale.mkv",
+        "5",
+      ]);
+      await lateInspection.promise;
+    });
+    expect(screen.queryByText("Stale TV torrent")).toBeNull();
+    expect(within(comparisonDialog).getByText("Selected release")).toBeTruthy();
     comparisonDialog.scrollTop = 140;
     fireEvent.scroll(comparisonDialog);
 
@@ -5971,14 +6114,20 @@ describe("TMDB TV Discover", () => {
         /Metadata-only comparison for the exact selected episode/,
       )
     ).closest('[role="dialog"]') as HTMLElement;
-    expect(within(comparisonDialog).getByText("Selected release")).toBeTruthy();
+    expect(within(comparisonDialog).queryByText("Selected release")).toBeNull();
+    expect(
+      within(comparisonDialog).getByText(
+        "Select one verified release to compare its metadata.",
+      ),
+    ).toBeTruthy();
     expect(
       [...comparisonDialog.querySelectorAll(".vr-releases__release-name")].some(
         (element) => element.textContent === standardReleaseName,
       ),
     ).toBe(true);
-    expect(comparisonDialog.scrollTop).toBe(140);
-    expect(fetchApiBayTvReleasesMock).toHaveBeenCalledTimes(1);
+    expect(comparisonDialog.scrollTop).toBe(0);
+    expect(fetchApiBayTvReleasesMock).toHaveBeenCalledTimes(2);
+    expect(invalidateTvReleaseContextMock).toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(document.documentElement.dataset.theme).toBe("dark");
   });

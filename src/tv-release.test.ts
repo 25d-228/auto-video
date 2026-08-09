@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { fetchVerifiedApiBayTvReleases } from "./tv-release";
+import {
+  fetchVerifiedApiBayTvReleases,
+  inspectVerifiedApiBayTvTorrent,
+  invalidateTvReleaseContext,
+  invalidateVerifiedTvTorrent,
+  saveVerifiedTvTorrent,
+  selectVerifiedApiBayTvRelease,
+} from "./tv-release";
 
 const invokeMock = vi.fn<
   (command: string, parameters?: Record<string, unknown>) => Promise<unknown>
@@ -99,6 +106,129 @@ describe("verified API Bay TV release boundary", () => {
       providerSeasonId: 9001,
       providerEpisodeId: 9103,
     });
+  });
+
+  it("inspects only native-selected TV identity and parses the complete exact file list", async () => {
+    const context = {
+      tmdbTvId: 701,
+      showName: "Exact  Show — 特別版",
+      providerSeasonId: 9001,
+      seasonNumber: 2,
+      providerEpisodeId: 9103,
+      episodeNumber: 3,
+      episodeName: "第三話  —  Exact Episode",
+      imdbId: "tt0123456",
+    };
+    const release = {
+      providerItemId: "1001",
+      name: "Exact  Show — 特別版.S02E03+720p.第三話",
+      category: "205" as const,
+      sizeBytes: "419000000",
+      seeders: "12",
+      leechers: "4",
+      uploader: "Exact Uploader",
+      providerStatus: "vip",
+      added: "1710000000",
+      infohash: firstHash,
+      source: "API Bay" as const,
+    };
+    invokeMock
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce([
+        "tv-1-1-1001",
+        "Exact  Torrent — 特別版",
+        firstHash,
+        "12",
+        "Show/第三話  —  Exact Episode.mkv",
+        "5",
+        "Extras/予告  編.mp4",
+        "7",
+      ]);
+
+    await selectVerifiedApiBayTvRelease(context, release);
+    await expect(inspectVerifiedApiBayTvTorrent(context, release)).resolves.toEqual({
+      status: "ready",
+      inspection: {
+        inspectionId: "tv-1-1-1001",
+        displayName: "Exact  Torrent — 特別版",
+        infohash: firstHash,
+        totalBytes: "12",
+        files: [
+          { path: "Show/第三話  —  Exact Episode.mkv", sizeBytes: "5" },
+          { path: "Extras/予告  編.mp4", sizeBytes: "7" },
+        ],
+      },
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "select_apibay_tv_release", {
+      tmdbTvId: 701,
+      providerSeasonId: 9001,
+      providerEpisodeId: 9103,
+      providerItemId: "1001",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "inspect_apibay_tv_torrent", {
+      tmdbTvId: 701,
+      providerSeasonId: 9001,
+      providerEpisodeId: 9103,
+      providerItemId: "1001",
+    });
+  });
+
+  it("keeps local readiness, metadata, identity, and Save failures distinct", async () => {
+    const context = {
+      tmdbTvId: 701,
+      showName: "Exact Show",
+      providerSeasonId: 9001,
+      seasonNumber: 2,
+      providerEpisodeId: 9103,
+      episodeNumber: 3,
+      episodeName: "Episode 3",
+      imdbId: "tt0123456",
+    };
+    const release = {
+      providerItemId: "1001",
+      name: "Exact Show S02E03",
+      category: "205" as const,
+      sizeBytes: null,
+      seeders: null,
+      leechers: null,
+      uploader: null,
+      providerStatus: null,
+      added: null,
+      infohash: firstHash,
+      source: "API Bay" as const,
+    };
+    for (const [error, status] of [
+      ["tv_torrent_local_pending", "local-pending"],
+      ["tv_torrent_local_unavailable", "local-unavailable"],
+      ["tv_torrent_network_error", "network-error"],
+      ["tv_torrent_timeout", "timeout"],
+      ["tv_torrent_no_metadata_source", "no-metadata-source"],
+      ["tv_torrent_malformed", "malformed-torrent"],
+      ["tv_torrent_unsupported", "unsupported-torrent"],
+      ["tv_torrent_infohash_mismatch", "infohash-mismatch"],
+      ["tv_torrent_stale", "stale-context"],
+      ["unexpected", "inspection-error"],
+    ] as const) {
+      invokeMock.mockRejectedValueOnce(error);
+      await expect(inspectVerifiedApiBayTvTorrent(context, release)).resolves.toEqual({
+        status,
+      });
+    }
+
+    invokeMock
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined);
+    await expect(saveVerifiedTvTorrent("tv-1-1-1001")).resolves.toBe(false);
+    await expect(saveVerifiedTvTorrent("tv-1-1-1001")).resolves.toBe(true);
+    await invalidateVerifiedTvTorrent();
+    await invalidateTvReleaseContext();
+    expect(invokeMock).toHaveBeenNthCalledWith(11, "save_verified_tv_torrent", {
+      inspectionId: "tv-1-1-1001",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(13, "invalidate_verified_tv_torrent");
+    expect(invokeMock).toHaveBeenNthCalledWith(14, "invalidate_tv_release_context");
   });
 
   it("preserves a native no-match without inventing release rows", async () => {
