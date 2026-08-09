@@ -24,6 +24,13 @@ pub const TV_FILE_REVEAL_OUTSIDE_FOLDER: &str = "tv_file_reveal_outside_folder";
 pub const TV_FILE_REVEAL_STALE: &str = "tv_file_reveal_stale";
 pub const TV_FILE_REVEAL_UNAVAILABLE: &str = "tv_file_reveal_unavailable";
 pub const TV_FILE_REVEAL_UNSUPPORTED: &str = "tv_file_reveal_unsupported";
+pub const TV_FILE_TRASH_FAILED: &str = "tv_file_trash_failed";
+pub const TV_FILE_TRASH_NOT_FILE: &str = "tv_file_trash_not_file";
+pub const TV_FILE_TRASH_NOT_FOUND: &str = "tv_file_trash_not_found";
+pub const TV_FILE_TRASH_OUTSIDE_FOLDER: &str = "tv_file_trash_outside_folder";
+pub const TV_FILE_TRASH_STALE: &str = "tv_file_trash_stale";
+pub const TV_FILE_TRASH_UNAVAILABLE: &str = "tv_file_trash_unavailable";
+pub const TV_FILE_TRASH_UNSUPPORTED: &str = "tv_file_trash_unsupported";
 
 #[derive(Clone)]
 struct TrustedTvFile {
@@ -34,6 +41,7 @@ struct TrustedTvFile {
 
 struct CompletedTvScan {
     folder: PathBuf,
+    generation: u64,
     files: Vec<TrustedTvFile>,
 }
 
@@ -212,7 +220,8 @@ pub fn scan_tv_library_with(state: &TvLibraryState) -> Result<Vec<String>, &'sta
     };
     let files = scan_media_files(&folder)?;
 
-    let mut response = Vec::with_capacity(files.len() * 3);
+    let mut response = Vec::with_capacity(1 + files.len() * 3);
+    response.push(generation.to_string());
     for file in &files {
         response.push(
             file.path
@@ -236,7 +245,11 @@ pub fn scan_tv_library_with(state: &TvLibraryState) -> Result<Vec<String>, &'sta
     if context.generation != generation || context.folder.as_ref() != Some(&folder) {
         return Err(TV_LIBRARY_STALE);
     }
-    context.completed_scan = Some(CompletedTvScan { folder, files });
+    context.completed_scan = Some(CompletedTvScan {
+        folder,
+        generation,
+        files,
+    });
     Ok(response)
 }
 
@@ -252,8 +265,11 @@ fn validate_tv_file(
     requested_path: &Path,
     configured_folder: &Path,
     scan: &CompletedTvScan,
+    requested_generation: Option<u64>,
 ) -> Result<(), TvFileValidationError> {
-    if scan.folder != configured_folder {
+    if scan.folder != configured_folder
+        || requested_generation.is_some_and(|generation| generation != scan.generation)
+    {
         return Err(TvFileValidationError::Stale);
     }
     let relative_path = requested_path
@@ -325,7 +341,7 @@ fn run_tv_file_action(
         .completed_scan
         .as_ref()
         .ok_or(TvFileValidationError::Stale)?;
-    validate_tv_file(path, &canonical_folder, scan)?;
+    validate_tv_file(path, &canonical_folder, scan, None)?;
     dispatch(path).map_err(|_| TvFileValidationError::Dispatch)
 }
 
@@ -359,6 +375,46 @@ pub fn reveal_tv_file_with(
         TvFileValidationError::Stale => TV_FILE_REVEAL_STALE,
         TvFileValidationError::Dispatch => TV_FILE_REVEAL_FAILED,
     })
+}
+
+pub fn trash_tv_file_with(
+    path: &Path,
+    scan_generation: u64,
+    state: &TvLibraryState,
+    dispatch: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    let mut context = state.0.lock().map_err(|_| TV_FILE_TRASH_UNAVAILABLE)?;
+    let configured_folder = context.folder.clone().ok_or(TV_FILE_TRASH_UNAVAILABLE)?;
+    let canonical_folder =
+        fs::canonicalize(&configured_folder).map_err(|_| TV_FILE_TRASH_UNAVAILABLE)?;
+    if canonical_folder != configured_folder
+        || !fs::metadata(&canonical_folder)
+            .map_err(|_| TV_FILE_TRASH_UNAVAILABLE)?
+            .is_dir()
+    {
+        return Err(TV_FILE_TRASH_UNAVAILABLE);
+    }
+    let scan = context.completed_scan.as_ref().ok_or(TV_FILE_TRASH_STALE)?;
+    validate_tv_file(path, &canonical_folder, scan, Some(scan_generation)).map_err(|error| {
+        match error {
+            TvFileValidationError::NotFound => TV_FILE_TRASH_NOT_FOUND,
+            TvFileValidationError::Unavailable => TV_FILE_TRASH_UNAVAILABLE,
+            TvFileValidationError::NotFile => TV_FILE_TRASH_NOT_FILE,
+            TvFileValidationError::Unsupported => TV_FILE_TRASH_UNSUPPORTED,
+            TvFileValidationError::OutsideFolder => TV_FILE_TRASH_OUTSIDE_FOLDER,
+            TvFileValidationError::Stale => TV_FILE_TRASH_STALE,
+            TvFileValidationError::Dispatch => TV_FILE_TRASH_FAILED,
+        }
+    })?;
+
+    dispatch(path).map_err(|_| TV_FILE_TRASH_FAILED)?;
+    context
+        .completed_scan
+        .as_mut()
+        .ok_or(TV_FILE_TRASH_STALE)?
+        .files
+        .retain(|file| file.path != path);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -458,6 +514,7 @@ mod tests {
         assert_eq!(
             scan_tv_library_with(&state),
             Ok(vec![
+                "2".to_owned(),
                 first.to_string_lossy().into_owned(),
                 "A  Show.S01E02.mp4".to_owned(),
                 "3".to_owned(),
@@ -593,5 +650,219 @@ mod tests {
             reveal_tv_file_with(&movie, &state, |_| Err(())),
             Err(TV_FILE_REVEAL_FAILED)
         );
+    }
+
+    #[test]
+    fn trash_dispatches_one_exact_scanned_file_and_updates_state_only_after_success() {
+        let fixture = Fixture::new("trash-exact");
+        let first = fixture.path.join("Show.S01E01.mp4");
+        let sibling = fixture.path.join("Show.S01E02.mkv");
+        let unassociated = fixture.path.join("Special feature.mp4");
+        fs::write(&first, b"first").expect("first episode must be written");
+        fs::write(&sibling, b"sibling").expect("sibling episode must be written");
+        fs::write(&unassociated, b"special").expect("special must be written");
+        let state = TvLibraryState::default();
+        set_tv_folder(&state, &fixture.path.join("config"), fixture.path.clone())
+            .expect("TV folder must be configured");
+        let scan = scan_tv_library_with(&state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+        let dispatch_count = Cell::new(0);
+
+        assert_eq!(
+            trash_tv_file_with(&first, generation, &state, |_| {
+                dispatch_count.set(dispatch_count.get() + 1);
+                Err(())
+            }),
+            Err(TV_FILE_TRASH_FAILED)
+        );
+        assert_eq!(
+            trash_tv_file_with(&first, generation, &state, |path| {
+                assert_eq!(path, first);
+                dispatch_count.set(dispatch_count.get() + 1);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            trash_tv_file_with(&first, generation, &state, |_| {
+                dispatch_count.set(dispatch_count.get() + 1);
+                Ok(())
+            }),
+            Err(TV_FILE_TRASH_STALE)
+        );
+        assert_eq!(
+            trash_tv_file_with(&sibling, generation, &state, |_| Ok(())),
+            Ok(())
+        );
+        assert_eq!(
+            trash_tv_file_with(&unassociated, generation, &state, |_| Ok(())),
+            Ok(())
+        );
+        assert_eq!(dispatch_count.get(), 2);
+    }
+
+    #[test]
+    fn trash_rejects_untrusted_changed_and_unsafe_paths_without_dispatch() {
+        let trusted = Fixture::new("trash-trusted");
+        let unrelated = Fixture::new("trash-unrelated");
+        let current = trusted.path.join("Show.S01E01.mp4");
+        let changed = trusted.path.join("Show.S01E02.mkv");
+        let missing = trusted.path.join("Show.S01E03.mp4");
+        fs::write(&current, b"current").expect("current episode must be written");
+        fs::write(&changed, b"changed").expect("changed episode must be written");
+        fs::write(&missing, b"missing").expect("missing episode must be written");
+        let state = TvLibraryState::default();
+        set_tv_folder(&state, &trusted.path.join("config"), trusted.path.clone())
+            .expect("TV folder must be configured");
+        let scan = scan_tv_library_with(&state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+        let dispatched = Cell::new(false);
+        let same_name_elsewhere = unrelated.path.join("Show.S01E01.mp4");
+        fs::write(&same_name_elsewhere, b"current").expect("unrelated episode must be written");
+        let neighbor = trusted.path.join("Show.S01E04.mp4");
+        fs::write(&neighbor, b"neighbor").expect("neighbor must be written");
+        let directory = trusted.path.join("directory.mkv");
+        fs::create_dir(&directory).expect("directory must be created");
+        let unsupported = trusted.path.join("unsupported.avi");
+        fs::write(&unsupported, b"unsupported").expect("unsupported file must be written");
+        fs::write(&changed, b"different content").expect("episode must change");
+        fs::remove_file(&missing).expect("episode must be removed");
+
+        for (path, expected) in [
+            (same_name_elsewhere, TV_FILE_TRASH_OUTSIDE_FOLDER),
+            (neighbor, TV_FILE_TRASH_STALE),
+            (directory, TV_FILE_TRASH_NOT_FILE),
+            (unsupported, TV_FILE_TRASH_UNSUPPORTED),
+            (changed, TV_FILE_TRASH_STALE),
+            (missing, TV_FILE_TRASH_NOT_FOUND),
+        ] {
+            assert_eq!(
+                trash_tv_file_with(&path, generation, &state, |_| {
+                    dispatched.set(true);
+                    Ok(())
+                }),
+                Err(expected)
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let link = trusted.path.join("linked.mp4");
+            std::os::unix::fs::symlink(&current, &link).expect("file symlink must be created");
+            assert_eq!(
+                trash_tv_file_with(&link, generation, &state, |_| {
+                    dispatched.set(true);
+                    Ok(())
+                }),
+                Err(TV_FILE_TRASH_NOT_FILE)
+            );
+            let linked_parent = trusted.path.join("linked-parent");
+            std::os::unix::fs::symlink(&unrelated.path, &linked_parent)
+                .expect("parent symlink must be created");
+            let linked_child = linked_parent.join("Show.S01E01.mp4");
+            assert_eq!(
+                trash_tv_file_with(&linked_child, generation, &state, |_| {
+                    dispatched.set(true);
+                    Ok(())
+                }),
+                Err(TV_FILE_TRASH_NOT_FILE)
+            );
+        }
+        assert!(!dispatched.get());
+    }
+
+    #[test]
+    fn trash_rejects_stale_generations_and_restart_scan_reflects_an_accepted_move() {
+        let fixture = Fixture::new("trash-generation");
+        let holding = Fixture::new("trash-holding");
+        let persistence_path = fixture.path.join("config");
+        let movie = fixture.path.join("Show.S01E01.mp4");
+        fs::write(&movie, b"episode").expect("episode must be written");
+        let state = TvLibraryState::default();
+        set_tv_folder(&state, &persistence_path, fixture.path.clone())
+            .expect("TV folder must be configured");
+        let first_scan = scan_tv_library_with(&state).expect("scan must complete");
+        let first_generation = first_scan[0].parse().expect("generation must be valid");
+        let second_scan = scan_tv_library_with(&state).expect("scan must complete");
+        let current_generation = second_scan[0].parse().expect("generation must be valid");
+        let dispatched = Cell::new(false);
+
+        assert_eq!(
+            trash_tv_file_with(&movie, first_generation, &state, |_| {
+                dispatched.set(true);
+                Ok(())
+            }),
+            Err(TV_FILE_TRASH_STALE)
+        );
+        assert!(!dispatched.get());
+
+        let moved_path = holding.path.join("Show.S01E01.mp4");
+        trash_tv_file_with(&movie, current_generation, &state, |path| {
+            fs::rename(path, &moved_path).map_err(|_| ())
+        })
+        .expect("accepted dispatch must succeed");
+        assert!(moved_path.is_file());
+        assert!(!movie.exists());
+
+        let restarted = TvLibraryState::default();
+        assert_eq!(
+            load_tv_folder_with(&restarted, &persistence_path),
+            Ok(vec![
+                "ready".to_owned(),
+                fixture.path.to_string_lossy().into_owned(),
+            ])
+        );
+        let restarted_scan = scan_tv_library_with(&restarted).expect("restart scan must complete");
+        assert_eq!(restarted_scan.len(), 1);
+    }
+
+    #[test]
+    fn folder_replacement_clear_and_failed_refresh_invalidate_trash_requests() {
+        let configuration = Fixture::new("trash-configuration");
+        let first = Fixture::new("trash-first-folder");
+        let replacement = Fixture::new("trash-replacement-folder");
+        let persistence_path = configuration.path.join("config");
+        let movie = first.path.join("Show.S01E01.mp4");
+        fs::write(&movie, b"episode").expect("episode must be written");
+        let state = TvLibraryState::default();
+        set_tv_folder(&state, &persistence_path, first.path.clone())
+            .expect("first TV folder must be configured");
+        let scan = scan_tv_library_with(&state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+        let dispatched = Cell::new(false);
+
+        set_tv_folder(&state, &persistence_path, replacement.path.clone())
+            .expect("replacement TV folder must be configured");
+        assert_eq!(
+            trash_tv_file_with(&movie, generation, &state, |_| {
+                dispatched.set(true);
+                Ok(())
+            }),
+            Err(TV_FILE_TRASH_STALE)
+        );
+        clear_tv_folder(&state, &persistence_path).expect("TV folder must clear");
+        assert_eq!(
+            trash_tv_file_with(&movie, generation, &state, |_| {
+                dispatched.set(true);
+                Ok(())
+            }),
+            Err(TV_FILE_TRASH_UNAVAILABLE)
+        );
+
+        set_tv_folder(&state, &persistence_path, first.path.clone())
+            .expect("first TV folder must be restored");
+        let refreshed_scan = scan_tv_library_with(&state).expect("scan must complete");
+        let refreshed_generation = refreshed_scan[0].parse().expect("generation must be valid");
+        let unavailable_folder = configuration.path.join("unavailable-TV-folder");
+        fs::rename(&first.path, &unavailable_folder).expect("TV folder must become unavailable");
+        assert_eq!(scan_tv_library_with(&state), Err(TV_FOLDER_UNAVAILABLE));
+        assert_eq!(
+            trash_tv_file_with(&movie, refreshed_generation, &state, |_| {
+                dispatched.set(true);
+                Ok(())
+            }),
+            Err(TV_FILE_TRASH_UNAVAILABLE)
+        );
+        assert!(!dispatched.get());
     }
 }

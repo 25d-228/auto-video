@@ -19,6 +19,11 @@ export type TvLibraryItem = {
   files: TvLibraryFile[];
 };
 
+export type TvLibraryScan = {
+  generation: string;
+  items: TvLibraryItem[];
+};
+
 export type TvVolumeStorage = {
   totalBytes: bigint;
   freeBytes: bigint;
@@ -105,11 +110,19 @@ function parsedEpisodeIdentity(stem: string, relativePath: string) {
     : null;
 }
 
-function parseTvLibrary(value: unknown): TvLibraryItem[] {
+function parseTvLibrary(value: unknown): TvLibraryScan {
   if (
     !Array.isArray(value) ||
-    value.length % 3 !== 0 ||
+    value.length === 0 ||
+    (value.length - 1) % 3 !== 0 ||
     !value.every((entry) => typeof entry === "string")
+  ) {
+    throw new Error("The native TV scanner returned invalid data.");
+  }
+  const generation = value[0] as string;
+  if (
+    !unsignedU64Pattern.test(generation) ||
+    BigInt(generation) > maximumU64
   ) {
     throw new Error("The native TV scanner returned invalid data.");
   }
@@ -118,7 +131,7 @@ function parseTvLibrary(value: unknown): TvLibraryItem[] {
   const unassociatedItems: TvLibraryItem[] = [];
   const paths = new Set<string>();
   const relativePaths = new Set<string>();
-  for (let index = 0; index < value.length; index += 3) {
+  for (let index = 1; index < value.length; index += 3) {
     const path = value[index] as string;
     const relativePath = value[index + 1] as string;
     const sizeBytes = value[index + 2] as string;
@@ -173,7 +186,7 @@ function parseTvLibrary(value: unknown): TvLibraryItem[] {
         left.path.localeCompare(right.path),
     ),
   }));
-  return [...showItems, ...unassociatedItems];
+  return { generation, items: [...showItems, ...unassociatedItems] };
 }
 
 export async function loadTvFolder() {
@@ -231,4 +244,11 @@ export async function openTvFile(path: string) {
 
 export async function revealTvFile(path: string) {
   await window.__TAURI__.core.invoke("reveal_tv_file", { path });
+}
+
+export async function trashTvFile(path: string, scanGeneration: string) {
+  await window.__TAURI__.core.invoke("trash_tv_file", {
+    path,
+    scanGeneration,
+  });
 }
