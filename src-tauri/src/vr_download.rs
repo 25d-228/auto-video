@@ -4,15 +4,16 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context};
 use librqbit::{
     limits::LimitsConfig,
     storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage},
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, Session, SessionOptions,
-    TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, PeerConnectionOptions,
+    Session, SessionOptions, TorrentStatsState,
 };
 
 use crate::vr_library::is_supported_media;
@@ -54,6 +55,13 @@ const MAX_SELECTED_FILES: usize = 100_000;
 const BYTES_PER_MIB: u32 = 1024 * 1024;
 const MAX_DOWNLOAD_LIMIT_MIB_PER_SECOND: u32 = u32::MAX / BYTES_PER_MIB;
 const DOWNLOAD_LIMIT_UNLIMITED: &str = "unlimited\n";
+const TV_METADATA_TRACKERS: [&str; 3] = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "https://tracker.tamersunion.org:443/announce",
+];
+// A bounded request prevents an unavailable metadata swarm from holding the inspection open.
+const TV_METADATA_TIMEOUT: Duration = Duration::from_secs(45);
 
 type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
@@ -272,6 +280,15 @@ struct VrDownloadContext {
 
 #[derive(Clone, Default)]
 pub struct VrDownloadState(Arc<Mutex<VrDownloadContext>>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TvMetainfoAcquisitionError {
+    LocalPending,
+    LocalUnavailable,
+    Network,
+    NoMetadataSource,
+    Timeout,
+}
 
 fn invalidate_organization_plan(context: &mut VrDownloadContext) {
     context.organization_generation = context.organization_generation.wrapping_add(1);
@@ -1588,6 +1605,99 @@ async fn session_for(
             Ok(session)
         }
         Err(error) => Err(error),
+    }
+}
+
+pub(crate) async fn acquire_tv_metainfo(
+    state: &VrDownloadState,
+    session_folder: &Path,
+    infohash: &str,
+) -> Result<Vec<u8>, TvMetainfoAcquisitionError> {
+    let existing_session = {
+        let context = state
+            .0
+            .lock()
+            .map_err(|_| TvMetainfoAcquisitionError::LocalUnavailable)?;
+        if let Some(session) = &context.session {
+            Some(session.clone())
+        } else if context.session_starting {
+            return Err(TvMetainfoAcquisitionError::LocalPending);
+        } else if context.download_limit == DownloadLimitState::Unloaded {
+            return Err(TvMetainfoAcquisitionError::LocalUnavailable);
+        } else {
+            None
+        }
+    };
+    let session = match existing_session {
+        Some(session) => session,
+        None => session_for(state, session_folder)
+            .await
+            .map_err(|error| match error {
+                VR_DOWNLOAD_ACTION_INVALID => TvMetainfoAcquisitionError::LocalPending,
+                _ => TvMetainfoAcquisitionError::LocalUnavailable,
+            })?,
+    };
+    let magnet = format!("magnet:?xt=urn:btih:{infohash}");
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let acquisition = tauri::async_runtime::spawn(async move {
+        let response = session
+            .add_torrent(
+                AddTorrent::from_url(magnet),
+                Some(AddTorrentOptions {
+                    list_only: true,
+                    peer_opts: Some(PeerConnectionOptions {
+                        connect_timeout: Some(Duration::from_secs(10)),
+                        read_write_timeout: Some(Duration::from_secs(20)),
+                        keep_alive_interval: Some(Duration::from_secs(10)),
+                    }),
+                    trackers: Some(
+                        TV_METADATA_TRACKERS
+                            .iter()
+                            .map(|tracker| (*tracker).to_owned())
+                            .collect(),
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let _ = sender.send(response);
+    });
+    let response = match tauri::async_runtime::spawn_blocking(move || {
+        receiver.recv_timeout(TV_METADATA_TIMEOUT)
+    })
+    .await
+    .map_err(|_| TvMetainfoAcquisitionError::LocalUnavailable)?
+    {
+        Ok(response) => {
+            let _ = acquisition.await;
+            response
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            acquisition.abort();
+            return Err(TvMetainfoAcquisitionError::Timeout);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(TvMetainfoAcquisitionError::Network);
+        }
+    }
+    .map_err(|error| {
+        let message = error.to_string().to_ascii_lowercase();
+        if message.contains("timeout") {
+            TvMetainfoAcquisitionError::Timeout
+        } else if message.contains("input address stream exhausted")
+            || message.contains("no known way to resolve peers")
+            || message.contains("metadata") && message.contains("peer")
+        {
+            TvMetainfoAcquisitionError::NoMetadataSource
+        } else {
+            TvMetainfoAcquisitionError::Network
+        }
+    })?;
+    match response {
+        AddTorrentResponse::ListOnly(metadata) => Ok(metadata.torrent_bytes.to_vec()),
+        AddTorrentResponse::AlreadyManaged(_, _) | AddTorrentResponse::Added(_, _) => {
+            Err(TvMetainfoAcquisitionError::LocalUnavailable)
+        }
     }
 }
 
@@ -3752,6 +3862,44 @@ mod tests {
                 size: 5,
             }],
         }
+    }
+
+    #[test]
+    fn tv_metainfo_reports_shared_session_readiness_without_network_activity() {
+        let fixture = FilesystemFixture::new();
+        let state = VrDownloadState::default();
+        assert_eq!(
+            tauri::async_runtime::block_on(acquire_tv_metainfo(
+                &state,
+                &fixture.path,
+                "0123456789abcdef0123456789abcdef01234567",
+            )),
+            Err(TvMetainfoAcquisitionError::LocalUnavailable)
+        );
+        assert!(fs::read_dir(&fixture.path)
+            .expect("fixture directory must remain readable")
+            .next()
+            .is_none());
+
+        state
+            .0
+            .lock()
+            .expect("state must remain available")
+            .session_starting = true;
+        assert_eq!(
+            tauri::async_runtime::block_on(acquire_tv_metainfo(
+                &state,
+                &fixture.path,
+                "0123456789abcdef0123456789abcdef01234567",
+            )),
+            Err(TvMetainfoAcquisitionError::LocalPending)
+        );
+        assert!(state
+            .0
+            .lock()
+            .expect("state must remain available")
+            .session
+            .is_none());
     }
 
     fn persistable_fixture_source() -> VerifiedDownloadSource {

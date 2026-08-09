@@ -1,11 +1,13 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
 };
+
+use crate::tv_release::{TrustedTvReleaseIdentity, TvReleaseState};
 
 const SUKEBEI_DOWNLOAD_PREFIX: &str = "https://sukebei.nyaa.si/download/";
 const SUKEBEI_VIEW_PREFIX: &str = "https://sukebei.nyaa.si/view/";
@@ -48,6 +50,17 @@ pub const MOVIE_TORRENT_STALE: &str = "movie_torrent_stale";
 pub const MOVIE_TORRENT_UNSUPPORTED: &str = "movie_torrent_unsupported";
 pub const MOVIE_YTS_CONFLICTING_PROVIDER: &str = "movie_yts_conflicting_provider";
 pub const MOVIE_YTS_MALFORMED: &str = "movie_yts_malformed";
+pub const TV_TORRENT_CONTEXT_INVALID: &str = "tv_torrent_context_invalid";
+pub const TV_TORRENT_INFOHASH_MISMATCH: &str = "tv_torrent_infohash_mismatch";
+pub const TV_TORRENT_LOCAL_PENDING: &str = "tv_torrent_local_pending";
+pub const TV_TORRENT_LOCAL_UNAVAILABLE: &str = "tv_torrent_local_unavailable";
+pub const TV_TORRENT_MALFORMED: &str = "tv_torrent_malformed";
+pub const TV_TORRENT_NETWORK_ERROR: &str = "tv_torrent_network_error";
+pub const TV_TORRENT_NO_METADATA_SOURCE: &str = "tv_torrent_no_metadata_source";
+pub const TV_TORRENT_SAVE_FAILED: &str = "tv_torrent_save_failed";
+pub const TV_TORRENT_STALE: &str = "tv_torrent_stale";
+pub const TV_TORRENT_TIMEOUT: &str = "tv_torrent_timeout";
+pub const TV_TORRENT_UNSUPPORTED: &str = "tv_torrent_unsupported";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TrustedArtifact {
@@ -333,6 +346,135 @@ struct MovieTorrentContext {
 
 #[derive(Clone, Default)]
 pub struct MovieTorrentState(Arc<Mutex<MovieTorrentContext>>);
+
+struct CachedTvTorrent {
+    identity: TrustedTvReleaseIdentity,
+    generation: u64,
+    inspection_id: String,
+    default_file_name: String,
+    bytes: Vec<u8>,
+    metadata: TorrentMetadata,
+}
+
+#[derive(Default)]
+struct TvTorrentContext {
+    inspection_generation: u64,
+    pending_identity: Option<TrustedTvReleaseIdentity>,
+    cached_torrent: Option<CachedTvTorrent>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct TvTorrentState(Arc<Mutex<TvTorrentContext>>);
+
+#[derive(Clone)]
+pub(crate) struct TvTorrentInspectionPlan {
+    generation: u64,
+    identity: TrustedTvReleaseIdentity,
+}
+
+impl TvTorrentInspectionPlan {
+    pub(crate) fn expected_infohash(&self) -> &str {
+        &self.identity.infohash
+    }
+}
+
+pub(crate) enum TvTorrentInspectionStart {
+    Cached(Vec<String>),
+    Acquire(TvTorrentInspectionPlan),
+}
+
+impl TvTorrentState {
+    pub(crate) fn begin_inspection(
+        &self,
+        release_state: &TvReleaseState,
+        tmdb_tv_id: u64,
+        provider_season_id: u64,
+        provider_episode_id: u64,
+        provider_item_id: &str,
+    ) -> Result<TvTorrentInspectionStart, &'static str> {
+        let identity = release_state
+            .resolve_release(
+                tmdb_tv_id,
+                provider_season_id,
+                provider_episode_id,
+                provider_item_id,
+            )
+            .ok_or(TV_TORRENT_CONTEXT_INVALID)?;
+        let mut context = self.0.lock().map_err(|_| TV_TORRENT_CONTEXT_INVALID)?;
+        if let Some(cached) = context
+            .cached_torrent
+            .as_ref()
+            .filter(|cached| cached.identity == identity)
+        {
+            return Ok(TvTorrentInspectionStart::Cached(encode_torrent_inspection(
+                cached.inspection_id.clone(),
+                cached.metadata.clone(),
+            )));
+        }
+
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.cached_torrent = None;
+        context.pending_identity = Some(identity.clone());
+        Ok(TvTorrentInspectionStart::Acquire(TvTorrentInspectionPlan {
+            generation: context.inspection_generation,
+            identity,
+        }))
+    }
+
+    pub(crate) fn finish_inspection(
+        &self,
+        release_state: &TvReleaseState,
+        plan: TvTorrentInspectionPlan,
+        bytes: Vec<u8>,
+    ) -> Result<Vec<String>, &'static str> {
+        if bytes.len() > TORRENT_MAX_BYTES {
+            return Err(TV_TORRENT_MALFORMED);
+        }
+        let metadata = parse_torrent_metadata(&bytes).map_err(tv_torrent_error_code)?;
+        if metadata.infohash != plan.identity.infohash {
+            return Err(TV_TORRENT_INFOHASH_MISMATCH);
+        }
+        if !release_state.contains(&plan.identity) {
+            return Err(TV_TORRENT_STALE);
+        }
+
+        let mut context = self.0.lock().map_err(|_| TV_TORRENT_CONTEXT_INVALID)?;
+        if context.inspection_generation != plan.generation
+            || context.pending_identity.as_ref() != Some(&plan.identity)
+        {
+            return Err(TV_TORRENT_STALE);
+        }
+        let inspection_id = format!(
+            "tv-{}-{}-{}",
+            plan.identity.release_generation, plan.generation, plan.identity.provider_item_id
+        );
+        let response = encode_torrent_inspection(inspection_id.clone(), metadata.clone());
+        context.cached_torrent = Some(CachedTvTorrent {
+            default_file_name: format!(
+                "tv-{}-s{:02}e{:02}-{}.torrent",
+                plan.identity.tmdb_tv_id,
+                plan.identity.season_number,
+                plan.identity.episode_number,
+                plan.identity.provider_item_id
+            ),
+            identity: plan.identity,
+            generation: plan.generation,
+            inspection_id,
+            bytes,
+            metadata,
+        });
+        context.pending_identity = None;
+        Ok(response)
+    }
+
+    pub(crate) fn invalidate_inspection(&self) -> Result<(), &'static str> {
+        let mut context = self.0.lock().map_err(|_| TV_TORRENT_CONTEXT_INVALID)?;
+        context.inspection_generation = context.inspection_generation.wrapping_add(1);
+        context.pending_identity = None;
+        context.cached_torrent = None;
+        Ok(())
+    }
+}
 
 impl MovieTorrentState {
     pub fn begin_release_lookup(&self) -> Result<u64, &'static str> {
@@ -1033,6 +1175,45 @@ pub fn save_verified_movie_torrent_with(
     Ok(true)
 }
 
+pub(crate) fn save_verified_tv_torrent_with(
+    state: &TvTorrentState,
+    inspection_id: &str,
+    choose_destination: impl FnOnce(&str) -> Option<PathBuf>,
+    write: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+) -> Result<bool, &'static str> {
+    let default_file_name = {
+        let context = state.0.lock().map_err(|_| TV_TORRENT_SAVE_FAILED)?;
+        context
+            .cached_torrent
+            .as_ref()
+            .filter(|torrent| {
+                torrent.inspection_id == inspection_id
+                    && torrent.generation == context.inspection_generation
+            })
+            .map(|torrent| torrent.default_file_name.clone())
+            .ok_or(TV_TORRENT_STALE)?
+    };
+    let Some(destination) = choose_destination(&default_file_name) else {
+        return Ok(false);
+    };
+
+    let context = state.0.lock().map_err(|_| TV_TORRENT_SAVE_FAILED)?;
+    let torrent = context
+        .cached_torrent
+        .as_ref()
+        .filter(|torrent| {
+            torrent.inspection_id == inspection_id
+                && torrent.generation == context.inspection_generation
+        })
+        .ok_or(TV_TORRENT_STALE)?;
+    let metadata = parse_torrent_metadata(&torrent.bytes).map_err(tv_torrent_error_code)?;
+    if metadata != torrent.metadata || metadata.infohash != torrent.identity.infohash {
+        return Err(TV_TORRENT_MALFORMED);
+    }
+    write(&destination, &torrent.bytes).map_err(|_| TV_TORRENT_SAVE_FAILED)?;
+    Ok(true)
+}
+
 pub fn write_new_torrent_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)
@@ -1148,6 +1329,16 @@ fn movie_torrent_error_code(error: TorrentInspectionError) -> &'static str {
         TorrentInspectionError::Provider => MOVIE_TORRENT_PROVIDER_ERROR,
         TorrentInspectionError::Malformed => MOVIE_TORRENT_MALFORMED,
         TorrentInspectionError::Unsupported => MOVIE_TORRENT_UNSUPPORTED,
+    }
+}
+
+fn tv_torrent_error_code(error: TorrentInspectionError) -> &'static str {
+    match error {
+        TorrentInspectionError::Malformed => TV_TORRENT_MALFORMED,
+        TorrentInspectionError::Unsupported => TV_TORRENT_UNSUPPORTED,
+        TorrentInspectionError::SourceUnavailable
+        | TorrentInspectionError::Network
+        | TorrentInspectionError::Provider => TV_TORRENT_MALFORMED,
     }
 }
 
@@ -2210,7 +2401,7 @@ fn parse_torrent_metadata(bytes: &[u8]) -> Result<TorrentMetadata, TorrentInspec
         Some(name) => node_text(name)?,
         None => text_value(info_dictionary, b"name")?,
     };
-    validate_display_text(&display_name)?;
+    validate_path_component(&display_name)?;
 
     let single_length = dictionary_value(info_dictionary, b"length");
     let multi_files = dictionary_value(info_dictionary, b"files");
@@ -2253,7 +2444,7 @@ fn parse_multi_file_list(
     }
 
     let mut parsed_files = Vec::with_capacity(files.len());
-    let mut paths = HashSet::new();
+    let mut paths: BTreeSet<String> = BTreeSet::new();
     for file in files {
         let file = dictionary(file)?;
         let size = nonnegative_integer(
@@ -2277,15 +2468,23 @@ fn parse_multi_file_list(
                 _ => Err(TorrentInspectionError::Unsupported),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if path.iter().any(|component| {
-            validate_display_text(component).is_err()
-                || matches!(component.as_str(), "." | "..")
-                || component.contains(['/', '\\'])
-        }) {
+        if path
+            .iter()
+            .any(|component| validate_path_component(component).is_err())
+        {
             return Err(TorrentInspectionError::Unsupported);
         }
         let path = path.join("/");
-        if !paths.insert(path.clone()) {
+        let normalized_path = path.to_lowercase();
+        let has_ancestor = normalized_path
+            .match_indices('/')
+            .any(|(index, _)| paths.contains(&normalized_path[..index]));
+        let descendant_prefix = format!("{normalized_path}/");
+        let has_descendant = paths
+            .range(normalized_path.clone()..)
+            .next()
+            .is_some_and(|candidate| candidate.starts_with(&descendant_prefix));
+        if has_ancestor || has_descendant || !paths.insert(normalized_path) {
             return Err(TorrentInspectionError::Unsupported);
         }
         parsed_files.push(TorrentFile { path, size });
@@ -2369,6 +2568,14 @@ fn validate_display_text(value: &str) -> Result<(), TorrentInspectionError> {
     Ok(())
 }
 
+fn validate_path_component(value: &str) -> Result<(), TorrentInspectionError> {
+    validate_display_text(value)?;
+    if matches!(value, "." | "..") || value.contains(['/', '\\', ':']) {
+        return Err(TorrentInspectionError::Unsupported);
+    }
+    Ok(())
+}
+
 pub(crate) fn hex_sha1(input: &[u8]) -> String {
     sha1(input)
         .iter()
@@ -2445,6 +2652,8 @@ fn sha1(input: &[u8]) -> [u8; 20] {
 mod tests {
     use std::{cell::RefCell, fs};
 
+    use crate::tv_release::{fetch_apibay_tv_releases_for_state_with, TvReleaseState};
+
     use super::*;
 
     fn single_file_torrent_with_fields(
@@ -2463,6 +2672,40 @@ mod tests {
         encoded.extend(std::iter::repeat_n(b'a', piece_bytes));
         encoded.extend_from_slice(b"ee");
         encoded
+    }
+
+    fn selected_tv_release_state(infohash: &str) -> TvReleaseState {
+        let state = TvReleaseState::default();
+        let generation = state.begin_release_lookup().expect("lookup must begin");
+        let standard = format!(
+            r#"[{{"id":"1001","name":"Exact  Show — 特別版.S02E03+720p.第三話","info_hash":"{infohash}","leechers":"4","seeders":"12","size":"419000000","username":"Exact Uploader","added":"1710000000","status":"vip","category":"205","imdb":"tt0123456"}}]"#
+        );
+        fetch_apibay_tv_releases_for_state_with(
+            &state,
+            generation,
+            701,
+            9001,
+            9103,
+            "fixture-token",
+            |url, _| {
+                if url.ends_with("/tv/701") {
+                    Ok(r#"{"id":701,"name":"Exact  Show — 特別版","seasons":[{"id":9001,"season_number":2}]}"#.to_owned())
+                } else if url.ends_with("/season/2") {
+                    Ok(r#"{"id":9001,"season_number":2,"episodes":[{"id":9103,"season_number":2,"episode_number":3,"name":"第三話  —  Exact Episode"}]}"#.to_owned())
+                } else if url.ends_with("/external_ids") {
+                    Ok(r#"{"id":701,"imdb_id":"tt0123456"}"#.to_owned())
+                } else if url.ends_with("cat=205") {
+                    Ok(standard.clone())
+                } else {
+                    Ok("[]".to_owned())
+                }
+            },
+        )
+        .expect("the exact TV release must be trusted");
+        state
+            .select_release(701, 9001, 9103, "1001")
+            .expect("the exact TV release must be selected");
+        state
     }
 
     fn single_file_torrent() -> Vec<u8> {
@@ -2508,6 +2751,19 @@ mod tests {
         for _ in 0..2 {
             encoded.extend_from_slice(b"d6:lengthi1e4:pathl");
             push_bencoded_bytes(&mut encoded, "same.mp4");
+            encoded.extend_from_slice(b"ee");
+        }
+        encoded.extend_from_slice(
+            b"e4:name4:Root12:piece lengthi1e6:pieces40:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaee",
+        );
+        encoded
+    }
+
+    fn case_conflicting_path_torrent() -> Vec<u8> {
+        let mut encoded = b"d4:infod5:filesl".to_vec();
+        for path in ["Episode.mkv", "episode.MKV"] {
+            encoded.extend_from_slice(b"d6:lengthi1e4:pathl");
+            push_bencoded_bytes(&mut encoded, path);
             encoded.extend_from_slice(b"ee");
         }
         encoded.extend_from_slice(
@@ -3099,6 +3355,214 @@ mod tests {
         assert_eq!(multi.total_size, 10);
         assert_eq!(multi.files[0].path, "Folder/Part  1 — 映画.mkv");
         assert_eq!(multi.files[1].path, "Folder/特別版  B.mp4");
+    }
+
+    #[test]
+    fn tv_inspection_verifies_exact_generated_metainfo_and_reuses_its_native_cache() {
+        let bytes = multi_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let release_state = selected_tv_release_state(&infohash);
+        let torrent_state = TvTorrentState::default();
+
+        let plan = match torrent_state
+            .begin_inspection(&release_state, 701, 9001, 9103, "1001")
+            .expect("the current selected release must be inspectable")
+        {
+            TvTorrentInspectionStart::Acquire(plan) => plan,
+            TvTorrentInspectionStart::Cached(_) => panic!("nothing was acquired yet"),
+        };
+        assert_eq!(plan.expected_infohash(), infohash);
+        let response = torrent_state
+            .finish_inspection(&release_state, plan, bytes.clone())
+            .expect("exact generated metainfo must verify");
+        assert!(response[0].starts_with("tv-"));
+        assert_eq!(response[1], "VR  — 作品");
+        assert_eq!(response[2], infohash);
+        assert_eq!(response[3], "10");
+        assert_eq!(response[4], "Folder/Part  1 — 映画.mkv");
+        assert_eq!(response[6], "Folder/特別版  B.mp4");
+
+        let cached = match torrent_state
+            .begin_inspection(&release_state, 701, 9001, 9103, "1001")
+            .expect("the unchanged inspection must reopen")
+        {
+            TvTorrentInspectionStart::Cached(cached) => cached,
+            TvTorrentInspectionStart::Acquire(_) => panic!("cached bytes must not be reacquired"),
+        };
+        assert_eq!(cached, response);
+
+        let wrote_cancelled = RefCell::new(false);
+        assert_eq!(
+            save_verified_tv_torrent_with(
+                &torrent_state,
+                &response[0],
+                |_| None,
+                |_, _| {
+                    wrote_cancelled.replace(true);
+                    Ok(())
+                },
+            ),
+            Ok(false)
+        );
+        assert!(!wrote_cancelled.into_inner());
+        let saved = RefCell::new(Vec::new());
+        assert_eq!(
+            save_verified_tv_torrent_with(
+                &torrent_state,
+                &response[0],
+                |default_name| {
+                    assert_eq!(default_name, "tv-701-s02e03-1001.torrent");
+                    Some(PathBuf::from("unused.torrent"))
+                },
+                |_, saved_bytes| {
+                    saved.replace(saved_bytes.to_vec());
+                    Ok(())
+                },
+            ),
+            Ok(true)
+        );
+        assert_eq!(saved.into_inner(), bytes);
+        let vr_state = VrTorrentState::default();
+        assert_eq!(
+            save_verified_torrent_with(
+                &vr_state,
+                &response[0],
+                |_| Some(PathBuf::from("unused.torrent")),
+                |_, _| Ok(()),
+            ),
+            Err(VR_TORRENT_STALE)
+        );
+    }
+
+    #[test]
+    fn invalidated_tv_inspection_id_cannot_choose_a_destination_or_write() {
+        let bytes = single_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let release_state = selected_tv_release_state(&infohash);
+        let torrent_state = TvTorrentState::default();
+        let plan = match torrent_state
+            .begin_inspection(&release_state, 701, 9001, 9103, "1001")
+            .expect("inspection must begin")
+        {
+            TvTorrentInspectionStart::Acquire(plan) => plan,
+            TvTorrentInspectionStart::Cached(_) => unreachable!(),
+        };
+        let response = torrent_state
+            .finish_inspection(&release_state, plan, bytes)
+            .expect("exact generated metainfo must verify");
+        torrent_state
+            .invalidate_inspection()
+            .expect("inspection must invalidate");
+
+        let chose_destination = RefCell::new(false);
+        let wrote = RefCell::new(false);
+        assert_eq!(
+            save_verified_tv_torrent_with(
+                &torrent_state,
+                &response[0],
+                |_| {
+                    chose_destination.replace(true);
+                    Some(PathBuf::from("unused.torrent"))
+                },
+                |_, _| {
+                    wrote.replace(true);
+                    Ok(())
+                },
+            ),
+            Err(TV_TORRENT_STALE)
+        );
+        assert!(!chose_destination.into_inner());
+        assert!(!wrote.into_inner());
+    }
+
+    #[test]
+    fn tv_inspection_rejects_fabricated_stale_malformed_and_cross_category_authority() {
+        let bytes = single_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let release_state = selected_tv_release_state(&infohash);
+        let torrent_state = TvTorrentState::default();
+
+        for selectors in [
+            (702, 9001, 9103, "1001"),
+            (701, 9002, 9103, "1001"),
+            (701, 9001, 9104, "1001"),
+            (701, 9001, 9103, "9999"),
+        ] {
+            assert!(matches!(
+                torrent_state.begin_inspection(
+                    &release_state,
+                    selectors.0,
+                    selectors.1,
+                    selectors.2,
+                    selectors.3,
+                ),
+                Err(TV_TORRENT_CONTEXT_INVALID)
+            ));
+        }
+
+        let stale_plan = match torrent_state
+            .begin_inspection(&release_state, 701, 9001, 9103, "1001")
+            .expect("inspection must begin")
+        {
+            TvTorrentInspectionStart::Acquire(plan) => plan,
+            TvTorrentInspectionStart::Cached(_) => unreachable!(),
+        };
+        release_state
+            .invalidate()
+            .expect("release context must invalidate");
+        assert_eq!(
+            torrent_state.finish_inspection(&release_state, stale_plan, bytes.clone()),
+            Err(TV_TORRENT_STALE)
+        );
+
+        let release_state = selected_tv_release_state(&infohash);
+        for (rejected_bytes, error) in [
+            (b"not-bencode".to_vec(), TV_TORRENT_MALFORMED),
+            (
+                b"d4:infod12:meta versioni2eee".to_vec(),
+                TV_TORRENT_UNSUPPORTED,
+            ),
+            (case_conflicting_path_torrent(), TV_TORRENT_UNSUPPORTED),
+            (
+                b"d4:infod6:lengthi1e4:name8:/bad.mp412:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee".to_vec(),
+                TV_TORRENT_UNSUPPORTED,
+            ),
+            (vec![b'a'; TORRENT_MAX_BYTES + 1], TV_TORRENT_MALFORMED),
+        ] {
+            let plan = match torrent_state
+                .begin_inspection(&release_state, 701, 9001, 9103, "1001")
+                .expect("inspection must begin")
+            {
+                TvTorrentInspectionStart::Acquire(plan) => plan,
+                TvTorrentInspectionStart::Cached(_) => unreachable!(),
+            };
+            assert_eq!(
+                torrent_state.finish_inspection(&release_state, plan, rejected_bytes),
+                Err(error)
+            );
+        }
+
+        let wrong_hash_state = selected_tv_release_state(&"f".repeat(40));
+        let plan = match torrent_state
+            .begin_inspection(&wrong_hash_state, 701, 9001, 9103, "1001")
+            .expect("inspection must begin")
+        {
+            TvTorrentInspectionStart::Acquire(plan) => plan,
+            TvTorrentInspectionStart::Cached(_) => unreachable!(),
+        };
+        assert_eq!(
+            torrent_state.finish_inspection(&wrong_hash_state, plan, bytes),
+            Err(TV_TORRENT_INFOHASH_MISMATCH)
+        );
+        assert_eq!(
+            save_verified_tv_torrent_with(
+                &torrent_state,
+                "vr-1-1-123",
+                |_| Some(PathBuf::from("unused.torrent")),
+                |_, _| Ok(()),
+            ),
+            Err(TV_TORRENT_STALE)
+        );
     }
 
     #[test]

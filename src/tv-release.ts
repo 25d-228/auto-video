@@ -41,6 +41,19 @@ export type TvEpisodeReleasesResult =
   | { status: "apibay-conflicting-provider" }
   | { status: "apibay-provider-error" };
 
+export type TvTorrentInspectionResult =
+  | { status: "ready"; inspection: TorrentInspection }
+  | { status: "local-pending" }
+  | { status: "local-unavailable" }
+  | { status: "network-error" }
+  | { status: "timeout" }
+  | { status: "no-metadata-source" }
+  | { status: "malformed-torrent" }
+  | { status: "unsupported-torrent" }
+  | { status: "infohash-mismatch" }
+  | { status: "stale-context" }
+  | { status: "inspection-error" };
+
 const headerLength = 9;
 const rowLength = 11;
 const positiveIntegerPattern = /^[1-9]\d{0,19}$/;
@@ -240,3 +253,101 @@ export async function fetchVerifiedApiBayTvReleases(
     return { status: tvReleaseErrorStatus(error) };
   }
 }
+
+function tvTorrentErrorStatus(
+  error: unknown,
+): Exclude<TvTorrentInspectionResult["status"], "ready"> {
+  const errorCode =
+    typeof error === "string"
+      ? error
+      : error instanceof Error
+        ? error.message
+        : "";
+  switch (errorCode) {
+    case "tv_torrent_local_pending":
+      return "local-pending";
+    case "tv_torrent_local_unavailable":
+      return "local-unavailable";
+    case "tv_torrent_network_error":
+      return "network-error";
+    case "tv_torrent_timeout":
+      return "timeout";
+    case "tv_torrent_no_metadata_source":
+      return "no-metadata-source";
+    case "tv_torrent_malformed":
+      return "malformed-torrent";
+    case "tv_torrent_unsupported":
+      return "unsupported-torrent";
+    case "tv_torrent_infohash_mismatch":
+      return "infohash-mismatch";
+    case "tv_torrent_context_invalid":
+    case "tv_torrent_stale":
+      return "stale-context";
+    default:
+      return "inspection-error";
+  }
+}
+
+export async function inspectVerifiedApiBayTvTorrent(
+  context: TvEpisodeReleaseContext,
+  release: ApiBayTvRelease,
+): Promise<TvTorrentInspectionResult> {
+  try {
+    const value = await window.__TAURI__.core.invoke<unknown>(
+      "inspect_apibay_tv_torrent",
+      {
+        tmdbTvId: context.tmdbTvId,
+        providerSeasonId: context.providerSeasonId,
+        providerEpisodeId: context.providerEpisodeId,
+        providerItemId: release.providerItemId,
+      },
+    );
+    const inspection = parseTorrentInspection(value);
+    if (inspection === null) {
+      return { status: "malformed-torrent" };
+    }
+    return inspection.infohash === release.infohash
+      ? { status: "ready", inspection }
+      : { status: "infohash-mismatch" };
+  } catch (error: unknown) {
+    return { status: tvTorrentErrorStatus(error) };
+  }
+}
+
+export function selectVerifiedApiBayTvRelease(
+  context: TvEpisodeReleaseContext,
+  release: ApiBayTvRelease,
+) {
+  return window.__TAURI__.core.invoke<void>("select_apibay_tv_release", {
+    tmdbTvId: context.tmdbTvId,
+    providerSeasonId: context.providerSeasonId,
+    providerEpisodeId: context.providerEpisodeId,
+    providerItemId: release.providerItemId,
+  });
+}
+
+export async function saveVerifiedTvTorrent(inspectionId: string) {
+  if (inspectionId.trim() === "") {
+    throw new Error("A current TV torrent inspection is required.");
+  }
+  const saved = await window.__TAURI__.core.invoke<unknown>(
+    "save_verified_tv_torrent",
+    { inspectionId },
+  );
+  if (typeof saved !== "boolean") {
+    throw new Error("The native TV save response was invalid.");
+  }
+  return saved;
+}
+
+export function invalidateVerifiedTvTorrent() {
+  return window.__TAURI__.core.invoke<void>("invalidate_verified_tv_torrent");
+}
+
+export function invalidateTvReleaseContext() {
+  return window.__TAURI__.core.invoke<void>("invalidate_tv_release_context");
+}
+import {
+  parseTorrentInspection,
+  type TorrentInspection,
+} from "@/vr";

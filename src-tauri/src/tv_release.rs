@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     is_valid_tmdb_token,
@@ -28,6 +31,7 @@ const API_BAY_NO_RESULTS_INFOHASH: &str = "0000000000000000000000000000000000000
 const TV_CATEGORIES: [u64; 2] = [205, 208];
 const MAX_PROVIDER_ROWS: usize = 500;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TrustedEpisodeContext {
     tmdb_tv_id: u64,
     show_name: String,
@@ -39,6 +43,7 @@ struct TrustedEpisodeContext {
     imdb_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ApiBayRelease {
     provider_item_id: String,
     name: String,
@@ -50,6 +55,147 @@ struct ApiBayRelease {
     status: String,
     added: String,
     infohash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrustedTvReleaseIdentity {
+    pub(crate) release_generation: u64,
+    pub(crate) tmdb_tv_id: u64,
+    pub(crate) show_name: String,
+    pub(crate) provider_season_id: u64,
+    pub(crate) season_number: u64,
+    pub(crate) provider_episode_id: u64,
+    pub(crate) episode_number: u64,
+    pub(crate) episode_name: String,
+    pub(crate) imdb_id: String,
+    pub(crate) provider_item_id: String,
+    pub(crate) category: String,
+    pub(crate) release_name: String,
+    pub(crate) infohash: String,
+}
+
+struct TrustedTvReleaseSet {
+    generation: u64,
+    context: TrustedEpisodeContext,
+    releases: Vec<ApiBayRelease>,
+    selected_provider_item_id: Option<String>,
+}
+
+#[derive(Default)]
+struct TvReleaseContext {
+    generation: u64,
+    release_set: Option<TrustedTvReleaseSet>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct TvReleaseState(Arc<Mutex<TvReleaseContext>>);
+
+impl TvReleaseState {
+    pub(crate) fn begin_release_lookup(&self) -> Result<u64, &'static str> {
+        let mut state = self.0.lock().map_err(|_| TV_APIBAY_PROVIDER_ERROR)?;
+        state.generation = state.generation.wrapping_add(1);
+        state.release_set = None;
+        Ok(state.generation)
+    }
+
+    pub(crate) fn invalidate(&self) -> Result<(), &'static str> {
+        self.begin_release_lookup().map(|_| ())
+    }
+
+    pub(crate) fn resolve_release(
+        &self,
+        tmdb_tv_id: u64,
+        provider_season_id: u64,
+        provider_episode_id: u64,
+        provider_item_id: &str,
+    ) -> Option<TrustedTvReleaseIdentity> {
+        let state = self.0.lock().ok()?;
+        let release_set = state.release_set.as_ref().filter(|release_set| {
+            release_set.generation == state.generation
+                && release_set.context.tmdb_tv_id == tmdb_tv_id
+                && release_set.context.provider_season_id == provider_season_id
+                && release_set.context.provider_episode_id == provider_episode_id
+                && release_set.selected_provider_item_id.as_deref() == Some(provider_item_id)
+        })?;
+        let release = release_set
+            .releases
+            .iter()
+            .find(|release| release.provider_item_id == provider_item_id)?;
+        Some(TrustedTvReleaseIdentity {
+            release_generation: release_set.generation,
+            tmdb_tv_id: release_set.context.tmdb_tv_id,
+            show_name: release_set.context.show_name.clone(),
+            provider_season_id: release_set.context.provider_season_id,
+            season_number: release_set.context.season_number,
+            provider_episode_id: release_set.context.provider_episode_id,
+            episode_number: release_set.context.episode_number,
+            episode_name: release_set.context.episode_name.clone(),
+            imdb_id: release_set.context.imdb_id.clone(),
+            provider_item_id: release.provider_item_id.clone(),
+            category: release.category.clone(),
+            release_name: release.name.clone(),
+            infohash: release.infohash.clone(),
+        })
+    }
+
+    pub(crate) fn contains(&self, identity: &TrustedTvReleaseIdentity) -> bool {
+        self.resolve_release(
+            identity.tmdb_tv_id,
+            identity.provider_season_id,
+            identity.provider_episode_id,
+            &identity.provider_item_id,
+        )
+        .as_ref()
+            == Some(identity)
+    }
+
+    pub(crate) fn select_release(
+        &self,
+        tmdb_tv_id: u64,
+        provider_season_id: u64,
+        provider_episode_id: u64,
+        provider_item_id: &str,
+    ) -> Result<bool, &'static str> {
+        let mut state = self.0.lock().map_err(|_| TV_APIBAY_PROVIDER_ERROR)?;
+        let generation = state.generation;
+        let release_set = state
+            .release_set
+            .as_mut()
+            .filter(|release_set| {
+                release_set.generation == generation
+                    && release_set.context.tmdb_tv_id == tmdb_tv_id
+                    && release_set.context.provider_season_id == provider_season_id
+                    && release_set.context.provider_episode_id == provider_episode_id
+                    && release_set
+                        .releases
+                        .iter()
+                        .any(|release| release.provider_item_id == provider_item_id)
+            })
+            .ok_or(TV_APIBAY_PROVIDER_ERROR)?;
+        let changed = release_set.selected_provider_item_id.as_deref() != Some(provider_item_id);
+        release_set.selected_provider_item_id = Some(provider_item_id.to_owned());
+        Ok(changed)
+    }
+
+    fn finish_release_lookup(
+        &self,
+        generation: u64,
+        context: TrustedEpisodeContext,
+        releases: Vec<ApiBayRelease>,
+    ) -> Result<Vec<String>, &'static str> {
+        let response = flatten_releases(&context, &releases);
+        let mut state = self.0.lock().map_err(|_| TV_APIBAY_PROVIDER_ERROR)?;
+        if state.generation != generation {
+            return Err(TV_APIBAY_PROVIDER_ERROR);
+        }
+        state.release_set = Some(TrustedTvReleaseSet {
+            generation,
+            context,
+            releases,
+            selected_provider_item_id: None,
+        });
+        Ok(response)
+    }
 }
 
 fn tmdb_error_code(error: MovieProviderRequestError) -> &'static str {
@@ -73,13 +219,50 @@ fn apibay_error_code(error: MovieProviderRequestError) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn fetch_apibay_tv_releases_with(
     tmdb_tv_id: u64,
     requested_provider_season_id: u64,
     requested_provider_episode_id: u64,
     tmdb_token: &str,
-    mut request: impl FnMut(&str, Option<&str>) -> Result<String, MovieProviderRequestError>,
+    request: impl FnMut(&str, Option<&str>) -> Result<String, MovieProviderRequestError>,
 ) -> Result<Vec<String>, &'static str> {
+    let (context, releases) = fetch_trusted_apibay_tv_releases_with(
+        tmdb_tv_id,
+        requested_provider_season_id,
+        requested_provider_episode_id,
+        tmdb_token,
+        request,
+    )?;
+    Ok(flatten_releases(&context, &releases))
+}
+
+pub(crate) fn fetch_apibay_tv_releases_for_state_with(
+    state: &TvReleaseState,
+    generation: u64,
+    tmdb_tv_id: u64,
+    requested_provider_season_id: u64,
+    requested_provider_episode_id: u64,
+    tmdb_token: &str,
+    request: impl FnMut(&str, Option<&str>) -> Result<String, MovieProviderRequestError>,
+) -> Result<Vec<String>, &'static str> {
+    let (context, releases) = fetch_trusted_apibay_tv_releases_with(
+        tmdb_tv_id,
+        requested_provider_season_id,
+        requested_provider_episode_id,
+        tmdb_token,
+        request,
+    )?;
+    state.finish_release_lookup(generation, context, releases)
+}
+
+fn fetch_trusted_apibay_tv_releases_with(
+    tmdb_tv_id: u64,
+    requested_provider_season_id: u64,
+    requested_provider_episode_id: u64,
+    tmdb_token: &str,
+    mut request: impl FnMut(&str, Option<&str>) -> Result<String, MovieProviderRequestError>,
+) -> Result<(TrustedEpisodeContext, Vec<ApiBayRelease>), &'static str> {
     if tmdb_tv_id == 0
         || requested_provider_season_id == 0
         || requested_provider_episode_id == 0
@@ -135,7 +318,7 @@ pub(crate) fn fetch_apibay_tv_releases_with(
         )?);
     }
 
-    Ok(flatten_releases(&context, &releases))
+    Ok((context, releases))
 }
 
 fn trusted_show_season(
@@ -672,6 +855,68 @@ mod tests {
         assert_eq!(requests[4].1, None);
         assert_eq!(requests[3].0, "https://apibay.org/q.php?q=Exact%20%20Show%20%E2%80%94%20%E7%89%B9%E5%88%A5%E7%89%88%20S02E03&cat=205");
         assert_eq!(requests[4].0, "https://apibay.org/q.php?q=Exact%20%20Show%20%E2%80%94%20%E7%89%B9%E5%88%A5%E7%89%88%20S02E03&cat=208");
+    }
+
+    #[test]
+    fn native_release_state_reconstructs_only_the_manually_selected_exact_identity() {
+        let infohash = "a".repeat(40);
+        let standard = format!(
+            "[{}]",
+            release(
+                "1001",
+                "Exact  Show — 特別版.S02E03+720p.第三話",
+                "205",
+                "tt0123456",
+                &infohash,
+            )
+        );
+        let state = TvReleaseState::default();
+        let generation = state.begin_release_lookup().expect("lookup must begin");
+        fetch_apibay_tv_releases_for_state_with(
+            &state,
+            generation,
+            701,
+            9001,
+            9103,
+            "fixture-token",
+            |url, _| {
+                if url.ends_with("/tv/701") {
+                    Ok(DETAILS.to_owned())
+                } else if url.ends_with("/season/2") {
+                    Ok(SEASON.to_owned())
+                } else if url.ends_with("/external_ids") {
+                    Ok(EXTERNAL_IDS.to_owned())
+                } else if url.ends_with("cat=205") {
+                    Ok(standard.clone())
+                } else {
+                    Ok("[]".to_owned())
+                }
+            },
+        )
+        .expect("the verified release set must be stored");
+
+        assert!(state.resolve_release(701, 9001, 9103, "1001").is_none());
+        assert_eq!(state.select_release(701, 9001, 9103, "1001"), Ok(true));
+        let identity = state
+            .resolve_release(701, 9001, 9103, "1001")
+            .expect("the exact selected identity must resolve");
+        assert_eq!(identity.tmdb_tv_id, 701);
+        assert_eq!(identity.show_name, "Exact  Show — 特別版");
+        assert_eq!(identity.provider_season_id, 9001);
+        assert_eq!(identity.season_number, 2);
+        assert_eq!(identity.provider_episode_id, 9103);
+        assert_eq!(identity.episode_number, 3);
+        assert_eq!(identity.episode_name, "第三話  —  Exact Episode");
+        assert_eq!(identity.imdb_id, "tt0123456");
+        assert_eq!(identity.provider_item_id, "1001");
+        assert_eq!(identity.category, "205");
+        assert_eq!(
+            identity.release_name,
+            "Exact  Show — 特別版.S02E03+720p.第三話"
+        );
+        assert_eq!(identity.infohash, infohash);
+        assert!(state.resolve_release(701, 9001, 9103, "9999").is_none());
+        assert!(state.resolve_release(701, 9001, 9104, "1001").is_none());
     }
 
     #[test]
