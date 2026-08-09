@@ -24,6 +24,13 @@ pub const ADULT_FILE_REVEAL_OUTSIDE_FOLDER: &str = "adult_file_reveal_outside_fo
 pub const ADULT_FILE_REVEAL_STALE: &str = "adult_file_reveal_stale";
 pub const ADULT_FILE_REVEAL_UNAVAILABLE: &str = "adult_file_reveal_unavailable";
 pub const ADULT_FILE_REVEAL_UNSUPPORTED: &str = "adult_file_reveal_unsupported";
+pub const ADULT_FILE_TRASH_FAILED: &str = "adult_file_trash_failed";
+pub const ADULT_FILE_TRASH_NOT_FILE: &str = "adult_file_trash_not_file";
+pub const ADULT_FILE_TRASH_NOT_FOUND: &str = "adult_file_trash_not_found";
+pub const ADULT_FILE_TRASH_OUTSIDE_FOLDER: &str = "adult_file_trash_outside_folder";
+pub const ADULT_FILE_TRASH_STALE: &str = "adult_file_trash_stale";
+pub const ADULT_FILE_TRASH_UNAVAILABLE: &str = "adult_file_trash_unavailable";
+pub const ADULT_FILE_TRASH_UNSUPPORTED: &str = "adult_file_trash_unsupported";
 
 #[derive(Clone)]
 struct TrustedAdultFile {
@@ -34,6 +41,7 @@ struct TrustedAdultFile {
 
 struct CompletedAdultScan {
     folder: PathBuf,
+    generation: u64,
     files: Vec<TrustedAdultFile>,
 }
 
@@ -214,7 +222,8 @@ pub fn scan_adult_library_with(state: &AdultLibraryState) -> Result<Vec<String>,
     };
     let files = scan_media_files(&folder)?;
 
-    let mut response = Vec::with_capacity(files.len() * 3);
+    let mut response = Vec::with_capacity(1 + files.len() * 3);
+    response.push(generation.to_string());
     for file in &files {
         response.push(
             file.path
@@ -238,7 +247,11 @@ pub fn scan_adult_library_with(state: &AdultLibraryState) -> Result<Vec<String>,
     if context.generation != generation || context.folder.as_ref() != Some(&folder) {
         return Err(ADULT_LIBRARY_STALE);
     }
-    context.completed_scan = Some(CompletedAdultScan { folder, files });
+    context.completed_scan = Some(CompletedAdultScan {
+        folder,
+        generation,
+        files,
+    });
     Ok(response)
 }
 
@@ -254,8 +267,11 @@ fn validate_adult_file(
     requested_path: &Path,
     configured_folder: &Path,
     scan: &CompletedAdultScan,
+    requested_generation: Option<u64>,
 ) -> Result<(), AdultFileValidationError> {
-    if scan.folder != configured_folder {
+    if scan.folder != configured_folder
+        || requested_generation.is_some_and(|generation| generation != scan.generation)
+    {
         return Err(AdultFileValidationError::Stale);
     }
     let relative_path = requested_path
@@ -327,7 +343,7 @@ fn run_adult_file_action(
         .completed_scan
         .as_ref()
         .ok_or(AdultFileValidationError::Stale)?;
-    validate_adult_file(path, &canonical_folder, scan)?;
+    validate_adult_file(path, &canonical_folder, scan, None)?;
     dispatch(path).map_err(|_| AdultFileValidationError::Dispatch)
 }
 
@@ -361,6 +377,49 @@ pub fn reveal_adult_file_with(
         AdultFileValidationError::Stale => ADULT_FILE_REVEAL_STALE,
         AdultFileValidationError::Dispatch => ADULT_FILE_REVEAL_FAILED,
     })
+}
+
+pub fn trash_adult_file_with(
+    path: &Path,
+    scan_generation: u64,
+    state: &AdultLibraryState,
+    dispatch: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    let mut context = state.0.lock().map_err(|_| ADULT_FILE_TRASH_UNAVAILABLE)?;
+    let configured_folder = context.folder.clone().ok_or(ADULT_FILE_TRASH_UNAVAILABLE)?;
+    let canonical_folder =
+        fs::canonicalize(&configured_folder).map_err(|_| ADULT_FILE_TRASH_UNAVAILABLE)?;
+    if canonical_folder != configured_folder
+        || !fs::metadata(&canonical_folder)
+            .map_err(|_| ADULT_FILE_TRASH_UNAVAILABLE)?
+            .is_dir()
+    {
+        return Err(ADULT_FILE_TRASH_UNAVAILABLE);
+    }
+    let scan = context
+        .completed_scan
+        .as_ref()
+        .ok_or(ADULT_FILE_TRASH_STALE)?;
+    validate_adult_file(path, &canonical_folder, scan, Some(scan_generation)).map_err(|error| {
+        match error {
+            AdultFileValidationError::NotFound => ADULT_FILE_TRASH_NOT_FOUND,
+            AdultFileValidationError::Unavailable => ADULT_FILE_TRASH_UNAVAILABLE,
+            AdultFileValidationError::NotFile => ADULT_FILE_TRASH_NOT_FILE,
+            AdultFileValidationError::Unsupported => ADULT_FILE_TRASH_UNSUPPORTED,
+            AdultFileValidationError::OutsideFolder => ADULT_FILE_TRASH_OUTSIDE_FOLDER,
+            AdultFileValidationError::Stale => ADULT_FILE_TRASH_STALE,
+            AdultFileValidationError::Dispatch => ADULT_FILE_TRASH_FAILED,
+        }
+    })?;
+
+    dispatch(path).map_err(|_| ADULT_FILE_TRASH_FAILED)?;
+    context
+        .completed_scan
+        .as_mut()
+        .ok_or(ADULT_FILE_TRASH_STALE)?
+        .files
+        .retain(|file| file.path != path);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -460,6 +519,7 @@ mod tests {
         assert_eq!(
             scan_adult_library_with(&state),
             Ok(vec![
+                "2".to_owned(),
                 first.to_string_lossy().into_owned(),
                 "ADLT-123  Part 01.mp4".to_owned(),
                 "3".to_owned(),
@@ -595,5 +655,230 @@ mod tests {
             reveal_adult_file_with(&movie, &state, |_| Err(())),
             Err(ADULT_FILE_REVEAL_FAILED)
         );
+    }
+
+    #[test]
+    fn trash_dispatches_one_exact_scanned_adult_member_and_updates_state_only_after_success() {
+        let fixture = Fixture::new("trash-exact");
+        let first = fixture.path.join("ADLT-123 Part 01.mp4");
+        let sibling = fixture.path.join("ADLT-123 CD2.mkv");
+        let ambiguous = fixture.path.join("ADLT-123 Part 1-2.mp4");
+        let unassociated = fixture.path.join("作品 without code.mp4");
+        for (path, content) in [
+            (&first, b"first".as_slice()),
+            (&sibling, b"sibling".as_slice()),
+            (&ambiguous, b"ambiguous".as_slice()),
+            (&unassociated, b"unassociated".as_slice()),
+        ] {
+            fs::write(path, content).expect("Adult file must be written");
+        }
+        let state = AdultLibraryState::default();
+        set_adult_folder(&state, &fixture.path.join("config"), fixture.path.clone())
+            .expect("Adult folder must be configured");
+        let scan = scan_adult_library_with(&state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+        let dispatch_count = Cell::new(0);
+
+        assert_eq!(
+            trash_adult_file_with(&first, generation, &state, |_| {
+                dispatch_count.set(dispatch_count.get() + 1);
+                Err(())
+            }),
+            Err(ADULT_FILE_TRASH_FAILED)
+        );
+        assert_eq!(
+            trash_adult_file_with(&first, generation, &state, |path| {
+                assert_eq!(path, first);
+                dispatch_count.set(dispatch_count.get() + 1);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            trash_adult_file_with(&first, generation, &state, |_| {
+                dispatch_count.set(dispatch_count.get() + 1);
+                Ok(())
+            }),
+            Err(ADULT_FILE_TRASH_STALE)
+        );
+        for path in [&sibling, &ambiguous, &unassociated] {
+            assert_eq!(
+                trash_adult_file_with(path, generation, &state, |_| Ok(())),
+                Ok(())
+            );
+        }
+        assert_eq!(dispatch_count.get(), 2);
+    }
+
+    #[test]
+    fn trash_rejects_untrusted_changed_and_unsafe_adult_paths_without_dispatch() {
+        let trusted = Fixture::new("trash-trusted");
+        let unrelated = Fixture::new("trash-unrelated");
+        let current = trusted.path.join("ADLT-123 Part 01.mp4");
+        let changed = trusted.path.join("ADLT-123 CD2.mkv");
+        let missing = trusted.path.join("ADLT-124.mp4");
+        fs::write(&current, b"current").expect("current member must be written");
+        fs::write(&changed, b"changed").expect("changed member must be written");
+        fs::write(&missing, b"missing").expect("missing member must be written");
+        let state = AdultLibraryState::default();
+        set_adult_folder(&state, &trusted.path.join("config"), trusted.path.clone())
+            .expect("Adult folder must be configured");
+        let scan = scan_adult_library_with(&state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+        let dispatched = Cell::new(false);
+        let same_name_elsewhere = unrelated.path.join("ADLT-123 Part 01.mp4");
+        fs::write(&same_name_elsewhere, b"current").expect("unrelated file must be written");
+        let neighboring_code = trusted.path.join("ADLT-125.mp4");
+        fs::write(&neighboring_code, b"neighbor").expect("neighbor must be written");
+        let mixed_code = trusted.path.join("ADLT-123 + XYZ-7.mp4");
+        fs::write(&mixed_code, b"mixed").expect("mixed-code file must be written");
+        let directory = trusted.path.join("directory.mkv");
+        fs::create_dir(&directory).expect("directory must be created");
+        let unsupported = trusted.path.join("unsupported.avi");
+        fs::write(&unsupported, b"unsupported").expect("unsupported file must be written");
+        fs::write(&changed, b"different content").expect("member must change");
+        fs::remove_file(&missing).expect("member must be removed");
+
+        for (path, expected) in [
+            (same_name_elsewhere, ADULT_FILE_TRASH_OUTSIDE_FOLDER),
+            (neighboring_code, ADULT_FILE_TRASH_STALE),
+            (mixed_code, ADULT_FILE_TRASH_STALE),
+            (directory, ADULT_FILE_TRASH_NOT_FILE),
+            (unsupported, ADULT_FILE_TRASH_UNSUPPORTED),
+            (changed, ADULT_FILE_TRASH_STALE),
+            (missing, ADULT_FILE_TRASH_NOT_FOUND),
+        ] {
+            assert_eq!(
+                trash_adult_file_with(&path, generation, &state, |_| {
+                    dispatched.set(true);
+                    Ok(())
+                }),
+                Err(expected)
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let link = trusted.path.join("linked.mp4");
+            std::os::unix::fs::symlink(&current, &link).expect("file symlink must be created");
+            assert_eq!(
+                trash_adult_file_with(&link, generation, &state, |_| {
+                    dispatched.set(true);
+                    Ok(())
+                }),
+                Err(ADULT_FILE_TRASH_NOT_FILE)
+            );
+            let linked_parent = trusted.path.join("linked-parent");
+            std::os::unix::fs::symlink(&unrelated.path, &linked_parent)
+                .expect("parent symlink must be created");
+            let linked_child = linked_parent.join("ADLT-123 Part 01.mp4");
+            assert_eq!(
+                trash_adult_file_with(&linked_child, generation, &state, |_| {
+                    dispatched.set(true);
+                    Ok(())
+                }),
+                Err(ADULT_FILE_TRASH_NOT_FILE)
+            );
+        }
+        assert!(!dispatched.get());
+    }
+
+    #[test]
+    fn trash_rejects_stale_generations_and_restart_scan_keeps_an_accepted_member_absent() {
+        let fixture = Fixture::new("trash-generation");
+        let holding = Fixture::new("trash-holding");
+        let persistence_path = fixture.path.join("config");
+        let member = fixture.path.join("ADLT-123 Disk-4.mp4");
+        fs::write(&member, b"member").expect("Adult member must be written");
+        let state = AdultLibraryState::default();
+        set_adult_folder(&state, &persistence_path, fixture.path.clone())
+            .expect("Adult folder must be configured");
+        let first_scan = scan_adult_library_with(&state).expect("scan must complete");
+        let first_generation = first_scan[0].parse().expect("generation must be valid");
+        let second_scan = scan_adult_library_with(&state).expect("scan must complete");
+        let current_generation = second_scan[0].parse().expect("generation must be valid");
+        let dispatched = Cell::new(false);
+
+        assert_eq!(
+            trash_adult_file_with(&member, first_generation, &state, |_| {
+                dispatched.set(true);
+                Ok(())
+            }),
+            Err(ADULT_FILE_TRASH_STALE)
+        );
+        assert!(!dispatched.get());
+
+        let moved_path = holding.path.join("ADLT-123 Disk-4.mp4");
+        trash_adult_file_with(&member, current_generation, &state, |path| {
+            fs::rename(path, &moved_path).map_err(|_| ())
+        })
+        .expect("accepted dispatch must succeed");
+        assert!(moved_path.is_file());
+        assert!(!member.exists());
+
+        let restarted = AdultLibraryState::default();
+        assert_eq!(
+            load_adult_folder_with(&restarted, &persistence_path),
+            Ok(vec![
+                "ready".to_owned(),
+                fixture.path.to_string_lossy().into_owned(),
+            ])
+        );
+        let restarted_scan =
+            scan_adult_library_with(&restarted).expect("restart scan must complete");
+        assert_eq!(restarted_scan.len(), 1);
+    }
+
+    #[test]
+    fn folder_replacement_clear_and_failed_refresh_invalidate_adult_trash_requests() {
+        let configuration = Fixture::new("trash-configuration");
+        let first = Fixture::new("trash-first-folder");
+        let replacement = Fixture::new("trash-replacement-folder");
+        let persistence_path = configuration.path.join("config");
+        let member = first.path.join("ADLT-123 Disc 03.mp4");
+        fs::write(&member, b"member").expect("Adult member must be written");
+        let state = AdultLibraryState::default();
+        set_adult_folder(&state, &persistence_path, first.path.clone())
+            .expect("first Adult folder must be configured");
+        let scan = scan_adult_library_with(&state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+        let dispatched = Cell::new(false);
+
+        set_adult_folder(&state, &persistence_path, replacement.path.clone())
+            .expect("replacement Adult folder must be configured");
+        assert_eq!(
+            trash_adult_file_with(&member, generation, &state, |_| {
+                dispatched.set(true);
+                Ok(())
+            }),
+            Err(ADULT_FILE_TRASH_STALE)
+        );
+        clear_adult_folder(&state, &persistence_path).expect("Adult folder must clear");
+        assert_eq!(
+            trash_adult_file_with(&member, generation, &state, |_| {
+                dispatched.set(true);
+                Ok(())
+            }),
+            Err(ADULT_FILE_TRASH_UNAVAILABLE)
+        );
+
+        set_adult_folder(&state, &persistence_path, first.path.clone())
+            .expect("first Adult folder must be restored");
+        let refreshed_scan = scan_adult_library_with(&state).expect("scan must complete");
+        let refreshed_generation = refreshed_scan[0].parse().expect("generation must be valid");
+        let unavailable_folder = configuration.path.join("unavailable-Adult-folder");
+        fs::rename(&first.path, &unavailable_folder).expect("Adult folder must be unavailable");
+        assert_eq!(
+            scan_adult_library_with(&state),
+            Err(ADULT_FOLDER_UNAVAILABLE)
+        );
+        assert_eq!(
+            trash_adult_file_with(&member, refreshed_generation, &state, |_| {
+                dispatched.set(true);
+                Ok(())
+            }),
+            Err(ADULT_FILE_TRASH_UNAVAILABLE)
+        );
+        assert!(!dispatched.get());
     }
 }

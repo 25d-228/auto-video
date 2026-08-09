@@ -20,8 +20,9 @@ use std::process::{Command, Stdio};
 use adult_library::{
     clear_adult_folder as clear_trusted_adult_folder, configured_adult_folder,
     load_adult_folder_with, open_adult_file_with, reveal_adult_file_with, scan_adult_library_with,
-    set_adult_folder, AdultLibraryState, ADULT_FILE_OPEN_FAILED, ADULT_FILE_REVEAL_FAILED,
-    ADULT_FOLDER_STORAGE_FAILED, ADULT_FOLDER_UNAVAILABLE, ADULT_LIBRARY_SCAN_FAILED,
+    set_adult_folder, trash_adult_file_with, AdultLibraryState, ADULT_FILE_OPEN_FAILED,
+    ADULT_FILE_REVEAL_FAILED, ADULT_FILE_TRASH_FAILED, ADULT_FOLDER_STORAGE_FAILED,
+    ADULT_FOLDER_UNAVAILABLE, ADULT_LIBRARY_SCAN_FAILED,
 };
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
@@ -1396,6 +1397,24 @@ async fn reveal_adult_file(
 }
 
 #[tauri::command]
+async fn trash_adult_file(
+    path: String,
+    scan_generation: String,
+    state: tauri::State<'_, AdultLibraryState>,
+) -> Result<(), String> {
+    let scan_generation = scan_generation
+        .parse::<u64>()
+        .map_err(|_| adult_library::ADULT_FILE_TRASH_STALE.to_owned())?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        trash_adult_file_with(Path::new(&path), scan_generation, &state, move_to_os_trash)
+    })
+    .await
+    .map_err(|_| ADULT_FILE_TRASH_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn trash_movie(
     path: String,
     folder: Option<String>,
@@ -2264,6 +2283,7 @@ fn main() {
             query_adult_storage,
             open_adult_file,
             reveal_adult_file,
+            trash_adult_file,
             load_tmdb_token,
             save_tmdb_token,
             clear_tmdb_token,

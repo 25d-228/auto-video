@@ -70,6 +70,9 @@ let openAdultFileMock: Mock<
 let revealAdultFileMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
+let trashAdultFileMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
 let loadTmdbTokenMock: Mock<() => Promise<string | null>>;
 let saveTmdbTokenMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
@@ -616,6 +619,7 @@ beforeEach(() => {
     .mockResolvedValue(["4398046511104", "1099511627776"]);
   openAdultFileMock = vi.fn().mockResolvedValue(undefined);
   revealAdultFileMock = vi.fn().mockResolvedValue(undefined);
+  trashAdultFileMock = vi.fn().mockResolvedValue(undefined);
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
@@ -801,13 +805,15 @@ beforeEach(() => {
             savedAdultFolder = null;
           });
         case "scan_adult_library":
-          return scanAdultLibraryMock();
+          return scanAdultLibraryMock().then((rows) => ["1", ...rows]);
         case "query_adult_storage":
           return queryAdultStorageMock();
         case "open_adult_file":
           return openAdultFileMock(parameters);
         case "reveal_adult_file":
           return revealAdultFileMock(parameters);
+        case "trash_adult_file":
+          return trashAdultFileMock(parameters);
         case "load_tmdb_token":
           return loadTmdbTokenMock();
         case "save_tmdb_token":
@@ -2099,6 +2105,387 @@ describe("parsed Adult Library and Dashboard", () => {
     expect(scanTvLibraryMock).not.toHaveBeenCalled();
     expect(scanVrLibraryMock).not.toHaveBeenCalled();
     expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
+  });
+
+  it("requires exact Adult member confirmation and keeps every dismissal non-mutating", async () => {
+    savedAdultFolder = "/Adult";
+    const path = "/Adult/作品/ADLT-123  Part 01 — 前編.MKV";
+    scanAdultLibraryMock.mockResolvedValue([
+      path,
+      "作品/ADLT-123  Part 01 — 前編.MKV",
+      "10",
+    ]);
+    const parentActivation = vi.fn();
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    const trashButton = await screen.findByRole("button", {
+      name: "Move Adult file to Trash or Recycle Bin: ADLT-123 Part 01 — 前編.MKV",
+    });
+    parentActivation.mockClear();
+    trashButton.focus();
+    fireEvent.click(trashButton);
+
+    let dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain(
+      "Move “ADLT-123  Part 01 — 前編.MKV” to Trash?",
+    );
+    expect(dialog.textContent).toContain(
+      "exact member “ADLT-123  Part 01 — 前編.MKV” of “ADLT-123” (Part 01)",
+    );
+    expect(dialog.textContent).not.toContain(path);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("button", { name: "Cancel" }),
+      );
+    });
+    expect(trashAdultFileMock).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    dialog = await screen.findByRole("alertdialog");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Close confirmation" }),
+    );
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    await screen.findByRole("alertdialog");
+    const backdrop = document.querySelector(".trash-dialog__backdrop");
+    if (backdrop === null) {
+      throw new Error("The Adult Trash confirmation backdrop was not rendered.");
+    }
+    fireEvent.pointerDown(backdrop);
+    fireEvent.click(backdrop);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+    expect(trashAdultFileMock).not.toHaveBeenCalled();
+    expect(openAdultFileMock).not.toHaveBeenCalled();
+    expect(revealAdultFileMock).not.toHaveBeenCalled();
+    expect(clipboardWriteMock).not.toHaveBeenCalled();
+    expect(parentActivation).not.toHaveBeenCalled();
+    expect(scanAdultLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryAdultStorageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("moves one grouped Adult member once and preserves every exact remaining basename", async () => {
+    savedAdultFolder = "/Adult";
+    const removedPath = "/Adult/ADLT-123 Part 01.mp4";
+    const siblingPath = "/Adult/ADLT-123 CD2.mkv";
+    const ambiguousPath = "/Adult/ADLT-123 Part 1-2.mp4";
+    const unassociatedPath = "/Adult/Unicode  特典.mp4";
+    const initialRows = [
+      removedPath,
+      "ADLT-123 Part 01.mp4",
+      "10",
+      siblingPath,
+      "ADLT-123 CD2.mkv",
+      "20",
+      ambiguousPath,
+      "ADLT-123 Part 1-2.mp4",
+      "30",
+      unassociatedPath,
+      "Unicode  特典.mp4",
+      "40",
+    ];
+    const remainingRows = initialRows.slice(3);
+    const pendingTrash = createDeferred<void>();
+    scanAdultLibraryMock
+      .mockResolvedValueOnce(initialRows)
+      .mockResolvedValueOnce(remainingRows);
+    trashAdultFileMock.mockReturnValueOnce(pendingTrash.promise);
+    queryAdultStorageMock
+      .mockResolvedValueOnce(["1000", "400"])
+      .mockResolvedValueOnce(["1000", "410"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { level: 3, name: "ADLT-123" });
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort titles" }), {
+      target: { value: "descending" },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "ADLT-123" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move Adult file to Trash or Recycle Bin: ADLT-123 Part 01.mp4",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    const confirmButton = within(dialog).getByRole("button", {
+      name: "Confirm moving Adult file to Trash or Recycle Bin: ADLT-123 Part 01.mp4",
+    });
+    fireEvent.click(confirmButton);
+    confirmButton.click();
+
+    expect(trashAdultFileMock).toHaveBeenCalledTimes(1);
+    expect(trashAdultFileMock).toHaveBeenCalledWith({
+      path: removedPath,
+      scanGeneration: "1",
+    });
+    expect(confirmButton).toHaveProperty("disabled", true);
+    expect(dialog.getAttribute("aria-busy")).toBe("true");
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveProperty(
+      "disabled",
+      true,
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "Close confirmation" }),
+    ).toHaveProperty("disabled", true);
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    const pendingBackdrop = document.querySelector(".trash-dialog__backdrop");
+    if (pendingBackdrop === null) {
+      throw new Error("The pending Adult Trash backdrop was not rendered.");
+    }
+    fireEvent.click(pendingBackdrop);
+    expect(screen.getByRole("alertdialog")).toBe(dialog);
+
+    await act(async () => {
+      pendingTrash.resolve(undefined);
+      await pendingTrash.promise;
+    });
+    expect(
+      await screen.findByText(
+        "ADLT-123 Part 01.mp4 was moved to Trash or the Recycle Bin.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("ADLT-123 Part 01.mp4")).toBeNull();
+    expect(screen.getByText("ADLT-123 CD2.mkv")).toBeTruthy();
+    expect(screen.getByText("CD2 · 20 B")).toBeTruthy();
+    expect(screen.getByText("ADLT-123 Part 1-2.mp4")).toBeTruthy();
+    expect(screen.queryByText("Part 1 · 30 B")).toBeNull();
+    expect(screen.getByRole("heading", { level: 3, name: "ADLT-123" }))
+      .toBeTruthy();
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "ADLT-123",
+    );
+    expect(screen.getByRole("combobox", { name: "Sort titles" })).toHaveProperty(
+      "value",
+      "descending",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Clear Adult search" }));
+    await waitFor(() => {
+      expect(
+        Array.from(document.querySelectorAll("[data-adult-file-path]"), (row) =>
+          row.getAttribute("data-adult-file-path"),
+        ),
+      ).toContain(unassociatedPath);
+    });
+    expect(scanAdultLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryAdultStorageMock).toHaveBeenCalledTimes(2);
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(scanTvLibraryMock).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
+
+    selectDashboard();
+    const summary = screen
+      .getByRole("heading", { level: 2, name: "Adult Library" })
+      .closest("section");
+    if (summary === null) {
+      throw new Error("The Adult Dashboard summary was not rendered.");
+    }
+    expect(
+      within(summary).getByRole("heading", {
+        level: 3,
+        name: "1 grouped title · 3 supported files",
+      }),
+    ).toBeTruthy();
+    expect(within(summary).getByText("1 file remains unassociated.")).toBeTruthy();
+    expect(within(summary).getByText("590 B")).toBeTruthy();
+  });
+
+  it("keeps an accepted unassociated Adult move truthful when reconciliation fails", async () => {
+    savedAdultFolder = "/Adult";
+    const removedPath = "/Adult/Unassociated  —  remove me.MKV";
+    const remainingPath = "/Adult/ADLT-123 Disk-4.mp4";
+    const initialRows = [
+      removedPath,
+      "Unassociated  —  remove me.MKV",
+      "10",
+      remainingPath,
+      "ADLT-123 Disk-4.mp4",
+      "20",
+    ];
+    const remainingRows = [remainingPath, "ADLT-123 Disk-4.mp4", "20"];
+    scanAdultLibraryMock
+      .mockResolvedValueOnce(initialRows)
+      .mockRejectedValueOnce("adult_library_scan_failed")
+      .mockResolvedValueOnce(remainingRows);
+    queryAdultStorageMock
+      .mockResolvedValueOnce(["1000", "400"])
+      .mockRejectedValueOnce("adult_storage_failed")
+      .mockResolvedValueOnce(["1000", "420"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Move Adult file to Trash or Recycle Bin: Unassociated — remove me.MKV",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain(
+      "exact unassociated file “Unassociated  —  remove me”",
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving Adult file to Trash or Recycle Bin: Unassociated — remove me.MKV",
+      }),
+    );
+
+    expect(
+      await screen.findByText(
+        "Unassociated — remove me.MKV was moved to Trash or the Recycle Bin.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Unassociated  —  remove me.MKV")).toBeNull();
+    expect(screen.getByText("ADLT-123 Disk-4.mp4")).toBeTruthy();
+    const attention = await screen.findByRole("alert");
+    expect(attention.textContent).toContain("file move succeeded");
+    expect(attention.textContent).toContain("remains removed");
+    expect(trashAdultFileMock).toHaveBeenCalledTimes(1);
+    expect(scanAdultLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryAdultStorageMock).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(
+      within(attention).getByRole("button", { name: "Retry reconciliation" }),
+    );
+    await screen.findByRole("heading", { level: 3, name: "ADLT-123" });
+    await waitFor(() => {
+      expect(screen.queryByText(/Library or storage could not be refreshed/))
+        .toBeNull();
+    });
+    expect(screen.queryByText("Unassociated  —  remove me.MKV")).toBeNull();
+    expect(scanAdultLibraryMock).toHaveBeenCalledTimes(3);
+    expect(queryAdultStorageMock).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    ["adult_file_trash_not_found", "This file is no longer available."],
+    [
+      "adult_file_trash_unavailable",
+      "Auto-Video could not access the configured Adult folder.",
+    ],
+    [
+      "adult_file_trash_not_file",
+      "This item is not an eligible video file.",
+    ],
+    [
+      "adult_file_trash_unsupported",
+      "This item is not a supported .mp4 or .mkv file.",
+    ],
+    [
+      "adult_file_trash_outside_folder",
+      "This file is outside the configured Adult folder.",
+    ],
+    [
+      "adult_file_trash_stale",
+      "This file is no longer part of the latest Adult Library scan.",
+    ],
+    [
+      "adult_file_trash_failed",
+      "The operating system could not move this file to Trash or the Recycle Bin.",
+    ],
+  ])("reports %s and preserves every current Adult result", async (error, message) => {
+    savedAdultFolder = "/Adult";
+    const path = "/Adult/ADLT-123 Disc 03.mp4";
+    scanAdultLibraryMock.mockResolvedValue([
+      path,
+      "ADLT-123 Disc 03.mp4",
+      "10",
+    ]);
+    trashAdultFileMock.mockRejectedValueOnce(error);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Move Adult file to Trash or Recycle Bin: ADLT-123 Disc 03.mp4",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving Adult file to Trash or Recycle Bin: ADLT-123 Disc 03.mp4",
+      }),
+    );
+
+    expect(await within(dialog).findByRole("alert")).toHaveProperty(
+      "textContent",
+      message,
+    );
+    expect(screen.getByText("ADLT-123 Disc 03.mp4")).toBeTruthy();
+    expect(scanAdultLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryAdultStorageMock).toHaveBeenCalledTimes(1);
+    expect(trashAdultFileMock).toHaveBeenCalledWith({
+      path,
+      scanGeneration: "1",
+    });
+  });
+
+  it("removing the final grouped Adult member clamps only an invalid page", async () => {
+    savedAdultFolder = "/Adult";
+    const rows = Array.from({ length: 29 }, (_, index) => {
+      const code = `ADLT-${String(index + 101)}`;
+      return [`/Adult/${code}.mp4`, `${code}.mp4`, "1"];
+    }).flat();
+    scanAdultLibraryMock
+      .mockResolvedValueOnce(rows)
+      .mockResolvedValueOnce(rows.slice(0, -3));
+    gallerySizes.library = { width: 1528, height: 136 };
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { level: 3, name: "ADLT-101" });
+    for (let page = 1; page < 5; page += 1) {
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "Next Adult titles and unassociated files page",
+        }),
+      );
+    }
+    expect(screen.getByText("Page 5 of 5")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move Adult file to Trash or Recycle Bin: ADLT-129.mp4",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving Adult file to Trash or Recycle Bin: ADLT-129.mp4",
+      }),
+    );
+
+    expect(await screen.findByText("Page 4 of 4")).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 3, name: "ADLT-129" }))
+      .toBeNull();
+    expect(screen.getByRole("heading", { level: 3, name: "ADLT-128" }))
+      .toBeTruthy();
+    expect(scanAdultLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryAdultStorageMock).toHaveBeenCalledTimes(2);
   });
 
   it("keeps a complete Adult scan visible when its storage query fails", async () => {
