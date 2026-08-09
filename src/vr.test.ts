@@ -15,11 +15,13 @@ import {
   loadVrDownloads,
   loadVrFolder,
   previewVrOrganization,
+  queryVrStorage,
   scanVrLibrary,
   saveVrDownloadLimit,
   saveVerifiedAdultTorrent,
   startVerifiedAdultDownload,
   startVerifiedVrDownload,
+  trashVrFile,
 } from "./vr";
 
 const catalogFixture = `
@@ -102,6 +104,7 @@ describe("parsed VR Library identity", () => {
     const secondPath = "/VR/mdvr_00419_CD2  特別版.MKV";
     const mixedPath = "/VR/MDVR-419 + ABC-123  pack.mp4";
     invokeMock.mockResolvedValue([
+      "7",
       firstPath,
       "10",
       secondPath,
@@ -121,8 +124,9 @@ describe("parsed VR Library identity", () => {
       mixedPath,
       "90",
     ]);
-    const items = await scanVrLibrary();
+    const { generation, items } = await scanVrLibrary();
 
+    expect(generation).toBe("7");
     const mdvr419 = items.find((item) => item.code === "MDVR-419");
     expect(mdvr419).toEqual({
       id: "code:MDVR-419",
@@ -163,9 +167,12 @@ describe("parsed VR Library identity", () => {
   });
 
   it("rejects malformed native rows and duplicate paths", async () => {
+    invokeMock.mockResolvedValueOnce([]);
+    await expect(scanVrLibrary()).rejects.toThrow("invalid data");
     invokeMock.mockResolvedValueOnce(["/VR/MDVR-419.mp4"]);
     await expect(scanVrLibrary()).rejects.toThrow("invalid data");
     invokeMock.mockResolvedValueOnce([
+        "1",
         "/VR/MDVR-419.mp4",
         "1",
         "/VR/MDVR-419.mp4",
@@ -176,6 +183,7 @@ describe("parsed VR Library identity", () => {
 
   it("records only unambiguous multipart labels without inventing missing members", async () => {
     invokeMock.mockResolvedValue([
+      "8",
       "/VR/Folder A/MDVR-777 Part 01.mp4",
       "1",
       "/VR/Folder C/MDVR-777 Part 03.mkv",
@@ -184,7 +192,7 @@ describe("parsed VR Library identity", () => {
       "4",
     ]);
 
-    const items = await scanVrLibrary();
+    const { items } = await scanVrLibrary();
 
     expect(items).toHaveLength(1);
     expect(items[0].files.map((file) => [file.path, file.partLabel])).toEqual([
@@ -192,6 +200,31 @@ describe("parsed VR Library identity", () => {
       ["/VR/Folder C/MDVR-777 Part 03.mkv", "Part 03"],
       ["/VR/Folder D/MDVR-777 Part 01 Disc 02.mp4", null],
     ]);
+  });
+
+  it("accepts a generation-only response and dispatches exact Trash authority", async () => {
+    invokeMock.mockResolvedValueOnce(["9"]);
+
+    await expect(scanVrLibrary()).resolves.toEqual({
+      generation: "9",
+      items: [],
+    });
+    invokeMock.mockResolvedValueOnce(undefined);
+    await trashVrFile("/VR/MDVR-419 PT 02.mp4", "9");
+    expect(invokeMock).toHaveBeenLastCalledWith("trash_vr_file", {
+      path: "/VR/MDVR-419 PT 02.mp4",
+      scanGeneration: "9",
+    });
+  });
+
+  it("validates VR volume storage at the interface boundary", async () => {
+    invokeMock.mockResolvedValueOnce(["100", "40"]);
+    await expect(queryVrStorage()).resolves.toEqual({
+      totalBytes: 100n,
+      freeBytes: 40n,
+    });
+    invokeMock.mockResolvedValueOnce(["0", "0"]);
+    await expect(queryVrStorage()).rejects.toThrow("inconsistent");
   });
 });
 

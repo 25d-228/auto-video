@@ -135,6 +135,7 @@ import {
   openVrFile,
   pauseVrDownload,
   previewVrOrganization,
+  queryVrStorage,
   revealVrFile,
   resumeVrDownload,
   saveVrDownloadLimit,
@@ -143,6 +144,7 @@ import {
   scanVrLibrary,
   startVerifiedAdultDownload,
   startVerifiedVrDownload,
+  trashVrFile,
   type VrDownload,
   type VrDownloadLimit,
   type VrFolderState,
@@ -314,10 +316,10 @@ type VrLibraryScanState =
   | { status: "loading" }
   | { status: "unconfigured" }
   | { status: "scanning" }
-  | { status: "empty" }
+  | { status: "empty"; generation: string }
   | { status: "unavailable" }
   | { status: "error" }
-  | { status: "ready"; items: VrLibraryItem[] };
+  | { status: "ready"; generation: string; items: VrLibraryItem[] };
 type VrCatalogState =
   | { status: "idle" }
   | { status: "loading" }
@@ -639,6 +641,25 @@ const vrFileRevealErrorMessages: Record<string, string> = {
   vr_file_reveal_outside_folder: "This file is outside the configured VR folder.",
   vr_file_reveal_stale: "This file is no longer part of the current VR Library.",
   vr_file_reveal_failed: "The operating system could not reveal this file.",
+};
+
+const vrFileTrashErrorMessages: Record<string, string> = {
+  vr_file_trash_not_found: "This file is no longer available.",
+  vr_file_trash_unavailable:
+    "Auto-Video could not access the configured VR folder.",
+  vr_file_trash_not_file: "This item is not an eligible video file.",
+  vr_file_trash_owned:
+    "This file belongs to a current transfer or organization recovery and cannot be moved.",
+  vr_file_trash_ownership_unavailable:
+    "Auto-Video could not safely verify that no current transfer or recovery owns this file.",
+  vr_file_trash_unsupported:
+    "This item is not a supported .mp4 or .mkv file.",
+  vr_file_trash_outside_folder:
+    "This file is outside the configured VR folder.",
+  vr_file_trash_stale:
+    "This file is no longer part of the latest VR Library scan.",
+  vr_file_trash_failed:
+    "The operating system could not move this file to Trash or the Recycle Bin.",
 };
 
 const movieOpenErrorMessages: Record<string, string> = {
@@ -4173,12 +4194,37 @@ function LibraryMovieCard({
   );
 }
 
-function VrLibraryFileRow({ file }: { file: VrLibraryFile }) {
+function VrLibraryFileRow({
+  file,
+  itemCode,
+  itemTitle,
+  onFileTrashed,
+  onTrashPendingChange,
+  scanGeneration,
+  trashActionsDisabled,
+  trashPendingPath,
+}: {
+  file: VrLibraryFile;
+  itemCode: string | null;
+  itemTitle: string;
+  onFileTrashed: (file: VrLibraryFile, scanGeneration: string) => void;
+  onTrashPendingChange: (path: string | null) => void;
+  scanGeneration: string;
+  trashActionsDisabled: boolean;
+  trashPendingPath: string | null;
+}) {
   const [pendingAction, setPendingAction] = useState<"open" | "reveal" | null>(
     null,
   );
   const [actionError, setActionError] = useState<string | null>(null);
+  const [isTrashing, setIsTrashing] = useState(false);
+  const [trashDialogOpen, setTrashDialogOpen] = useState(false);
+  const [trashError, setTrashError] = useState<string | null>(null);
   const actionPending = useRef(false);
+  const trashRequestPending = useRef(false);
+  const trashCancelButton = useRef<HTMLButtonElement | null>(null);
+  const trashDialogPopup = useRef<HTMLDivElement | null>(null);
+  const trashTriggerId = useId();
 
   const runAction = async (action: "open" | "reveal") => {
     if (actionPending.current) {
@@ -4208,6 +4254,51 @@ function VrLibraryFileRow({ file }: { file: VrLibraryFile }) {
     }
   };
 
+  const updateTrashDialog = (open: boolean) => {
+    if (!open && trashRequestPending.current) {
+      return;
+    }
+    setTrashDialogOpen(open);
+    if (open) {
+      setTrashError(null);
+    }
+  };
+
+  const trashFile = async (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (
+      trashRequestPending.current ||
+      trashPendingPath !== null ||
+      trashActionsDisabled
+    ) {
+      return;
+    }
+
+    trashRequestPending.current = true;
+    setIsTrashing(true);
+    setTrashError(null);
+    onTrashPendingChange(file.path);
+    trashDialogPopup.current?.focus();
+    let succeeded = false;
+    try {
+      await trashVrFile(file.path, scanGeneration);
+      succeeded = true;
+      onFileTrashed(file, scanGeneration);
+    } catch (error: unknown) {
+      setTrashError(
+        vrFileTrashErrorMessages[nativeErrorCode(error)] ??
+          "Auto-Video could not move this VR file to Trash or the Recycle Bin.",
+      );
+    } finally {
+      trashRequestPending.current = false;
+      setIsTrashing(false);
+      onTrashPendingChange(null);
+      if (succeeded) {
+        setTrashDialogOpen(false);
+      }
+    }
+  };
+
   return (
     <li className="vr-library-file" data-vr-file-path={file.path}>
       <div className="vr-library-file__identity">
@@ -4221,7 +4312,12 @@ function VrLibraryFileRow({ file }: { file: VrLibraryFile }) {
         <Button
           aria-label={`${pendingAction === "open" ? "Opening" : "Open"} VR file: ${file.path}`}
           disabled={pendingAction !== null}
-          onClick={() => void runAction("open")}
+          onClick={(event) => {
+            event.stopPropagation();
+            void runAction("open");
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
           size="icon-xs"
           title="Open file"
           type="button"
@@ -4232,7 +4328,12 @@ function VrLibraryFileRow({ file }: { file: VrLibraryFile }) {
         <Button
           aria-label={`${pendingAction === "reveal" ? "Revealing" : "Reveal"} VR file: ${file.path}`}
           disabled={pendingAction !== null}
-          onClick={() => void runAction("reveal")}
+          onClick={(event) => {
+            event.stopPropagation();
+            void runAction("reveal");
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
           size="icon-xs"
           title="Reveal file"
           type="button"
@@ -4240,6 +4341,111 @@ function VrLibraryFileRow({ file }: { file: VrLibraryFile }) {
         >
           <AppIcon name="reveal" />
         </Button>
+        <AlertDialog.Root
+          onOpenChange={updateTrashDialog}
+          open={trashDialogOpen}
+          triggerId={trashDialogOpen ? trashTriggerId : null}
+        >
+          <AlertDialog.Trigger
+            id={trashTriggerId}
+            render={
+              <Button
+                aria-label={`Move VR file to Trash or Recycle Bin: ${file.filename}`}
+                disabled={trashPendingPath !== null || trashActionsDisabled}
+                onClick={(event) => event.stopPropagation()}
+                onKeyDown={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+                size="icon-xs"
+                title="Move to Trash or Recycle Bin"
+                type="button"
+                variant="destructive"
+              >
+                <AppIcon name="trash" />
+              </Button>
+            }
+          />
+          <AlertDialog.Portal>
+            <AlertDialog.Backdrop
+              className="trash-dialog__backdrop"
+              onClick={(event) => {
+                event.stopPropagation();
+                updateTrashDialog(false);
+              }}
+              onPointerDown={(event) => event.stopPropagation()}
+            />
+            <AlertDialog.Viewport className="trash-dialog__viewport">
+              <AlertDialog.Popup
+                aria-busy={isTrashing}
+                className="trash-dialog__popup"
+                initialFocus={() => trashCancelButton.current}
+                onClick={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+                ref={trashDialogPopup}
+              >
+                <div className="trash-dialog__heading">
+                  <AlertDialog.Title>
+                    Move “{file.filename}” to Trash?
+                  </AlertDialog.Title>
+                  <AlertDialog.Close
+                    render={
+                      <Button
+                        aria-label="Close confirmation"
+                        disabled={isTrashing}
+                        size="icon-xs"
+                        type="button"
+                        variant="ghost"
+                      >
+                        <AppIcon name="close" />
+                      </Button>
+                    }
+                  />
+                </div>
+                <AlertDialog.Description>
+                  {itemCode === null
+                    ? `This moves the exact unassociated file “${itemTitle}” to macOS Trash or the Windows Recycle Bin.`
+                    : `This moves the exact member “${file.filename}” of “${itemCode}”${
+                        file.partLabel === null ? "" : ` (${file.partLabel})`
+                      } to macOS Trash or the Windows Recycle Bin.`} It may be
+                  recoverable there.
+                </AlertDialog.Description>
+                {trashError === null ? null : (
+                  <p
+                    aria-atomic="true"
+                    className="trash-dialog__error"
+                    role="alert"
+                  >
+                    {trashError}
+                  </p>
+                )}
+                <div className="trash-dialog__actions">
+                  <AlertDialog.Close
+                    render={
+                      <Button
+                        disabled={isTrashing}
+                        ref={trashCancelButton}
+                        type="button"
+                        variant="outline"
+                      >
+                        Cancel
+                      </Button>
+                    }
+                  />
+                  <Button
+                    aria-label={`${isTrashing ? "Moving" : "Confirm moving"} VR file to Trash or Recycle Bin: ${file.filename}`}
+                    disabled={isTrashing}
+                    onClick={trashFile}
+                    onKeyDown={(event) => event.stopPropagation()}
+                    type="button"
+                    variant="destructive"
+                  >
+                    <AppIcon name="trash" />
+                    {isTrashing ? "Moving…" : "Move file"}
+                  </Button>
+                </div>
+              </AlertDialog.Popup>
+            </AlertDialog.Viewport>
+          </AlertDialog.Portal>
+        </AlertDialog.Root>
       </div>
       {actionError === null ? null : (
         <p aria-atomic="true" role="alert">
@@ -4250,7 +4456,21 @@ function VrLibraryFileRow({ file }: { file: VrLibraryFile }) {
   );
 }
 
-function VrLibraryCard({ item }: { item: VrLibraryItem }) {
+function VrLibraryCard({
+  item,
+  onFileTrashed,
+  onTrashPendingChange,
+  scanGeneration,
+  trashActionsDisabled,
+  trashPendingPath,
+}: {
+  item: VrLibraryItem;
+  onFileTrashed: (file: VrLibraryFile, scanGeneration: string) => void;
+  onTrashPendingChange: (path: string | null) => void;
+  scanGeneration: string;
+  trashActionsDisabled: boolean;
+  trashPendingPath: string | null;
+}) {
   return (
     <article className="movie-card vr-library-card">
       <div className="media-title-row">
@@ -4266,7 +4486,17 @@ function VrLibraryCard({ item }: { item: VrLibraryItem }) {
       </div>
       <ul aria-label={`Files for ${item.title}`} className="vr-library-card__files">
         {item.files.map((file) => (
-          <VrLibraryFileRow file={file} key={file.path} />
+          <VrLibraryFileRow
+            file={file}
+            itemCode={item.code}
+            itemTitle={item.title}
+            key={file.path}
+            onFileTrashed={onFileTrashed}
+            onTrashPendingChange={onTrashPendingChange}
+            scanGeneration={scanGeneration}
+            trashActionsDisabled={trashActionsDisabled}
+            trashPendingPath={trashPendingPath}
+          />
         ))}
       </ul>
     </article>
@@ -5321,6 +5551,13 @@ function removeAdultLibraryFile(items: AdultLibraryItem[], path: string) {
   });
 }
 
+function removeVrLibraryFile(items: VrLibraryItem[], path: string) {
+  return items.flatMap((item) => {
+    const files = item.files.filter((file) => file.path !== path);
+    return files.length === 0 ? [] : [{ ...item, files }];
+  });
+}
+
 function compareAdultLibraryItemsByTitle(
   leftItem: AdultLibraryItem,
   rightItem: AdultLibraryItem,
@@ -5519,6 +5756,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [vrLibrarySearchQuery, setVrLibrarySearchQuery] = useState("");
   const [vrLibraryTitleSortDirection, setVrLibraryTitleSortDirection] =
     useState<LibraryTitleSortDirection>("ascending");
+  const [vrTrashAnnouncement, setVrTrashAnnouncement] = useState<string | null>(
+    null,
+  );
+  const [vrTrashReconciliationState, setVrTrashReconciliationState] = useState<
+    "pending" | "attention" | null
+  >(null);
+  const [vrTrashPendingPath, setVrTrashPendingPath] = useState<string | null>(
+    null,
+  );
   const [movieTrashAnnouncement, setMovieTrashAnnouncement] = useState<
     string | null
   >(null);
@@ -5797,6 +6043,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const currentTvLibraryScanState = useRef(tvLibraryScanState);
   const currentAdultFolderState = useRef(adultFolderState);
   const currentAdultLibraryScanState = useRef(adultLibraryScanState);
+  const currentVrFolderState = useRef(vrFolderState);
+  const currentVrLibraryScanState = useRef(vrLibraryScanState);
   const currentVrDownloadsState = useRef(vrDownloadsState);
   const previousDownloadStates = useRef<Map<string, VrDownload["state"]>>(
     new Map(),
@@ -5812,6 +6060,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   currentTvLibraryScanState.current = tvLibraryScanState;
   currentAdultFolderState.current = adultFolderState;
   currentAdultLibraryScanState.current = adultLibraryScanState;
+  currentVrFolderState.current = vrFolderState;
+  currentVrLibraryScanState.current = vrLibraryScanState;
   currentVrDownloadsState.current = vrDownloadsState;
   currentTvDiscoverState.current = tvDiscoverState;
 
@@ -6093,13 +6343,16 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     setVrLibraryScanState({ status: "scanning" });
     void scanVrLibrary()
-      .then((items) => {
+      .then(({ generation, items }) => {
         if (requestId !== vrLibraryScanRequestId.current) {
           return;
         }
-        setVrLibraryScanState(
-          items.length === 0 ? { status: "empty" } : { status: "ready", items },
-        );
+        const scanState: VrLibraryScanState =
+          items.length === 0
+            ? { status: "empty", generation }
+            : { status: "ready", generation, items };
+        currentVrLibraryScanState.current = scanState;
+        setVrLibraryScanState(scanState);
       })
       .catch((error: unknown) => {
         if (requestId !== vrLibraryScanRequestId.current) {
@@ -6138,23 +6391,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
 
     setVrStorageState({ status: "loading" });
-    void window.__TAURI__.core
-      .invoke<unknown>("query_vr_storage")
-      .then((values) => {
+    void queryVrStorage()
+      .then(({ totalBytes, freeBytes }) => {
         if (requestId !== vrStorageRequestId.current) {
           return;
-        }
-        if (
-          !Array.isArray(values) ||
-          values.length !== 2 ||
-          values.some((value) => typeof value !== "string" || !/^\d+$/.test(value))
-        ) {
-          throw new Error("The native VR storage query returned invalid data.");
-        }
-        const totalBytes = BigInt(values[0]);
-        const freeBytes = BigInt(values[1]);
-        if (totalBytes === 0n || freeBytes > totalBytes) {
-          throw new Error("The native VR storage values were inconsistent.");
         }
         setVrStorageState({ status: "ready", totalBytes, freeBytes });
       })
@@ -7571,6 +7811,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       ) {
         vrOrganizationRequestId.current += 1;
         setVrOrganizationPreview(null);
+        setVrTrashAnnouncement(null);
+        setVrTrashReconciliationState(null);
+        setVrTrashPendingPath(null);
         vrLibraryScanRequestId.current += 1;
         vrStorageRequestId.current += 1;
         setVrLibraryScanState({ status: "scanning" });
@@ -7591,6 +7834,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     vrOrganizationRequestId.current += 1;
     setVrOrganizationPreview(null);
     setIsRevalidatingVrFolder(false);
+    setVrTrashAnnouncement(null);
+    setVrTrashReconciliationState(null);
+    setVrTrashPendingPath(null);
     vrLibraryScanRequestId.current += 1;
     vrStorageRequestId.current += 1;
     setVrFolderActionError(null);
@@ -7606,6 +7852,90 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         );
       }
     }
+  };
+
+  const recordTrashedVrFile = (
+    file: VrLibraryFile,
+    scanGeneration: string,
+  ) => {
+    const currentFolder = currentVrFolderState.current;
+    const currentScan = currentVrLibraryScanState.current;
+    if (
+      currentFolder.status !== "ready" ||
+      currentScan.status !== "ready" ||
+      currentScan.generation !== scanGeneration
+    ) {
+      return;
+    }
+
+    const remainingItems = removeVrLibraryFile(currentScan.items, file.path);
+    const localState: VrLibraryScanState =
+      remainingItems.length === 0
+        ? { status: "empty", generation: scanGeneration }
+        : { status: "ready", generation: scanGeneration, items: remainingItems };
+    currentVrLibraryScanState.current = localState;
+    setVrLibraryScanState(localState);
+    setVrTrashAnnouncement(
+      `${file.filename} was moved to Trash or the Recycle Bin.`,
+    );
+    setVrTrashReconciliationState("pending");
+    setVrStorageState({ status: "loading" });
+
+    const folderPath = currentFolder.path;
+    const scanRequestId = ++vrLibraryScanRequestId.current;
+    const storageRequestId = ++vrStorageRequestId.current;
+    void Promise.allSettled([scanVrLibrary(), queryVrStorage()]).then(
+      ([scanResult, storageResult]) => {
+        if (
+          currentVrFolderState.current.status !== "ready" ||
+          currentVrFolderState.current.path !== folderPath ||
+          scanRequestId !== vrLibraryScanRequestId.current ||
+          storageRequestId !== vrStorageRequestId.current
+        ) {
+          return;
+        }
+
+        let needsAttention = false;
+        if (scanResult.status === "fulfilled") {
+          const reconciledItems = removeVrLibraryFile(
+            scanResult.value.items,
+            file.path,
+          );
+          const reconciledState: VrLibraryScanState =
+            reconciledItems.length === 0
+              ? {
+                  status: "empty",
+                  generation: scanResult.value.generation,
+                }
+              : {
+                  status: "ready",
+                  generation: scanResult.value.generation,
+                  items: reconciledItems,
+                };
+          currentVrLibraryScanState.current = reconciledState;
+          setVrLibraryScanState(reconciledState);
+        } else {
+          needsAttention = true;
+        }
+
+        if (storageResult.status === "fulfilled") {
+          setVrStorageState({
+            status: "ready",
+            totalBytes: storageResult.value.totalBytes,
+            freeBytes: storageResult.value.freeBytes,
+          });
+        } else {
+          needsAttention = true;
+          setVrStorageState({
+            status:
+              nativeErrorCode(storageResult.reason) === vrStorageUnavailable
+                ? "unavailable"
+                : "error",
+          });
+        }
+        setVrTrashReconciliationState(needsAttention ? "attention" : null);
+      },
+    );
   };
 
   const refreshVrLibrary = () => {
@@ -7638,6 +7968,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     if (vrFolderState.status !== "ready") {
       return;
     }
+    setVrTrashReconciliationState(null);
     vrLibraryScanRequestId.current += 1;
     vrStorageRequestId.current += 1;
     setVrLibraryScanState({ status: "scanning" });
@@ -9286,6 +9617,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     (count, item) => count + item.files.length,
     0,
   );
+  const completeVrLibraryGroupedCount = completeVrLibraryItems.filter(
+    (item) => item.code !== null,
+  ).length;
+  const completeVrLibraryUnassociatedCount =
+    completeVrLibraryItems.length - completeVrLibraryGroupedCount;
   const currentTvLibraryScanMessage =
     tvLibraryScanState.status === "ready"
       ? null
@@ -9623,13 +9959,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     dashboardVrHeading = "Scanning VR Library";
     dashboardVrMessage = "Looking recursively for supported .mp4 and .mkv files.";
   } else if (vrLibraryScanState.status === "empty") {
-    dashboardVrHeading = "0 VR titles · 0 files";
+    dashboardVrHeading = "0 grouped titles · 0 supported files";
     dashboardVrMessage = "The configured folder contains no supported video files.";
     dashboardVrRole = undefined;
   } else if (vrLibraryScanState.status === "ready") {
-    const titleCount = vrLibraryScanState.items.length;
-    dashboardVrHeading = `${titleCount} VR ${titleCount === 1 ? "title" : "titles"} · ${completeVrLibraryFileCount} ${completeVrLibraryFileCount === 1 ? "file" : "files"}`;
-    dashboardVrMessage = "These totals come from the latest complete VR folder scan.";
+    dashboardVrHeading = `${completeVrLibraryGroupedCount} grouped ${completeVrLibraryGroupedCount === 1 ? "title" : "titles"} · ${completeVrLibraryFileCount} supported ${completeVrLibraryFileCount === 1 ? "file" : "files"}`;
+    dashboardVrMessage = completeVrLibraryUnassociatedCount === 0
+      ? "These totals come from the latest complete VR folder scan."
+      : `${completeVrLibraryUnassociatedCount} ${completeVrLibraryUnassociatedCount === 1 ? "file remains" : "files remain"} unassociated.`;
     dashboardVrRole = undefined;
   } else if (vrLibraryScanState.status === "unavailable") {
     dashboardVrHeading = "VR folder is unavailable";
@@ -11069,7 +11406,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     <Button
                       disabled={
                         vrLibraryScanState.status === "scanning" ||
-                        isRevalidatingVrFolder
+                        isRevalidatingVrFolder ||
+                        vrTrashReconciliationState === "pending" ||
+                        vrTrashPendingPath !== null
                       }
                       onClick={refreshVrLibrary}
                       type="button"
@@ -11151,6 +11490,43 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   </p>
                   <Button
                     onClick={refreshAdultLibrary}
+                    type="button"
+                    variant="outline"
+                  >
+                    <AppIcon name="refresh" />
+                    Retry reconciliation
+                  </Button>
+                </div>
+              ) : null}
+              {libraryCategory === "vr" && vrTrashAnnouncement !== null ? (
+                <p
+                  aria-atomic="true"
+                  aria-live="polite"
+                  className="library-action-status"
+                >
+                  {vrTrashAnnouncement}
+                </p>
+              ) : null}
+              {libraryCategory === "vr" &&
+              vrTrashReconciliationState === "pending" ? (
+                <p
+                  aria-atomic="true"
+                  className="library-action-status"
+                  role="status"
+                >
+                  The file move succeeded. Updating the VR Library and storage…
+                </p>
+              ) : null}
+              {libraryCategory === "vr" &&
+              vrTrashReconciliationState === "attention" ? (
+                <div className="library-action-attention" role="alert">
+                  <p>
+                    The file move succeeded, but the VR Library or storage could
+                    not be refreshed. The moved file remains removed from this
+                    result.
+                  </p>
+                  <Button
+                    onClick={refreshVrLibrary}
                     type="button"
                     variant="outline"
                   >
@@ -11357,7 +11733,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   >
                     {isVrLibrarySearchActive
                       ? `${matchingVrLibraryItems.length} VR titles match the current search.`
-                      : `${completeVrLibraryItems.length} VR titles and ${completeVrLibraryFileCount} files in the complete current result.`}
+                      : `${completeVrLibraryGroupedCount} grouped titles, ${completeVrLibraryFileCount} supported files, and ${completeVrLibraryUnassociatedCount} unassociated files in the complete current result.`}
                   </p>
                   {matchingVrLibraryItems.length === 0 &&
                   isVrLibrarySearchActive ? (
@@ -11381,7 +11757,18 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       items={orderedVrLibraryItems}
                       key="vr-library-gallery"
                       onSelectedPageChange={setVrLibrarySelectedPage}
-                      renderItem={(item) => <VrLibraryCard item={item} />}
+                      renderItem={(item) => (
+                        <VrLibraryCard
+                          item={item}
+                          onFileTrashed={recordTrashedVrFile}
+                          onTrashPendingChange={setVrTrashPendingPath}
+                          scanGeneration={vrLibraryScanState.generation}
+                          trashActionsDisabled={
+                            vrTrashReconciliationState !== null
+                          }
+                          trashPendingPath={vrTrashPendingPath}
+                        />
+                      )}
                       selectedPage={vrLibrarySelectedPage}
                       variant="library"
                     />

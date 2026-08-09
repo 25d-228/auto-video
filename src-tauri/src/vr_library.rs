@@ -5,7 +5,10 @@ use std::{
     time::SystemTime,
 };
 
-use crate::vr_download::{configured_vr_folder, with_configured_vr_folder, VrDownloadState};
+use crate::vr_download::{
+    configured_vr_folder, with_configured_vr_folder, with_unowned_vr_library_path, VrDownloadState,
+    VrLibraryTrashOwnershipError,
+};
 
 pub const VR_LIBRARY_FOLDER_UNAVAILABLE: &str = "vr_library_folder_unavailable";
 pub const VR_LIBRARY_SCAN_FAILED: &str = "vr_library_scan_failed";
@@ -24,6 +27,15 @@ pub const VR_FILE_REVEAL_OUTSIDE_FOLDER: &str = "vr_file_reveal_outside_folder";
 pub const VR_FILE_REVEAL_STALE: &str = "vr_file_reveal_stale";
 pub const VR_FILE_REVEAL_UNAVAILABLE: &str = "vr_file_reveal_unavailable";
 pub const VR_FILE_REVEAL_UNSUPPORTED: &str = "vr_file_reveal_unsupported";
+pub const VR_FILE_TRASH_FAILED: &str = "vr_file_trash_failed";
+pub const VR_FILE_TRASH_NOT_FILE: &str = "vr_file_trash_not_file";
+pub const VR_FILE_TRASH_NOT_FOUND: &str = "vr_file_trash_not_found";
+pub const VR_FILE_TRASH_OWNED: &str = "vr_file_trash_owned";
+pub const VR_FILE_TRASH_OWNERSHIP_UNAVAILABLE: &str = "vr_file_trash_ownership_unavailable";
+pub const VR_FILE_TRASH_OUTSIDE_FOLDER: &str = "vr_file_trash_outside_folder";
+pub const VR_FILE_TRASH_STALE: &str = "vr_file_trash_stale";
+pub const VR_FILE_TRASH_UNAVAILABLE: &str = "vr_file_trash_unavailable";
+pub const VR_FILE_TRASH_UNSUPPORTED: &str = "vr_file_trash_unsupported";
 
 #[derive(Clone)]
 struct TrustedVrFile {
@@ -34,6 +46,7 @@ struct TrustedVrFile {
 
 struct CompletedVrScan {
     folder: PathBuf,
+    generation: u64,
     files: Vec<TrustedVrFile>,
 }
 
@@ -126,7 +139,8 @@ pub fn scan_vr_library_with(
         return Err(VR_LIBRARY_STALE);
     }
 
-    let mut response = Vec::with_capacity(files.len() * 2);
+    let mut response = Vec::with_capacity(1 + files.len() * 2);
+    response.push(generation.to_string());
     for file in &files {
         response.push(
             file.path
@@ -140,7 +154,11 @@ pub fn scan_vr_library_with(
     if context.generation != generation {
         return Err(VR_LIBRARY_STALE);
     }
-    context.completed_scan = Some(CompletedVrScan { folder, files });
+    context.completed_scan = Some(CompletedVrScan {
+        folder,
+        generation,
+        files,
+    });
     Ok(response)
 }
 
@@ -156,8 +174,11 @@ fn validate_vr_file(
     requested_path: &Path,
     configured_folder: &Path,
     scan: &CompletedVrScan,
+    requested_generation: Option<u64>,
 ) -> Result<(), VrFileValidationError> {
-    if scan.folder != configured_folder {
+    if scan.folder != configured_folder
+        || requested_generation.is_some_and(|generation| generation != scan.generation)
+    {
         return Err(VrFileValidationError::Stale);
     }
 
@@ -232,7 +253,7 @@ fn run_vr_file_action(
             .completed_scan
             .as_ref()
             .ok_or(VrFileValidationError::Stale)?;
-        validate_vr_file(path, &canonical_folder, scan)?;
+        validate_vr_file(path, &canonical_folder, scan, None)?;
         dispatch(path).map_err(|_| VrFileValidationError::Dispatch)
     })
     .map_err(|_| VrFileValidationError::Unavailable)?
@@ -272,10 +293,61 @@ pub fn reveal_vr_file_with(
     })
 }
 
+pub fn trash_vr_file_with(
+    path: &Path,
+    scan_generation: u64,
+    download_state: &VrDownloadState,
+    library_state: &VrLibraryState,
+    dispatch: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    with_unowned_vr_library_path(download_state, path, |configured_folder| {
+        let configured_folder = configured_folder.ok_or(VR_FILE_TRASH_UNAVAILABLE)?;
+        let canonical_folder =
+            fs::canonicalize(configured_folder).map_err(|_| VR_FILE_TRASH_UNAVAILABLE)?;
+        if canonical_folder != configured_folder
+            || !fs::metadata(&canonical_folder)
+                .map_err(|_| VR_FILE_TRASH_UNAVAILABLE)?
+                .is_dir()
+        {
+            return Err(VR_FILE_TRASH_UNAVAILABLE);
+        }
+
+        let mut context = library_state
+            .0
+            .lock()
+            .map_err(|_| VR_FILE_TRASH_UNAVAILABLE)?;
+        let scan = context.completed_scan.as_ref().ok_or(VR_FILE_TRASH_STALE)?;
+        validate_vr_file(path, &canonical_folder, scan, Some(scan_generation)).map_err(
+            |error| match error {
+                VrFileValidationError::NotFound => VR_FILE_TRASH_NOT_FOUND,
+                VrFileValidationError::Unavailable => VR_FILE_TRASH_UNAVAILABLE,
+                VrFileValidationError::NotFile => VR_FILE_TRASH_NOT_FILE,
+                VrFileValidationError::Unsupported => VR_FILE_TRASH_UNSUPPORTED,
+                VrFileValidationError::OutsideFolder => VR_FILE_TRASH_OUTSIDE_FOLDER,
+                VrFileValidationError::Stale => VR_FILE_TRASH_STALE,
+                VrFileValidationError::Dispatch => VR_FILE_TRASH_FAILED,
+            },
+        )?;
+
+        dispatch(path).map_err(|_| VR_FILE_TRASH_FAILED)?;
+        context
+            .completed_scan
+            .as_mut()
+            .ok_or(VR_FILE_TRASH_STALE)?
+            .files
+            .retain(|file| file.path != path);
+        Ok(())
+    })
+    .map_err(|error| match error {
+        VrLibraryTrashOwnershipError::Owned => VR_FILE_TRASH_OWNED,
+        VrLibraryTrashOwnershipError::Unavailable => VR_FILE_TRASH_OWNERSHIP_UNAVAILABLE,
+    })?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vr_download::set_vr_folder;
+    use crate::vr_download::{clear_vr_folder, load_downloads, load_vr_folder_with, set_vr_folder};
     use std::{
         cell::Cell,
         fs,
@@ -312,6 +384,13 @@ mod tests {
         let state = VrDownloadState::default();
         set_vr_folder(&state, config_path, folder.to_path_buf())
             .expect("VR folder must be configured");
+        tauri::async_runtime::block_on(load_downloads(
+            &state,
+            &config_path.with_extension("downloads"),
+            &config_path.with_extension("session"),
+            &config_path.with_extension("limit"),
+        ))
+        .expect("empty transfer state must load");
         state
     }
 
@@ -336,6 +415,7 @@ mod tests {
         assert_eq!(
             scan_vr_library_with(&download_state, &library_state),
             Ok(vec![
+                "1".to_owned(),
                 first.to_string_lossy().into_owned(),
                 "3".to_owned(),
                 second.to_string_lossy().into_owned(),
@@ -460,6 +540,311 @@ mod tests {
                 Ok(())
             }),
             Err(VR_FILE_REVEAL_NOT_FILE)
+        );
+        assert!(!dispatched.get());
+    }
+
+    #[test]
+    fn trash_dispatches_one_exact_mdvr_419_member_without_mutating_siblings_or_neighbors() {
+        let fixture = Fixture::new("trash-exact");
+        let configuration = Fixture::new("trash-config");
+        let removed = fixture.path.join("MDVR-419 Part 01.mp4");
+        let sibling = fixture.path.join("MDVR-419 PT 02.mkv");
+        let ambiguous = fixture.path.join("MDVR-419 Part 01 Disc 02.mp4");
+        let unassociated = fixture.path.join("MDVR-419 + ABC-123 pack.mkv");
+        let neighbors = [
+            fixture.path.join("MDVR-422.mp4"),
+            fixture.path.join("MDVR-430.mp4"),
+            fixture.path.join("MDVR-433.mp4"),
+            fixture.path.join("MDVR-374.mp4"),
+        ];
+        for path in [
+            &removed,
+            &sibling,
+            &ambiguous,
+            &unassociated,
+            &neighbors[0],
+            &neighbors[1],
+            &neighbors[2],
+            &neighbors[3],
+        ] {
+            fs::write(path, b"file").expect("VR fixture file must be written");
+        }
+        let download_state = configured_state(&fixture.path, &configuration.path.join("config"));
+        let library_state = VrLibraryState::default();
+        let scan =
+            scan_vr_library_with(&download_state, &library_state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+        let dispatch_count = Cell::new(0);
+
+        assert_eq!(
+            trash_vr_file_with(
+                &removed,
+                generation,
+                &download_state,
+                &library_state,
+                |_| {
+                    dispatch_count.set(dispatch_count.get() + 1);
+                    Err(())
+                },
+            ),
+            Err(VR_FILE_TRASH_FAILED)
+        );
+        assert_eq!(
+            trash_vr_file_with(
+                &removed,
+                generation,
+                &download_state,
+                &library_state,
+                |path| {
+                    assert_eq!(path, removed);
+                    dispatch_count.set(dispatch_count.get() + 1);
+                    Ok(())
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            trash_vr_file_with(
+                &removed,
+                generation,
+                &download_state,
+                &library_state,
+                |_| {
+                    dispatch_count.set(dispatch_count.get() + 1);
+                    Ok(())
+                },
+            ),
+            Err(VR_FILE_TRASH_STALE)
+        );
+        assert_eq!(
+            trash_vr_file_with(
+                &sibling,
+                generation,
+                &download_state,
+                &library_state,
+                |_| Ok(()),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            trash_vr_file_with(
+                &unassociated,
+                generation,
+                &download_state,
+                &library_state,
+                |_| Ok(()),
+            ),
+            Ok(())
+        );
+        for path in [
+            &ambiguous,
+            &neighbors[0],
+            &neighbors[1],
+            &neighbors[2],
+            &neighbors[3],
+        ] {
+            assert!(path.is_file());
+        }
+        assert_eq!(dispatch_count.get(), 2);
+    }
+
+    #[test]
+    fn trash_rejects_untrusted_changed_and_unsafe_vr_paths_without_dispatch() {
+        let trusted = Fixture::new("trash-trusted");
+        let unrelated = Fixture::new("trash-unrelated");
+        let configuration = Fixture::new("trash-invalid-config");
+        let current = trusted.path.join("MDVR-419 Part 01.mp4");
+        let changed = trusted.path.join("MDVR-419 CD2.mkv");
+        let missing = trusted.path.join("MDVR-422.mp4");
+        fs::write(&current, b"current").expect("current member must be written");
+        fs::write(&changed, b"changed").expect("changed member must be written");
+        fs::write(&missing, b"missing").expect("missing member must be written");
+        let download_state = configured_state(&trusted.path, &configuration.path.join("config"));
+        let library_state = VrLibraryState::default();
+        let scan =
+            scan_vr_library_with(&download_state, &library_state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+        let dispatched = Cell::new(false);
+        let same_name_elsewhere = unrelated.path.join("MDVR-419 Part 01.mp4");
+        fs::write(&same_name_elsewhere, b"current").expect("unrelated file must be written");
+        let neighboring_code = trusted.path.join("MDVR-430.mp4");
+        fs::write(&neighboring_code, b"neighbor").expect("neighbor must be written");
+        let mixed_code = trusted.path.join("MDVR-419 + ABC-123.mp4");
+        fs::write(&mixed_code, b"mixed").expect("mixed-code file must be written");
+        let directory = trusted.path.join("directory.mkv");
+        fs::create_dir(&directory).expect("directory must be created");
+        let unsupported = trusted.path.join("unsupported.avi");
+        fs::write(&unsupported, b"unsupported").expect("unsupported file must be written");
+        fs::write(&changed, b"different content").expect("member must change");
+        fs::remove_file(&missing).expect("member must be removed");
+
+        for (path, expected) in [
+            (same_name_elsewhere, VR_FILE_TRASH_OUTSIDE_FOLDER),
+            (neighboring_code, VR_FILE_TRASH_STALE),
+            (mixed_code, VR_FILE_TRASH_STALE),
+            (directory, VR_FILE_TRASH_NOT_FILE),
+            (unsupported, VR_FILE_TRASH_UNSUPPORTED),
+            (changed, VR_FILE_TRASH_STALE),
+            (missing, VR_FILE_TRASH_NOT_FOUND),
+        ] {
+            assert_eq!(
+                trash_vr_file_with(&path, generation, &download_state, &library_state, |_| {
+                    dispatched.set(true);
+                    Ok(())
+                },),
+                Err(expected)
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let link = trusted.path.join("linked.mp4");
+            std::os::unix::fs::symlink(&current, &link).expect("file symlink must be created");
+            assert_eq!(
+                trash_vr_file_with(&link, generation, &download_state, &library_state, |_| {
+                    dispatched.set(true);
+                    Ok(())
+                },),
+                Err(VR_FILE_TRASH_NOT_FILE)
+            );
+            let linked_parent = trusted.path.join("linked-parent");
+            std::os::unix::fs::symlink(&unrelated.path, &linked_parent)
+                .expect("parent symlink must be created");
+            let linked_child = linked_parent.join("MDVR-419 Part 01.mp4");
+            assert_eq!(
+                trash_vr_file_with(
+                    &linked_child,
+                    generation,
+                    &download_state,
+                    &library_state,
+                    |_| {
+                        dispatched.set(true);
+                        Ok(())
+                    },
+                ),
+                Err(VR_FILE_TRASH_NOT_FILE)
+            );
+        }
+        assert!(!dispatched.get());
+    }
+
+    #[test]
+    fn trash_rejects_stale_generations_and_restart_scan_keeps_an_accepted_member_absent() {
+        let fixture = Fixture::new("trash-generation");
+        let configuration = Fixture::new("trash-generation-config");
+        let holding = Fixture::new("trash-holding");
+        let persistence_path = configuration.path.join("config");
+        let member = fixture.path.join("MDVR-419 Disk-4.mp4");
+        fs::write(&member, b"member").expect("VR member must be written");
+        let download_state = configured_state(&fixture.path, &persistence_path);
+        let library_state = VrLibraryState::default();
+        let first_scan =
+            scan_vr_library_with(&download_state, &library_state).expect("scan must complete");
+        let first_generation = first_scan[0].parse().expect("generation must be valid");
+        let second_scan =
+            scan_vr_library_with(&download_state, &library_state).expect("scan must complete");
+        let current_generation = second_scan[0].parse().expect("generation must be valid");
+        let dispatched = Cell::new(false);
+
+        assert_eq!(
+            trash_vr_file_with(
+                &member,
+                first_generation,
+                &download_state,
+                &library_state,
+                |_| {
+                    dispatched.set(true);
+                    Ok(())
+                },
+            ),
+            Err(VR_FILE_TRASH_STALE)
+        );
+        assert!(!dispatched.get());
+
+        let moved_path = holding.path.join("MDVR-419 Disk-4.mp4");
+        trash_vr_file_with(
+            &member,
+            current_generation,
+            &download_state,
+            &library_state,
+            |path| fs::rename(path, &moved_path).map_err(|_| ()),
+        )
+        .expect("accepted dispatch must succeed");
+        assert!(moved_path.is_file());
+        assert!(!member.exists());
+
+        let restarted_download_state = VrDownloadState::default();
+        assert_eq!(
+            load_vr_folder_with(&restarted_download_state, &persistence_path),
+            Ok(vec![
+                "ready".to_owned(),
+                fixture.path.to_string_lossy().into_owned(),
+            ])
+        );
+        let restarted_library_state = VrLibraryState::default();
+        let restarted_scan =
+            scan_vr_library_with(&restarted_download_state, &restarted_library_state)
+                .expect("restart scan must complete");
+        assert_eq!(restarted_scan.len(), 1);
+    }
+
+    #[test]
+    fn folder_replacement_clear_and_failed_refresh_invalidate_vr_trash_requests() {
+        let configuration = Fixture::new("trash-configuration");
+        let first = Fixture::new("trash-first-folder");
+        let replacement = Fixture::new("trash-replacement-folder");
+        let persistence_path = configuration.path.join("config");
+        let member = first.path.join("MDVR-419 Disc 03.mp4");
+        fs::write(&member, b"member").expect("VR member must be written");
+        let download_state = configured_state(&first.path, &persistence_path);
+        let library_state = VrLibraryState::default();
+        let scan =
+            scan_vr_library_with(&download_state, &library_state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+        let dispatched = Cell::new(false);
+
+        set_vr_folder(&download_state, &persistence_path, replacement.path.clone())
+            .expect("replacement VR folder must be configured");
+        assert_eq!(
+            trash_vr_file_with(&member, generation, &download_state, &library_state, |_| {
+                dispatched.set(true);
+                Ok(())
+            },),
+            Err(VR_FILE_TRASH_STALE)
+        );
+        clear_vr_folder(&download_state, &persistence_path).expect("VR folder must clear");
+        assert_eq!(
+            trash_vr_file_with(&member, generation, &download_state, &library_state, |_| {
+                dispatched.set(true);
+                Ok(())
+            },),
+            Err(VR_FILE_TRASH_UNAVAILABLE)
+        );
+
+        set_vr_folder(&download_state, &persistence_path, first.path.clone())
+            .expect("first VR folder must be restored");
+        let refreshed_scan =
+            scan_vr_library_with(&download_state, &library_state).expect("scan must complete");
+        let refreshed_generation = refreshed_scan[0].parse().expect("generation must be valid");
+        let unavailable_folder = configuration.path.join("unavailable-VR-folder");
+        fs::rename(&first.path, &unavailable_folder).expect("VR folder must be unavailable");
+        assert_eq!(
+            scan_vr_library_with(&download_state, &library_state),
+            Err(VR_LIBRARY_FOLDER_UNAVAILABLE)
+        );
+        assert_eq!(
+            trash_vr_file_with(
+                &member,
+                refreshed_generation,
+                &download_state,
+                &library_state,
+                |_| {
+                    dispatched.set(true);
+                    Ok(())
+                },
+            ),
+            Err(VR_FILE_TRASH_UNAVAILABLE)
         );
         assert!(!dispatched.get());
     }
