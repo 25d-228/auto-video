@@ -7,6 +7,7 @@ import {
   queryTvStorage,
   revealTvFile,
   scanTvLibrary,
+  trashTvFile,
 } from "./tv";
 
 let invokeMock: ReturnType<typeof vi.fn>;
@@ -48,8 +49,18 @@ describe("TV folder and storage boundaries", () => {
 });
 
 describe("conservative parsed TV Library identity", () => {
+  it("preserves the trusted generation for an empty scan", async () => {
+    invokeMock.mockResolvedValue(["6"]);
+
+    await expect(scanTvLibrary()).resolves.toEqual({
+      generation: "6",
+      items: [],
+    });
+  });
+
   it("groups ordinary marker and padding variants while preserving exact file data", async () => {
     invokeMock.mockResolvedValue([
+      "7",
       "/TV/Series/星  Show.S01E02 — Pilot.mp4",
       "Series/星  Show.S01E02 — Pilot.mp4",
       "10",
@@ -64,9 +75,10 @@ describe("conservative parsed TV Library identity", () => {
       "40",
     ]);
 
-    const items = await scanTvLibrary();
+    const scan = await scanTvLibrary();
 
-    expect(items).toEqual([
+    expect(scan.generation).toBe("7");
+    expect(scan.items).toEqual([
       {
         id: "show:星  Show",
         title: "星  Show",
@@ -130,15 +142,16 @@ describe("conservative parsed TV Library identity", () => {
       "Show.S00E02.mp4",
       "Show.S01E00.mp4",
     ];
-    invokeMock.mockResolvedValue(
-      filenames.flatMap((filename, index) => [
+    invokeMock.mockResolvedValue([
+      "8",
+      ...filenames.flatMap((filename, index) => [
         `/TV/${filename}`,
         filename,
         String(index + 1),
       ]),
-    );
+    ]);
 
-    const items = await scanTvLibrary();
+    const { items } = await scanTvLibrary();
 
     expect(items).toHaveLength(filenames.length);
     expect(items.every((item) => item.showTitle === null)).toBe(true);
@@ -148,6 +161,7 @@ describe("conservative parsed TV Library identity", () => {
 
   it("does not merge prefix, substring, or neighboring show titles", async () => {
     invokeMock.mockResolvedValue([
+      "9",
       "/TV/Show.S01E02.mp4",
       "Show.S01E02.mp4",
       "1",
@@ -159,7 +173,7 @@ describe("conservative parsed TV Library identity", () => {
       "3",
     ]);
 
-    const items = await scanTvLibrary();
+    const { items } = await scanTvLibrary();
 
     expect(items.map((item) => item.title)).toEqual(["Show", "Showtime", "Show 2"]);
     expect(items.every((item) => item.files.length === 1)).toBe(true);
@@ -167,8 +181,11 @@ describe("conservative parsed TV Library identity", () => {
 
   it("rejects malformed rows, duplicate paths, traversal, unsupported files, and oversized sizes", async () => {
     for (const response of [
-      ["/TV/Show.S01E02.mp4"],
+      [],
+      ["invalid"],
+      ["1", "/TV/Show.S01E02.mp4"],
       [
+        "1",
         "/TV/Show.S01E02.mp4",
         "Show.S01E02.mp4",
         "1",
@@ -176,9 +193,14 @@ describe("conservative parsed TV Library identity", () => {
         "Show.S01E02.mp4",
         "1",
       ],
-      ["/TV/Show.S01E02.mp4", "../Show.S01E02.mp4", "1"],
-      ["/TV/Show.S01E02.avi", "Show.S01E02.avi", "1"],
-      ["/TV/Show.S01E02.mp4", "Show.S01E02.mp4", "18446744073709551616"],
+      ["1", "/TV/Show.S01E02.mp4", "../Show.S01E02.mp4", "1"],
+      ["1", "/TV/Show.S01E02.avi", "Show.S01E02.avi", "1"],
+      [
+        "1",
+        "/TV/Show.S01E02.mp4",
+        "Show.S01E02.mp4",
+        "18446744073709551616",
+      ],
     ]) {
       invokeMock.mockResolvedValueOnce(response);
       await expect(scanTvLibrary()).rejects.toThrow("invalid data");
@@ -192,12 +214,17 @@ describe("TV file actions", () => {
 
     await openTvFile("/TV/番組  Show.S01E02.mp4");
     await revealTvFile("/TV/番組  Show.S01E02.mp4");
+    await trashTvFile("/TV/番組  Show.S01E02.mp4", "42");
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, "open_tv_file", {
       path: "/TV/番組  Show.S01E02.mp4",
     });
     expect(invokeMock).toHaveBeenNthCalledWith(2, "reveal_tv_file", {
       path: "/TV/番組  Show.S01E02.mp4",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "trash_tv_file", {
+      path: "/TV/番組  Show.S01E02.mp4",
+      scanGeneration: "42",
     });
   });
 });

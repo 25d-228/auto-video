@@ -27,9 +27,9 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tv_library::{
     clear_tv_folder as clear_trusted_tv_folder, configured_tv_folder, load_tv_folder_with,
-    open_tv_file_with, reveal_tv_file_with, scan_tv_library_with, set_tv_folder, TvLibraryState,
-    TV_FILE_OPEN_FAILED, TV_FILE_REVEAL_FAILED, TV_FOLDER_STORAGE_FAILED, TV_FOLDER_UNAVAILABLE,
-    TV_LIBRARY_SCAN_FAILED,
+    open_tv_file_with, reveal_tv_file_with, scan_tv_library_with, set_tv_folder,
+    trash_tv_file_with, TvLibraryState, TV_FILE_OPEN_FAILED, TV_FILE_REVEAL_FAILED,
+    TV_FILE_TRASH_FAILED, TV_FOLDER_STORAGE_FAILED, TV_FOLDER_UNAVAILABLE, TV_LIBRARY_SCAN_FAILED,
 };
 use tv_release::{
     fetch_apibay_tv_releases_with, TV_APIBAY_PROVIDER_ERROR, TV_TMDB_MALFORMED,
@@ -1237,6 +1237,24 @@ async fn reveal_tv_file(
 }
 
 #[tauri::command]
+async fn trash_tv_file(
+    path: String,
+    scan_generation: String,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<(), String> {
+    let scan_generation = scan_generation
+        .parse::<u64>()
+        .map_err(|_| tv_library::TV_FILE_TRASH_STALE.to_owned())?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        trash_tv_file_with(Path::new(&path), scan_generation, &state, move_to_os_trash)
+    })
+    .await
+    .map_err(|_| TV_FILE_TRASH_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn load_adult_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, AdultLibraryState>,
@@ -2089,6 +2107,7 @@ fn main() {
             query_tv_storage,
             open_tv_file,
             reveal_tv_file,
+            trash_tv_file,
             load_adult_folder,
             choose_adult_folder,
             clear_adult_folder,

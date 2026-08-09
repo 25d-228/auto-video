@@ -1066,6 +1066,28 @@ button {
   min-height: 12rem;
 }
 
+.library-action-status,
+.library-action-attention {
+  margin: 0.75rem 0 0;
+  padding: 0.625rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.library-action-attention {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.library-action-attention p {
+  margin: 0;
+}
+
 .library-search-empty__query {
   white-space: pre-wrap;
 }

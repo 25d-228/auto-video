@@ -58,6 +58,7 @@ let scanTvLibraryMock: Mock<() => Promise<string[]>>;
 let queryTvStorageMock: Mock<() => Promise<[string, string]>>;
 let openTvFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
 let revealTvFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
+let trashTvFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
 let loadAdultFolderMock: Mock<() => Promise<string[]>>;
 let chooseAdultFolderMock: Mock<() => Promise<string | null>>;
 let clearAdultFolderMock: Mock<() => Promise<void>>;
@@ -588,6 +589,7 @@ beforeEach(() => {
     .mockResolvedValue(["3298534883328", "1099511627776"]);
   openTvFileMock = vi.fn().mockResolvedValue(undefined);
   revealTvFileMock = vi.fn().mockResolvedValue(undefined);
+  trashTvFileMock = vi.fn().mockResolvedValue(undefined);
   loadAdultFolderMock = vi.fn().mockImplementation(() =>
     Promise.resolve(
       savedAdultFolder === null
@@ -753,13 +755,15 @@ beforeEach(() => {
             savedTvFolder = null;
           });
         case "scan_tv_library":
-          return scanTvLibraryMock();
+          return scanTvLibraryMock().then((rows) => ["1", ...rows]);
         case "query_tv_storage":
           return queryTvStorageMock();
         case "open_tv_file":
           return openTvFileMock(parameters);
         case "reveal_tv_file":
           return revealTvFileMock(parameters);
+        case "trash_tv_file":
+          return trashTvFileMock(parameters);
         case "load_adult_folder":
           return loadAdultFolderMock();
         case "choose_adult_folder":
@@ -1240,6 +1244,393 @@ describe("parsed TV Library and Dashboard", () => {
     expect(revealTvFileMock).toHaveBeenCalledWith({ path });
     expect(scanMoviesMock).not.toHaveBeenCalled();
     expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
+  });
+
+  it("requires exact member confirmation and keeps every dismissal non-mutating", async () => {
+    savedTvFolder = "/TV";
+    const path = "/TV/番組/Exact  Show.S02E03 — Finale.MKV";
+    scanTvLibraryMock.mockResolvedValue([
+      path,
+      "番組/Exact  Show.S02E03 — Finale.MKV",
+      "10",
+    ]);
+    const parentActivation = vi.fn();
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    const trashButton = await screen.findByRole("button", {
+      name: "Move TV file to Trash or Recycle Bin: Exact Show.S02E03 — Finale.MKV",
+    });
+    parentActivation.mockClear();
+    trashButton.focus();
+    fireEvent.click(trashButton);
+
+    let dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain(
+      "Move “Exact  Show.S02E03 — Finale.MKV” to Trash?",
+    );
+    expect(dialog.textContent).toContain("exact member of “Exact  Show”");
+    expect(dialog.textContent).toContain("Season 2, Episode 3");
+    expect(dialog.textContent).not.toContain(path);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("button", { name: "Cancel" }),
+      );
+    });
+    expect(trashTvFileMock).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    dialog = await screen.findByRole("alertdialog");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Close confirmation" }),
+    );
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    await screen.findByRole("alertdialog");
+    const backdrop = document.querySelector(".trash-dialog__backdrop");
+    if (backdrop === null) {
+      throw new Error("The TV Trash confirmation backdrop was not rendered.");
+    }
+    fireEvent.pointerDown(backdrop);
+    fireEvent.click(backdrop);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+    expect(trashTvFileMock).not.toHaveBeenCalled();
+    expect(openTvFileMock).not.toHaveBeenCalled();
+    expect(revealTvFileMock).not.toHaveBeenCalled();
+    expect(clipboardWriteMock).not.toHaveBeenCalled();
+    expect(parentActivation).not.toHaveBeenCalled();
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryTvStorageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("moves one grouped member once and reconciles complete TV state only", async () => {
+    savedTvFolder = "/TV";
+    const removedPath = "/TV/Exact Show.S01E01.mp4";
+    const siblingPath = "/TV/Exact Show.S01E02.mkv";
+    const unassociatedPath = "/TV/Unicode  特典.mp4";
+    const initialRows = [
+      removedPath,
+      "Exact Show.S01E01.mp4",
+      "10",
+      siblingPath,
+      "Exact Show.S01E02.mkv",
+      "20",
+      unassociatedPath,
+      "Unicode  特典.mp4",
+      "30",
+    ];
+    const remainingRows = [
+      siblingPath,
+      "Exact Show.S01E02.mkv",
+      "20",
+      unassociatedPath,
+      "Unicode  特典.mp4",
+      "30",
+    ];
+    const pendingTrash = createDeferred<void>();
+    scanTvLibraryMock
+      .mockResolvedValueOnce(initialRows)
+      .mockResolvedValueOnce(remainingRows);
+    trashTvFileMock.mockReturnValueOnce(pendingTrash.promise);
+    queryTvStorageMock
+      .mockResolvedValueOnce(["1000", "400"])
+      .mockResolvedValueOnce(["1000", "410"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    await screen.findByRole("heading", { level: 3, name: "Exact Show" });
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort titles" }), {
+      target: { value: "descending" },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "Exact Show" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move TV file to Trash or Recycle Bin: Exact Show.S01E01.mp4",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    const confirmButton = within(dialog).getByRole("button", {
+      name: "Confirm moving TV file to Trash or Recycle Bin: Exact Show.S01E01.mp4",
+    });
+    fireEvent.click(confirmButton);
+    confirmButton.click();
+
+    expect(trashTvFileMock).toHaveBeenCalledTimes(1);
+    expect(trashTvFileMock).toHaveBeenCalledWith({
+      path: removedPath,
+      scanGeneration: "1",
+    });
+    expect(confirmButton).toHaveProperty("disabled", true);
+    expect(dialog.getAttribute("aria-busy")).toBe("true");
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveProperty(
+      "disabled",
+      true,
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "Close confirmation" }),
+    ).toHaveProperty("disabled", true);
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    const pendingBackdrop = document.querySelector(".trash-dialog__backdrop");
+    if (pendingBackdrop === null) {
+      throw new Error("The pending TV Trash backdrop was not rendered.");
+    }
+    fireEvent.click(pendingBackdrop);
+    expect(screen.getByRole("alertdialog")).toBe(dialog);
+    expect(trashTvFileMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingTrash.resolve(undefined);
+      await pendingTrash.promise;
+    });
+    expect(
+      await screen.findByText(
+        "Exact Show.S01E01.mp4 was moved to Trash or the Recycle Bin.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Exact Show.S01E01.mp4")).toBeNull();
+    expect(screen.getByText("Exact Show.S01E02.mkv")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "Exact Show" }))
+      .toBeTruthy();
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "Exact Show",
+    );
+    expect(screen.getByRole("combobox", { name: "Sort titles" })).toHaveProperty(
+      "value",
+      "descending",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Clear TV search" }));
+    await waitFor(() => {
+      expect(
+        Array.from(document.querySelectorAll("[data-tv-file-path]"), (row) =>
+          row.getAttribute("data-tv-file-path"),
+        ),
+      ).toContain(unassociatedPath);
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryTvStorageMock).toHaveBeenCalledTimes(2);
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(scanAdultLibraryMock).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    selectDashboard();
+    const summary = screen
+      .getByRole("heading", { level: 2, name: "TV Library" })
+      .closest("section");
+    if (summary === null) {
+      throw new Error("The TV Dashboard summary was not rendered.");
+    }
+    expect(
+      within(summary).getByRole("heading", {
+        level: 3,
+        name: "2 supported TV files",
+      }),
+    ).toBeTruthy();
+    expect(
+      within(summary).getByText(
+        "1 show · 1 associated episode · 1 file remains unassociated.",
+      ),
+    ).toBeTruthy();
+    expect(within(summary).getByText("590 B")).toBeTruthy();
+  });
+
+  it("keeps an accepted unassociated move truthful when reconciliation fails", async () => {
+    savedTvFolder = "/TV";
+    const removedPath = "/TV/Unassociated  —  remove me.MKV";
+    const remainingPath = "/TV/Keep Show.S01E01.mp4";
+    const initialRows = [
+      removedPath,
+      "Unassociated  —  remove me.MKV",
+      "10",
+      remainingPath,
+      "Keep Show.S01E01.mp4",
+      "20",
+    ];
+    const remainingRows = [
+      remainingPath,
+      "Keep Show.S01E01.mp4",
+      "20",
+    ];
+    scanTvLibraryMock
+      .mockResolvedValueOnce(initialRows)
+      .mockRejectedValueOnce("tv_library_scan_failed")
+      .mockResolvedValueOnce(remainingRows);
+    queryTvStorageMock
+      .mockResolvedValueOnce(["1000", "400"])
+      .mockRejectedValueOnce("tv_storage_failed")
+      .mockResolvedValueOnce(["1000", "420"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Move TV file to Trash or Recycle Bin: Unassociated — remove me.MKV",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain(
+      "exact unassociated file “Unassociated  —  remove me”",
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving TV file to Trash or Recycle Bin: Unassociated — remove me.MKV",
+      }),
+    );
+
+    expect(
+      await screen.findByText(
+        "Unassociated — remove me.MKV was moved to Trash or the Recycle Bin.",
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByText("Unassociated  —  remove me.MKV")).toBeNull();
+    expect(screen.getByText("Keep Show.S01E01.mp4")).toBeTruthy();
+    const attention = await screen.findByRole("alert");
+    expect(attention.textContent).toContain("file move succeeded");
+    expect(attention.textContent).toContain("remains removed");
+    expect(trashTvFileMock).toHaveBeenCalledTimes(1);
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryTvStorageMock).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(
+      within(attention).getByRole("button", { name: "Retry reconciliation" }),
+    );
+    await screen.findByRole("heading", { level: 3, name: "Keep Show" });
+    await waitFor(() => {
+      expect(screen.queryByText(/Library or storage could not be refreshed/))
+        .toBeNull();
+    });
+    expect(screen.queryByText("Unassociated  —  remove me.MKV")).toBeNull();
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(3);
+    expect(queryTvStorageMock).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    ["tv_file_trash_not_found", "This file is no longer available."],
+    [
+      "tv_file_trash_unavailable",
+      "Auto-Video could not access the current TV folder or file.",
+    ],
+    [
+      "tv_file_trash_not_file",
+      "This item is not an eligible regular video file.",
+    ],
+    [
+      "tv_file_trash_unsupported",
+      "This item is not a supported .mp4 or .mkv file.",
+    ],
+    [
+      "tv_file_trash_outside_folder",
+      "This file is outside the configured TV folder.",
+    ],
+    [
+      "tv_file_trash_stale",
+      "This file is no longer part of the latest TV Library scan.",
+    ],
+    [
+      "tv_file_trash_failed",
+      "The operating system could not move this file to Trash or the Recycle Bin.",
+    ],
+  ])("reports %s and preserves every current TV result", async (error, message) => {
+    savedTvFolder = "/TV";
+    const path = "/TV/Failure Show.S01E01.mp4";
+    scanTvLibraryMock.mockResolvedValue([
+      path,
+      "Failure Show.S01E01.mp4",
+      "10",
+    ]);
+    trashTvFileMock.mockRejectedValueOnce(error);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Move TV file to Trash or Recycle Bin: Failure Show.S01E01.mp4",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving TV file to Trash or Recycle Bin: Failure Show.S01E01.mp4",
+      }),
+    );
+
+    expect(await within(dialog).findByRole("alert")).toHaveProperty(
+      "textContent",
+      message,
+    );
+    expect(screen.getByText("Failure Show.S01E01.mp4")).toBeTruthy();
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryTvStorageMock).toHaveBeenCalledTimes(1);
+    expect(trashTvFileMock).toHaveBeenCalledWith({
+      path,
+      scanGeneration: "1",
+    });
+  });
+
+  it("removing the final grouped member clamps only an invalid TV page", async () => {
+    savedTvFolder = "/TV";
+    const rows = Array.from({ length: 29 }, (_, index) => {
+      const title = `Show ${String(index + 1).padStart(2, "0")}`;
+      return [`/TV/${title}.S01E01.mp4`, `${title}.S01E01.mp4`, "1"];
+    }).flat();
+    scanTvLibraryMock
+      .mockResolvedValueOnce(rows)
+      .mockResolvedValueOnce(rows.slice(0, -3));
+    gallerySizes.library = { width: 1528, height: 136 };
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    await screen.findByRole("heading", { level: 3, name: "Show 01" });
+    for (let page = 1; page < 5; page += 1) {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Next TV shows and unassociated files page" }),
+      );
+    }
+    expect(screen.getByText("Page 5 of 5")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move TV file to Trash or Recycle Bin: Show 29.S01E01.mp4",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving TV file to Trash or Recycle Bin: Show 29.S01E01.mp4",
+      }),
+    );
+
+    expect(await screen.findByText("Page 4 of 4")).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 3, name: "Show 29" }))
+      .toBeNull();
+    expect(screen.getByRole("heading", { level: 3, name: "Show 28" }))
+      .toBeTruthy();
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryTvStorageMock).toHaveBeenCalledTimes(2);
   });
 });
 

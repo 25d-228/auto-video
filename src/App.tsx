@@ -99,6 +99,7 @@ import {
   queryTvStorage,
   revealTvFile,
   scanTvLibrary,
+  trashTvFile,
   type TvFolderState,
   type TvLibraryFile,
   type TvLibraryItem,
@@ -251,10 +252,10 @@ type TvLibraryScanState =
   | { status: "loading" }
   | { status: "unconfigured" }
   | { status: "scanning" }
-  | { status: "empty" }
+  | { status: "empty"; generation: string }
   | { status: "unavailable" }
   | { status: "error" }
-  | { status: "ready"; items: TvLibraryItem[] };
+  | { status: "ready"; generation: string; items: TvLibraryItem[] };
 type VolumeStorageState =
   | { status: "unconfigured" }
   | { status: "loading" }
@@ -522,6 +523,17 @@ const tvFileRevealErrorMessages: Record<string, string> = {
   tv_file_reveal_outside_folder: "This file is outside the configured TV folder.",
   tv_file_reveal_stale: "This file is no longer part of the current TV Library.",
   tv_file_reveal_failed: "The operating system could not reveal this file.",
+};
+
+const tvFileTrashErrorMessages: Record<string, string> = {
+  tv_file_trash_not_found: "This file is no longer available.",
+  tv_file_trash_unavailable: "Auto-Video could not access the current TV folder or file.",
+  tv_file_trash_not_file: "This item is not an eligible regular video file.",
+  tv_file_trash_unsupported: "This item is not a supported .mp4 or .mkv file.",
+  tv_file_trash_outside_folder: "This file is outside the configured TV folder.",
+  tv_file_trash_stale: "This file is no longer part of the latest TV Library scan.",
+  tv_file_trash_failed:
+    "The operating system could not move this file to Trash or the Recycle Bin.",
 };
 
 const adultLibraryScanMessages = {
@@ -3990,12 +4002,37 @@ function VrLibraryCard({ item }: { item: VrLibraryItem }) {
   );
 }
 
-function TvLibraryFileRow({ file }: { file: TvLibraryFile }) {
+function TvLibraryFileRow({
+  file,
+  itemTitle,
+  onFileTrashed,
+  onTrashPendingChange,
+  scanGeneration,
+  showTitle,
+  trashActionsDisabled,
+  trashPendingPath,
+}: {
+  file: TvLibraryFile;
+  itemTitle: string;
+  onFileTrashed: (file: TvLibraryFile, scanGeneration: string) => void;
+  onTrashPendingChange: (path: string | null) => void;
+  scanGeneration: string;
+  showTitle: string | null;
+  trashActionsDisabled: boolean;
+  trashPendingPath: string | null;
+}) {
   const [pendingAction, setPendingAction] = useState<"open" | "reveal" | null>(
     null,
   );
   const [actionError, setActionError] = useState<string | null>(null);
+  const [isTrashing, setIsTrashing] = useState(false);
+  const [trashDialogOpen, setTrashDialogOpen] = useState(false);
+  const [trashError, setTrashError] = useState<string | null>(null);
   const actionPending = useRef(false);
+  const trashRequestPending = useRef(false);
+  const trashCancelButton = useRef<HTMLButtonElement | null>(null);
+  const trashDialogPopup = useRef<HTMLDivElement | null>(null);
+  const trashTriggerId = useId();
 
   const runAction = async (action: "open" | "reveal") => {
     if (actionPending.current) {
@@ -4025,6 +4062,51 @@ function TvLibraryFileRow({ file }: { file: TvLibraryFile }) {
     }
   };
 
+  const updateTrashDialog = (open: boolean) => {
+    if (!open && trashRequestPending.current) {
+      return;
+    }
+    setTrashDialogOpen(open);
+    if (open) {
+      setTrashError(null);
+    }
+  };
+
+  const trashFile = async (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (
+      trashRequestPending.current ||
+      trashPendingPath !== null ||
+      trashActionsDisabled
+    ) {
+      return;
+    }
+
+    trashRequestPending.current = true;
+    setIsTrashing(true);
+    setTrashError(null);
+    onTrashPendingChange(file.path);
+    trashDialogPopup.current?.focus();
+    let succeeded = false;
+    try {
+      await trashTvFile(file.path, scanGeneration);
+      succeeded = true;
+      onFileTrashed(file, scanGeneration);
+    } catch (error: unknown) {
+      setTrashError(
+        tvFileTrashErrorMessages[nativeErrorCode(error)] ??
+          "Auto-Video could not move this TV file to Trash or the Recycle Bin.",
+      );
+    } finally {
+      trashRequestPending.current = false;
+      setIsTrashing(false);
+      onTrashPendingChange(null);
+      if (succeeded) {
+        setTrashDialogOpen(false);
+      }
+    }
+  };
+
   return (
     <li className="vr-library-file" data-tv-file-path={file.path}>
       <div className="vr-library-file__identity">
@@ -4040,7 +4122,12 @@ function TvLibraryFileRow({ file }: { file: TvLibraryFile }) {
         <Button
           aria-label={`${pendingAction === "open" ? "Opening" : "Open"} TV file: ${file.filename}`}
           disabled={pendingAction !== null}
-          onClick={() => void runAction("open")}
+          onClick={(event) => {
+            event.stopPropagation();
+            void runAction("open");
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
           size="icon-xs"
           title="Open file"
           type="button"
@@ -4051,7 +4138,12 @@ function TvLibraryFileRow({ file }: { file: TvLibraryFile }) {
         <Button
           aria-label={`${pendingAction === "reveal" ? "Revealing" : "Reveal"} TV file: ${file.filename}`}
           disabled={pendingAction !== null}
-          onClick={() => void runAction("reveal")}
+          onClick={(event) => {
+            event.stopPropagation();
+            void runAction("reveal");
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
           size="icon-xs"
           title="Reveal file"
           type="button"
@@ -4059,6 +4151,113 @@ function TvLibraryFileRow({ file }: { file: TvLibraryFile }) {
         >
           <AppIcon name="reveal" />
         </Button>
+        <AlertDialog.Root
+          onOpenChange={updateTrashDialog}
+          open={trashDialogOpen}
+          triggerId={trashDialogOpen ? trashTriggerId : null}
+        >
+          <AlertDialog.Trigger
+            id={trashTriggerId}
+            render={
+              <Button
+                aria-label={`Move TV file to Trash or Recycle Bin: ${file.filename}`}
+                disabled={trashPendingPath !== null || trashActionsDisabled}
+                onClick={(event) => event.stopPropagation()}
+                onKeyDown={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+                size="icon-xs"
+                title="Move to Trash or Recycle Bin"
+                type="button"
+                variant="destructive"
+              >
+                <AppIcon name="trash" />
+              </Button>
+            }
+          />
+          <AlertDialog.Portal>
+            <AlertDialog.Backdrop
+              className="trash-dialog__backdrop"
+              onClick={(event) => {
+                event.stopPropagation();
+                updateTrashDialog(false);
+              }}
+              onPointerDown={(event) => event.stopPropagation()}
+            />
+            <AlertDialog.Viewport className="trash-dialog__viewport">
+              <AlertDialog.Popup
+                aria-busy={isTrashing}
+                className="trash-dialog__popup"
+                initialFocus={() => trashCancelButton.current}
+                onClick={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+                ref={trashDialogPopup}
+              >
+                <div className="trash-dialog__heading">
+                  <AlertDialog.Title>
+                    Move “{file.filename}” to Trash?
+                  </AlertDialog.Title>
+                  <AlertDialog.Close
+                    render={
+                      <Button
+                        aria-label="Close confirmation"
+                        disabled={isTrashing}
+                        size="icon-xs"
+                        type="button"
+                        variant="ghost"
+                      >
+                        <AppIcon name="close" />
+                      </Button>
+                    }
+                  />
+                </div>
+                <AlertDialog.Description>
+                  {showTitle === null
+                    ? `This moves the exact unassociated file “${itemTitle}” to macOS Trash or the Windows Recycle Bin.`
+                    : `This moves the exact member of “${showTitle}”${
+                        file.season === null || file.episode === null
+                          ? ""
+                          : `, Season ${file.season}, Episode ${file.episode}`
+                      } to macOS Trash or the Windows Recycle Bin.`} It may be
+                  recoverable there.
+                </AlertDialog.Description>
+                {trashError === null ? null : (
+                  <p
+                    aria-atomic="true"
+                    className="trash-dialog__error"
+                    role="alert"
+                  >
+                    {trashError}
+                  </p>
+                )}
+                <div className="trash-dialog__actions">
+                  <AlertDialog.Close
+                    render={
+                      <Button
+                        disabled={isTrashing}
+                        ref={trashCancelButton}
+                        type="button"
+                        variant="outline"
+                      >
+                        Cancel
+                      </Button>
+                    }
+                  />
+                  <Button
+                    aria-label={`${isTrashing ? "Moving" : "Confirm moving"} TV file to Trash or Recycle Bin: ${file.filename}`}
+                    disabled={isTrashing}
+                    onClick={trashFile}
+                    onKeyDown={(event) => event.stopPropagation()}
+                    type="button"
+                    variant="destructive"
+                  >
+                    <AppIcon name="trash" />
+                    {isTrashing ? "Moving…" : "Move file"}
+                  </Button>
+                </div>
+              </AlertDialog.Popup>
+            </AlertDialog.Viewport>
+          </AlertDialog.Portal>
+        </AlertDialog.Root>
       </div>
       {actionError === null ? null : (
         <p aria-atomic="true" role="alert">
@@ -4069,7 +4268,21 @@ function TvLibraryFileRow({ file }: { file: TvLibraryFile }) {
   );
 }
 
-function TvLibraryCard({ item }: { item: TvLibraryItem }) {
+function TvLibraryCard({
+  item,
+  onFileTrashed,
+  onTrashPendingChange,
+  scanGeneration,
+  trashActionsDisabled,
+  trashPendingPath,
+}: {
+  item: TvLibraryItem;
+  onFileTrashed: (file: TvLibraryFile, scanGeneration: string) => void;
+  onTrashPendingChange: (path: string | null) => void;
+  scanGeneration: string;
+  trashActionsDisabled: boolean;
+  trashPendingPath: string | null;
+}) {
   return (
     <article className="movie-card vr-library-card tv-library-card">
       <div className="media-title-row">
@@ -4092,7 +4305,17 @@ function TvLibraryCard({ item }: { item: TvLibraryItem }) {
         className="vr-library-card__files"
       >
         {item.files.map((file) => (
-          <TvLibraryFileRow file={file} key={file.path} />
+          <TvLibraryFileRow
+            file={file}
+            itemTitle={item.title}
+            key={file.path}
+            onFileTrashed={onFileTrashed}
+            onTrashPendingChange={onTrashPendingChange}
+            scanGeneration={scanGeneration}
+            showTitle={item.showTitle}
+            trashActionsDisabled={trashActionsDisabled}
+            trashPendingPath={trashPendingPath}
+          />
         ))}
       </ul>
     </article>
@@ -4604,6 +4827,13 @@ function compareTvLibraryItemsByTitle(
   return leftItem.id < rightItem.id ? -1 : leftItem.id > rightItem.id ? 1 : 0;
 }
 
+function removeTvLibraryFile(items: TvLibraryItem[], path: string) {
+  return items.flatMap((item) => {
+    const files = item.files.filter((file) => file.path !== path);
+    return files.length === 0 ? [] : [{ ...item, files }];
+  });
+}
+
 function compareAdultLibraryItemsByTitle(
   leftItem: AdultLibraryItem,
   rightItem: AdultLibraryItem,
@@ -4749,6 +4979,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [tvLibrarySearchQuery, setTvLibrarySearchQuery] = useState("");
   const [tvLibraryTitleSortDirection, setTvLibraryTitleSortDirection] =
     useState<LibraryTitleSortDirection>("ascending");
+  const [tvTrashAnnouncement, setTvTrashAnnouncement] = useState<string | null>(
+    null,
+  );
+  const [tvTrashReconciliationState, setTvTrashReconciliationState] = useState<
+    "pending" | "attention" | null
+  >(null);
+  const [tvTrashPendingPath, setTvTrashPendingPath] = useState<string | null>(
+    null,
+  );
   const [isChoosingTvFolder, setIsChoosingTvFolder] = useState(false);
   const [isRevalidatingTvFolder, setIsRevalidatingTvFolder] = useState(false);
   const [tvFolderActionError, setTvFolderActionError] = useState<string | null>(
@@ -5047,6 +5286,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const currentTvDiscoverState = useRef(tvDiscoverState);
   const currentMoviesFolder = useRef(moviesFolder);
   const currentMovieScanState = useRef(movieScanState);
+  const currentTvFolderState = useRef(tvFolderState);
+  const currentTvLibraryScanState = useRef(tvLibraryScanState);
   const currentVrDownloadsState = useRef(vrDownloadsState);
   const previousDownloadStates = useRef<Map<string, VrDownload["state"]>>(
     new Map(),
@@ -5058,6 +5299,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   // Late Trash responses read current state so an old card cannot modify replacement results.
   currentMoviesFolder.current = moviesFolder;
   currentMovieScanState.current = movieScanState;
+  currentTvFolderState.current = tvFolderState;
+  currentTvLibraryScanState.current = tvLibraryScanState;
   currentVrDownloadsState.current = vrDownloadsState;
   currentTvDiscoverState.current = tvDiscoverState;
 
@@ -5441,12 +5684,12 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     setTvLibraryScanState({ status: "scanning" });
     void scanTvLibrary()
-      .then((items) => {
+      .then(({ generation, items }) => {
         if (requestId === tvLibraryScanRequestId.current) {
           setTvLibraryScanState(
             items.length === 0
-              ? { status: "empty" }
-              : { status: "ready", items },
+              ? { status: "empty", generation }
+              : { status: "ready", generation, items },
           );
         }
       })
@@ -6405,6 +6648,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     try {
       const selectedFolder = await chooseTvFolder();
       if (requestId === tvFolderRequestId.current && selectedFolder !== null) {
+        setTvTrashAnnouncement(null);
+        setTvTrashReconciliationState(null);
+        setTvTrashPendingPath(null);
         tvLibraryScanRequestId.current += 1;
         tvStorageRequestId.current += 1;
         setTvLibraryScanState({ status: "scanning" });
@@ -6423,6 +6669,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const clearConfiguredTvFolder = async () => {
     const requestId = ++tvFolderRequestId.current;
     setIsRevalidatingTvFolder(false);
+    setTvTrashAnnouncement(null);
+    setTvTrashReconciliationState(null);
+    setTvTrashPendingPath(null);
     tvLibraryScanRequestId.current += 1;
     tvStorageRequestId.current += 1;
     setTvFolderActionError(null);
@@ -6438,6 +6687,90 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         );
       }
     }
+  };
+
+  const recordTrashedTvFile = (
+    file: TvLibraryFile,
+    scanGeneration: string,
+  ) => {
+    const currentFolder = currentTvFolderState.current;
+    const currentScan = currentTvLibraryScanState.current;
+    if (
+      currentFolder.status !== "ready" ||
+      currentScan.status !== "ready" ||
+      currentScan.generation !== scanGeneration
+    ) {
+      return;
+    }
+
+    const remainingItems = removeTvLibraryFile(currentScan.items, file.path);
+    const localState: TvLibraryScanState =
+      remainingItems.length === 0
+        ? { status: "empty", generation: scanGeneration }
+        : { status: "ready", generation: scanGeneration, items: remainingItems };
+    currentTvLibraryScanState.current = localState;
+    setTvLibraryScanState(localState);
+    setTvTrashAnnouncement(
+      `${file.filename} was moved to Trash or the Recycle Bin.`,
+    );
+    setTvTrashReconciliationState("pending");
+    setTvStorageState({ status: "loading" });
+
+    const folderPath = currentFolder.path;
+    const scanRequestId = ++tvLibraryScanRequestId.current;
+    const storageRequestId = ++tvStorageRequestId.current;
+    void Promise.allSettled([scanTvLibrary(), queryTvStorage()]).then(
+      ([scanResult, storageResult]) => {
+        if (
+          currentTvFolderState.current.status !== "ready" ||
+          currentTvFolderState.current.path !== folderPath ||
+          scanRequestId !== tvLibraryScanRequestId.current ||
+          storageRequestId !== tvStorageRequestId.current
+        ) {
+          return;
+        }
+
+        let needsAttention = false;
+        if (scanResult.status === "fulfilled") {
+          const reconciledItems = removeTvLibraryFile(
+            scanResult.value.items,
+            file.path,
+          );
+          const reconciledState: TvLibraryScanState =
+            reconciledItems.length === 0
+              ? {
+                  status: "empty",
+                  generation: scanResult.value.generation,
+                }
+              : {
+                  status: "ready",
+                  generation: scanResult.value.generation,
+                  items: reconciledItems,
+                };
+          currentTvLibraryScanState.current = reconciledState;
+          setTvLibraryScanState(reconciledState);
+        } else {
+          needsAttention = true;
+        }
+
+        if (storageResult.status === "fulfilled") {
+          setTvStorageState({
+            status: "ready",
+            totalBytes: storageResult.value.totalBytes,
+            freeBytes: storageResult.value.freeBytes,
+          });
+        } else {
+          needsAttention = true;
+          setTvStorageState({
+            status:
+              nativeErrorCode(storageResult.reason) === tvStorageUnavailable
+                ? "unavailable"
+                : "error",
+          });
+        }
+        setTvTrashReconciliationState(needsAttention ? "attention" : null);
+      },
+    );
   };
 
   const refreshTvLibrary = () => {
@@ -6470,6 +6803,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     if (tvFolderState.status !== "ready") {
       return;
     }
+    setTvTrashReconciliationState(null);
     tvLibraryScanRequestId.current += 1;
     tvStorageRequestId.current += 1;
     setTvLibraryScanState({ status: "scanning" });
@@ -8442,6 +8776,22 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     dashboardTvMessage = "Auto-Video could not read every item in the configured folder.";
     dashboardTvRole = "alert";
   }
+  if (
+    (tvLibraryScanState.status === "ready" ||
+      tvLibraryScanState.status === "empty") &&
+    tvTrashReconciliationState === "pending"
+  ) {
+    dashboardTvMessage += " Library and storage reconciliation is in progress.";
+    dashboardTvRole = "status";
+  } else if (
+    (tvLibraryScanState.status === "ready" ||
+      tvLibraryScanState.status === "empty") &&
+    tvTrashReconciliationState === "attention"
+  ) {
+    dashboardTvMessage +=
+      " A moved file remains removed, but Library or storage reconciliation needs a retry.";
+    dashboardTvRole = "alert";
+  }
 
   let dashboardTvStorageHeading = "Waiting for TV folder configuration";
   let dashboardTvStorageMessage =
@@ -9835,7 +10185,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     <Button
                       disabled={
                         tvLibraryScanState.status === "scanning" ||
-                        isRevalidatingTvFolder
+                        isRevalidatingTvFolder ||
+                        tvTrashReconciliationState === "pending" ||
+                        tvTrashPendingPath !== null
                       }
                       onClick={refreshTvLibrary}
                       type="button"
@@ -10001,6 +10353,44 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                 </div>
               </div>
 
+              {libraryCategory === "tv" && tvTrashAnnouncement !== null ? (
+                <p
+                  aria-atomic="true"
+                  aria-live="polite"
+                  className="library-action-status"
+                >
+                  {tvTrashAnnouncement}
+                </p>
+              ) : null}
+              {libraryCategory === "tv" &&
+              tvTrashReconciliationState === "pending" ? (
+                <p
+                  aria-atomic="true"
+                  className="library-action-status"
+                  role="status"
+                >
+                  The file move succeeded. Updating the TV Library and storage…
+                </p>
+              ) : null}
+              {libraryCategory === "tv" &&
+              tvTrashReconciliationState === "attention" ? (
+                <div className="library-action-attention" role="alert">
+                  <p>
+                    The file move succeeded, but the TV Library or storage could
+                    not be refreshed. The moved file remains removed from this
+                    result.
+                  </p>
+                  <Button
+                    onClick={refreshTvLibrary}
+                    type="button"
+                    variant="outline"
+                  >
+                    <AppIcon name="refresh" />
+                    Retry reconciliation
+                  </Button>
+                </div>
+              ) : null}
+
               {libraryCategory === "movies" ? (
                 movieScanState.status === "ready" && moviesFolder !== null ? (
                 <>
@@ -10095,7 +10485,18 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         items={orderedTvLibraryItems}
                         key="tv-library-gallery"
                         onSelectedPageChange={setTvLibrarySelectedPage}
-                        renderItem={(item) => <TvLibraryCard item={item} />}
+                        renderItem={(item) => (
+                          <TvLibraryCard
+                            item={item}
+                            onFileTrashed={recordTrashedTvFile}
+                            onTrashPendingChange={setTvTrashPendingPath}
+                            scanGeneration={tvLibraryScanState.generation}
+                            trashActionsDisabled={
+                              tvTrashReconciliationState !== null
+                            }
+                            trashPendingPath={tvTrashPendingPath}
+                          />
+                        )}
                         selectedPage={tvLibrarySelectedPage}
                         variant="library"
                       />
