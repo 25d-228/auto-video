@@ -5,7 +5,10 @@ use std::{
     time::SystemTime,
 };
 
-use crate::vr_download::{configured_vr_folder, with_configured_vr_folder, VrDownloadState};
+use crate::vr_download::{
+    configured_vr_folder, with_configured_vr_folder, with_unowned_vr_library_path, VrDownloadState,
+    VrLibraryTrashOwnershipError,
+};
 
 pub const VR_LIBRARY_FOLDER_UNAVAILABLE: &str = "vr_library_folder_unavailable";
 pub const VR_LIBRARY_SCAN_FAILED: &str = "vr_library_scan_failed";
@@ -27,6 +30,8 @@ pub const VR_FILE_REVEAL_UNSUPPORTED: &str = "vr_file_reveal_unsupported";
 pub const VR_FILE_TRASH_FAILED: &str = "vr_file_trash_failed";
 pub const VR_FILE_TRASH_NOT_FILE: &str = "vr_file_trash_not_file";
 pub const VR_FILE_TRASH_NOT_FOUND: &str = "vr_file_trash_not_found";
+pub const VR_FILE_TRASH_OWNED: &str = "vr_file_trash_owned";
+pub const VR_FILE_TRASH_OWNERSHIP_UNAVAILABLE: &str = "vr_file_trash_ownership_unavailable";
 pub const VR_FILE_TRASH_OUTSIDE_FOLDER: &str = "vr_file_trash_outside_folder";
 pub const VR_FILE_TRASH_STALE: &str = "vr_file_trash_stale";
 pub const VR_FILE_TRASH_UNAVAILABLE: &str = "vr_file_trash_unavailable";
@@ -295,7 +300,7 @@ pub fn trash_vr_file_with(
     library_state: &VrLibraryState,
     dispatch: impl FnOnce(&Path) -> Result<(), ()>,
 ) -> Result<(), &'static str> {
-    with_configured_vr_folder(download_state, |configured_folder| {
+    with_unowned_vr_library_path(download_state, path, |configured_folder| {
         let configured_folder = configured_folder.ok_or(VR_FILE_TRASH_UNAVAILABLE)?;
         let canonical_folder =
             fs::canonicalize(configured_folder).map_err(|_| VR_FILE_TRASH_UNAVAILABLE)?;
@@ -333,13 +338,16 @@ pub fn trash_vr_file_with(
             .retain(|file| file.path != path);
         Ok(())
     })
-    .map_err(|_| VR_FILE_TRASH_UNAVAILABLE)?
+    .map_err(|error| match error {
+        VrLibraryTrashOwnershipError::Owned => VR_FILE_TRASH_OWNED,
+        VrLibraryTrashOwnershipError::Unavailable => VR_FILE_TRASH_OWNERSHIP_UNAVAILABLE,
+    })?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vr_download::{clear_vr_folder, load_vr_folder_with, set_vr_folder};
+    use crate::vr_download::{clear_vr_folder, load_downloads, load_vr_folder_with, set_vr_folder};
     use std::{
         cell::Cell,
         fs,
@@ -376,6 +384,13 @@ mod tests {
         let state = VrDownloadState::default();
         set_vr_folder(&state, config_path, folder.to_path_buf())
             .expect("VR folder must be configured");
+        tauri::async_runtime::block_on(load_downloads(
+            &state,
+            &config_path.with_extension("downloads"),
+            &config_path.with_extension("session"),
+            &config_path.with_extension("limit"),
+        ))
+        .expect("empty transfer state must load");
         state
     }
 

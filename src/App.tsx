@@ -648,6 +648,10 @@ const vrFileTrashErrorMessages: Record<string, string> = {
   vr_file_trash_unavailable:
     "Auto-Video could not access the configured VR folder.",
   vr_file_trash_not_file: "This item is not an eligible video file.",
+  vr_file_trash_owned:
+    "This file belongs to a current VR transfer or organization recovery and cannot be moved.",
+  vr_file_trash_ownership_unavailable:
+    "Auto-Video could not safely verify that no current VR transfer or recovery owns this file.",
   vr_file_trash_unsupported:
     "This item is not a supported .mp4 or .mkv file.",
   vr_file_trash_outside_folder:

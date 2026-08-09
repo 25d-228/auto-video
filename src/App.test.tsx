@@ -3200,6 +3200,14 @@ describe("parsed VR Library and Dashboard", () => {
     ],
     ["vr_file_trash_not_file", "This item is not an eligible video file."],
     [
+      "vr_file_trash_owned",
+      "This file belongs to a current VR transfer or organization recovery and cannot be moved.",
+    ],
+    [
+      "vr_file_trash_ownership_unavailable",
+      "Auto-Video could not safely verify that no current VR transfer or recovery owns this file.",
+    ],
+    [
       "vr_file_trash_unsupported",
       "This item is not a supported .mp4 or .mkv file.",
     ],
@@ -3247,6 +3255,12 @@ describe("parsed VR Library and Dashboard", () => {
       path,
       scanGeneration: "1",
     });
+    expect(listVrDownloadsMock).not.toHaveBeenCalled();
+    expect(cancelVrDownloadMock).not.toHaveBeenCalled();
+    expect(dismissVrDownloadMock).not.toHaveBeenCalled();
+    expect(previewVrOrganizationMock).not.toHaveBeenCalled();
+    expect(applyVrOrganizationMock).not.toHaveBeenCalled();
+    expect(dismissVrOrganizationMock).not.toHaveBeenCalled();
   });
 
   it("removing the final grouped VR member clamps only an invalid page", async () => {
