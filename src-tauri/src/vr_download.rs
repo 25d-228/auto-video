@@ -2681,11 +2681,12 @@ async fn restore_record(
     );
 }
 
-pub async fn load_downloads(
+async fn load_downloads_with_persistence(
     state: &VrDownloadState,
     persistence_path: &Path,
     session_folder: &Path,
     download_limit_path: &Path,
+    persist_transfers: fn(&Path, &[StoredTransfer]) -> Result<(), &'static str>,
 ) -> Result<Vec<String>, &'static str> {
     load_download_limit(state, download_limit_path)?;
     let (organization_recovery_destinations, current_tv_destination) = {
@@ -2812,7 +2813,23 @@ pub async fn load_downloads(
     for transfer_id in active_ids {
         restore_record(state, session_folder, persistence_path, &transfer_id).await;
     }
-    list_downloads(state, persistence_path)
+    list_downloads_with_persistence(state, persistence_path, persist_transfers)
+}
+
+pub async fn load_downloads(
+    state: &VrDownloadState,
+    persistence_path: &Path,
+    session_folder: &Path,
+    download_limit_path: &Path,
+) -> Result<Vec<String>, &'static str> {
+    load_downloads_with_persistence(
+        state,
+        persistence_path,
+        session_folder,
+        download_limit_path,
+        write_persisted_transfers,
+    )
+    .await
 }
 
 fn verified_selected_bytes(record: &TransferRecord, handle: &ManagedTorrentHandle) -> Option<u64> {
@@ -3736,31 +3753,40 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
     rows
 }
 
-pub fn list_downloads(
+fn list_downloads_with_persistence(
     state: &VrDownloadState,
     persistence_path: &Path,
+    persist_transfers: fn(&Path, &[StoredTransfer]) -> Result<(), &'static str>,
 ) -> Result<Vec<String>, &'static str> {
     let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
     if !context.transfers_loaded {
         return Err(VR_DOWNLOAD_ACTION_INVALID);
     }
     let rows = download_rows(&mut context);
-    let recovery_transfer_ids = context
+    let recovery_destinations = context
         .transfers
         .iter()
         .filter_map(|transfer| match transfer {
             StoredTransfer::Valid(record) => Some(record.destination.clone()),
             StoredTransfer::Corrupt(_) => None,
         })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .flat_map(|destination| read_organization_recoveries(&destination))
+        .collect::<BTreeSet<_>>();
+    let organization_recovery_transfer_ids = recovery_destinations
+        .iter()
+        .flat_map(|destination| read_organization_recoveries(destination))
         .map(|record| record.transfer_id)
         .collect::<BTreeSet<_>>();
+    let tv_completion_recoveries = recovery_destinations
+        .into_iter()
+        .flat_map(|destination| read_tv_completion_recoveries(&destination))
+        .collect::<Vec<_>>();
     let has_durable_recovery = context.transfers.iter().any(|transfer| {
-        matches!(transfer, StoredTransfer::Valid(record) if recovery_transfer_ids.contains(&record.transfer_id))
+        matches!(transfer, StoredTransfer::Valid(record) if organization_recovery_transfer_ids.contains(&record.transfer_id)
+            || record.category == TransferCategory::Tv
+                && tv_completion_recoveries.iter().any(|recovery| recovery.transfer_id == record.transfer_id
+                    && recovery.destination == record.destination))
     });
-    match write_persisted_transfers(persistence_path, &context.transfers) {
+    match persist_transfers(persistence_path, &context.transfers) {
         Ok(()) => {
             for transfer in &context.transfers {
                 if let StoredTransfer::Valid(record) = transfer {
@@ -3773,6 +3799,13 @@ pub fn list_downloads(
         Err(_) if has_durable_recovery => Ok(rows),
         Err(error) => Err(error),
     }
+}
+
+pub fn list_downloads(
+    state: &VrDownloadState,
+    persistence_path: &Path,
+) -> Result<Vec<String>, &'static str> {
+    list_downloads_with_persistence(state, persistence_path, write_persisted_transfers)
 }
 
 async fn start_download_source(
@@ -7432,6 +7465,93 @@ mod tests {
         assert_eq!(
             fs::read(destination.join("Folder/特別版  B.mp4"))
                 .expect("dismiss must retain selected TV media"),
+            b"1234567"
+        );
+    }
+
+    #[test]
+    fn tv_completion_recovery_remains_available_while_primary_persistence_stays_unavailable() {
+        let fixture = FilesystemFixture::new();
+        let record =
+            locally_completed_tv_boundary_record(&fixture, "TV — persistent write failure");
+        let transfer_id = record.transfer_id.clone();
+        let destination = record.destination.clone();
+        let persistence_path = fixture.path.join("downloads");
+        write_persisted_transfers(&persistence_path, &[StoredTransfer::Valid(record)])
+            .expect("old active TV state must persist");
+        let mut persisted = read_persisted_transfers(&persistence_path)
+            .expect("old active TV state must remain readable");
+        let StoredTransfer::Valid(mut recovery) = persisted.remove(0) else {
+            panic!("old active TV state must remain valid");
+        };
+        recovery.state = TransferState::Failed;
+        recovery.downloaded_bytes = recovery.selected_total();
+        write_tv_completion_recovery(&recovery)
+            .expect("failed TV completion recovery must persist");
+        let recovery_path = tv_completion_recovery_path(&recovery);
+
+        let restarted = VrDownloadState::default();
+        configure_tv_download_folder(&restarted, Some(destination.clone()))
+            .expect("restarted TV folder must configure");
+        let rows = tauri::async_runtime::block_on(load_downloads_with_persistence(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("persistent-failure-session"),
+            &fixture.path.join("download-limit"),
+            |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+        ))
+        .expect("durable TV recovery must survive a failed primary rewrite during load");
+        assert_eq!(rows[0], transfer_id);
+        assert_eq!(rows[1], "tv");
+        assert_eq!(rows[6], "7");
+        assert_eq!(rows[8], "failed");
+        assert_eq!(rows[10], "none");
+        assert_eq!(rows[12], "false");
+        assert!(recovery_path.is_file());
+
+        let listed_rows = list_downloads_with_persistence(&restarted, &persistence_path, |_, _| {
+            Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+        })
+        .expect("durable TV recovery must survive another failed primary rewrite during list");
+        assert_eq!(listed_rows, rows);
+        assert!(recovery_path.is_file());
+        assert!(matches!(
+            &read_persisted_transfers(&persistence_path)
+                .expect("old primary state must remain readable")[0],
+            StoredTransfer::Valid(record) if record.state == TransferState::Downloading
+        ));
+        assert!(restarted
+            .0
+            .lock()
+            .expect("state must lock")
+            .session
+            .is_none());
+        assert_eq!(
+            preview_organization(&restarted, &transfer_id),
+            Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+        {
+            let context = restarted.0.lock().expect("state must lock");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("recovered TV completion must remain valid");
+            };
+            assert_eq!(record.state, TransferState::Failed);
+            assert!(record.state.can_dismiss());
+            assert!(record.handle.is_none());
+            assert_eq!(record.organization_state, OrganizationState::None);
+            assert_eq!(
+                record
+                    .boundary_segments
+                    .lock()
+                    .expect("boundary state must lock")[&0][0]
+                    .bytes,
+                b"abc"
+            );
+        }
+        assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
+        assert_eq!(
+            fs::read(destination.join("Folder/特別版  B.mp4"))
+                .expect("selected TV media must remain"),
             b"1234567"
         );
     }
