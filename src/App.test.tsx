@@ -80,6 +80,14 @@ let fetchYtsMovieReleasesMock: Mock<
 let fetchApiBayTvReleasesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
+let inspectApiBayTvTorrentMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let invalidateVerifiedTvTorrentMock: Mock<() => Promise<void>>;
+let invalidateTvReleaseContextMock: Mock<() => Promise<void>>;
+let saveVerifiedTvTorrentMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<boolean>
+>;
 let inspectYtsMovieTorrentMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
@@ -131,6 +139,9 @@ let startVerifiedAdultDownloadMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string>
 >;
 let startVerifiedMovieDownloadMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string>
+>;
+let startVerifiedTvDownloadMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string>
 >;
 let pauseVrDownloadMock: Mock<
@@ -646,6 +657,17 @@ beforeEach(() => {
     "tt0123456",
     "0",
   ]);
+  inspectApiBayTvTorrentMock = vi.fn().mockResolvedValue([
+    "tv-1-1-1001",
+    "Exact Show S02E03",
+    "0123456789abcdef0123456789abcdef01234567",
+    "5",
+    "Exact Show S02E03.mp4",
+    "5",
+  ]);
+  invalidateVerifiedTvTorrentMock = vi.fn().mockResolvedValue(undefined);
+  invalidateTvReleaseContextMock = vi.fn().mockResolvedValue(undefined);
+  saveVerifiedTvTorrentMock = vi.fn().mockResolvedValue(true);
   inspectYtsMovieTorrentMock = vi.fn().mockResolvedValue([
     "movie-1-1-hash",
     "Verified Movie torrent",
@@ -695,6 +717,7 @@ beforeEach(() => {
   startVerifiedVrDownloadMock = vi.fn().mockResolvedValue("transfer-123");
   startVerifiedAdultDownloadMock = vi.fn().mockResolvedValue("adult-transfer-123");
   startVerifiedMovieDownloadMock = vi.fn().mockResolvedValue("movie-transfer-123");
+  startVerifiedTvDownloadMock = vi.fn().mockResolvedValue("tv-transfer-123");
   pauseVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   resumeVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   cancelVrDownloadMock = vi.fn().mockResolvedValue(undefined);
@@ -791,6 +814,14 @@ beforeEach(() => {
           return fetchYtsMovieReleasesMock(parameters);
         case "fetch_apibay_tv_releases":
           return fetchApiBayTvReleasesMock(parameters);
+        case "inspect_apibay_tv_torrent":
+          return inspectApiBayTvTorrentMock(parameters);
+        case "invalidate_verified_tv_torrent":
+          return invalidateVerifiedTvTorrentMock();
+        case "invalidate_tv_release_context":
+          return invalidateTvReleaseContextMock();
+        case "save_verified_tv_torrent":
+          return saveVerifiedTvTorrentMock(parameters);
         case "inspect_yts_movie_torrent":
           return inspectYtsMovieTorrentMock(parameters);
         case "invalidate_verified_movie_torrent":
@@ -853,6 +884,8 @@ beforeEach(() => {
           return startVerifiedAdultDownloadMock(parameters);
         case "start_verified_movie_download":
           return startVerifiedMovieDownloadMock(parameters);
+        case "start_verified_tv_download":
+          return startVerifiedTvDownloadMock(parameters);
         case "pause_vr_download":
           return pauseVrDownloadMock(parameters);
         case "resume_vr_download":
@@ -2384,6 +2417,118 @@ describe("parsed VR Library and Dashboard", () => {
     });
     expect(scanMoviesMock).toHaveBeenCalledTimes(2);
     expect(queryMoviesStorageMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes only TV Library and storage once for a current-folder TV completion", async () => {
+    vi.useFakeTimers();
+    savedTvFolder = "/TV";
+    const activeRows = [
+      ...vrDownloadFixture({
+        category: "tv",
+        code: "Exact Show S02E03",
+        releaseName: "Exact Show S02E03 current",
+        state: "downloading",
+        transferId: "tv-current",
+      }),
+      ...vrDownloadFixture({
+        category: "tv",
+        code: "Exact Show S02E04",
+        isCurrentFolder: "false",
+        releaseName: "Exact Show S02E04 old folder",
+        state: "downloading",
+        transferId: "tv-old",
+      }),
+    ];
+    const oldFolderCompletedRows = [
+      ...activeRows.slice(0, 13),
+      ...vrDownloadFixture({
+        category: "tv",
+        code: "Exact Show S02E04",
+        downloadedBytes: "10",
+        isCurrentFolder: "false",
+        releaseName: "Exact Show S02E04 old folder",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "tv-old",
+      }),
+    ];
+    const currentFolderCompletedRows = [
+      ...vrDownloadFixture({
+        category: "tv",
+        code: "Exact Show S02E03",
+        downloadedBytes: "10",
+        releaseName: "Exact Show S02E03 current",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        transferId: "tv-current",
+      }),
+      ...oldFolderCompletedRows.slice(13),
+    ];
+    loadVrDownloadsMock.mockResolvedValue(activeRows);
+    listVrDownloadsMock
+      .mockResolvedValueOnce(oldFolderCompletedRows)
+      .mockResolvedValueOnce(currentFolderCompletedRows)
+      .mockResolvedValue(currentFolderCompletedRows);
+
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledOnce();
+    expect(queryTvStorageMock).toHaveBeenCalledOnce();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledOnce();
+    expect(queryTvStorageMock).toHaveBeenCalledOnce();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryTvStorageMock).toHaveBeenCalledTimes(2);
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(scanAdultLibraryMock).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryTvStorageMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not refresh TV Library or storage when completion persistence leaves a failed row", async () => {
+    vi.useFakeTimers();
+    savedTvFolder = "/TV";
+    const activeRows = vrDownloadFixture({
+      category: "tv",
+      code: "Exact Show S02E03",
+      releaseName: "Exact Show S02E03 current",
+      state: "downloading",
+      transferId: "tv-current",
+    });
+    const failedRows = vrDownloadFixture({
+      category: "tv",
+      code: "Exact Show S02E03",
+      downloadedBytes: "10",
+      releaseName: "Exact Show S02E03 current",
+      speedBytesPerSecond: "0",
+      state: "failed",
+      transferId: "tv-current",
+    });
+    loadVrDownloadsMock.mockResolvedValue(activeRows);
+    listVrDownloadsMock.mockResolvedValue(failedRows);
+
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledOnce();
+    expect(queryTvStorageMock).toHaveBeenCalledOnce();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4000);
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledOnce();
+    expect(queryTvStorageMock).toHaveBeenCalledOnce();
   });
 });
 
@@ -5384,7 +5529,7 @@ describe("TMDB TV Discover", () => {
     expect(startVerifiedMovieDownloadMock).not.toHaveBeenCalled();
   });
 
-  it("compares exact API Bay episode rows, excludes compact continuations, and preserves manual state", async () => {
+  it("compares, inspects, saves, and starts exact API Bay TV episode files without automatic selection", async () => {
     const showName = "Exact  Show — 特別版";
     const episodeName = "第三話  —  Exact Episode";
     const standardReleaseName =
@@ -5406,6 +5551,7 @@ describe("TMDB TV Discover", () => {
     ];
     const standardHash = "0123456789abcdef0123456789abcdef01234567";
     const hdHash = "abcdef0123456789abcdef0123456789abcdef01";
+    savedTvFolder = "/TV";
     loadTmdbTokenMock.mockResolvedValue("episode-release-token");
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ results: [] }))
@@ -5467,6 +5613,16 @@ describe("TMDB TV Discover", () => {
       "",
       hdHash,
       "API Bay",
+    ]);
+    inspectApiBayTvTorrentMock.mockResolvedValue([
+      "tv-1-1-1001",
+      "Exact  Show — 特別版 S02E03",
+      standardHash,
+      "9",
+      "Exact  Show — 特別版/第三話  —  Exact Episode.mkv",
+      "5",
+      "Exact  Show — 特別版/notes.txt",
+      "4",
     ]);
 
     render(<App />);
@@ -5547,6 +5703,62 @@ describe("TMDB TV Discover", () => {
     expect(within(selection).getByText(/Season 2, Episode 3/).textContent).toContain(
       episodeName,
     );
+    const inspectButton = within(selection).getByRole("button", {
+      name: "Inspect torrent",
+    });
+    inspectButton.focus();
+    fireEvent.click(inspectButton);
+    const inspectionHeading = await screen.findByRole("heading", {
+      name: "Exact Show — 特別版 · S02E03",
+    });
+    const inspectionDialog = inspectionHeading.closest(
+      '[role="dialog"]',
+    ) as HTMLElement;
+    expect(inspectApiBayTvTorrentMock).toHaveBeenCalledWith({
+      tmdbTvId: 701,
+      showName,
+      providerSeasonId: 9001,
+      seasonNumber: 2,
+      providerEpisodeId: 9103,
+      episodeNumber: 3,
+      episodeName,
+      imdbId: "tt0123456",
+      providerItemId: "1001",
+      providerCategory: "205",
+      releaseName: standardReleaseName,
+      expectedInfohash: standardHash,
+    });
+    const fileCheckboxes = within(inspectionDialog).getAllByRole("checkbox");
+    expect(fileCheckboxes).toHaveLength(2);
+    expect(fileCheckboxes.every((checkbox) => !(checkbox as HTMLInputElement).checked)).toBe(
+      true,
+    );
+    const startButton = within(inspectionDialog).getByRole("button", {
+      name: "Start download",
+    });
+    expect((startButton as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(fileCheckboxes[0]);
+    expect((startButton as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(
+      within(inspectionDialog).getByRole("button", { name: "Save `.torrent`" }),
+    );
+    expect(
+      await within(inspectionDialog).findByText("Verified TV torrent file saved."),
+    ).toBeTruthy();
+    fireEvent.click(startButton);
+    expect(
+      await within(inspectionDialog).findByText(
+        "Selected TV files were added to Downloads.",
+      ),
+    ).toBeTruthy();
+    expect(startVerifiedTvDownloadMock).toHaveBeenCalledWith({
+      inspectionId: "tv-1-1-1001",
+      selectedFileIds: [0],
+    });
+    fireEvent.click(
+      within(inspectionDialog).getByRole("button", { name: "Close" }),
+    );
+    await waitFor(() => expect(document.activeElement).toBe(inspectButton));
     comparisonDialog.scrollTop = 140;
     fireEvent.scroll(comparisonDialog);
 
@@ -8131,6 +8343,14 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
         transferId: "active-movie",
       }),
       ...vrDownloadFixture({
+        category: "tv",
+        code: "Exact  Show — 特別版 S02E03",
+        releaseName: "Exact  Show — 特別版.S02E03+720p.第三話",
+        speedBytesPerSecond: "4096",
+        state: "downloading",
+        transferId: "active-tv",
+      }),
+      ...vrDownloadFixture({
         releaseName: "Queued",
         speedBytesPerSecond: "8192",
         state: "queued",
@@ -8175,11 +8395,11 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
       "Transfer summary",
     );
     const expectedDashboardValues = [
-      ["Active", "3"],
+      ["Active", "4"],
       ["Paused", "1"],
       ["Completed", "1"],
       ["Needs attention", "2"],
-      ["Download speed", "4.0 KiB/s"],
+      ["Download speed", "8.0 KiB/s"],
       ["Limit", "8 MiB/s"],
     ];
     for (const [label, value] of expectedDashboardValues) {
@@ -8192,8 +8412,8 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
       within(dashboard).getByRole("button", { name: "Open Downloads" }),
     );
     const aggregate = screen.getByLabelText("Downloads aggregate status");
-    expect(within(aggregate).getByText("3", { selector: "dd" })).toBeTruthy();
-    expect(within(aggregate).getByText("4.0 KiB/s")).toBeTruthy();
+    expect(within(aggregate).getByText("4", { selector: "dd" })).toBeTruthy();
+    expect(within(aggregate).getByText("8.0 KiB/s")).toBeTruthy();
     expect(screen.getByText("Adult · ADLT-123")).toBeTruthy();
     const movieHeading = screen.getByRole("heading", {
       name: "Exact Movie — 特別版",
@@ -8201,6 +8421,14 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
     const movieCard = movieHeading.closest("article") as HTMLElement;
     expect(within(movieCard).getByText("Movie · tt0123456")).toBeTruthy();
     expect(within(movieCard).queryByRole("button", { name: "Organize files" })).toBeNull();
+    const tvHeading = screen.getByRole("heading", {
+      name: "Exact Show — 特別版.S02E03+720p.第三話",
+    });
+    const tvCard = tvHeading.closest("article") as HTMLElement;
+    expect(
+      within(tvCard).getByText("TV · Exact Show — 特別版 S02E03"),
+    ).toBeTruthy();
+    expect(within(tvCard).queryByRole("button", { name: "Organize files" })).toBeNull();
     expect(screen.getAllByText(/VR · MDVR-/).length).toBeGreaterThan(0);
 
     selectSettings();

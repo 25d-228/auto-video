@@ -72,7 +72,7 @@ export type VrDownloadState =
 
 export type VrDownload = {
   transferId: string;
-  category: "adult" | "movie" | "unknown" | "vr";
+  category: "adult" | "movie" | "tv" | "unknown" | "vr";
   identity: string;
   releaseName: string;
   selectedFileCount: number;
@@ -859,7 +859,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
     if (
       transferId === "" ||
       transferIds.has(transferId) ||
-      !["adult", "movie", "unknown", "vr"].includes(category) ||
+      !["adult", "movie", "tv", "unknown", "vr"].includes(category) ||
       identity.trim() === "" ||
       ((category === "adult" || category === "vr") &&
         canonicalCode !== identity) ||
@@ -868,6 +868,11 @@ function parseVrDownloads(value: unknown): VrDownload[] {
           (organizationStatus !== "none" &&
             (movieOrganizationDirectory === null ||
               !/^(?!0000)\d{4}$/.test(movieOrganizationDirectory))))) ||
+      (category === "tv" &&
+        (!/^.+ S0*[1-9]\d*E0*[1-9]\d*$/u.test(identity) ||
+          organizationStatus !== "none" ||
+          organizationRelativeDirectory !== "" ||
+          canOrganize !== "false")) ||
       (category === "unknown" &&
         (count !== 0 ||
           totalBytes !== "0" ||
