@@ -455,6 +455,7 @@ function vrDownloadFixture({
   isCurrentFolder = "true",
   organizationRelativeDirectory = "",
   organizationStatus = "none",
+  terminalRecovery = "false",
 }: {
   canOrganize?: string;
   category?: string;
@@ -469,6 +470,7 @@ function vrDownloadFixture({
   isCurrentFolder?: string;
   organizationRelativeDirectory?: string;
   organizationStatus?: string;
+  terminalRecovery?: string;
 }) {
   return [
     transferId,
@@ -484,6 +486,7 @@ function vrDownloadFixture({
     organizationStatus,
     organizationRelativeDirectory,
     canOrganize,
+    terminalRecovery,
   ];
 }
 
@@ -3481,7 +3484,7 @@ describe("parsed VR Library and Dashboard", () => {
         state: "completed",
         transferId: "adult-current",
       }),
-      ...oldAdultCompletedRows.slice(13),
+      ...oldAdultCompletedRows.slice(14),
     ];
     loadVrDownloadsMock.mockResolvedValue(activeRows);
     listVrDownloadsMock
@@ -3540,7 +3543,7 @@ describe("parsed VR Library and Dashboard", () => {
       }),
     ];
     const oldFolderCompletedRows = [
-      ...activeRows.slice(0, 13),
+      ...activeRows.slice(0, 14),
       ...vrDownloadFixture({
         category: "movie",
         code: "tt0765432",
@@ -3562,7 +3565,7 @@ describe("parsed VR Library and Dashboard", () => {
         state: "completed",
         transferId: "movie-current",
       }),
-      ...oldFolderCompletedRows.slice(13),
+      ...oldFolderCompletedRows.slice(14),
     ];
     loadVrDownloadsMock.mockResolvedValue(activeRows);
     listVrDownloadsMock
@@ -9195,7 +9198,7 @@ describe("VR Discover and verified release comparison", () => {
       downloadRows[7] = "0";
     });
     dismissVrDownloadMock.mockImplementation(async () => {
-      downloadRows = downloadRows.slice(13);
+      downloadRows = downloadRows.slice(14);
     });
     resumeVrDownloadMock.mockRejectedValueOnce("vr_download_failed");
     render(<App />);
@@ -9597,6 +9600,127 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
       await vi.advanceTimersByTimeAsync(3000);
     });
     expect(listVrDownloadsMock).toHaveBeenCalledOnce();
+  });
+
+  it("shows recovered terminal authority as attention and retries Dismiss without a success refresh", async () => {
+    savedMoviesFolder = "/Movies";
+    savedAdultFolder = "/Adult";
+    savedVrFolder = "/VR";
+    const recoveredRows = [
+      ...vrDownloadFixture({
+        category: "movie",
+        code: "tt0123456",
+        downloadedBytes: "10",
+        releaseName: "Recovered Movie transfer",
+        speedBytesPerSecond: "0",
+        state: "failed",
+        terminalRecovery: "true",
+        transferId: "recovered-movie",
+      }),
+      ...vrDownloadFixture({
+        category: "adult",
+        code: "ADLT-123",
+        downloadedBytes: "10",
+        releaseName: "Recovered Adult transfer",
+        speedBytesPerSecond: "0",
+        state: "failed",
+        terminalRecovery: "true",
+        transferId: "recovered-adult",
+      }),
+      ...vrDownloadFixture({
+        downloadedBytes: "10",
+        releaseName: "Recovered VR transfer",
+        speedBytesPerSecond: "0",
+        state: "failed",
+        terminalRecovery: "true",
+        transferId: "recovered-vr",
+      }),
+    ];
+    loadVrDownloadsMock.mockResolvedValue(recoveredRows);
+    const pendingDismiss = createDeferred<void>();
+    dismissVrDownloadMock
+      .mockReturnValueOnce(pendingDismiss.promise)
+      .mockResolvedValueOnce(undefined);
+    listVrDownloadsMock.mockResolvedValue(recoveredRows.slice(14));
+    render(<App />);
+
+    const dashboard = await screen.findByRole("region", { name: "Downloads" });
+    const summary = within(dashboard).getByLabelText("Transfer summary");
+    const completed = within(summary).getByText("Completed").closest("div");
+    const attention = within(summary).getByText("Needs attention").closest("div");
+    expect(within(completed as HTMLElement).getByText("0")).toBeTruthy();
+    expect(within(attention as HTMLElement).getByText("3")).toBeTruthy();
+    await waitFor(() => {
+      expect(scanMoviesMock).toHaveBeenCalledOnce();
+      expect(queryMoviesStorageMock).toHaveBeenCalledOnce();
+      expect(scanAdultLibraryMock).toHaveBeenCalledOnce();
+      expect(queryAdultStorageMock).toHaveBeenCalledOnce();
+      expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+      expect(queryVrStorageMock).toHaveBeenCalledOnce();
+    });
+
+    fireEvent.click(
+      within(dashboard).getByRole("button", { name: "Open Downloads" }),
+    );
+    expect(screen.getAllByText("Persistence needs attention")).toHaveLength(3);
+    expect(
+      screen.getAllByText(
+        "The transfer stopped safely. Its exact terminal state is stored in recovery metadata because the Downloads file could not be updated. Media and partial data remain untouched.",
+      ),
+    ).toHaveLength(3);
+    expect(screen.queryByRole("button", { name: "Organize files" })).toBeNull();
+
+    const heading = screen.getByRole("heading", {
+      name: "Recovered Movie transfer",
+    });
+    const card = heading.closest("article") as HTMLElement;
+    expect(within(card).getByRole("status").textContent).toBe(
+      "Persistence needs attention",
+    );
+    const dismiss = within(card).getByRole("button", { name: "Dismiss" });
+    fireEvent.click(dismiss);
+    expect(card.getAttribute("aria-busy")).toBe("true");
+    expect(
+      (
+        within(card).getByRole("button", {
+          name: "Dismissing…",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(dismissVrDownloadMock).toHaveBeenCalledWith({
+      transferId: "recovered-movie",
+    });
+
+    await act(async () => {
+      pendingDismiss.reject("vr_download_persistence_failed");
+      try {
+        await pendingDismiss.promise;
+      } catch {
+        // The rejected native action is represented by the card's local alert.
+      }
+    });
+    expect(card.getAttribute("aria-busy")).toBe("false");
+    expect(
+      within(card).getByText(
+        "The dismiss action could not be completed for this transfer.",
+      ),
+    ).toBeTruthy();
+    expect(heading.isConnected).toBe(true);
+    expect(listVrDownloadsMock).not.toHaveBeenCalled();
+
+    fireEvent.click(within(card).getByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(heading.isConnected).toBe(false));
+    expect(dismissVrDownloadMock).toHaveBeenCalledTimes(2);
+    expect(listVrDownloadsMock).toHaveBeenCalledOnce();
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Refresh" }),
+    );
+    expect(scanMoviesMock).toHaveBeenCalledOnce();
+    expect(queryMoviesStorageMock).toHaveBeenCalledOnce();
+    expect(scanAdultLibraryMock).toHaveBeenCalledOnce();
+    expect(queryAdultStorageMock).toHaveBeenCalledOnce();
+    expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+    expect(queryVrStorageMock).toHaveBeenCalledOnce();
   });
 
   it("ignores a late save result after relaunch", async () => {

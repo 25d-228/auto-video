@@ -84,6 +84,7 @@ export type VrDownload = {
   organizationStatus: "none" | "organized" | "attention";
   organizationRelativeDirectory: string | null;
   canOrganize: boolean;
+  terminalRecovery: boolean;
 };
 
 export type VrOrganizationPreviewEntry = {
@@ -875,7 +876,7 @@ const vrDownloadStates = new Set<VrDownloadState>([
 function parseVrDownloads(value: unknown): VrDownload[] {
   if (
     !Array.isArray(value) ||
-    value.length % 13 !== 0 ||
+    value.length % 14 !== 0 ||
     !value.every((entry) => typeof entry === "string")
   ) {
     throw new Error("The native download store returned invalid data.");
@@ -883,7 +884,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
 
   const downloads: VrDownload[] = [];
   const transferIds = new Set<string>();
-  for (let index = 0; index < value.length; index += 13) {
+  for (let index = 0; index < value.length; index += 14) {
     const [
       transferId,
       category,
@@ -898,7 +899,8 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       organizationStatus,
       organizationRelativeDirectory,
       canOrganize,
-    ] = value.slice(index, index + 13) as string[];
+      terminalRecovery,
+    ] = value.slice(index, index + 14) as string[];
     const count = Number(selectedFileCount);
     const canonicalCode = canonicalizeProductCode(identity);
     const movieOrganizationPath = organizationRelativeDirectory.endsWith("/")
@@ -932,7 +934,8 @@ function parseVrDownloads(value: unknown): VrDownload[] {
           currentFolder !== "false" ||
           organizationStatus !== "none" ||
           organizationRelativeDirectory !== "" ||
-          canOrganize !== "false")) ||
+          canOrganize !== "false" ||
+          terminalRecovery !== "false")) ||
       releaseName.trim() === "" ||
       !Number.isSafeInteger(count) ||
       count < 0 ||
@@ -958,7 +961,12 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       (canOrganize === "true" &&
         (state !== "completed" ||
           currentFolder !== "true" ||
-          organizationStatus === "organized"))
+          organizationStatus === "organized")) ||
+      (terminalRecovery !== "true" && terminalRecovery !== "false") ||
+      (terminalRecovery === "true" &&
+        (state !== "failed" ||
+          organizationStatus !== "none" ||
+          canOrganize !== "false"))
     ) {
       throw new Error("The native download store returned invalid data.");
     }
@@ -980,6 +988,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
           ? null
           : organizationRelativeDirectory,
       canOrganize: canOrganize === "true",
+      terminalRecovery: terminalRecovery === "true",
     });
   }
   return downloads;

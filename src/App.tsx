@@ -5170,13 +5170,15 @@ function VrDownloadCard({
   const percent =
     totalBytes === 0n ? 0 : Number((downloadedBytes * 100n) / totalBytes);
   const stateLabel =
-    download.organizationStatus === "organized"
+    download.terminalRecovery
+      ? "Persistence needs attention"
+      : download.organizationStatus === "organized"
       ? "Organized"
       : download.organizationStatus === "attention"
         ? "Organization needs attention"
         : download.state.charAt(0).toUpperCase() + download.state.slice(1);
   const stateClass =
-    download.organizationStatus === "attention"
+    download.terminalRecovery || download.organizationStatus === "attention"
       ? "attention"
       : download.organizationStatus === "organized"
         ? "organized"
@@ -5201,6 +5203,7 @@ function VrDownloadCard({
 
   return (
     <article
+      aria-busy={isPending}
       aria-labelledby={`vr-download-${download.transferId}`}
       className="vr-download-card"
     >
@@ -5215,7 +5218,11 @@ function VrDownloadCard({
         </div>
         <span
           className={`vr-download-card__state is-${stateClass}`}
-          role={download.organizationStatus === "none" ? undefined : "status"}
+          role={
+            download.terminalRecovery || download.organizationStatus !== "none"
+              ? "status"
+              : undefined
+          }
         >
           {stateLabel}
         </span>
@@ -5259,7 +5266,7 @@ function VrDownloadCard({
           </div>
         )}
       </dl>
-      <div className="vr-download-card__actions">
+      <div aria-live="polite" className="vr-download-card__actions">
         {download.state === "downloading" ? (
           <Button
             disabled={isPending}
@@ -5467,6 +5474,13 @@ function VrDownloadCard({
           {error}
         </p>
       )}
+      {download.terminalRecovery ? (
+        <p className="field-error" role="alert">
+          The transfer stopped safely. Its exact terminal state is stored in
+          recovery metadata because the Downloads file could not be updated.
+          Media and partial data remain untouched.
+        </p>
+      ) : null}
     </article>
   );
 }
