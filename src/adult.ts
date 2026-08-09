@@ -21,6 +21,11 @@ export type AdultLibraryItem = {
   files: AdultLibraryFile[];
 };
 
+export type AdultLibraryScan = {
+  generation: string;
+  items: AdultLibraryItem[];
+};
+
 export type AdultVolumeStorage = {
   totalBytes: bigint;
   freeBytes: bigint;
@@ -82,11 +87,19 @@ function canonicalAdultLibraryProductCode(title: string) {
   return uniqueCandidates.size === 1 ? candidates[0] : null;
 }
 
-function parseAdultLibrary(value: unknown): AdultLibraryItem[] {
+function parseAdultLibrary(value: unknown): AdultLibraryScan {
   if (
     !Array.isArray(value) ||
-    value.length % 3 !== 0 ||
+    value.length === 0 ||
+    (value.length - 1) % 3 !== 0 ||
     !value.every((entry) => typeof entry === "string")
+  ) {
+    throw new Error("The native Adult scanner returned invalid data.");
+  }
+  const generation = value[0] as string;
+  if (
+    !unsignedU64Pattern.test(generation) ||
+    BigInt(generation) > maximumU64
   ) {
     throw new Error("The native Adult scanner returned invalid data.");
   }
@@ -95,7 +108,7 @@ function parseAdultLibrary(value: unknown): AdultLibraryItem[] {
   const unassociatedItems: AdultLibraryItem[] = [];
   const paths = new Set<string>();
   const relativePaths = new Set<string>();
-  for (let index = 0; index < value.length; index += 3) {
+  for (let index = 1; index < value.length; index += 3) {
     const path = value[index] as string;
     const relativePath = value[index + 1] as string;
     const sizeBytes = value[index + 2] as string;
@@ -147,7 +160,10 @@ function parseAdultLibrary(value: unknown): AdultLibraryItem[] {
     }
   }
 
-  return [...groupedItems.values(), ...unassociatedItems];
+  return {
+    generation,
+    items: [...groupedItems.values(), ...unassociatedItems],
+  };
 }
 
 export async function loadAdultFolder() {
@@ -211,4 +227,14 @@ export async function revealAdultFile(path: string) {
     throw new Error("An Adult Library file path is required.");
   }
   await window.__TAURI__.core.invoke("reveal_adult_file", { path });
+}
+
+export async function trashAdultFile(path: string, scanGeneration: string) {
+  if (path === "") {
+    throw new Error("An Adult Library file path is required.");
+  }
+  await window.__TAURI__.core.invoke("trash_adult_file", {
+    path,
+    scanGeneration,
+  });
 }

@@ -7,6 +7,7 @@ import {
   queryAdultStorage,
   revealAdultFile,
   scanAdultLibrary,
+  trashAdultFile,
 } from "./adult";
 
 let invokeMock: ReturnType<typeof vi.fn>;
@@ -53,6 +54,7 @@ describe("conservative parsed Adult Library identity", () => {
     const conflictingPath = "/Adult/ADLT-123 ADLT-124.mp4";
     const noCodePath = "/Adult/作品  without code.mp4";
     invokeMock.mockResolvedValue([
+      "7",
       firstPath,
       "作品/ADLT-123 Part 01 — 前編.mp4",
       "10",
@@ -82,8 +84,9 @@ describe("conservative parsed Adult Library identity", () => {
       "80",
     ]);
 
-    const items = await scanAdultLibrary();
+    const { generation, items } = await scanAdultLibrary();
 
+    expect(generation).toBe("7");
     expect(items.find((item) => item.code === "ADLT-123")).toEqual({
       id: "code:ADLT-123",
       title: "ADLT-123",
@@ -122,6 +125,7 @@ describe("conservative parsed Adult Library identity", () => {
 
   it("shows only one exact unambiguous multipart label without inventing order", async () => {
     invokeMock.mockResolvedValue([
+      "8",
       "/Adult/ADLT-777 Disk 03.mp4",
       "ADLT-777 Disk 03.mp4",
       "3",
@@ -139,7 +143,7 @@ describe("conservative parsed Adult Library identity", () => {
       "7",
     ]);
 
-    const items = await scanAdultLibrary();
+    const { items } = await scanAdultLibrary();
 
     expect(items).toHaveLength(1);
     expect(items[0].files.map((file) => [file.filename, file.partLabel])).toEqual([
@@ -153,8 +157,11 @@ describe("conservative parsed Adult Library identity", () => {
 
   it("rejects malformed rows, duplicate paths, traversal, unsupported files, and oversized sizes", async () => {
     for (const response of [
+      [],
+      ["invalid"],
       ["/Adult/ADLT-123.mp4"],
       [
+        "1",
         "/Adult/ADLT-123.mp4",
         "ADLT-123.mp4",
         "1",
@@ -162,13 +169,27 @@ describe("conservative parsed Adult Library identity", () => {
         "ADLT-123-copy.mp4",
         "1",
       ],
-      ["/Adult/ADLT-123.mp4", "../ADLT-123.mp4", "1"],
-      ["/Adult/ADLT-123.avi", "ADLT-123.avi", "1"],
-      ["/Adult/ADLT-123.mp4", "ADLT-123.mp4", "18446744073709551616"],
+      ["1", "/Adult/ADLT-123.mp4", "../ADLT-123.mp4", "1"],
+      ["1", "/Adult/ADLT-123.avi", "ADLT-123.avi", "1"],
+      [
+        "1",
+        "/Adult/ADLT-123.mp4",
+        "ADLT-123.mp4",
+        "18446744073709551616",
+      ],
     ]) {
       invokeMock.mockResolvedValueOnce(response);
       await expect(scanAdultLibrary()).rejects.toThrow("invalid data");
     }
+  });
+
+  it("accepts a generation-only response as an empty trusted scan", async () => {
+    invokeMock.mockResolvedValue(["6"]);
+
+    await expect(scanAdultLibrary()).resolves.toEqual({
+      generation: "6",
+      items: [],
+    });
   });
 });
 
@@ -178,12 +199,17 @@ describe("Adult file actions", () => {
 
     await openAdultFile("/Adult/作品  ADLT-123.mp4");
     await revealAdultFile("/Adult/作品  ADLT-123.mp4");
+    await trashAdultFile("/Adult/作品  ADLT-123.mp4", "9");
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, "open_adult_file", {
       path: "/Adult/作品  ADLT-123.mp4",
     });
     expect(invokeMock).toHaveBeenNthCalledWith(2, "reveal_adult_file", {
       path: "/Adult/作品  ADLT-123.mp4",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "trash_adult_file", {
+      path: "/Adult/作品  ADLT-123.mp4",
+      scanGeneration: "9",
     });
   });
 });

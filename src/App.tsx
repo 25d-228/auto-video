@@ -52,6 +52,7 @@ import {
   queryAdultStorage,
   revealAdultFile,
   scanAdultLibrary,
+  trashAdultFile,
   type AdultFolderState,
   type AdultLibraryFile,
   type AdultLibraryItem,
@@ -354,10 +355,10 @@ type AdultLibraryScanState =
   | { status: "loading" }
   | { status: "unconfigured" }
   | { status: "scanning" }
-  | { status: "empty" }
+  | { status: "empty"; generation: string }
   | { status: "unavailable" }
   | { status: "error" }
-  | { status: "ready"; items: AdultLibraryItem[] };
+  | { status: "ready"; generation: string; items: AdultLibraryItem[] };
 type AdultFolderUiState =
   | { status: "loading" }
   | AdultFolderState
@@ -603,6 +604,21 @@ const adultFileRevealErrorMessages: Record<string, string> = {
   adult_file_reveal_outside_folder: "This file is outside the configured Adult folder.",
   adult_file_reveal_stale: "This file is no longer part of the current Adult Library.",
   adult_file_reveal_failed: "The operating system could not reveal this file.",
+};
+
+const adultFileTrashErrorMessages: Record<string, string> = {
+  adult_file_trash_not_found: "This file is no longer available.",
+  adult_file_trash_unavailable:
+    "Auto-Video could not access the configured Adult folder.",
+  adult_file_trash_not_file: "This item is not an eligible video file.",
+  adult_file_trash_unsupported:
+    "This item is not a supported .mp4 or .mkv file.",
+  adult_file_trash_outside_folder:
+    "This file is outside the configured Adult folder.",
+  adult_file_trash_stale:
+    "This file is no longer part of the latest Adult Library scan.",
+  adult_file_trash_failed:
+    "The operating system could not move this file to Trash or the Recycle Bin.",
 };
 
 const vrFileOpenErrorMessages: Record<string, string> = {
@@ -4577,12 +4593,37 @@ function TvLibraryCard({
   );
 }
 
-function AdultLibraryFileRow({ file }: { file: AdultLibraryFile }) {
+function AdultLibraryFileRow({
+  file,
+  itemCode,
+  itemTitle,
+  onFileTrashed,
+  onTrashPendingChange,
+  scanGeneration,
+  trashActionsDisabled,
+  trashPendingPath,
+}: {
+  file: AdultLibraryFile;
+  itemCode: string | null;
+  itemTitle: string;
+  onFileTrashed: (file: AdultLibraryFile, scanGeneration: string) => void;
+  onTrashPendingChange: (path: string | null) => void;
+  scanGeneration: string;
+  trashActionsDisabled: boolean;
+  trashPendingPath: string | null;
+}) {
   const [pendingAction, setPendingAction] = useState<"open" | "reveal" | null>(
     null,
   );
   const [actionError, setActionError] = useState<string | null>(null);
+  const [isTrashing, setIsTrashing] = useState(false);
+  const [trashDialogOpen, setTrashDialogOpen] = useState(false);
+  const [trashError, setTrashError] = useState<string | null>(null);
   const actionPending = useRef(false);
+  const trashRequestPending = useRef(false);
+  const trashCancelButton = useRef<HTMLButtonElement | null>(null);
+  const trashDialogPopup = useRef<HTMLDivElement | null>(null);
+  const trashTriggerId = useId();
 
   const runAction = async (action: "open" | "reveal") => {
     if (actionPending.current) {
@@ -4612,6 +4653,51 @@ function AdultLibraryFileRow({ file }: { file: AdultLibraryFile }) {
     }
   };
 
+  const updateTrashDialog = (open: boolean) => {
+    if (!open && trashRequestPending.current) {
+      return;
+    }
+    setTrashDialogOpen(open);
+    if (open) {
+      setTrashError(null);
+    }
+  };
+
+  const trashFile = async (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (
+      trashRequestPending.current ||
+      trashPendingPath !== null ||
+      trashActionsDisabled
+    ) {
+      return;
+    }
+
+    trashRequestPending.current = true;
+    setIsTrashing(true);
+    setTrashError(null);
+    onTrashPendingChange(file.path);
+    trashDialogPopup.current?.focus();
+    let succeeded = false;
+    try {
+      await trashAdultFile(file.path, scanGeneration);
+      succeeded = true;
+      onFileTrashed(file, scanGeneration);
+    } catch (error: unknown) {
+      setTrashError(
+        adultFileTrashErrorMessages[nativeErrorCode(error)] ??
+          "Auto-Video could not move this Adult file to Trash or the Recycle Bin.",
+      );
+    } finally {
+      trashRequestPending.current = false;
+      setIsTrashing(false);
+      onTrashPendingChange(null);
+      if (succeeded) {
+        setTrashDialogOpen(false);
+      }
+    }
+  };
+
   return (
     <li className="vr-library-file" data-adult-file-path={file.path}>
       <div className="vr-library-file__identity">
@@ -4625,7 +4711,12 @@ function AdultLibraryFileRow({ file }: { file: AdultLibraryFile }) {
         <Button
           aria-label={`${pendingAction === "open" ? "Opening" : "Open"} Adult file: ${file.filename}`}
           disabled={pendingAction !== null}
-          onClick={() => void runAction("open")}
+          onClick={(event) => {
+            event.stopPropagation();
+            void runAction("open");
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
           size="icon-xs"
           title="Open file"
           type="button"
@@ -4636,7 +4727,12 @@ function AdultLibraryFileRow({ file }: { file: AdultLibraryFile }) {
         <Button
           aria-label={`${pendingAction === "reveal" ? "Revealing" : "Reveal"} Adult file: ${file.filename}`}
           disabled={pendingAction !== null}
-          onClick={() => void runAction("reveal")}
+          onClick={(event) => {
+            event.stopPropagation();
+            void runAction("reveal");
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
           size="icon-xs"
           title="Reveal file"
           type="button"
@@ -4644,6 +4740,111 @@ function AdultLibraryFileRow({ file }: { file: AdultLibraryFile }) {
         >
           <AppIcon name="reveal" />
         </Button>
+        <AlertDialog.Root
+          onOpenChange={updateTrashDialog}
+          open={trashDialogOpen}
+          triggerId={trashDialogOpen ? trashTriggerId : null}
+        >
+          <AlertDialog.Trigger
+            id={trashTriggerId}
+            render={
+              <Button
+                aria-label={`Move Adult file to Trash or Recycle Bin: ${file.filename}`}
+                disabled={trashPendingPath !== null || trashActionsDisabled}
+                onClick={(event) => event.stopPropagation()}
+                onKeyDown={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+                size="icon-xs"
+                title="Move to Trash or Recycle Bin"
+                type="button"
+                variant="destructive"
+              >
+                <AppIcon name="trash" />
+              </Button>
+            }
+          />
+          <AlertDialog.Portal>
+            <AlertDialog.Backdrop
+              className="trash-dialog__backdrop"
+              onClick={(event) => {
+                event.stopPropagation();
+                updateTrashDialog(false);
+              }}
+              onPointerDown={(event) => event.stopPropagation()}
+            />
+            <AlertDialog.Viewport className="trash-dialog__viewport">
+              <AlertDialog.Popup
+                aria-busy={isTrashing}
+                className="trash-dialog__popup"
+                initialFocus={() => trashCancelButton.current}
+                onClick={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+                ref={trashDialogPopup}
+              >
+                <div className="trash-dialog__heading">
+                  <AlertDialog.Title>
+                    Move “{file.filename}” to Trash?
+                  </AlertDialog.Title>
+                  <AlertDialog.Close
+                    render={
+                      <Button
+                        aria-label="Close confirmation"
+                        disabled={isTrashing}
+                        size="icon-xs"
+                        type="button"
+                        variant="ghost"
+                      >
+                        <AppIcon name="close" />
+                      </Button>
+                    }
+                  />
+                </div>
+                <AlertDialog.Description>
+                  {itemCode === null
+                    ? `This moves the exact unassociated file “${itemTitle}” to macOS Trash or the Windows Recycle Bin.`
+                    : `This moves the exact member “${file.filename}” of “${itemCode}”${
+                        file.partLabel === null ? "" : ` (${file.partLabel})`
+                      } to macOS Trash or the Windows Recycle Bin.`} It may be
+                  recoverable there.
+                </AlertDialog.Description>
+                {trashError === null ? null : (
+                  <p
+                    aria-atomic="true"
+                    className="trash-dialog__error"
+                    role="alert"
+                  >
+                    {trashError}
+                  </p>
+                )}
+                <div className="trash-dialog__actions">
+                  <AlertDialog.Close
+                    render={
+                      <Button
+                        disabled={isTrashing}
+                        ref={trashCancelButton}
+                        type="button"
+                        variant="outline"
+                      >
+                        Cancel
+                      </Button>
+                    }
+                  />
+                  <Button
+                    aria-label={`${isTrashing ? "Moving" : "Confirm moving"} Adult file to Trash or Recycle Bin: ${file.filename}`}
+                    disabled={isTrashing}
+                    onClick={trashFile}
+                    onKeyDown={(event) => event.stopPropagation()}
+                    type="button"
+                    variant="destructive"
+                  >
+                    <AppIcon name="trash" />
+                    {isTrashing ? "Moving…" : "Move file"}
+                  </Button>
+                </div>
+              </AlertDialog.Popup>
+            </AlertDialog.Viewport>
+          </AlertDialog.Portal>
+        </AlertDialog.Root>
       </div>
       {actionError === null ? null : (
         <p aria-atomic="true" role="alert">
@@ -4654,7 +4855,21 @@ function AdultLibraryFileRow({ file }: { file: AdultLibraryFile }) {
   );
 }
 
-function AdultLibraryCard({ item }: { item: AdultLibraryItem }) {
+function AdultLibraryCard({
+  item,
+  onFileTrashed,
+  onTrashPendingChange,
+  scanGeneration,
+  trashActionsDisabled,
+  trashPendingPath,
+}: {
+  item: AdultLibraryItem;
+  onFileTrashed: (file: AdultLibraryFile, scanGeneration: string) => void;
+  onTrashPendingChange: (path: string | null) => void;
+  scanGeneration: string;
+  trashActionsDisabled: boolean;
+  trashPendingPath: string | null;
+}) {
   return (
     <article className="movie-card vr-library-card adult-library-card">
       <div className="media-title-row">
@@ -4677,7 +4892,17 @@ function AdultLibraryCard({ item }: { item: AdultLibraryItem }) {
         className="vr-library-card__files"
       >
         {item.files.map((file) => (
-          <AdultLibraryFileRow file={file} key={file.path} />
+          <AdultLibraryFileRow
+            file={file}
+            itemCode={item.code}
+            itemTitle={item.title}
+            key={file.path}
+            onFileTrashed={onFileTrashed}
+            onTrashPendingChange={onTrashPendingChange}
+            scanGeneration={scanGeneration}
+            trashActionsDisabled={trashActionsDisabled}
+            trashPendingPath={trashPendingPath}
+          />
         ))}
       </ul>
     </article>
@@ -5089,6 +5314,13 @@ function removeTvLibraryFile(items: TvLibraryItem[], path: string) {
   });
 }
 
+function removeAdultLibraryFile(items: AdultLibraryItem[], path: string) {
+  return items.flatMap((item) => {
+    const files = item.files.filter((file) => file.path !== path);
+    return files.length === 0 ? [] : [{ ...item, files }];
+  });
+}
+
 function compareAdultLibraryItemsByTitle(
   leftItem: AdultLibraryItem,
   rightItem: AdultLibraryItem,
@@ -5262,6 +5494,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [adultLibrarySearchQuery, setAdultLibrarySearchQuery] = useState("");
   const [adultLibraryTitleSortDirection, setAdultLibraryTitleSortDirection] =
     useState<LibraryTitleSortDirection>("ascending");
+  const [adultTrashAnnouncement, setAdultTrashAnnouncement] = useState<
+    string | null
+  >(null);
+  const [adultTrashReconciliationState, setAdultTrashReconciliationState] =
+    useState<"pending" | "attention" | null>(null);
+  const [adultTrashPendingPath, setAdultTrashPendingPath] = useState<
+    string | null
+  >(null);
   const [isChoosingAdultFolder, setIsChoosingAdultFolder] = useState(false);
   const [isRevalidatingAdultFolder, setIsRevalidatingAdultFolder] =
     useState(false);
@@ -5555,6 +5795,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const currentMovieScanState = useRef(movieScanState);
   const currentTvFolderState = useRef(tvFolderState);
   const currentTvLibraryScanState = useRef(tvLibraryScanState);
+  const currentAdultFolderState = useRef(adultFolderState);
+  const currentAdultLibraryScanState = useRef(adultLibraryScanState);
   const currentVrDownloadsState = useRef(vrDownloadsState);
   const previousDownloadStates = useRef<Map<string, VrDownload["state"]>>(
     new Map(),
@@ -5568,6 +5810,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   currentMovieScanState.current = movieScanState;
   currentTvFolderState.current = tvFolderState;
   currentTvLibraryScanState.current = tvLibraryScanState;
+  currentAdultFolderState.current = adultFolderState;
+  currentAdultLibraryScanState.current = adultLibraryScanState;
   currentVrDownloadsState.current = vrDownloadsState;
   currentTvDiscoverState.current = tvDiscoverState;
 
@@ -6037,13 +6281,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     setAdultLibraryScanState({ status: "scanning" });
     void scanAdultLibrary()
-      .then((items) => {
+      .then(({ generation, items }) => {
         if (requestId === adultLibraryScanRequestId.current) {
-          setAdultLibraryScanState(
+          const scanState: AdultLibraryScanState =
             items.length === 0
-              ? { status: "empty" }
-              : { status: "ready", items },
-          );
+              ? { status: "empty", generation }
+              : { status: "ready", generation, items };
+          currentAdultLibraryScanState.current = scanState;
+          setAdultLibraryScanState(scanState);
         }
       })
       .catch((error: unknown) => {
@@ -7128,6 +7373,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       ) {
         vrOrganizationRequestId.current += 1;
         setVrOrganizationPreview(null);
+        setAdultTrashAnnouncement(null);
+        setAdultTrashReconciliationState(null);
+        setAdultTrashPendingPath(null);
         adultLibraryScanRequestId.current += 1;
         adultStorageRequestId.current += 1;
         setAdultLibraryScanState({ status: "scanning" });
@@ -7148,6 +7396,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     vrOrganizationRequestId.current += 1;
     setVrOrganizationPreview(null);
     setIsRevalidatingAdultFolder(false);
+    setAdultTrashAnnouncement(null);
+    setAdultTrashReconciliationState(null);
+    setAdultTrashPendingPath(null);
     adultLibraryScanRequestId.current += 1;
     adultStorageRequestId.current += 1;
     setAdultFolderActionError(null);
@@ -7163,6 +7414,94 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         );
       }
     }
+  };
+
+  const recordTrashedAdultFile = (
+    file: AdultLibraryFile,
+    scanGeneration: string,
+  ) => {
+    const currentFolder = currentAdultFolderState.current;
+    const currentScan = currentAdultLibraryScanState.current;
+    if (
+      currentFolder.status !== "ready" ||
+      currentScan.status !== "ready" ||
+      currentScan.generation !== scanGeneration
+    ) {
+      return;
+    }
+
+    const remainingItems = removeAdultLibraryFile(
+      currentScan.items,
+      file.path,
+    );
+    const localState: AdultLibraryScanState =
+      remainingItems.length === 0
+        ? { status: "empty", generation: scanGeneration }
+        : { status: "ready", generation: scanGeneration, items: remainingItems };
+    currentAdultLibraryScanState.current = localState;
+    setAdultLibraryScanState(localState);
+    setAdultTrashAnnouncement(
+      `${file.filename} was moved to Trash or the Recycle Bin.`,
+    );
+    setAdultTrashReconciliationState("pending");
+    setAdultStorageState({ status: "loading" });
+
+    const folderPath = currentFolder.path;
+    const scanRequestId = ++adultLibraryScanRequestId.current;
+    const storageRequestId = ++adultStorageRequestId.current;
+    void Promise.allSettled([scanAdultLibrary(), queryAdultStorage()]).then(
+      ([scanResult, storageResult]) => {
+        if (
+          currentAdultFolderState.current.status !== "ready" ||
+          currentAdultFolderState.current.path !== folderPath ||
+          scanRequestId !== adultLibraryScanRequestId.current ||
+          storageRequestId !== adultStorageRequestId.current
+        ) {
+          return;
+        }
+
+        let needsAttention = false;
+        if (scanResult.status === "fulfilled") {
+          const reconciledItems = removeAdultLibraryFile(
+            scanResult.value.items,
+            file.path,
+          );
+          const reconciledState: AdultLibraryScanState =
+            reconciledItems.length === 0
+              ? {
+                  status: "empty",
+                  generation: scanResult.value.generation,
+                }
+              : {
+                  status: "ready",
+                  generation: scanResult.value.generation,
+                  items: reconciledItems,
+                };
+          currentAdultLibraryScanState.current = reconciledState;
+          setAdultLibraryScanState(reconciledState);
+        } else {
+          needsAttention = true;
+        }
+
+        if (storageResult.status === "fulfilled") {
+          setAdultStorageState({
+            status: "ready",
+            totalBytes: storageResult.value.totalBytes,
+            freeBytes: storageResult.value.freeBytes,
+          });
+        } else {
+          needsAttention = true;
+          setAdultStorageState({
+            status:
+              nativeErrorCode(storageResult.reason) ===
+              "adult_storage_unavailable"
+                ? "unavailable"
+                : "error",
+          });
+        }
+        setAdultTrashReconciliationState(needsAttention ? "attention" : null);
+      },
+    );
   };
 
   const refreshAdultLibrary = () => {
@@ -7195,6 +7534,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     if (adultFolderState.status !== "ready") {
       return;
     }
+    setAdultTrashReconciliationState(null);
     adultLibraryScanRequestId.current += 1;
     adultStorageRequestId.current += 1;
     setAdultLibraryScanState({ status: "scanning" });
@@ -10651,7 +10991,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     <Button
                       disabled={
                         adultLibraryScanState.status === "scanning" ||
-                        isRevalidatingAdultFolder
+                        isRevalidatingAdultFolder ||
+                        adultTrashReconciliationState === "pending" ||
+                        adultTrashPendingPath !== null
                       }
                       onClick={refreshAdultLibrary}
                       type="button"
@@ -10770,6 +11112,45 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   </p>
                   <Button
                     onClick={refreshTvLibrary}
+                    type="button"
+                    variant="outline"
+                  >
+                    <AppIcon name="refresh" />
+                    Retry reconciliation
+                  </Button>
+                </div>
+              ) : null}
+              {libraryCategory === "adult" &&
+              adultTrashAnnouncement !== null ? (
+                <p
+                  aria-atomic="true"
+                  aria-live="polite"
+                  className="library-action-status"
+                >
+                  {adultTrashAnnouncement}
+                </p>
+              ) : null}
+              {libraryCategory === "adult" &&
+              adultTrashReconciliationState === "pending" ? (
+                <p
+                  aria-atomic="true"
+                  className="library-action-status"
+                  role="status"
+                >
+                  The file move succeeded. Updating the Adult Library and
+                  storage…
+                </p>
+              ) : null}
+              {libraryCategory === "adult" &&
+              adultTrashReconciliationState === "attention" ? (
+                <div className="library-action-attention" role="alert">
+                  <p>
+                    The file move succeeded, but the Adult Library or storage
+                    could not be refreshed. The moved file remains removed from
+                    this result.
+                  </p>
+                  <Button
+                    onClick={refreshAdultLibrary}
                     type="button"
                     variant="outline"
                   >
@@ -10937,7 +11318,18 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         items={orderedAdultLibraryItems}
                         key="adult-library-gallery"
                         onSelectedPageChange={setAdultLibrarySelectedPage}
-                        renderItem={(item) => <AdultLibraryCard item={item} />}
+                        renderItem={(item) => (
+                          <AdultLibraryCard
+                            item={item}
+                            onFileTrashed={recordTrashedAdultFile}
+                            onTrashPendingChange={setAdultTrashPendingPath}
+                            scanGeneration={adultLibraryScanState.generation}
+                            trashActionsDisabled={
+                              adultTrashReconciliationState !== null
+                            }
+                            trashPendingPath={adultTrashPendingPath}
+                          />
+                        )}
                         selectedPage={adultLibrarySelectedPage}
                         variant="library"
                       />
