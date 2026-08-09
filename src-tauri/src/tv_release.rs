@@ -29,6 +29,7 @@ pub(crate) const TV_APIBAY_CONFLICTING: &str = "tv_release_apibay_conflicting";
 pub(crate) const TV_APIBAY_PROVIDER_ERROR: &str = "tv_release_apibay_provider_error";
 pub(crate) const TV_TORRENT_CONTEXT_INVALID: &str = "tv_torrent_context_invalid";
 pub(crate) const TV_TORRENT_INFOHASH_MISMATCH: &str = "tv_torrent_infohash_mismatch";
+pub(crate) const TV_TORRENT_INSPECTION_UNAVAILABLE: &str = "tv_torrent_inspection_unavailable";
 pub(crate) const TV_TORRENT_MALFORMED: &str = "tv_torrent_malformed";
 pub(crate) const TV_TORRENT_NETWORK_ERROR: &str = "tv_torrent_network_error";
 pub(crate) const TV_TORRENT_NO_PEERS: &str = "tv_torrent_no_peers";

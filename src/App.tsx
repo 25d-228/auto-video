@@ -1168,20 +1168,70 @@ const movieTorrentMessages = {
 } as const;
 
 const tvTorrentMessages = {
-  ...vrTorrentMessages,
   loading: {
-    heading: "Inspecting verified TV torrent",
-    message: "Acquiring and verifying metainfo for the exact selected API Bay infohash.",
+    heading: "Inspecting exact-infohash TV metadata",
+    message:
+      "Acquiring metadata for the exact selected API Bay infohash and generating verified metainfo.",
     role: "status",
+  },
+  "inspection-unavailable": {
+    heading: "TV metadata inspection is locally unavailable",
+    message:
+      "Auto-Video could not prepare its local exact-infohash metadata session. No metadata request was sent.",
+    role: "alert",
+  },
+  "source-unavailable": {
+    heading: "Exact-infohash TV metadata is unavailable",
+    message:
+      "No metadata source supplied data for the exact selected API Bay infohash.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "Exact-infohash TV metadata could not be reached",
+    message:
+      "The metadata request failed on the network. Retry the exact selected infohash.",
+    role: "alert",
   },
   timeout: {
     heading: "TV torrent inspection timed out",
-    message: "Metainfo was not available within the bounded inspection window. Try again.",
+    message:
+      "Exact-infohash metadata was not available within the bounded inspection window. Try again.",
     role: "alert",
   },
   "no-peers": {
     heading: "No TV torrent metadata peers were available",
-    message: "No peer supplied the exact selected metainfo. Try again later.",
+    message:
+      "No peer supplied metadata for the exact selected API Bay infohash. Try again later.",
+    role: "alert",
+  },
+  "malformed-torrent": {
+    heading: "Exact-infohash TV metadata is malformed",
+    message:
+      "The acquired metadata could not produce valid generated torrent metainfo.",
+    role: "alert",
+  },
+  "unsupported-torrent": {
+    heading: "Exact-infohash TV metadata is unsupported",
+    message:
+      "The acquired metadata could not produce supported v1 generated metainfo.",
+    role: "alert",
+  },
+  "infohash-mismatch": {
+    heading: "Exact TV infohash did not match",
+    message:
+      "The generated metainfo did not match the exact selected API Bay infohash.",
+    role: "alert",
+  },
+  "stale-context": {
+    heading: "TV metadata inspection is no longer current",
+    message:
+      "Return to the current exact API Bay release and inspect its infohash again.",
+    role: "alert",
+  },
+  "inspection-error": {
+    heading: "Exact-infohash TV metadata could not be inspected",
+    message:
+      "Auto-Video could not generate verified metainfo for the exact selected infohash.",
     role: "alert",
   },
 } as const;
@@ -2321,9 +2371,11 @@ function TvTorrentInspectionDialog({
                   {saveState === "saving" ? "Saving…" : "Save `.torrent`"}
                 </Button>
                 {saveState === "success" ? (
-                  <p role="status">Verified TV torrent file saved.</p>
+                  <p role="status">Verified generated TV metainfo saved.</p>
                 ) : saveState === "error" ? (
-                  <p role="alert">The verified TV torrent file could not be saved.</p>
+                  <p role="alert">
+                    The verified generated TV metainfo could not be saved.
+                  </p>
                 ) : null}
                 {startState.status === "success" ? (
                   <div className="vr-torrent__start-result" role="status">

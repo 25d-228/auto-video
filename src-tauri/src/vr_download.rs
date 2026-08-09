@@ -17,8 +17,9 @@ use librqbit::{
 };
 
 use crate::tv_release::{
-    TvInspectionTicket, TvReleaseState, TvTorrentInspectionRequest, TV_TORRENT_NETWORK_ERROR,
-    TV_TORRENT_NO_PEERS, TV_TORRENT_SOURCE_UNAVAILABLE, TV_TORRENT_TIMEOUT,
+    TvInspectionTicket, TvReleaseState, TvTorrentInspectionRequest,
+    TV_TORRENT_INSPECTION_UNAVAILABLE, TV_TORRENT_NETWORK_ERROR, TV_TORRENT_NO_PEERS,
+    TV_TORRENT_SOURCE_UNAVAILABLE, TV_TORRENT_TIMEOUT,
 };
 use crate::vr_library::is_supported_media;
 use crate::vr_torrent::{
@@ -57,6 +58,7 @@ const ORGANIZATION_RECOVERY_SUFFIX: &str = ".recovery";
 const ORGANIZATION_RECOVERY_SUCCESSOR_SUFFIX: &str = ".recovery.next";
 const TV_COMPLETION_RECOVERY_PREFIX: &str = ".auto-video-tv-completion-";
 const TV_COMPLETION_RECOVERY_SUFFIX: &str = ".recovery";
+const TV_METADATA_SESSION_FOLDER_NAME: &str = "tv-metadata";
 const MAX_PERSISTENCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PERSISTED_TRANSFERS: usize = 100;
 const MAX_SELECTED_FILES: usize = 100_000;
@@ -283,6 +285,8 @@ struct VrDownloadContext {
     tv_future_folder: Option<PathBuf>,
     session: Option<Arc<Session>>,
     session_starting: bool,
+    tv_metadata_session: Option<Arc<Session>>,
+    tv_metadata_session_starting: bool,
     download_limit: DownloadLimitState,
     transfers_loaded: bool,
     transfers_loading: bool,
@@ -1852,6 +1856,49 @@ async fn session_for(
     }
 }
 
+async fn tv_metadata_session_for(
+    state: &VrDownloadState,
+    session_folder: &Path,
+) -> Result<Arc<Session>, &'static str> {
+    {
+        let mut context = state
+            .0
+            .lock()
+            .map_err(|_| TV_TORRENT_INSPECTION_UNAVAILABLE)?;
+        if let Some(session) = &context.tv_metadata_session {
+            return Ok(session.clone());
+        }
+        if context.tv_metadata_session_starting {
+            return Err(TV_TORRENT_INSPECTION_UNAVAILABLE);
+        }
+        context.tv_metadata_session_starting = true;
+    }
+
+    let metadata_session_folder = session_folder.join(TV_METADATA_SESSION_FOLDER_NAME);
+    if fs::create_dir_all(&metadata_session_folder).is_err() {
+        if let Ok(mut context) = state.0.lock() {
+            context.tv_metadata_session_starting = false;
+        }
+        return Err(TV_TORRENT_INSPECTION_UNAVAILABLE);
+    }
+    let result = Session::new_with_opts(metadata_session_folder, session_options(None))
+        .await
+        .map_err(|_| TV_TORRENT_INSPECTION_UNAVAILABLE);
+
+    let mut context = state
+        .0
+        .lock()
+        .map_err(|_| TV_TORRENT_INSPECTION_UNAVAILABLE)?;
+    context.tv_metadata_session_starting = false;
+    match result {
+        Ok(session) => {
+            context.tv_metadata_session = Some(session.clone());
+            Ok(session)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn session_options(download_limit: Option<NonZeroU32>) -> SessionOptions {
     SessionOptions {
         disable_upload: true,
@@ -1931,9 +1978,7 @@ pub async fn inspect_tv_torrent(
     request: TvTorrentInspectionRequest,
 ) -> Result<Vec<String>, &'static str> {
     let ticket = torrent_state.begin_inspection(request)?;
-    let session = session_for(download_state, session_folder)
-        .await
-        .map_err(|_| TV_TORRENT_NETWORK_ERROR)?;
+    let session = tv_metadata_session_for(download_state, session_folder).await?;
     let bytes = acquire_tv_metainfo(session, &ticket).await?;
     torrent_state.finish_inspection(ticket, bytes)
 }
@@ -2479,6 +2524,10 @@ fn finalize_monitored_transfer_with(
         if record.handle_generation != handle_generation || !record.state.is_active() {
             return false;
         }
+        let active_state = record.state;
+        let active_downloaded_bytes = record.downloaded_bytes;
+        let active_handle = record.handle.clone();
+        let active_pending_action = record.pending_action;
         record.handle = None;
         record.pending_action = None;
         if completed {
@@ -2489,8 +2538,16 @@ fn finalize_monitored_transfer_with(
                 // Recovery must precede completion so a crash cannot revive the older active row.
                 tv_recovery_saved = write_tv_completion_recovery(record).is_ok();
                 if !tv_recovery_saved {
-                    let _ = persist(persistence_path, &context.transfers);
-                    return true;
+                    if persist(persistence_path, &context.transfers).is_ok() {
+                        return true;
+                    }
+                    let record = find_valid_record_mut(&mut context.transfers, transfer_id)
+                        .expect("the validated transfer must remain present");
+                    record.state = active_state;
+                    record.downloaded_bytes = active_downloaded_bytes;
+                    record.handle = active_handle;
+                    record.pending_action = active_pending_action;
+                    return false;
                 }
             }
             record.state = TransferState::Completed;
@@ -6792,6 +6849,55 @@ mod tests {
         assert_eq!(options.ratelimits.upload_bps, None);
     }
 
+    #[test]
+    fn tv_inspection_session_does_not_require_transfer_or_limit_readiness() {
+        let fixture = FilesystemFixture::new();
+        let state = VrDownloadState::default();
+        {
+            let mut context = state.0.lock().expect("state must lock");
+            context.session_starting = true;
+            context.transfers_loading = true;
+            assert_eq!(context.download_limit, DownloadLimitState::Unloaded);
+        }
+
+        assert!(matches!(
+            tauri::async_runtime::block_on(session_for(
+                &state,
+                &fixture.path.join("transfer-session"),
+            )),
+            Err(VR_DOWNLOAD_ACTION_INVALID)
+        ));
+        let metadata_session = tauri::async_runtime::block_on(tv_metadata_session_for(
+            &state,
+            &fixture.path.join("session"),
+        ))
+        .expect("TV metadata inspection must have independent local readiness");
+        let context = state.0.lock().expect("state must lock");
+        assert!(context.session.is_none());
+        assert!(context.session_starting);
+        assert!(context.transfers_loading);
+        assert_eq!(context.download_limit, DownloadLimitState::Unloaded);
+        assert!(context
+            .tv_metadata_session
+            .as_ref()
+            .is_some_and(|session| Arc::ptr_eq(session, &metadata_session)));
+        drop(context);
+
+        let pending_state = VrDownloadState::default();
+        pending_state
+            .0
+            .lock()
+            .expect("pending metadata state must lock")
+            .tv_metadata_session_starting = true;
+        assert!(matches!(
+            tauri::async_runtime::block_on(tv_metadata_session_for(
+                &pending_state,
+                &fixture.path.join("pending-session"),
+            )),
+            Err(TV_TORRENT_INSPECTION_UNAVAILABLE)
+        ));
+    }
+
     fn push_bencoded_text(encoded: &mut Vec<u8>, value: &str) {
         encoded.extend_from_slice(value.len().to_string().as_bytes());
         encoded.push(b':');
@@ -7541,6 +7647,182 @@ mod tests {
                 .expect("selected TV media must remain"),
             b"1234567"
         );
+    }
+
+    #[test]
+    fn tv_completion_double_persistence_failure_keeps_active_handle_and_restart_authority() {
+        let fixture = FilesystemFixture::new();
+        let mut record =
+            locally_completed_tv_boundary_record(&fixture, "TV — double persistence failure");
+        record.state = TransferState::Paused;
+        fs::write(record.destination.join("Folder/特別版  B.mp4"), b"partial")
+            .expect("partial selected TV media must remain writable");
+        record.downloaded_bytes = 0;
+        let transfer_id = record.transfer_id.clone();
+        let destination = record.destination.clone();
+        let persistence_path = fixture.path.join("downloads");
+        let recovery_path = tv_completion_recovery_path(&record);
+        write_persisted_transfers(&persistence_path, &[StoredTransfer::Valid(record)])
+            .expect("active TV state must persist before completion");
+        fs::create_dir(&recovery_path).expect("recovery creation must fail deterministically");
+
+        tauri::async_runtime::block_on(async {
+            let mut stored = read_persisted_transfers(&persistence_path)
+                .expect("active TV state must reload for completion");
+            let StoredTransfer::Valid(record) = stored
+                .pop()
+                .expect("active TV transfer must remain persisted")
+            else {
+                panic!("active TV transfer must remain valid");
+            };
+            let session_folder = fixture.path.join("active-session");
+            fs::create_dir(&session_folder).expect("active session folder must exist");
+            let session = Session::new_with_opts(session_folder, session_options(None))
+                .await
+                .expect("active session must start");
+            let handle = add_record_to_session(&session, &record, true)
+                .await
+                .expect("active TV handle must attach");
+            let state = VrDownloadState::default();
+            configure_tv_download_folder(&state, Some(destination.clone()))
+                .expect("TV folder must configure");
+            {
+                let mut context = state.0.lock().expect("state must lock");
+                context.download_limit = DownloadLimitState::Loaded(None);
+                context.transfers_loaded = true;
+                context.session = Some(session.clone());
+                let mut record = record;
+                record.handle = Some(handle.clone());
+                context.transfers.push(StoredTransfer::Valid(record));
+
+                let mut persistence_attempts = 0;
+                assert!(!finalize_monitored_transfer_with(
+                    &mut context,
+                    &transfer_id,
+                    0,
+                    true,
+                    &persistence_path,
+                    |_path, transfers| {
+                        persistence_attempts += 1;
+                        assert!(matches!(
+                            &transfers[0],
+                            StoredTransfer::Valid(record)
+                                if record.state == TransferState::Failed
+                                    && record.downloaded_bytes == 7
+                                    && record.handle.is_none()
+                        ));
+                        Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+                    },
+                ));
+                assert_eq!(persistence_attempts, 1);
+                let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                    panic!("active TV transfer must remain valid");
+                };
+                assert_eq!(record.state, TransferState::Paused);
+                assert_eq!(record.downloaded_bytes, 0);
+                assert!(record
+                    .handle
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &handle)));
+                assert!(record.pending_action.is_none());
+                assert_eq!(
+                    record
+                        .boundary_segments
+                        .lock()
+                        .expect("boundary state must lock")[&0][0]
+                        .bytes,
+                    b"abc"
+                );
+            }
+
+            let persisted = read_persisted_transfers(&persistence_path)
+                .expect("older active authority must remain readable");
+            let StoredTransfer::Valid(persisted) = &persisted[0] else {
+                panic!("older active TV authority must remain valid");
+            };
+            assert_eq!(persisted.state, TransferState::Paused);
+            assert_eq!(persisted.downloaded_bytes, 0);
+            assert_eq!(
+                persisted
+                    .boundary_segments
+                    .lock()
+                    .expect("persisted boundary state must lock")[&0][0]
+                    .bytes,
+                b"abc"
+            );
+            assert_eq!(
+                fs::read(destination.join("Folder/特別版  B.mp4"))
+                    .expect("double failure must retain selected TV media"),
+                b"partial"
+            );
+            assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
+
+            {
+                let mut context = state.0.lock().expect("state must lock");
+                let record = find_valid_record_mut(&mut context.transfers, &transfer_id)
+                    .expect("active TV transfer must remain attached");
+                assert!(record.handle.take().is_some());
+                context.session = None;
+            }
+            session
+                .delete(handle.id().into(), false)
+                .await
+                .expect("old process handle must detach without deleting files");
+
+            let restarted = VrDownloadState::default();
+            configure_tv_download_folder(&restarted, Some(destination.clone()))
+                .expect("restarted TV folder must configure");
+            let rows = load_downloads(
+                &restarted,
+                &persistence_path,
+                &fixture.path.join("restarted-session"),
+                &fixture.path.join("download-limit"),
+            )
+            .await
+            .expect("older active TV authority must restore after relaunch");
+            assert_eq!(rows[0], transfer_id);
+            assert_eq!(rows[1], "tv");
+            assert_eq!(rows[6], "0");
+            assert_eq!(rows[8], "paused");
+            assert_eq!(rows[10], "none");
+            assert_eq!(rows[12], "false");
+            let (restarted_session, restarted_handle) = {
+                let mut context = restarted.0.lock().expect("state must lock");
+                let StoredTransfer::Valid(record) = &mut context.transfers[0] else {
+                    panic!("restarted active TV transfer must remain valid");
+                };
+                assert_eq!(record.state, TransferState::Paused);
+                assert_eq!(record.downloaded_bytes, 0);
+                assert_eq!(
+                    record
+                        .boundary_segments
+                        .lock()
+                        .expect("restarted boundary state must lock")[&0][0]
+                        .bytes,
+                    b"abc"
+                );
+                let handle = record
+                    .handle
+                    .take()
+                    .expect("restarted active TV handle must remain attached");
+                let session = context
+                    .session
+                    .take()
+                    .expect("restarted session must exist");
+                (session, handle)
+            };
+            restarted_session
+                .delete(restarted_handle.id().into(), false)
+                .await
+                .expect("restarted handle must detach without deleting files");
+        });
+
+        assert_eq!(
+            fs::read(destination.join("Folder/特別版  B.mp4"))
+                .expect("relaunch must retain selected TV media"),
+            b"partial"
+        );
+        assert!(!destination.join("Folder/Part  1 — 映画.mkv").exists());
     }
 
     #[test]

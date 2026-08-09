@@ -50,6 +50,7 @@ export type TvTorrentInspectionResult =
   | { status: "ready"; inspection: TorrentInspection }
   | { status: "source-unavailable" }
   | { status: "network-error" }
+  | { status: "inspection-unavailable" }
   | { status: "timeout" }
   | { status: "no-peers" }
   | { status: "malformed-torrent" }
@@ -272,6 +273,8 @@ function tvTorrentErrorStatus(
       return "source-unavailable";
     case "tv_torrent_network_error":
       return "network-error";
+    case "tv_torrent_inspection_unavailable":
+      return "inspection-unavailable";
     case "tv_torrent_timeout":
       return "timeout";
     case "tv_torrent_no_peers":

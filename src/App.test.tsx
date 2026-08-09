@@ -5743,7 +5743,9 @@ describe("TMDB TV Discover", () => {
       within(inspectionDialog).getByRole("button", { name: "Save `.torrent`" }),
     );
     expect(
-      await within(inspectionDialog).findByText("Verified TV torrent file saved."),
+      await within(inspectionDialog).findByText(
+        "Verified generated TV metainfo saved.",
+      ),
     ).toBeTruthy();
     fireEvent.click(startButton);
     expect(
@@ -5802,6 +5804,183 @@ describe("TMDB TV Discover", () => {
     expect(fetchApiBayTvReleasesMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(document.documentElement.dataset.theme).toBe("dark");
+  });
+
+  it("inspects exact TV metadata while Start readiness is pending and uses generated-metainfo messages", async () => {
+    const pendingLimit = createDeferred<string[]>();
+    const showName = "Exact Show";
+    const episodeName = "Exact Episode";
+    const releaseName = "Exact Show S02E03+720p";
+    const infohash = "0123456789abcdef0123456789abcdef01234567";
+    loadVrDownloadLimitMock.mockReturnValue(pendingLimit.promise);
+    loadTmdbTokenMock.mockResolvedValue("episode-release-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 701, name: showName }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 701,
+          name: showName,
+          seasons: [{ id: 9001, season_number: 2, name: "Season 2" }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 9001,
+          season_number: 2,
+          episodes: [
+            {
+              id: 9103,
+              season_number: 2,
+              episode_number: 3,
+              name: episodeName,
+            },
+          ],
+        }),
+      );
+    fetchApiBayTvReleasesMock.mockResolvedValue([
+      "701",
+      showName,
+      "9001",
+      "2",
+      "9103",
+      "3",
+      episodeName,
+      "tt0123456",
+      "1",
+      "1001",
+      releaseName,
+      "205",
+      "419000000",
+      "12",
+      "4",
+      "Exact Uploader",
+      "vip",
+      "1710000000",
+      infohash,
+      "API Bay",
+    ]);
+    const failures = [
+      [
+        "tv_torrent_inspection_unavailable",
+        "TV metadata inspection is locally unavailable",
+        "No metadata request was sent.",
+      ],
+      [
+        "tv_torrent_source_unavailable",
+        "Exact-infohash TV metadata is unavailable",
+        "exact selected API Bay infohash",
+      ],
+      [
+        "tv_torrent_network_error",
+        "Exact-infohash TV metadata could not be reached",
+        "metadata request failed on the network",
+      ],
+      [
+        "tv_torrent_timeout",
+        "TV torrent inspection timed out",
+        "Exact-infohash metadata was not available",
+      ],
+      [
+        "tv_torrent_no_peers",
+        "No TV torrent metadata peers were available",
+        "exact selected API Bay infohash",
+      ],
+      [
+        "tv_torrent_malformed",
+        "Exact-infohash TV metadata is malformed",
+        "valid generated torrent metainfo",
+      ],
+      [
+        "tv_torrent_unsupported",
+        "Exact-infohash TV metadata is unsupported",
+        "supported v1 generated metainfo",
+      ],
+      [
+        "tv_torrent_infohash_mismatch",
+        "Exact TV infohash did not match",
+        "generated metainfo did not match",
+      ],
+      [
+        "tv_torrent_context_invalid",
+        "TV metadata inspection is no longer current",
+        "current exact API Bay release",
+      ],
+      [
+        "unexpected_error",
+        "Exact-infohash TV metadata could not be inspected",
+        "generate verified metainfo",
+      ],
+    ] as const;
+    for (const [error] of failures) {
+      inspectApiBayTvTorrentMock.mockRejectedValueOnce(error);
+    }
+    inspectApiBayTvTorrentMock.mockResolvedValueOnce([
+      "tv-1-11-1001",
+      "Exact Show S02E03",
+      infohash,
+      "5",
+      "Exact Show S02E03.mp4",
+      "5",
+    ]);
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "View details: Exact Show" }),
+    );
+    const detailsDialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      await within(detailsDialog).findByRole("button", { name: "View seasons" }),
+    );
+    fireEvent.click(
+      within(detailsDialog).getByRole("button", { name: "Select Season 2" }),
+    );
+    fireEvent.click(
+      await within(detailsDialog).findByRole("button", { name: "Find releases" }),
+    );
+    const comparisonDialog = (
+      await screen.findByText(
+        /Metadata-only comparison for the exact selected episode/,
+      )
+    ).closest('[role="dialog"]') as HTMLElement;
+    fireEvent.click(await within(comparisonDialog).findByText(releaseName));
+    fireEvent.click(
+      within(comparisonDialog).getByRole("button", { name: "Inspect torrent" }),
+    );
+
+    for (const [, heading, message] of failures) {
+      expect(
+        await screen.findByRole("heading", { name: heading }),
+      ).toBeTruthy();
+      expect(screen.getByText(new RegExp(message, "i"))).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Save `.torrent`" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Retry inspection" }));
+    }
+
+    const inspectionHeading = await screen.findByRole("heading", {
+      name: "Exact Show · S02E03",
+    });
+    const inspectionDialog = inspectionHeading.closest(
+      '[role="dialog"]',
+    ) as HTMLElement;
+    const fileCheckbox = await within(inspectionDialog).findByRole("checkbox");
+    fireEvent.click(fileCheckbox);
+    expect(
+      within(inspectionDialog).getByRole("button", { name: "Save `.torrent`" }),
+    ).toBeTruthy();
+    expect(
+      within(inspectionDialog).getByRole("button", { name: "Start download" }),
+    ).toHaveProperty("disabled", true);
+    expect(inspectionDialog.textContent).not.toMatch(/provider artifact/i);
+    expect(loadVrDownloadLimitMock).toHaveBeenCalledOnce();
+    expect(loadVrDownloadsMock).not.toHaveBeenCalled();
+    expect(inspectApiBayTvTorrentMock).toHaveBeenCalledTimes(failures.length + 1);
+    expect(startVerifiedTvDownloadMock).not.toHaveBeenCalled();
   });
 
   it("invalidates a dismissed API Bay request and keeps its late rows out of a newer episode", async () => {

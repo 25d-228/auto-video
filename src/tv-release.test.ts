@@ -255,6 +255,7 @@ describe("verified API Bay TV torrent boundary", () => {
     for (const [error, status] of [
       ["tv_torrent_source_unavailable", "source-unavailable"],
       ["tv_torrent_network_error", "network-error"],
+      ["tv_torrent_inspection_unavailable", "inspection-unavailable"],
       ["tv_torrent_timeout", "timeout"],
       ["tv_torrent_no_peers", "no-peers"],
       ["tv_torrent_malformed", "malformed-torrent"],
