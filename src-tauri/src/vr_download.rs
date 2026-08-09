@@ -58,7 +58,6 @@ const ORGANIZATION_RECOVERY_SUFFIX: &str = ".recovery";
 const ORGANIZATION_RECOVERY_SUCCESSOR_SUFFIX: &str = ".recovery.next";
 const TV_COMPLETION_RECOVERY_PREFIX: &str = ".auto-video-tv-completion-";
 const TV_COMPLETION_RECOVERY_SUFFIX: &str = ".recovery";
-const TV_METADATA_SESSION_FOLDER_NAME: &str = "tv-metadata";
 const MAX_PERSISTENCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PERSISTED_TRANSFERS: usize = 100;
 const MAX_SELECTED_FILES: usize = 100_000;
@@ -285,8 +284,6 @@ struct VrDownloadContext {
     tv_future_folder: Option<PathBuf>,
     session: Option<Arc<Session>>,
     session_starting: bool,
-    tv_metadata_session: Option<Arc<Session>>,
-    tv_metadata_session_starting: bool,
     download_limit: DownloadLimitState,
     transfers_loaded: bool,
     transfers_loading: bool,
@@ -1856,49 +1853,6 @@ async fn session_for(
     }
 }
 
-async fn tv_metadata_session_for(
-    state: &VrDownloadState,
-    session_folder: &Path,
-) -> Result<Arc<Session>, &'static str> {
-    {
-        let mut context = state
-            .0
-            .lock()
-            .map_err(|_| TV_TORRENT_INSPECTION_UNAVAILABLE)?;
-        if let Some(session) = &context.tv_metadata_session {
-            return Ok(session.clone());
-        }
-        if context.tv_metadata_session_starting {
-            return Err(TV_TORRENT_INSPECTION_UNAVAILABLE);
-        }
-        context.tv_metadata_session_starting = true;
-    }
-
-    let metadata_session_folder = session_folder.join(TV_METADATA_SESSION_FOLDER_NAME);
-    if fs::create_dir_all(&metadata_session_folder).is_err() {
-        if let Ok(mut context) = state.0.lock() {
-            context.tv_metadata_session_starting = false;
-        }
-        return Err(TV_TORRENT_INSPECTION_UNAVAILABLE);
-    }
-    let result = Session::new_with_opts(metadata_session_folder, session_options(None))
-        .await
-        .map_err(|_| TV_TORRENT_INSPECTION_UNAVAILABLE);
-
-    let mut context = state
-        .0
-        .lock()
-        .map_err(|_| TV_TORRENT_INSPECTION_UNAVAILABLE)?;
-    context.tv_metadata_session_starting = false;
-    match result {
-        Ok(session) => {
-            context.tv_metadata_session = Some(session.clone());
-            Ok(session)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 fn session_options(download_limit: Option<NonZeroU32>) -> SessionOptions {
     SessionOptions {
         disable_upload: true,
@@ -1978,7 +1932,9 @@ pub async fn inspect_tv_torrent(
     request: TvTorrentInspectionRequest,
 ) -> Result<Vec<String>, &'static str> {
     let ticket = torrent_state.begin_inspection(request)?;
-    let session = tv_metadata_session_for(download_state, session_folder).await?;
+    let session = session_for(download_state, session_folder)
+        .await
+        .map_err(|_| TV_TORRENT_INSPECTION_UNAVAILABLE)?;
     let bytes = acquire_tv_metainfo(session, &ticket).await?;
     torrent_state.finish_inspection(ticket, bytes)
 }
@@ -6850,52 +6806,60 @@ mod tests {
     }
 
     #[test]
-    fn tv_inspection_session_does_not_require_transfer_or_limit_readiness() {
+    fn tv_inspection_reports_unavailable_until_the_shared_session_is_ready() {
         let fixture = FilesystemFixture::new();
+        let metainfo = selected_file_torrent();
+        let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+        let torrent_state = TvReleaseState::default();
+        cache_tv_boundary_inspection(&torrent_state, metainfo);
+        let request = TvTorrentInspectionRequest {
+            tmdb_tv_id: 701,
+            show_name: "Exact  Show — 特別版".to_owned(),
+            provider_season_id: 9001,
+            season_number: 2,
+            provider_episode_id: 9103,
+            episode_number: 3,
+            episode_name: "第三話  —  Exact Episode".to_owned(),
+            imdb_id: "tt0123456".to_owned(),
+            provider_item_id: "1001".to_owned(),
+            provider_category: "205".to_owned(),
+            release_name: "Exact  Show — 特別版.S02E03+720p.第三話".to_owned(),
+            expected_infohash: infohash,
+        };
         let state = VrDownloadState::default();
+        let session_folder = fixture.path.join("session");
+
+        assert_eq!(
+            tauri::async_runtime::block_on(inspect_tv_torrent(
+                &state,
+                &torrent_state,
+                &session_folder,
+                request.clone(),
+            )),
+            Err(TV_TORRENT_INSPECTION_UNAVAILABLE)
+        );
+        assert!(!session_folder.exists());
         {
             let mut context = state.0.lock().expect("state must lock");
-            context.session_starting = true;
-            context.transfers_loading = true;
             assert_eq!(context.download_limit, DownloadLimitState::Unloaded);
+            assert!(context.session.is_none());
+            context.download_limit = DownloadLimitState::Loaded(None);
+            context.session_starting = true;
         }
 
-        assert!(matches!(
-            tauri::async_runtime::block_on(session_for(
+        assert_eq!(
+            tauri::async_runtime::block_on(inspect_tv_torrent(
                 &state,
-                &fixture.path.join("transfer-session"),
+                &torrent_state,
+                &session_folder,
+                request,
             )),
-            Err(VR_DOWNLOAD_ACTION_INVALID)
-        ));
-        let metadata_session = tauri::async_runtime::block_on(tv_metadata_session_for(
-            &state,
-            &fixture.path.join("session"),
-        ))
-        .expect("TV metadata inspection must have independent local readiness");
+            Err(TV_TORRENT_INSPECTION_UNAVAILABLE)
+        );
         let context = state.0.lock().expect("state must lock");
         assert!(context.session.is_none());
         assert!(context.session_starting);
-        assert!(context.transfers_loading);
-        assert_eq!(context.download_limit, DownloadLimitState::Unloaded);
-        assert!(context
-            .tv_metadata_session
-            .as_ref()
-            .is_some_and(|session| Arc::ptr_eq(session, &metadata_session)));
-        drop(context);
-
-        let pending_state = VrDownloadState::default();
-        pending_state
-            .0
-            .lock()
-            .expect("pending metadata state must lock")
-            .tv_metadata_session_starting = true;
-        assert!(matches!(
-            tauri::async_runtime::block_on(tv_metadata_session_for(
-                &pending_state,
-                &fixture.path.join("pending-session"),
-            )),
-            Err(TV_TORRENT_INSPECTION_UNAVAILABLE)
-        ));
+        assert!(!session_folder.exists());
     }
 
     fn push_bencoded_text(encoded: &mut Vec<u8>, value: &str) {
