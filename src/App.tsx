@@ -6860,7 +6860,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       );
       closeAdultReleaseComparison();
       closeMovieReleaseComparison();
-      resetTvReleaseComparison();
+      closeTvTorrentInspection();
+      closeTvReleaseComparison();
     }
     setActiveDestination(destination);
     if (workspace.current !== null) {
@@ -8232,7 +8233,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     closeDiscoverMovieDetails();
     closeDiscoverTvDetails();
-    resetTvReleaseComparison();
+    closeTvTorrentInspection();
+    closeTvReleaseComparison();
     closeMovieReleaseComparison();
     closeAdultReleaseComparison();
     closeVrReleaseComparison();

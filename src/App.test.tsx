@@ -5808,7 +5808,7 @@ describe("TMDB TV Discover", () => {
     expect(startVerifiedMovieDownloadMock).not.toHaveBeenCalled();
   });
 
-  it("compares exact API Bay episode rows, excludes compact continuations, and preserves manual state", async () => {
+  it("preserves completed API Bay comparison state through ordinary context changes and isolates late inspection and Save results", async () => {
     const showName = "Exact  Show — 特別版";
     const episodeName = "第三話  —  Exact Episode";
     const standardReleaseName =
@@ -6049,10 +6049,28 @@ describe("TMDB TV Discover", () => {
     expect(saveVerifiedTvTorrentMock).toHaveBeenLastCalledWith({
       inspectionId: "tv-1-1-1001",
     });
+    const lateSave = createDeferred<boolean>();
+    saveVerifiedTvTorrentMock.mockReturnValueOnce(lateSave.promise);
+    fireEvent.click(saveButton);
+    expect(
+      within(inspectionDialog).getByRole("button", { name: "Saving…" }),
+    ).toBeTruthy();
     fireEvent.click(
       within(inspectionDialog).getByRole("button", { name: "Close" }),
     );
     await waitFor(() => expect(document.activeElement).toBe(inspectButton));
+    await act(async () => {
+      lateSave.resolve(true);
+      await lateSave.promise;
+    });
+    expect(
+      screen.queryByText("Generated verified TV metainfo saved."),
+    ).toBeNull();
+    expect(
+      screen.queryByText(
+        "The destination exists or the generated metainfo could not be written.",
+      ),
+    ).toBeNull();
     expect(within(comparisonDialog).getByText("Selected release")).toBeTruthy();
     expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
     expect(startVerifiedAdultDownloadMock).not.toHaveBeenCalled();
@@ -6083,6 +6101,7 @@ describe("TMDB TV Discover", () => {
     expect(within(comparisonDialog).getByText("Selected release")).toBeTruthy();
     comparisonDialog.scrollTop = 140;
     fireEvent.scroll(comparisonDialog);
+    invalidateTvReleaseContextMock.mockClear();
 
     fireEvent.click(
       within(comparisonDialog).getByRole("button", { name: "Close" }),
@@ -6114,20 +6133,15 @@ describe("TMDB TV Discover", () => {
         /Metadata-only comparison for the exact selected episode/,
       )
     ).closest('[role="dialog"]') as HTMLElement;
-    expect(within(comparisonDialog).queryByText("Selected release")).toBeNull();
-    expect(
-      within(comparisonDialog).getByText(
-        "Select one verified release to compare its metadata.",
-      ),
-    ).toBeTruthy();
+    expect(within(comparisonDialog).getByText("Selected release")).toBeTruthy();
     expect(
       [...comparisonDialog.querySelectorAll(".vr-releases__release-name")].some(
         (element) => element.textContent === standardReleaseName,
       ),
     ).toBe(true);
-    expect(comparisonDialog.scrollTop).toBe(0);
-    expect(fetchApiBayTvReleasesMock).toHaveBeenCalledTimes(2);
-    expect(invalidateTvReleaseContextMock).toHaveBeenCalled();
+    expect(comparisonDialog.scrollTop).toBe(140);
+    expect(fetchApiBayTvReleasesMock).toHaveBeenCalledTimes(1);
+    expect(invalidateTvReleaseContextMock).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(document.documentElement.dataset.theme).toBe("dark");
   });

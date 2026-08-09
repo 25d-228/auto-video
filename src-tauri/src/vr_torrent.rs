@@ -3435,6 +3435,47 @@ mod tests {
     }
 
     #[test]
+    fn invalidated_tv_inspection_id_cannot_choose_a_destination_or_write() {
+        let bytes = single_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let release_state = selected_tv_release_state(&infohash);
+        let torrent_state = TvTorrentState::default();
+        let plan = match torrent_state
+            .begin_inspection(&release_state, 701, 9001, 9103, "1001")
+            .expect("inspection must begin")
+        {
+            TvTorrentInspectionStart::Acquire(plan) => plan,
+            TvTorrentInspectionStart::Cached(_) => unreachable!(),
+        };
+        let response = torrent_state
+            .finish_inspection(&release_state, plan, bytes)
+            .expect("exact generated metainfo must verify");
+        torrent_state
+            .invalidate_inspection()
+            .expect("inspection must invalidate");
+
+        let chose_destination = RefCell::new(false);
+        let wrote = RefCell::new(false);
+        assert_eq!(
+            save_verified_tv_torrent_with(
+                &torrent_state,
+                &response[0],
+                |_| {
+                    chose_destination.replace(true);
+                    Some(PathBuf::from("unused.torrent"))
+                },
+                |_, _| {
+                    wrote.replace(true);
+                    Ok(())
+                },
+            ),
+            Err(TV_TORRENT_STALE)
+        );
+        assert!(!chose_destination.into_inner());
+        assert!(!wrote.into_inner());
+    }
+
+    #[test]
     fn tv_inspection_rejects_fabricated_stale_malformed_and_cross_category_authority() {
         let bytes = single_file_torrent();
         let infohash = fixture_infohash(&bytes);
