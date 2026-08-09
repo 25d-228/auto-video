@@ -119,6 +119,16 @@ export type VrLibraryItem = {
   files: VrLibraryFile[];
 };
 
+export type VrLibraryScan = {
+  generation: string;
+  items: VrLibraryItem[];
+};
+
+export type VrVolumeStorage = {
+  totalBytes: bigint;
+  freeBytes: bigint;
+};
+
 export type SukebeiReleasesResult<Release extends SukebeiRelease> =
   | { status: "ready"; releases: Release[] }
   | { status: "source-unavailable" }
@@ -722,18 +732,26 @@ function canonicalVrLibraryProductCode(title: string) {
   return uniqueCandidates.size === 1 ? candidates[0] : null;
 }
 
-function parseVrLibrary(value: unknown): VrLibraryItem[] {
+function parseVrLibrary(value: unknown): VrLibraryScan {
   if (
     !Array.isArray(value) ||
-    value.length % 2 !== 0 ||
+    value.length === 0 ||
+    (value.length - 1) % 2 !== 0 ||
     !value.every((entry) => typeof entry === "string")
+  ) {
+    throw new Error("The native VR Library scanner returned invalid data.");
+  }
+  const generation = value[0] as string;
+  if (
+    !unsignedU64Pattern.test(generation) ||
+    BigInt(generation) > maximumU64
   ) {
     throw new Error("The native VR Library scanner returned invalid data.");
   }
 
   const files: VrLibraryFile[] = [];
   const paths = new Set<string>();
-  for (let index = 0; index < value.length; index += 2) {
+  for (let index = 1; index < value.length; index += 2) {
     const [path, sizeBytes] = value.slice(index, index + 2) as string[];
     if (
       path === "" ||
@@ -784,13 +802,40 @@ function parseVrLibrary(value: unknown): VrLibraryItem[] {
     }
   }
 
-  return [...groupedItems.values(), ...unassociatedItems];
+  return {
+    generation,
+    items: [...groupedItems.values(), ...unassociatedItems],
+  };
 }
 
 export async function scanVrLibrary() {
   return parseVrLibrary(
     await window.__TAURI__.core.invoke<unknown>("scan_vr_library"),
   );
+}
+
+export async function queryVrStorage(): Promise<VrVolumeStorage> {
+  const values = await window.__TAURI__.core.invoke<unknown>("query_vr_storage");
+  if (
+    !Array.isArray(values) ||
+    values.length !== 2 ||
+    values.some(
+      (value) => typeof value !== "string" || !unsignedU64Pattern.test(value),
+    )
+  ) {
+    throw new Error("The native VR storage query returned invalid data.");
+  }
+  const totalBytes = BigInt(values[0]);
+  const freeBytes = BigInt(values[1]);
+  if (
+    totalBytes === 0n ||
+    totalBytes > maximumU64 ||
+    freeBytes > maximumU64 ||
+    freeBytes > totalBytes
+  ) {
+    throw new Error("The native VR storage values were inconsistent.");
+  }
+  return { totalBytes, freeBytes };
 }
 
 export function openVrFile(path: string) {
@@ -805,6 +850,16 @@ export function revealVrFile(path: string) {
     throw new Error("A VR Library file path is required.");
   }
   return window.__TAURI__.core.invoke<void>("reveal_vr_file", { path });
+}
+
+export function trashVrFile(path: string, scanGeneration: string) {
+  if (path === "") {
+    throw new Error("A VR Library file path is required.");
+  }
+  return window.__TAURI__.core.invoke<void>("trash_vr_file", {
+    path,
+    scanGeneration,
+  });
 }
 
 const vrDownloadStates = new Set<VrDownloadState>([

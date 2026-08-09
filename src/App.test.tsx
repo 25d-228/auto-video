@@ -133,6 +133,7 @@ let scanVrLibraryMock: Mock<() => Promise<string[]>>;
 let queryVrStorageMock: Mock<() => Promise<[string, string]>>;
 let openVrFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
 let revealVrFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
+let trashVrFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
 let loadVrDownloadLimitMock: Mock<() => Promise<string[]>>;
 let saveVrDownloadLimitMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
@@ -709,6 +710,7 @@ beforeEach(() => {
     .mockResolvedValue(["2199023255552", "549755813888"]);
   openVrFileMock = vi.fn().mockResolvedValue(undefined);
   revealVrFileMock = vi.fn().mockResolvedValue(undefined);
+  trashVrFileMock = vi.fn().mockResolvedValue(undefined);
   loadVrDownloadLimitMock = vi.fn().mockResolvedValue(["unlimited"]);
   saveVrDownloadLimitMock = vi
     .fn()
@@ -875,13 +877,15 @@ beforeEach(() => {
             savedVrFolder = null;
           });
         case "scan_vr_library":
-          return scanVrLibraryMock();
+          return scanVrLibraryMock().then((rows) => ["1", ...rows]);
         case "query_vr_storage":
           return queryVrStorageMock();
         case "open_vr_file":
           return openVrFileMock(parameters);
         case "reveal_vr_file":
           return revealVrFileMock(parameters);
+        case "trash_vr_file":
+          return trashVrFileMock(parameters);
         case "load_vr_download_limit":
           return loadVrDownloadLimitMock();
         case "save_vr_download_limit":
@@ -2741,9 +2745,10 @@ describe("parsed VR Library and Dashboard", () => {
     expect(
       await screen.findByRole("heading", {
         level: 3,
-        name: "2 VR titles · 3 files",
+        name: "1 grouped title · 3 supported files",
       }),
     ).toBeTruthy();
+    expect(screen.getByText("1 file remains unassociated.")).toBeTruthy();
     const vrSummary = screen.getByRole("region", { name: "VR Library" });
     expect(within(vrSummary).getByText("2.0 TiB")).toBeTruthy();
     expect(within(vrSummary).getByText("1.5 TiB")).toBeTruthy();
@@ -2903,6 +2908,387 @@ describe("parsed VR Library and Dashboard", () => {
         "2.0 TiB",
       ),
     ).toBeTruthy();
+  });
+
+  it("requires exact VR member confirmation and keeps every dismissal non-mutating", async () => {
+    savedVrFolder = "/VR";
+    const path = "/VR/作品/MDVR-419  Disc 01 — 前編.MKV";
+    scanVrLibraryMock.mockResolvedValue([path, "10"]);
+    const parentActivation = vi.fn();
+
+    render(
+      <div onClick={parentActivation} onPointerDown={parentActivation}>
+        <App />
+      </div>,
+    );
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const trashButton = await screen.findByRole("button", {
+      name: "Move VR file to Trash or Recycle Bin: MDVR-419 Disc 01 — 前編.MKV",
+    });
+    parentActivation.mockClear();
+    trashButton.focus();
+    fireEvent.click(trashButton);
+
+    let dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain(
+      "Move “MDVR-419  Disc 01 — 前編.MKV” to Trash?",
+    );
+    expect(dialog.textContent).toContain(
+      "exact member “MDVR-419  Disc 01 — 前編.MKV” of “MDVR-419” (Disc 01)",
+    );
+    expect(dialog.textContent).not.toContain(path);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("button", { name: "Cancel" }),
+      );
+    });
+    expect(trashVrFileMock).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    dialog = await screen.findByRole("alertdialog");
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Close confirmation" }),
+    );
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+
+    fireEvent.click(trashButton);
+    await screen.findByRole("alertdialog");
+    const backdrop = document.querySelector(".trash-dialog__backdrop");
+    if (backdrop === null) {
+      throw new Error("The VR Trash confirmation backdrop was not rendered.");
+    }
+    fireEvent.pointerDown(backdrop);
+    fireEvent.click(backdrop);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(trashButton));
+    expect(trashVrFileMock).not.toHaveBeenCalled();
+    expect(openVrFileMock).not.toHaveBeenCalled();
+    expect(revealVrFileMock).not.toHaveBeenCalled();
+    expect(clipboardWriteMock).not.toHaveBeenCalled();
+    expect(parentActivation).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("moves one MDVR-419 member once while preserving exact siblings and protected identities", async () => {
+    savedVrFolder = "/VR";
+    const removedPath = "/VR/MDVR-419 Part 01.mp4";
+    const remainingRows = [
+      "/VR/MDVR-419 Part 06.mp4",
+      "11",
+      "/VR/MDVR-419 PT 02.mkv",
+      "12",
+      "/VR/MDVR-419 CD3.mp4",
+      "13",
+      "/VR/MDVR-419 Disc 04.mkv",
+      "14",
+      "/VR/MDVR-419 Disk-5.mp4",
+      "15",
+      "/VR/MDVR-419 Part 01 Disc 02.mp4",
+      "16",
+      "/VR/MDVR-422.mp4",
+      "20",
+      "/VR/MDVR-430.mp4",
+      "30",
+      "/VR/MDVR-433.mp4",
+      "40",
+      "/VR/MDVR-374.mp4",
+      "50",
+      "/VR/MDVR-419 + ABC-123 pack.mkv",
+      "60",
+    ];
+    const initialRows = [removedPath, "10", ...remainingRows];
+    const pendingTrash = createDeferred<void>();
+    scanVrLibraryMock
+      .mockResolvedValueOnce(initialRows)
+      .mockResolvedValueOnce(remainingRows);
+    trashVrFileMock.mockReturnValueOnce(pendingTrash.promise);
+    queryVrStorageMock
+      .mockResolvedValueOnce(["1000", "400"])
+      .mockResolvedValueOnce(["1000", "410"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    await screen.findByRole("heading", { level: 3, name: "MDVR-419" });
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort titles" }), {
+      target: { value: "descending" },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "MDVR-419" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move VR file to Trash or Recycle Bin: MDVR-419 Part 01.mp4",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    const confirmButton = within(dialog).getByRole("button", {
+      name: "Confirm moving VR file to Trash or Recycle Bin: MDVR-419 Part 01.mp4",
+    });
+    fireEvent.click(confirmButton);
+    confirmButton.click();
+
+    expect(trashVrFileMock).toHaveBeenCalledTimes(1);
+    expect(trashVrFileMock).toHaveBeenCalledWith({
+      path: removedPath,
+      scanGeneration: "1",
+    });
+    expect(confirmButton).toHaveProperty("disabled", true);
+    expect(dialog.getAttribute("aria-busy")).toBe("true");
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveProperty(
+      "disabled",
+      true,
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "Close confirmation" }),
+    ).toHaveProperty("disabled", true);
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    const pendingBackdrop = document.querySelector(".trash-dialog__backdrop");
+    if (pendingBackdrop === null) {
+      throw new Error("The pending VR Trash backdrop was not rendered.");
+    }
+    fireEvent.click(pendingBackdrop);
+    expect(screen.getByRole("alertdialog")).toBe(dialog);
+
+    await act(async () => {
+      pendingTrash.resolve(undefined);
+      await pendingTrash.promise;
+    });
+    expect(
+      await screen.findByText(
+        "MDVR-419 Part 01.mp4 was moved to Trash or the Recycle Bin.",
+      ),
+    ).toBeTruthy();
+    expect(document.querySelector(`[data-vr-file-path="${removedPath}"]`)).toBeNull();
+    for (const [path, label] of [
+      ["/VR/MDVR-419 Part 06.mp4", "Part 06"],
+      ["/VR/MDVR-419 PT 02.mkv", "PT 02"],
+      ["/VR/MDVR-419 CD3.mp4", "CD3"],
+      ["/VR/MDVR-419 Disc 04.mkv", "Disc 04"],
+      ["/VR/MDVR-419 Disk-5.mp4", "Disk-5"],
+    ]) {
+      const row = document.querySelector(`[data-vr-file-path="${path}"]`);
+      expect(row?.textContent).toContain(label);
+    }
+    const ambiguousRow = document.querySelector(
+      '[data-vr-file-path="/VR/MDVR-419 Part 01 Disc 02.mp4"]',
+    );
+    expect(ambiguousRow?.textContent).toContain(
+      "/VR/MDVR-419 Part 01 Disc 02.mp4",
+    );
+    expect(ambiguousRow?.textContent).not.toContain("Part 01 ·");
+    expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
+      "value",
+      "MDVR-419",
+    );
+    expect(screen.getByRole("combobox", { name: "Sort titles" })).toHaveProperty(
+      "value",
+      "descending",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Clear VR search" }));
+    for (const code of ["MDVR-422", "MDVR-430", "MDVR-433", "MDVR-374"]) {
+      expect(screen.getByRole("heading", { level: 3, name: code })).toBeTruthy();
+    }
+    expect(
+      document.querySelector(
+        '[data-vr-file-path="/VR/MDVR-419 + ABC-123 pack.mkv"]',
+      ),
+    ).not.toBeNull();
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(scanTvLibraryMock).not.toHaveBeenCalled();
+    expect(scanAdultLibraryMock).not.toHaveBeenCalled();
+    expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
+    expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
+    expect(listVrDownloadsMock).not.toHaveBeenCalled();
+    expect(startVerifiedVrDownloadMock).not.toHaveBeenCalled();
+    expect(previewVrOrganizationMock).not.toHaveBeenCalled();
+    expect(applyVrOrganizationMock).not.toHaveBeenCalled();
+
+    selectDashboard();
+    const summary = screen.getByRole("region", { name: "VR Library" });
+    expect(
+      within(summary).getByRole("heading", {
+        level: 3,
+        name: "5 grouped titles · 11 supported files",
+      }),
+    ).toBeTruthy();
+    expect(within(summary).getByText("1 file remains unassociated.")).toBeTruthy();
+    expect(within(summary).getByText("590 B")).toBeTruthy();
+  });
+
+  it("keeps an accepted unassociated VR move truthful when reconciliation fails", async () => {
+    savedVrFolder = "/VR";
+    const removedPath = "/VR/Unassociated  —  remove me.MKV";
+    const remainingPath = "/VR/MDVR-419 Disk-4.mp4";
+    const initialRows = [removedPath, "10", remainingPath, "20"];
+    const remainingRows = [remainingPath, "20"];
+    scanVrLibraryMock
+      .mockResolvedValueOnce(initialRows)
+      .mockRejectedValueOnce("vr_library_scan_failed")
+      .mockResolvedValueOnce(remainingRows);
+    queryVrStorageMock
+      .mockResolvedValueOnce(["1000", "400"])
+      .mockRejectedValueOnce("vr_storage_failed")
+      .mockResolvedValueOnce(["1000", "420"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Move VR file to Trash or Recycle Bin: Unassociated — remove me.MKV",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain(
+      "exact unassociated file “Unassociated  —  remove me”",
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving VR file to Trash or Recycle Bin: Unassociated — remove me.MKV",
+      }),
+    );
+
+    expect(
+      await screen.findByText(
+        "Unassociated — remove me.MKV was moved to Trash or the Recycle Bin.",
+      ),
+    ).toBeTruthy();
+    expect(document.querySelector(`[data-vr-file-path="${removedPath}"]`)).toBeNull();
+    expect(document.querySelector(`[data-vr-file-path="${remainingPath}"]`))
+      .not.toBeNull();
+    const attention = await screen.findByRole("alert");
+    expect(attention.textContent).toContain("file move succeeded");
+    expect(attention.textContent).toContain("remains removed");
+    expect(trashVrFileMock).toHaveBeenCalledTimes(1);
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(
+      within(attention).getByRole("button", { name: "Retry reconciliation" }),
+    );
+    await screen.findByRole("heading", { level: 3, name: "MDVR-419" });
+    await waitFor(() => {
+      expect(screen.queryByText(/Library or storage could not be refreshed/))
+        .toBeNull();
+    });
+    expect(document.querySelector(`[data-vr-file-path="${removedPath}"]`)).toBeNull();
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(3);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    ["vr_file_trash_not_found", "This file is no longer available."],
+    [
+      "vr_file_trash_unavailable",
+      "Auto-Video could not access the configured VR folder.",
+    ],
+    ["vr_file_trash_not_file", "This item is not an eligible video file."],
+    [
+      "vr_file_trash_unsupported",
+      "This item is not a supported .mp4 or .mkv file.",
+    ],
+    [
+      "vr_file_trash_outside_folder",
+      "This file is outside the configured VR folder.",
+    ],
+    [
+      "vr_file_trash_stale",
+      "This file is no longer part of the latest VR Library scan.",
+    ],
+    [
+      "vr_file_trash_failed",
+      "The operating system could not move this file to Trash or the Recycle Bin.",
+    ],
+  ])("reports %s and preserves every current VR result", async (error, message) => {
+    savedVrFolder = "/VR";
+    const path = "/VR/MDVR-419 Disc 03.mp4";
+    scanVrLibraryMock.mockResolvedValue([path, "10"]);
+    trashVrFileMock.mockRejectedValueOnce(error);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Move VR file to Trash or Recycle Bin: MDVR-419 Disc 03.mp4",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving VR file to Trash or Recycle Bin: MDVR-419 Disc 03.mp4",
+      }),
+    );
+
+    expect(await within(dialog).findByRole("alert")).toHaveProperty(
+      "textContent",
+      message,
+    );
+    expect(document.querySelector(`[data-vr-file-path="${path}"]`)).not.toBeNull();
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
+    expect(trashVrFileMock).toHaveBeenCalledWith({
+      path,
+      scanGeneration: "1",
+    });
+  });
+
+  it("removing the final grouped VR member clamps only an invalid page", async () => {
+    savedVrFolder = "/VR";
+    const rows = Array.from({ length: 29 }, (_, index) => {
+      const code = `MDVR-${String(index + 101)}`;
+      return [`/VR/${code}.mp4`, "1"];
+    }).flat();
+    scanVrLibraryMock
+      .mockResolvedValueOnce(rows)
+      .mockResolvedValueOnce(rows.slice(0, -2));
+    gallerySizes.library = { width: 1528, height: 136 };
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    await screen.findByRole("heading", { level: 3, name: "MDVR-101" });
+    for (let page = 1; page < 5; page += 1) {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Next VR titles page" }),
+      );
+    }
+    expect(screen.getByText("Page 5 of 5")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move VR file to Trash or Recycle Bin: MDVR-129.mp4",
+      }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Confirm moving VR file to Trash or Recycle Bin: MDVR-129.mp4",
+      }),
+    );
+
+    expect(await screen.findByText("Page 4 of 4")).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 3, name: "MDVR-129" }))
+      .toBeNull();
+    expect(screen.getByRole("heading", { level: 3, name: "MDVR-128" }))
+      .toBeTruthy();
+    expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
+    expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
   });
 
   it("ignores late scan and storage results from a replaced VR folder", async () => {

@@ -48,7 +48,8 @@ use vr_download::{
 };
 use vr_library::{
     invalidate_vr_library, open_vr_file_with, reveal_vr_file_with, scan_vr_library_with,
-    VrLibraryState, VR_FILE_OPEN_FAILED, VR_FILE_REVEAL_FAILED, VR_LIBRARY_SCAN_FAILED,
+    trash_vr_file_with, VrLibraryState, VR_FILE_OPEN_FAILED, VR_FILE_REVEAL_FAILED,
+    VR_FILE_TRASH_FAILED, VR_LIBRARY_SCAN_FAILED,
 };
 use vr_torrent::{
     fetch_artifact_response, inspect_sukebei_adult_torrent_with, inspect_sukebei_torrent_with,
@@ -1606,6 +1607,32 @@ async fn reveal_vr_file(
 }
 
 #[tauri::command]
+async fn trash_vr_file(
+    path: String,
+    scan_generation: String,
+    download_state: tauri::State<'_, VrDownloadState>,
+    library_state: tauri::State<'_, VrLibraryState>,
+) -> Result<(), String> {
+    let scan_generation = scan_generation
+        .parse::<u64>()
+        .map_err(|_| vr_library::VR_FILE_TRASH_STALE.to_owned())?;
+    let download_state = download_state.inner().clone();
+    let library_state = library_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        trash_vr_file_with(
+            Path::new(&path),
+            scan_generation,
+            &download_state,
+            &library_state,
+            move_to_os_trash,
+        )
+    })
+    .await
+    .map_err(|_| VR_FILE_TRASH_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn load_vr_download_limit(
     app: tauri::AppHandle,
     state: tauri::State<'_, VrDownloadState>,
@@ -2294,6 +2321,7 @@ fn main() {
             query_vr_storage,
             open_vr_file,
             reveal_vr_file,
+            trash_vr_file,
             load_vr_download_limit,
             save_vr_download_limit,
             load_vr_downloads,
