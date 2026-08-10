@@ -7074,6 +7074,174 @@ describe("TMDB TV Discover", () => {
     expect(document.documentElement.dataset.theme).toBe("dark");
   });
 
+  it("keeps an accepted TV Start truthful when Downloads reconciliation needs a retry", async () => {
+    savedTvFolder = "/TV";
+    const showName = "Exact  Show — 特別版";
+    const episodeName = "第三話  —  Exact Episode";
+    const releaseName = "Exact  Show — 特別版.S02E03+720p.第三話";
+    const infohash = "0123456789abcdef0123456789abcdef01234567";
+    loadTmdbTokenMock.mockResolvedValue("episode-release-token");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ results: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({ results: [{ id: 701, name: showName }] }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 701,
+          name: showName,
+          seasons: [{ id: 9001, season_number: 2, name: "Season 2" }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          id: 9001,
+          season_number: 2,
+          episodes: [
+            {
+              id: 9103,
+              season_number: 2,
+              episode_number: 3,
+              name: episodeName,
+            },
+          ],
+        }),
+      );
+    fetchApiBayTvReleasesMock.mockResolvedValue([
+      "701",
+      showName,
+      "9001",
+      "2",
+      "9103",
+      "3",
+      episodeName,
+      "tt0123456",
+      "1",
+      "1001",
+      releaseName,
+      "205",
+      "",
+      "12",
+      "4",
+      "Exact Uploader",
+      "vip",
+      "1710000000",
+      infohash,
+      "API Bay",
+    ]);
+    inspectApiBayTvTorrentMock.mockResolvedValue([
+      "tv-inspection-1001",
+      "Exact  TV torrent",
+      infohash,
+      "7",
+      `${showName}/${episodeName}.mkv`,
+      "7",
+    ]);
+    listVrDownloadsMock.mockRejectedValueOnce(
+      new Error("snapshot temporarily unavailable"),
+    );
+    const exactTvRow = vrDownloadFixture({
+      category: "tv",
+      code: "tt0123456 · S02E03",
+      downloadedBytes: "0",
+      releaseName,
+      speedBytesPerSecond: "0",
+      state: "downloading",
+      totalBytes: "7",
+      transferId: "tv-transfer-123",
+    });
+    loadVrDownloadsMock
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(exactTvRow);
+
+    render(<App />);
+    selectDiscover();
+    await screen.findByRole("heading", { name: "No trending movies returned" });
+    selectTvDiscover();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /View details: Exact Show — 特別版/,
+      }),
+    );
+    const detailsDialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      await within(detailsDialog).findByRole("button", {
+        name: "View seasons",
+      }),
+    );
+    fireEvent.click(
+      within(detailsDialog).getByRole("button", { name: "Select Season 2" }),
+    );
+    fireEvent.click(
+      await within(detailsDialog).findByRole("button", {
+        name: "Find releases",
+      }),
+    );
+    const comparisonDialog = (
+      await screen.findByText(
+        /Metadata-only comparison for the exact selected episode/,
+      )
+    ).closest('[role="dialog"]') as HTMLElement;
+    const releaseLabel = [
+      ...comparisonDialog.querySelectorAll(".vr-releases__release-name"),
+    ].find((element) => element.textContent === releaseName);
+    expect(releaseLabel).toBeTruthy();
+    fireEvent.click(releaseLabel!.closest("button")!);
+    fireEvent.click(
+      await within(comparisonDialog).findByRole("button", {
+        name: "Inspect torrent",
+      }),
+    );
+    const inspectionDialog = (await screen.findByText("Exact TV torrent"))
+      .closest('[role="dialog"]') as HTMLElement;
+    fireEvent.click(within(inspectionDialog).getByRole("checkbox"));
+    fireEvent.click(
+      within(inspectionDialog).getByRole("button", {
+        name: "Start download",
+      }),
+    );
+
+    expect(
+      await within(inspectionDialog).findByText(
+        "TV download started with the selected files.",
+      ),
+    ).toBeTruthy();
+    expect(
+      await within(inspectionDialog).findByText(
+        "Start was accepted, but Downloads could not be refreshed. Retry to load the accepted transfer.",
+      ),
+    ).toBeTruthy();
+    expect(
+      within(inspectionDialog).queryByText(
+        "The selected-file download could not be started.",
+      ),
+    ).toBeNull();
+    expect(startVerifiedTvDownloadMock).toHaveBeenCalledOnce();
+    expect(startVerifiedTvDownloadMock).toHaveBeenCalledWith({
+      inspectionId: "tv-inspection-1001",
+      selectedFileIds: [0],
+    });
+
+    fireEvent.click(
+      within(inspectionDialog).getByRole("button", {
+        name: "Retry Downloads reconciliation",
+      }),
+    );
+    await waitFor(() => expect(loadVrDownloadsMock).toHaveBeenCalledTimes(2));
+    fireEvent.click(
+      within(inspectionDialog).getByRole("button", {
+        name: "Open Downloads",
+      }),
+    );
+    const tvCard = (await screen.findByRole("heading", {
+      name: "Exact Show — 特別版.S02E03+720p.第三話",
+    }))
+      .closest("article") as HTMLElement;
+    expect(within(tvCard).getByText("TV · tt0123456 · S02E03")).toBeTruthy();
+    expect(within(tvCard).getByRole("button", { name: "Pause" })).toBeTruthy();
+    expect(startVerifiedTvDownloadMock).toHaveBeenCalledOnce();
+  });
+
   it("invalidates a dismissed API Bay request and keeps its late rows out of a newer episode", async () => {
     const lateRelease = createDeferred<string[]>();
     loadTmdbTokenMock.mockResolvedValue("episode-release-token");

@@ -368,7 +368,7 @@ type AdultFolderUiState =
   | { status: "error" };
 type VrDownloadsUiState =
   | { status: "loading" }
-  | { status: "error" }
+  | { status: "error"; reason?: "reconciliation" }
   | { status: "ready"; downloads: VrDownload[] };
 type VrDownloadLimitUiState =
   | { status: "loading" }
@@ -2258,12 +2258,13 @@ function TvEpisodeReleaseComparison({
 
 function TvTorrentInspectionDialog({
   context,
-  downloadsReady,
+  downloadsState,
   folderState,
   libraryState,
   onOpenDownloads,
   onOpenSettings,
   onRetry,
+  onRetryDownloads,
   onSave,
   onStart,
   onToggleFile,
@@ -2273,12 +2274,13 @@ function TvTorrentInspectionDialog({
   state,
 }: {
   context: TvTorrentInspectionContext;
-  downloadsReady: boolean;
+  downloadsState: VrDownloadsUiState;
   folderState: TvFolderUiState;
   libraryState: TvLibraryScanState;
   onOpenDownloads: () => void;
   onOpenSettings: () => void;
   onRetry: () => void;
+  onRetryDownloads: () => void;
   onSave: () => void;
   onStart: () => void;
   onToggleFile: (fileId: number) => void;
@@ -2287,6 +2289,7 @@ function TvTorrentInspectionDialog({
   startState: TorrentStartState;
   state: TvTorrentInspectionState;
 }) {
+  const downloadsReady = downloadsState.status === "ready";
   const currentMessage =
     tvTorrentMessages[state.status === "ready" ? "loading" : state.status];
   const isFolderReady =
@@ -2465,6 +2468,25 @@ function TvTorrentInspectionDialog({
                 {startState.status === "success" ? (
                   <div className="vr-torrent__start-success" role="status">
                     <p>TV download started with the selected files.</p>
+                    {downloadsState.status === "error" &&
+                    downloadsState.reason === "reconciliation" ? (
+                      <div role="alert">
+                        <p>
+                          Start was accepted, but Downloads could not be
+                          refreshed. Retry to load the accepted transfer.
+                        </p>
+                        <Button
+                          onClick={onRetryDownloads}
+                          type="button"
+                          variant="outline"
+                        >
+                          <AppIcon name="refresh" />
+                          Retry Downloads reconciliation
+                        </Button>
+                      </div>
+                    ) : downloadsState.status === "loading" ? (
+                      <p>Reconciling the accepted transfer with Downloads…</p>
+                    ) : null}
                     <Button onClick={onOpenDownloads} type="button" variant="outline">
                       <AppIcon name="downloads" />
                       Open Downloads
@@ -8131,7 +8153,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setVrLibrarySelectedPage(1);
   };
 
-  const refreshVrDownloads = async () => {
+  const refreshVrDownloads = async (reason?: "reconciliation") => {
     const requestId = ++vrDownloadsRequestId.current;
     try {
       const downloads = await listVrDownloads();
@@ -8140,12 +8162,16 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       }
     } catch {
       if (requestId === vrDownloadsRequestId.current) {
-        setVrDownloadsState({ status: "error" });
+        setVrDownloadsState({ status: "error", reason });
       }
     }
   };
 
   const retryVrDownloads = async () => {
+    const reason =
+      vrDownloadsState.status === "error"
+        ? vrDownloadsState.reason
+        : undefined;
     const limitRequestId =
       vrDownloadLimitState.status === "error"
         ? ++vrDownloadLimitRequestId.current
@@ -8168,7 +8194,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       } catch {
         if (limitRequestId === vrDownloadLimitRequestId.current) {
           setVrDownloadLimitState({ status: "error" });
-          setVrDownloadsState({ status: "error" });
+          setVrDownloadsState({ status: "error", reason });
         }
         return;
       }
@@ -8180,7 +8206,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       }
     } catch {
       if (downloadsRequestId === vrDownloadsRequestId.current) {
-        setVrDownloadsState({ status: "error" });
+        setVrDownloadsState({ status: "error", reason });
       }
     }
   };
@@ -8973,7 +8999,6 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         tvTorrentInspectionState.inspection.inspectionId,
         selectedFileIds,
       );
-      await refreshVrDownloads();
       if (requestId === tvTorrentStartRequestId.current) {
         setTvTorrentStartState({ status: "success" });
       }
@@ -8984,9 +9009,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           message: downloadStartError(error, "TV"),
         });
       }
+      return;
     } finally {
       tvTorrentStartPending.current = false;
     }
+    await refreshVrDownloads("reconciliation");
   };
 
   const openDiscoverTvDetails = (show: TmdbTvShow, triggerId: string) => {
@@ -12098,14 +12125,18 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     {vrDownloadsState.status === "loading"
                       ? "Loading downloads"
                       : vrDownloadsState.status === "error"
-                        ? "Downloads could not be loaded"
+                        ? vrDownloadsState.reason === "reconciliation"
+                          ? "Downloads need reconciliation"
+                          : "Downloads could not be loaded"
                         : activeDestination.emptyHeading}
                   </h2>
                   <p>
                     {vrDownloadsState.status === "loading"
                       ? "Validating saved transfers and their selected files."
                       : vrDownloadsState.status === "error"
-                        ? "Retry to validate the local transfer state again."
+                        ? vrDownloadsState.reason === "reconciliation"
+                          ? "Start was accepted, but this view could not be refreshed. Retry to load the accepted transfer."
+                          : "Retry to validate the local transfer state again."
                         : activeDestination.emptyMessage}
                   </p>
                 </div>
@@ -12846,7 +12877,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         tvTorrentInspectionState === null ? null : (
           <TvTorrentInspectionDialog
             context={tvTorrentInspectionContext}
-            downloadsReady={vrDownloadsState.status === "ready"}
+            downloadsState={vrDownloadsState}
             folderState={tvFolderState}
             libraryState={tvLibraryScanState}
             onOpenDownloads={() =>
@@ -12856,6 +12887,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
               openDownloadDestinationFromInspection(settingsDestination, "tv")
             }
             onRetry={() => void retryTvTorrentInspection()}
+            onRetryDownloads={() => void retryVrDownloads()}
             onSave={() => void saveTvTorrent()}
             onStart={() => void startTvDownload()}
             onToggleFile={toggleTvTorrentFile}

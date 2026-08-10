@@ -10154,6 +10154,230 @@ mod tests {
     }
 
     #[test]
+    fn tv_explicit_start_survives_pause_restart_resume_cancel_restart_and_durable_dismiss() {
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("TV — lifecycle");
+        fs::create_dir_all(&destination).expect("TV destination must exist");
+        let destination = fs::canonicalize(destination).expect("TV destination must canonicalize");
+        let (release_state, torrent_state, inspection_id) =
+            inspected_tv_torrent(selected_file_torrent());
+        let persistence_path = fixture.path.join("downloads");
+        let download_limit_path = fixture.path.join("limit");
+        let state = VrDownloadState::default();
+        let exact_authority = |record: &TransferRecord| {
+            (
+                record.transfer_id.clone(),
+                record.category,
+                record.code.clone(),
+                record.release_name.clone(),
+                record.tv_identity.clone(),
+                record.infohash.clone(),
+                record.metainfo.clone(),
+                record.selected_files.clone(),
+                record.destination.clone(),
+                record.fingerprints.clone(),
+                record.current_paths.clone(),
+                record.organization_state,
+            )
+        };
+
+        tauri::async_runtime::block_on(async {
+            load_downloads(
+                &state,
+                &persistence_path,
+                &fixture.path.join("session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("empty shared transfer state must load");
+            save_download_limit(&state, &download_limit_path, Some("2"))
+                .expect("finite aggregate limit must persist");
+            configure_tv_download_folder(&state, Some(destination.clone()))
+                .expect("native TV folder must configure");
+            let transfer_id = start_tv_download(
+                &state,
+                &torrent_state,
+                &release_state,
+                &persistence_path,
+                &fixture.path.join("session"),
+                &inspection_id,
+                &[1],
+            )
+            .await
+            .expect("explicit selected TV file must start");
+            let selected_path = destination.join("Folder/特別版  B.mp4");
+            let deselected_path = destination.join("Folder/Part  1 — 映画.mkv");
+            assert!(selected_path.is_file());
+            assert!(!deselected_path.exists());
+
+            pause_download(&state, &persistence_path, &transfer_id)
+                .await
+                .expect("TV transfer must pause and persist");
+            let expected_authority = {
+                let mut context = state.0.lock().expect("download state must lock");
+                let record = find_valid_record_mut(&mut context.transfers, &transfer_id)
+                    .expect("started TV transfer must remain valid");
+                assert_eq!(record.state, TransferState::Paused);
+                let boundary_storage = SelectedFileStorage {
+                    destination: record.destination.clone(),
+                    selected_files: Arc::new(
+                        record
+                            .selected_files
+                            .iter()
+                            .cloned()
+                            .map(|file| (file.file_id, file))
+                            .collect(),
+                    ),
+                    boundary_segments: record.boundary_segments.clone(),
+                    resume: true,
+                    slots: vec![SelectedStorageSlot::new(None)],
+                };
+                boundary_storage
+                    .pwrite_all(0, 0, b"ab")
+                    .expect("boundary-piece progress must be retained");
+                let authority = exact_authority(record);
+                write_persisted_transfers(&persistence_path, &context.transfers)
+                    .expect("paused TV boundary progress must persist");
+                authority
+            };
+            let selected_media = fs::read(&selected_path).expect("selected TV media must exist");
+            assert!(!deselected_path.exists());
+
+            let restarted = VrDownloadState::default();
+            configure_tv_download_folder(&restarted, Some(destination.clone()))
+                .expect("TV folder must restore");
+            let rows = load_downloads(
+                &restarted,
+                &persistence_path,
+                &fixture.path.join("restart-session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("paused TV transfer must reload");
+            assert_eq!(rows[0], transfer_id);
+            assert_eq!(rows[1], "tv");
+            assert_eq!(rows[2], "tt0123456 · S02E03");
+            assert_eq!(rows[3], "Exact  Show — 特別版.S02E03+720p.第三話");
+            assert_eq!(rows[8], "paused");
+            assert_eq!(rows[9], "true");
+            {
+                let mut context = restarted.0.lock().expect("restarted state must lock");
+                assert_eq!(
+                    context.download_limit,
+                    DownloadLimitState::Loaded(NonZeroU32::new(2))
+                );
+                let record = find_valid_record_mut(&mut context.transfers, &transfer_id)
+                    .expect("restarted TV transfer must remain exact");
+                assert_eq!(exact_authority(record), expected_authority);
+                let boundary = record
+                    .boundary_segments
+                    .lock()
+                    .expect("boundary state must lock");
+                assert_eq!(boundary[&0][0].offset, 0);
+                assert_eq!(boundary[&0][0].bytes, b"ab");
+                assert!(record.handle.is_some());
+            }
+            assert_eq!(
+                fs::read(&selected_path).expect("selected media must survive restart"),
+                selected_media
+            );
+            assert!(!deselected_path.exists());
+
+            resume_download(&restarted, &persistence_path, &transfer_id)
+                .await
+                .expect("paused TV transfer must resume explicitly");
+            {
+                let mut context = restarted.0.lock().expect("resumed state must lock");
+                let record = find_valid_record_mut(&mut context.transfers, &transfer_id)
+                    .expect("resumed TV transfer must remain valid");
+                assert_eq!(record.state, TransferState::Downloading);
+                assert_eq!(exact_authority(record), expected_authority);
+                assert_eq!(
+                    record
+                        .boundary_segments
+                        .lock()
+                        .expect("boundary state must lock")[&0][0]
+                        .bytes,
+                    b"ab"
+                );
+            }
+            assert_eq!(
+                fs::read(&selected_path).expect("resume must retain selected media"),
+                selected_media
+            );
+            assert!(!deselected_path.exists());
+
+            cancel_download(&restarted, &persistence_path, &transfer_id)
+                .await
+                .expect("TV cancel must retain all partial data");
+            assert_eq!(
+                fs::read(&selected_path).expect("cancel must retain selected media"),
+                selected_media
+            );
+            assert!(!deselected_path.exists());
+
+            let cancelled_restart = VrDownloadState::default();
+            configure_tv_download_folder(&cancelled_restart, Some(destination.clone()))
+                .expect("TV folder must remain current");
+            let rows = load_downloads(
+                &cancelled_restart,
+                &persistence_path,
+                &fixture.path.join("cancelled-restart-session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("cancelled TV transfer must reload");
+            assert_eq!(rows[0], transfer_id);
+            assert_eq!(rows[1], "tv");
+            assert_eq!(rows[8], "cancelled");
+            assert_eq!(rows[9], "true");
+            {
+                let mut context = cancelled_restart
+                    .0
+                    .lock()
+                    .expect("cancelled restart state must lock");
+                let record = find_valid_record_mut(&mut context.transfers, &transfer_id)
+                    .expect("cancelled TV transfer must remain exact");
+                assert_eq!(exact_authority(record), expected_authority);
+                assert_eq!(
+                    record
+                        .boundary_segments
+                        .lock()
+                        .expect("boundary state must lock")[&0][0]
+                        .bytes,
+                    b"ab"
+                );
+                assert!(record.handle.is_none());
+            }
+            dismiss_download(&cancelled_restart, &persistence_path, &transfer_id)
+                .expect("terminal TV row must dismiss durably");
+            assert_eq!(
+                fs::read(&selected_path).expect("dismiss must retain selected media"),
+                selected_media
+            );
+            assert!(!deselected_path.exists());
+
+            let dismissed_restart = VrDownloadState::default();
+            configure_tv_download_folder(&dismissed_restart, Some(destination.clone()))
+                .expect("TV folder must remain configured");
+            assert!(load_downloads(
+                &dismissed_restart,
+                &persistence_path,
+                &fixture.path.join("dismissed-restart-session"),
+                &download_limit_path,
+            )
+            .await
+            .expect("dismissed TV state must remain readable")
+            .is_empty());
+            assert_eq!(
+                fs::read(&selected_path).expect("durable dismiss must retain media"),
+                selected_media
+            );
+            assert!(!deselected_path.exists());
+        });
+    }
+
+    #[test]
     fn tv_library_trash_rejects_a_selected_transfer_file_without_mutating_transfer_state() {
         let fixture = FilesystemFixture::new();
         let destination = fixture.path.join("TV — transfer-owned");
