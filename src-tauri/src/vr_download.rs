@@ -3807,7 +3807,6 @@ fn organization_destination_relative(
                 .tv_identity
                 .as_deref()
                 .ok_or(VR_ORGANIZATION_INELIGIBLE)?;
-            validate_portable_organization_component(source_name)?;
             let destination_name = format!(
                 "{} - S{:02}E{:02} - {}.{extension}",
                 identity.show_name,
@@ -7217,6 +7216,60 @@ mod tests {
             fs::read(fixture.path.join("Provider/notes  exact.txt"),)
                 .expect("dismissal must retain selected non-media"),
             vec![b'b'; 4]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tv_organization_discards_a_nonportable_source_basename_and_regroups_the_exact_episode() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = tv_download_source(
+            &[("Provider/CON.MP4", 5), ("Provider/notes exact.txt", 4)],
+            &[0, 1],
+        );
+        let record = completed_tv_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+        let target_relative = "Exact  Show — 特別版/Season 02/Exact  Show — 特別版 - S02E03 - 第三話  —  Exact Episode.MP4";
+
+        let preview = preview_organization(&state, &transfer_id)
+            .expect("discarded source basename must not prevent an exact TV plan");
+        assert_eq!(
+            &preview[5..],
+            &[
+                "move",
+                "Provider/CON.MP4",
+                target_relative,
+                "non-media-unchanged",
+                "Provider/notes exact.txt",
+                "",
+            ]
+        );
+
+        apply_organization(&state, &persistence_path, &preview[0])
+            .expect("exact TV plan must apply");
+        let organized_file = destination.join(target_relative);
+        assert_eq!(
+            fs::read(&organized_file).expect("organized TV media must remain readable"),
+            vec![b'a'; 5]
+        );
+        assert!(!destination.join("Provider/CON.MP4").exists());
+        assert_eq!(
+            fs::read(destination.join("Provider/notes exact.txt"))
+                .expect("selected non-media must remain at its exact path"),
+            vec![b'b'; 4]
+        );
+
+        let library_state = TvLibraryState::default();
+        set_tv_folder(&library_state, &fixture.path.join("tv-folder"), destination)
+            .expect("TV Library folder must configure");
+        let scan = scan_tv_library_with(&library_state).expect("TV Library scan must succeed");
+        assert_eq!(scan.len(), 7);
+        assert_eq!(Path::new(&scan[1]), organized_file);
+        assert_eq!(
+            &scan[2..],
+            &[target_relative, "5", "Exact  Show — 特別版", "2", "3",]
         );
     }
 
