@@ -117,6 +117,7 @@ import {
   applyVrOrganization,
   canonicalizeProductCode,
   cancelVrDownload,
+  cleanupCancelledVrDownload,
   chooseVrFolder,
   clearVrFolder,
   dismissVrDownload,
@@ -368,7 +369,7 @@ type AdultFolderUiState =
   | { status: "error" };
 type VrDownloadsUiState =
   | { status: "loading" }
-  | { status: "error"; reason?: "reconciliation" }
+  | { status: "error"; reason?: "cleanup" | "reconciliation" }
   | { status: "ready"; downloads: VrDownload[] };
 type VrDownloadLimitUiState =
   | { status: "loading" }
@@ -5254,24 +5255,28 @@ function AdultLibraryCard({
 }
 
 function VrDownloadCard({
+  cleanupActionsDisabled,
   download,
   error,
   isPending,
   organizationPreview,
   onApplyOrganization,
   onCancel,
+  onCleanup,
   onCloseOrganization,
   onDismiss,
   onPause,
   onPreviewOrganization,
   onResume,
 }: {
+  cleanupActionsDisabled: boolean;
   download: VrDownload;
   error: string | null;
   isPending: boolean;
   organizationPreview: VrOrganizationPreview | null;
   onApplyOrganization: () => void;
   onCancel: () => void;
+  onCleanup: () => void;
   onCloseOrganization: () => void;
   onDismiss: () => void;
   onPause: () => void;
@@ -5279,12 +5284,15 @@ function VrDownloadCard({
   onResume: () => void;
 }) {
   const organizationCancelButton = useRef<HTMLButtonElement | null>(null);
+  const cleanupSafeButton = useRef<HTMLButtonElement | null>(null);
   const totalBytes = BigInt(download.totalBytes);
   const downloadedBytes = BigInt(download.downloadedBytes);
   const percent =
     totalBytes === 0n ? 0 : Number((downloadedBytes * 100n) / totalBytes);
   const stateLabel =
-    download.terminalRecovery
+    download.state === "cleanup"
+      ? "Cleanup needs attention"
+      : download.terminalRecovery
       ? "Persistence needs attention"
       : download.organizationStatus === "organized"
       ? "Organized"
@@ -5292,7 +5300,9 @@ function VrDownloadCard({
         ? "Organization needs attention"
         : download.state.charAt(0).toUpperCase() + download.state.slice(1);
   const stateClass =
-    download.terminalRecovery || download.organizationStatus === "attention"
+    download.state === "cleanup" ||
+    download.terminalRecovery ||
+    download.organizationStatus === "attention"
       ? "attention"
       : download.organizationStatus === "organized"
         ? "organized"
@@ -5351,7 +5361,9 @@ function VrDownloadCard({
         <span
           className={`vr-download-card__state is-${stateClass}`}
           role={
-            download.terminalRecovery || download.organizationStatus !== "none"
+            download.state === "cleanup" ||
+            download.terminalRecovery ||
+            download.organizationStatus !== "none"
               ? "status"
               : undefined
           }
@@ -5588,17 +5600,96 @@ function VrDownloadCard({
               </AlertDialog.Viewport>
             </AlertDialog.Portal>
           </AlertDialog.Root>
+        ) : download.state === "cleanup" ? (
+          download.cleanupAvailable ? (
+            <Button
+              disabled={isPending || cleanupActionsDisabled}
+              id={`vr-download-cleanup-${download.transferId}`}
+              onClick={onCleanup}
+              type="button"
+              variant="destructive"
+            >
+              <AppIcon name="trash" />
+              {isPending ? "Retrying cleanup…" : "Retry permanent cleanup"}
+            </Button>
+          ) : null
         ) : (
-          <Button
-            disabled={isPending}
-            id={`vr-download-dismiss-${download.transferId}`}
-            onClick={onDismiss}
-            type="button"
-            variant="outline"
-          >
-            <AppIcon name="close" />
-            {isPending ? "Dismissing…" : "Dismiss"}
-          </Button>
+          <>
+            {download.state === "cancelled" && download.cleanupAvailable ? (
+              <AlertDialog.Root>
+                <AlertDialog.Trigger
+                  render={
+                    <Button
+                      disabled={isPending || cleanupActionsDisabled}
+                      type="button"
+                      variant="destructive"
+                    >
+                      <AppIcon name="trash" />
+                      Permanently clean transfer files
+                    </Button>
+                  }
+                />
+                <AlertDialog.Portal>
+                  <AlertDialog.Backdrop className="trash-dialog__backdrop" />
+                  <AlertDialog.Viewport className="trash-dialog__viewport">
+                    <AlertDialog.Popup
+                      className="trash-dialog__popup"
+                      initialFocus={() => cleanupSafeButton.current}
+                    >
+                      <AlertDialog.Title>
+                        Permanently delete these selected files?
+                      </AlertDialog.Title>
+                      <AlertDialog.Description>
+                        Windows will permanently delete only the exact selected
+                        transfer files listed below. This does not use the
+                        Recycle Bin and cannot be undone.
+                      </AlertDialog.Description>
+                      <ul aria-label={`Selected files for ${download.releaseName}`}>
+                        {download.selectedFiles?.map((path) => (
+                          <li key={path}>{path}</li>
+                        ))}
+                      </ul>
+                      <div className="trash-dialog__actions">
+                        <AlertDialog.Close
+                          render={
+                            <Button
+                              ref={cleanupSafeButton}
+                              type="button"
+                              variant="outline"
+                            >
+                              Keep files
+                            </Button>
+                          }
+                        />
+                        <AlertDialog.Close
+                          render={
+                            <Button
+                              disabled={cleanupActionsDisabled}
+                              onClick={onCleanup}
+                              type="button"
+                              variant="destructive"
+                            >
+                              Permanently delete selected files
+                            </Button>
+                          }
+                        />
+                      </div>
+                    </AlertDialog.Popup>
+                  </AlertDialog.Viewport>
+                </AlertDialog.Portal>
+              </AlertDialog.Root>
+            ) : null}
+            <Button
+              disabled={isPending}
+              id={`vr-download-dismiss-${download.transferId}`}
+              onClick={onDismiss}
+              type="button"
+              variant="outline"
+            >
+              <AppIcon name="close" />
+              {isPending ? "Dismissing…" : "Dismiss"}
+            </Button>
+          </>
         )}
       </div>
       {tvOrganizationUnavailable ? (
@@ -5618,6 +5709,12 @@ function VrDownloadCard({
           The transfer stopped safely. Its exact terminal state is stored in
           recovery metadata because the Downloads file could not be updated.
           Media and partial data remain untouched.
+        </p>
+      ) : null}
+      {download.state === "cleanup" ? (
+        <p className="field-error" role="alert">
+          The cancelled transfer is stopped. Permanent cleanup can retry only
+          the exact selected files that remain.
         </p>
       ) : null}
     </article>
@@ -5744,6 +5841,7 @@ function summarizeVrDownloads(downloads: VrDownload[]): VrDownloadSummary {
       completedCount += 1;
     }
     if (
+      download.state === "cleanup" ||
       download.state === "offline" ||
       download.state === "failed" ||
       download.organizationStatus === "attention"
@@ -6132,6 +6230,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [pendingVrDownloadIds, setPendingVrDownloadIds] = useState<Set<string>>(
     new Set(),
   );
+  const [isVrCleanupPending, setIsVrCleanupPending] = useState(false);
+  const [vrCleanupAnnouncement, setVrCleanupAnnouncement] = useState<
+    string | null
+  >(null);
   const [vrDownloadErrors, setVrDownloadErrors] = useState<
     Record<string, string>
   >({});
@@ -6192,6 +6294,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const vrDownloadsRefreshPending = useRef(false);
   const vrDownloadLimitSavePending = useRef(false);
   const vrDownloadActionsPending = useRef(new Set<string>());
+  const vrCleanupPending = useRef(false);
   const trendingDiscoverResult = useRef<{
     refreshVersion: number;
     result: TmdbMoviesResult;
@@ -8236,7 +8339,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setVrLibrarySelectedPage(1);
   };
 
-  const refreshVrDownloads = async (reason?: "reconciliation") => {
+  const refreshVrDownloads = async (reason?: "cleanup" | "reconciliation") => {
     const requestId = ++vrDownloadsRequestId.current;
     try {
       const downloads = await listVrDownloads();
@@ -8594,6 +8697,86 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       setPendingVrDownloadIds(
         new Set(vrDownloadActionsPending.current),
       );
+    }
+  };
+
+  const cleanupCancelledDownload = async (download: VrDownload) => {
+    if (
+      vrCleanupPending.current ||
+      vrDownloadActionsPending.current.has(download.transferId)
+    ) {
+      return;
+    }
+    const currentState = currentVrDownloadsState.current;
+    const currentDownload =
+      currentState.status === "ready"
+        ? currentState.downloads.find(
+            (candidate) => candidate.transferId === download.transferId,
+          )
+        : undefined;
+    if (
+      currentDownload?.cleanupAvailable !== true ||
+      !["cancelled", "cleanup"].includes(currentDownload.state)
+    ) {
+      return;
+    }
+
+    vrCleanupPending.current = true;
+    setIsVrCleanupPending(true);
+    setVrCleanupAnnouncement(null);
+    vrDownloadActionsPending.current.add(download.transferId);
+    setPendingVrDownloadIds(new Set(vrDownloadActionsPending.current));
+    setVrDownloadErrors((errors) => {
+      const nextErrors = { ...errors };
+      delete nextErrors[download.transferId];
+      return nextErrors;
+    });
+    try {
+      const outcome = await cleanupCancelledVrDownload(download.transferId);
+      const downloadsReconciled = await refreshVrDownloads("cleanup");
+      if (outcome.isCurrentFolder) {
+        if (outcome.category === "adult") {
+          refreshAdultLibrary();
+        } else if (outcome.category === "movie") {
+          refreshMovies();
+        } else if (outcome.category === "tv") {
+          refreshTvLibrary();
+        } else {
+          refreshVrLibrary();
+        }
+      }
+      setVrCleanupAnnouncement(
+        downloadsReconciled
+          ? "The exact selected transfer files were permanently deleted."
+          : "The exact selected transfer files were permanently deleted, but Downloads still needs reconciliation.",
+      );
+      if (downloadsReconciled) {
+        setVrDownloadFocusTarget("vr-downloads-refresh");
+      }
+    } catch (error: unknown) {
+      await refreshVrDownloads();
+      const message = (() => {
+        switch (nativeErrorCode(error)) {
+          case "vr_download_action_invalid":
+            return "Permanent cleanup is available only for an exact durably cancelled Windows transfer.";
+          case "vr_download_stale":
+            return "Cleanup stopped because an exact file or ownership record changed. No replacement or unrelated file was deleted.";
+          case "vr_download_persistence_failed":
+            return "Cleanup could not make its exact recovery state durable. Review the current row before retrying.";
+          default:
+            return "Permanent cleanup could not finish. Retry only from the current Downloads state.";
+        }
+      })();
+      setVrDownloadErrors((errors) => ({
+        ...errors,
+        [download.transferId]: message,
+      }));
+      setVrDownloadFocusTarget(`vr-download-cleanup-${download.transferId}`);
+    } finally {
+      vrDownloadActionsPending.current.delete(download.transferId);
+      setPendingVrDownloadIds(new Set(vrDownloadActionsPending.current));
+      vrCleanupPending.current = false;
+      setIsVrCleanupPending(false);
     }
   };
 
@@ -12171,8 +12354,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   <p className="card-eyebrow">Selected-file transfers</p>
                   <h2 id="vr-downloads-heading">Movie, TV, Adult, and VR downloads</h2>
                   <p>
-                    Each row is managed independently. Cancelling keeps all
-                    downloaded files and partial data.
+                    Cancel stops a transfer and keeps every downloaded file
+                    and partial byte on macOS and Windows. A separate,
+                    explicitly confirmed permanent cleanup is available only
+                    for durably cancelled Windows transfers.
                   </p>
                 </div>
                 <Button
@@ -12186,6 +12371,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   Refresh
                 </Button>
               </div>
+              {vrCleanupAnnouncement === null ? null : (
+                <p aria-live="polite" role="status">
+                  {vrCleanupAnnouncement}
+                </p>
+              )}
               {vrDownloadsState.status === "ready" ? (
                 <div
                   aria-atomic="true"
@@ -12216,6 +12406,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                 <div className="vr-downloads__list">
                   {vrDownloadsState.downloads.map((download) => (
                     <VrDownloadCard
+                      cleanupActionsDisabled={isVrCleanupPending}
                       download={download}
                       error={vrDownloadErrors[download.transferId] ?? null}
                       isPending={pendingVrDownloadIds.has(download.transferId)}
@@ -12226,6 +12417,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       onCancel={() =>
                         void runVrDownloadAction(download, "cancel")
                       }
+                      onCleanup={() => void cleanupCancelledDownload(download)}
                       onCloseOrganization={closeDownloadOrganization}
                       onDismiss={() =>
                         void runVrDownloadAction(download, "dismiss")
@@ -12261,6 +12453,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       : vrDownloadsState.status === "error"
                         ? vrDownloadsState.reason === "reconciliation"
                           ? "Downloads need reconciliation"
+                          : vrDownloadsState.reason === "cleanup"
+                            ? "Cleanup needs reconciliation"
                           : "Downloads could not be loaded"
                         : activeDestination.emptyHeading}
                   </h2>
@@ -12270,6 +12464,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       : vrDownloadsState.status === "error"
                         ? vrDownloadsState.reason === "reconciliation"
                           ? "Start was accepted, but this view could not be refreshed. Retry to load the accepted transfer."
+                          : vrDownloadsState.reason === "cleanup"
+                            ? "Permanent cleanup succeeded, but this view could not be refreshed. Retry to reconcile Downloads without repeating cleanup."
                           : "Retry to validate the local transfer state again."
                         : activeDestination.emptyMessage}
                   </p>
