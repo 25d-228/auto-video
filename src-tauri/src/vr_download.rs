@@ -39,6 +39,7 @@ pub const VR_DOWNLOAD_LIMIT_STORAGE_FAILED: &str = "vr_download_limit_storage_fa
 pub const VR_DOWNLOAD_LIMIT_UNAVAILABLE: &str = "vr_download_limit_unavailable";
 pub const VR_DOWNLOAD_PERSISTENCE_FAILED: &str = "vr_download_persistence_failed";
 pub const VR_DOWNLOAD_STALE: &str = "vr_download_stale";
+pub const VR_DOWNLOAD_CLEANUP_FAILED: &str = "vr_download_cleanup_failed";
 pub const VR_FOLDER_STORAGE_FAILED: &str = "vr_folder_storage_failed";
 pub const VR_FOLDER_UNAVAILABLE: &str = "vr_folder_unavailable";
 pub const VR_ORGANIZATION_CONFLICT: &str = "vr_organization_conflict";
@@ -51,13 +52,16 @@ const LEGACY_PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_VR_DOWNLOADS_V1\n";
 const ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_ORGANIZATION_V2\n";
 const LEGACY_ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_VR_ORGANIZATION_V1\n";
 const TERMINAL_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_TRANSFER_TERMINAL_V1\n";
+const CLEANUP_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_WINDOWS_TRANSFER_CLEANUP_V1\n";
 const ORGANIZATION_RECOVERY_PREFIX: &str = ".auto-video-organization-";
 const ORGANIZATION_RECOVERY_SUFFIX: &str = ".recovery";
 const ORGANIZATION_RECOVERY_SUCCESSOR_SUFFIX: &str = ".recovery.next";
 const TERMINAL_RECOVERY_PREFIX: &str = ".auto-video-transfer-terminal-";
 const TERMINAL_RECOVERY_SUFFIX: &str = ".recovery";
+const CLEANUP_RECOVERY_PREFIX: &str = ".auto-video-windows-transfer-cleanup-";
 const PERSISTENCE_REPLACEMENT_SUFFIX: &str = ".next";
 const TERMINAL_RECOVERY_DIRECTORY: &str = ".auto-video-transfer-terminal-recovery";
+const CLEANUP_RECOVERY_DIRECTORY: &str = ".auto-video-windows-transfer-cleanup-recovery";
 const MAX_PERSISTENCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PERSISTED_TRANSFERS: usize = 100;
 const MAX_SELECTED_FILES: usize = 100_000;
@@ -112,6 +116,7 @@ enum TransferState {
     Cancelled,
     Offline,
     Failed,
+    Cleanup,
 }
 
 impl TransferState {
@@ -124,6 +129,7 @@ impl TransferState {
             Self::Cancelled => "cancelled",
             Self::Offline => "offline",
             Self::Failed => "failed",
+            Self::Cleanup => "cleanup",
         }
     }
 
@@ -136,6 +142,7 @@ impl TransferState {
             "cancelled" => Some(Self::Cancelled),
             "offline" => Some(Self::Offline),
             "failed" => Some(Self::Failed),
+            "cleanup" => Some(Self::Cleanup),
             _ => None,
         }
     }
@@ -186,6 +193,7 @@ impl OrganizationState {
     }
 }
 
+#[derive(Clone)]
 struct TransferRecord {
     transfer_id: String,
     category: TransferCategory,
@@ -207,6 +215,39 @@ struct TransferRecord {
     handle_generation: u64,
     terminal_recovery_generation: Option<u64>,
     pending_action: Option<TransferAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupFileState {
+    Present,
+    Deleted,
+    AbsentBeforeCleanup,
+}
+
+impl CleanupFileState {
+    #[cfg(any(target_os = "windows", test))]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Deleted => "deleted",
+            Self::AbsentBeforeCleanup => "absent",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "present" => Some(Self::Present),
+            "deleted" => Some(Self::Deleted),
+            "absent" => Some(Self::AbsentBeforeCleanup),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CleanupRecovery {
+    record: TransferRecord,
+    files: Vec<CleanupFileState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,6 +333,8 @@ struct VrDownloadContext {
     persistence_path: Option<PathBuf>,
     organization_generation: u64,
     organization_plan: Option<OrganizationPlan>,
+    #[cfg(any(target_os = "windows", test))]
+    cleanup_transfer_id: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -377,6 +420,9 @@ fn with_unowned_library_path<T>(
         .as_deref()
         .ok_or(VrLibraryTrashOwnershipError::Unavailable)?;
     if durable_terminal_recovery_owns_path(persistence_path, requested_path)? {
+        return Err(VrLibraryTrashOwnershipError::Owned);
+    }
+    if durable_cleanup_recovery_owns_path(persistence_path, requested_path)? {
         return Err(VrLibraryTrashOwnershipError::Owned);
     }
     let folder = configured_folder(&context, category);
@@ -1879,6 +1925,240 @@ fn remove_terminal_recovery(
     Ok(())
 }
 
+fn cleanup_recovery_directory(persistence_path: &Path) -> Result<PathBuf, &'static str> {
+    Ok(persistence_path
+        .parent()
+        .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?
+        .join(CLEANUP_RECOVERY_DIRECTORY))
+}
+
+fn cleanup_recovery_path(
+    persistence_path: &Path,
+    record: &TransferRecord,
+) -> Result<PathBuf, &'static str> {
+    Ok(cleanup_recovery_directory(persistence_path)?.join(format!(
+        "{CLEANUP_RECOVERY_PREFIX}{}{TERMINAL_RECOVERY_SUFFIX}",
+        record.transfer_id
+    )))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn encoded_cleanup_recovery(recovery: &CleanupRecovery) -> Result<Vec<u8>, &'static str> {
+    if recovery.record.state != TransferState::Cleanup
+        || recovery.record.organization_state != OrganizationState::None
+        || recovery.record.fingerprints.len() != recovery.record.selected_files.len()
+        || recovery.files.len() != recovery.record.selected_files.len()
+    {
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+    }
+    let states = recovery
+        .files
+        .iter()
+        .map(|state| state.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let encoded_record = encode_transfer(&recovery.record)?;
+    let mut checksum_input = states.as_bytes().to_vec();
+    checksum_input.push(b'\n');
+    checksum_input.extend_from_slice(&encoded_record);
+    let mut bytes = CLEANUP_RECOVERY_HEADER.to_vec();
+    bytes.extend_from_slice(hex_sha1(&checksum_input).as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&checksum_input);
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_PERSISTENCE_BYTES {
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+    }
+    Ok(bytes)
+}
+
+fn parse_cleanup_recovery(persistence_path: &Path, path: &Path) -> Option<CleanupRecovery> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PERSISTENCE_BYTES
+    {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let fields = bytes
+        .strip_prefix(CLEANUP_RECOVERY_HEADER)?
+        .split(|byte| *byte == b'\n')
+        .collect::<Vec<_>>();
+    let [checksum, states, encoded_record, trailing] = fields.as_slice() else {
+        return None;
+    };
+    if !trailing.is_empty() || checksum.len() != 40 {
+        return None;
+    }
+    let mut checksum_input = states.to_vec();
+    checksum_input.push(b'\n');
+    checksum_input.extend_from_slice(encoded_record);
+    if checksum != &hex_sha1(&checksum_input).as_bytes() {
+        return None;
+    }
+    let files = std::str::from_utf8(states)
+        .ok()?
+        .split(',')
+        .map(CleanupFileState::from_str)
+        .collect::<Option<Vec<_>>>()?;
+    let record = parse_transfer_line(encoded_record, false)?;
+    if record.state != TransferState::Cleanup
+        || record.organization_state != OrganizationState::None
+        || record.handle.is_some()
+        || record.pending_action.is_some()
+        || files.len() != record.selected_files.len()
+        || cleanup_recovery_path(persistence_path, &record)
+            .ok()?
+            .as_path()
+            != path
+    {
+        return None;
+    }
+    Some(CleanupRecovery { record, files })
+}
+
+fn cleanup_recovery_paths(persistence_path: &Path) -> Result<Vec<PathBuf>, &'static str> {
+    let directory = cleanup_recovery_directory(persistence_path)?;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+    };
+    let metadata = fs::symlink_metadata(&directory).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+    }
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+        let name = entry.file_name();
+        let Some(transfer_id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(CLEANUP_RECOVERY_PREFIX))
+            .and_then(|name| name.strip_suffix(TERMINAL_RECOVERY_SUFFIX))
+        else {
+            continue;
+        };
+        if transfer_id.len() != 40 || !transfer_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        if paths.len() >= MAX_PERSISTED_TRANSFERS {
+            return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+        }
+        paths.push(entry.path());
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn read_cleanup_recoveries(persistence_path: &Path) -> Result<Vec<CleanupRecovery>, &'static str> {
+    cleanup_recovery_paths(persistence_path)?
+        .into_iter()
+        .map(|path| {
+            parse_cleanup_recovery(persistence_path, &path).ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)
+        })
+        .collect()
+}
+
+fn same_cleanup_record_identity(left: &TransferRecord, right: &TransferRecord) -> bool {
+    left.transfer_id == right.transfer_id
+        && left.category == right.category
+        && left.code == right.code
+        && left.release_name == right.release_name
+        && left.movie_identity == right.movie_identity
+        && left.tv_identity == right.tv_identity
+        && left.infohash == right.infohash
+        && left.metainfo == right.metainfo
+        && left.selected_files == right.selected_files
+        && left.destination == right.destination
+        && left.fingerprints == right.fingerprints
+        && left.current_paths == right.current_paths
+        && left.organization_state == right.organization_state
+        && left.downloaded_bytes == right.downloaded_bytes
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn write_cleanup_recovery(
+    persistence_path: &Path,
+    recovery: &CleanupRecovery,
+) -> Result<(), &'static str> {
+    let directory = cleanup_recovery_directory(persistence_path)?;
+    fs::create_dir_all(&directory).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    let metadata = fs::symlink_metadata(&directory).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+    }
+    let path = cleanup_recovery_path(persistence_path, &recovery.record)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            let existing = parse_cleanup_recovery(persistence_path, &path)
+                .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+            let file_states_advance =
+                existing
+                    .files
+                    .iter()
+                    .zip(&recovery.files)
+                    .all(|(before, after)| {
+                        before == after
+                            || (*before == CleanupFileState::Present
+                                && *after == CleanupFileState::Deleted)
+                    });
+            let existing_boundary = encoded_boundary_segments(&existing.record)?;
+            let next_boundary = encoded_boundary_segments(&recovery.record)?;
+            let boundary_is_valid = existing_boundary == next_boundary
+                || (recovery
+                    .files
+                    .iter()
+                    .all(|state| *state != CleanupFileState::Present)
+                    && next_boundary.is_empty());
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || !same_cleanup_record_identity(&existing.record, &recovery.record)
+                || !file_states_advance
+                || !boundary_is_valid
+            {
+                return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+    }
+    let bytes = encoded_cleanup_recovery(recovery)?;
+    let replacement = path_with_suffix(&path, PERSISTENCE_REPLACEMENT_SUFFIX)?;
+    clear_stale_persistence_replacement(&replacement)?;
+    write_replacement_file(&replacement, &bytes)?;
+    if let Err(error) = replace_persistence_file(&replacement, &path) {
+        let _ = fs::remove_file(replacement);
+        return Err(error);
+    }
+    sync_parent_directory(&path);
+    Ok(())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn remove_cleanup_recovery(
+    persistence_path: &Path,
+    expected: &CleanupRecovery,
+) -> Result<(), &'static str> {
+    let path = cleanup_recovery_path(persistence_path, &expected.record)?;
+    let current =
+        parse_cleanup_recovery(persistence_path, &path).ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    if !same_transfer_authority(&current.record, &expected.record)
+        || current.record.state != expected.record.state
+        || current.record.downloaded_bytes != expected.record.downloaded_bytes
+        || current.files != expected.files
+    {
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+    }
+    fs::remove_file(&path).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    sync_parent_directory(&path);
+    if let Ok(directory) = cleanup_recovery_directory(persistence_path) {
+        let _ = fs::remove_dir(directory);
+    }
+    Ok(())
+}
+
 fn organization_recovery_path(record: &TransferRecord) -> PathBuf {
     record.destination.join(format!(
         "{ORGANIZATION_RECOVERY_PREFIX}{}{ORGANIZATION_RECOVERY_SUFFIX}",
@@ -2215,6 +2495,22 @@ fn durable_terminal_recovery_owns_path(
         let record = parse_terminal_recovery(persistence_path, &path)
             .ok_or(VrLibraryTrashOwnershipError::Unavailable)?;
         if transfer_record_owns_path(&record, requested_path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn durable_cleanup_recovery_owns_path(
+    persistence_path: &Path,
+    requested_path: &Path,
+) -> Result<bool, VrLibraryTrashOwnershipError> {
+    for path in cleanup_recovery_paths(persistence_path)
+        .map_err(|_| VrLibraryTrashOwnershipError::Unavailable)?
+    {
+        let recovery = parse_cleanup_recovery(persistence_path, &path)
+            .ok_or(VrLibraryTrashOwnershipError::Unavailable)?;
+        if transfer_record_owns_path(&recovery.record, requested_path)? {
             return Ok(true);
         }
     }
@@ -2838,30 +3134,109 @@ extern "system" {
         file: *mut std::ffi::c_void,
         information: *mut WindowsFileInformation,
     ) -> i32;
+
+    #[link_name = "SetFileInformationByHandle"]
+    fn set_file_information_by_handle(
+        file: *mut std::ffi::c_void,
+        information_class: i32,
+        information: *const std::ffi::c_void,
+        information_size: u32,
+    ) -> i32;
 }
 
 #[cfg(target_os = "windows")]
-fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
+fn open_file_fingerprint(file: &File) -> io::Result<String> {
     use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
 
-    let metadata = fs::symlink_metadata(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(VR_DOWNLOAD_DESTINATION_CONFLICT);
-    }
-    let file = File::open(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
     let mut information = MaybeUninit::<WindowsFileInformation>::uninit();
     // Rust's equivalent metadata methods are unstable, so use the stable Windows handle API.
     let succeeded = unsafe {
         get_file_information_by_handle(file.as_raw_handle().cast(), information.as_mut_ptr())
     };
     if succeeded == 0 {
-        return Err(VR_FOLDER_UNAVAILABLE);
+        return Err(io::Error::last_os_error());
     }
     // The Windows API initialized the complete structure after reporting success.
     let information = unsafe { information.assume_init() };
     let file_index =
         (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
     Ok(format!("{}:{file_index}", information.volume_serial_number))
+}
+
+#[cfg(target_os = "windows")]
+fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(VR_DOWNLOAD_DESTINATION_CONFLICT);
+    }
+    let file = File::open(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
+    open_file_fingerprint(&file).map_err(|_| VR_FOLDER_UNAVAILABLE)
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct WindowsFileDispositionInformation {
+    delete_file: i32,
+}
+
+#[cfg(target_os = "windows")]
+fn delete_exact_windows_cleanup_file_with(
+    target: &Path,
+    expected_fingerprint: &str,
+    before_disposition: impl FnOnce() -> io::Result<()>,
+) -> Result<(), &'static str> {
+    use std::{
+        mem::size_of,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    };
+
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+
+    let metadata = fs::symlink_metadata(target).map_err(|_| VR_DOWNLOAD_STALE)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(VR_DOWNLOAD_STALE);
+    }
+    let file = OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(target)
+        .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    if open_file_fingerprint(&file).map_err(|_| VR_DOWNLOAD_STALE)? != expected_fingerprint {
+        return Err(VR_DOWNLOAD_STALE);
+    }
+    before_disposition().map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    let disposition = WindowsFileDispositionInformation { delete_file: 1 };
+    let succeeded = unsafe {
+        set_file_information_by_handle(
+            file.as_raw_handle().cast(),
+            FILE_DISPOSITION_INFO_CLASS,
+            (&disposition as *const WindowsFileDispositionInformation).cast(),
+            size_of::<WindowsFileDispositionInformation>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        return Err(VR_DOWNLOAD_CLEANUP_FAILED);
+    }
+    drop(file);
+    match fs::symlink_metadata(target) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        _ => Err(VR_DOWNLOAD_STALE),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn delete_exact_windows_cleanup_file(
+    target: &Path,
+    expected_fingerprint: &str,
+) -> Result<(), &'static str> {
+    delete_exact_windows_cleanup_file_with(target, expected_fingerprint, || Ok(()))
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
@@ -2958,6 +3333,77 @@ fn has_active_duplicate(transfers: &[StoredTransfer], infohash: &str, destinatio
         }
         StoredTransfer::Corrupt(_) => false,
     })
+}
+
+fn corrupt_transfer_may_hold_cleanup_authority(record: &CorruptTransferRecord) -> bool {
+    let state = record
+        .raw_line
+        .split(|byte| *byte == b'\t')
+        .nth(5)
+        .and_then(|state| std::str::from_utf8(state).ok())
+        .and_then(TransferState::from_str);
+    state.is_none_or(|state| state == TransferState::Cleanup)
+}
+
+fn cleanup_record_start_conflict(
+    cleanup: &TransferRecord,
+    proposed: &TransferRecord,
+    proposed_targets: &[PathBuf],
+) -> Result<Option<&'static str>, &'static str> {
+    if cleanup.transfer_id == proposed.transfer_id {
+        return Ok(Some(VR_DOWNLOAD_DUPLICATE));
+    }
+    for target in proposed_targets {
+        if transfer_record_owns_path(cleanup, target).map_err(|_| VR_DOWNLOAD_STALE)? {
+            return Ok(Some(VR_DOWNLOAD_DESTINATION_CONFLICT));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_cleanup_start_reservations(
+    context: &VrDownloadContext,
+    persistence_path: &Path,
+    proposed: &TransferRecord,
+) -> Result<(), &'static str> {
+    let recoveries = read_cleanup_recoveries(persistence_path).map_err(|_| VR_DOWNLOAD_STALE)?;
+    let proposed_targets = proposed
+        .selected_files
+        .iter()
+        .map(|file| selected_target(&proposed.destination, file))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for transfer in &context.transfers {
+        match transfer {
+            StoredTransfer::Valid(cleanup) if cleanup.state == TransferState::Cleanup => {
+                if !recoveries.iter().any(|recovery| {
+                    recovery.record.state == TransferState::Cleanup
+                        && same_terminal_authority(cleanup, &recovery.record)
+                }) {
+                    return Err(VR_DOWNLOAD_STALE);
+                }
+                if let Some(error) =
+                    cleanup_record_start_conflict(cleanup, proposed, &proposed_targets)?
+                {
+                    return Err(error);
+                }
+            }
+            StoredTransfer::Corrupt(record)
+                if corrupt_transfer_may_hold_cleanup_authority(record) =>
+            {
+                return Err(VR_DOWNLOAD_STALE);
+            }
+            StoredTransfer::Valid(_) | StoredTransfer::Corrupt(_) => {}
+        }
+    }
+    for recovery in recoveries {
+        if let Some(error) =
+            cleanup_record_start_conflict(&recovery.record, proposed, &proposed_targets)?
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn finalize_monitored_transfer_with(
@@ -3277,7 +3723,19 @@ async fn load_downloads_with_persistence(
             return Err(error);
         }
     };
-    let has_durable_recovery = !recoveries.is_empty() || !terminal_recoveries.is_empty();
+    let cleanup_recoveries = match read_cleanup_recoveries(persistence_path) {
+        Ok(recoveries) => recoveries,
+        Err(error) => {
+            state
+                .0
+                .lock()
+                .map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?
+                .transfers_loading = false;
+            return Err(error);
+        }
+    };
+    let has_durable_recovery =
+        !recoveries.is_empty() || !terminal_recoveries.is_empty() || !cleanup_recoveries.is_empty();
     let mut transfers = match persisted_transfers {
         Ok(transfers) => transfers,
         Err(_) if has_durable_recovery => Vec::new(),
@@ -3328,6 +3786,34 @@ async fn load_downloads_with_persistence(
             None => {}
         }
     }
+    for recovery in cleanup_recoveries {
+        if recovery.files.len() != recovery.record.selected_files.len() {
+            return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+        }
+        let existing = transfers.iter().position(|transfer| {
+            matches!(transfer, StoredTransfer::Valid(record) if record.transfer_id == recovery.record.transfer_id)
+        });
+        match existing {
+            Some(index) => {
+                let StoredTransfer::Valid(record) = &transfers[index] else {
+                    continue;
+                };
+                if !same_cleanup_record_identity(record, &recovery.record) {
+                    state
+                        .0
+                        .lock()
+                        .map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?
+                        .transfers_loading = false;
+                    return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+                }
+                transfers[index] = StoredTransfer::Valid(recovery.record);
+            }
+            None if transfers.len() < MAX_PERSISTED_TRANSFERS => {
+                transfers.push(StoredTransfer::Valid(recovery.record));
+            }
+            None => {}
+        }
+    }
     let active_ids = {
         let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
         context.transfers_loading = false;
@@ -3335,7 +3821,9 @@ async fn load_downloads_with_persistence(
         context.transfers_loaded = true;
         for transfer in &mut context.transfers {
             if let StoredTransfer::Valid(record) = transfer {
-                if validate_resume_context(record).is_err() {
+                if record.state != TransferState::Cleanup
+                    && validate_resume_context(record).is_err()
+                {
                     if record.organization_state == OrganizationState::None {
                         record.state = TransferState::Offline;
                     } else {
@@ -4429,6 +4917,18 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                         .is_ok()
                         .to_string(),
                     record.terminal_recovery_generation.is_some().to_string(),
+                    record
+                        .selected_files
+                        .iter()
+                        .map(|file| encode_hex(file.path.as_bytes()))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    (cfg!(target_os = "windows")
+                        && matches!(
+                            record.state,
+                            TransferState::Cancelled | TransferState::Cleanup
+                        ))
+                    .to_string(),
                 ]);
             }
             StoredTransfer::Corrupt(record) => rows.extend([
@@ -4449,6 +4949,8 @@ fn download_rows(context: &mut VrDownloadContext) -> Vec<String> {
                 OrganizationState::None.as_str().to_owned(),
                 String::new(),
                 "false".to_owned(),
+                "false".to_owned(),
+                String::new(),
                 "false".to_owned(),
             ]),
         }
@@ -4488,17 +4990,21 @@ fn list_downloads_with_persistence(
         .map(|record| record.transfer_id)
         .collect::<BTreeSet<_>>();
     let terminal_recoveries = read_terminal_recoveries(persistence_path)?;
+    let cleanup_recoveries = read_cleanup_recoveries(persistence_path)?;
     let has_durable_recovery = context.transfers.iter().any(|transfer| {
         matches!(transfer, StoredTransfer::Valid(record) if organization_recovery_transfer_ids.contains(&record.transfer_id)
-            || terminal_recoveries.iter().any(|recovery| same_terminal_authority(record, recovery)))
+            || terminal_recoveries.iter().any(|recovery| same_terminal_authority(record, recovery))
+            || cleanup_recoveries.iter().any(|recovery| same_cleanup_record_identity(record, &recovery.record)))
     });
     match persist_transfers(persistence_path, &context.transfers) {
         Ok(()) => {
             for transfer in &mut context.transfers {
                 if let StoredTransfer::Valid(record) = transfer {
-                    clear_organization_recovery(record);
-                    if remove_terminal_recovery(persistence_path, record).is_ok() {
-                        record.terminal_recovery_generation = None;
+                    if record.state != TransferState::Cleanup {
+                        clear_organization_recovery(record);
+                        if remove_terminal_recovery(persistence_path, record).is_ok() {
+                            record.terminal_recovery_generation = None;
+                        }
                     }
                 }
             }
@@ -4548,7 +5054,7 @@ async fn start_download_source(
         return Err(VR_DOWNLOAD_CONTEXT_INVALID);
     }
     checked_selected_total(&source.selected_files)?;
-    let destination = {
+    let mut record = {
         let context = state.0.lock().map_err(|_| VR_DOWNLOAD_FAILED)?;
         if !context.transfers_loaded {
             return Err(VR_DOWNLOAD_ACTION_INVALID);
@@ -4566,13 +5072,15 @@ async fn start_download_source(
         if has_active_duplicate(&context.transfers, &source.infohash, &destination) {
             return Err(VR_DOWNLOAD_DUPLICATE);
         }
-        destination
+        let record = transfer_from_source(category, source, destination, TransferState::Queued);
+        validate_cleanup_start_reservations(&context, persistence_path, &record)?;
+        record
     };
-    validate_new_targets(&destination, &source.selected_files)?;
-    let mut record = transfer_from_source(category, source, destination, TransferState::Queued);
+    validate_new_targets(&record.destination, &record.selected_files)?;
     let transfer_id = record.transfer_id.clone();
     {
         let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_FAILED)?;
+        validate_cleanup_start_reservations(&context, persistence_path, &record)?;
         if has_active_duplicate(&context.transfers, &record.infohash, &record.destination) {
             return Err(VR_DOWNLOAD_DUPLICATE);
         }
@@ -4950,6 +5458,325 @@ pub async fn cancel_download(
     transfer_id: &str,
 ) -> Result<(), &'static str> {
     controlled_transfer(state, persistence_path, transfer_id, TransferAction::Cancel).await
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn cleanup_target_state(
+    record: &TransferRecord,
+    selected_index: usize,
+) -> Result<CleanupFileState, &'static str> {
+    if record.organization_state != OrganizationState::None
+        || record.current_paths.get(selected_index)
+            != record
+                .selected_files
+                .get(selected_index)
+                .map(|file| &file.path)
+        || canonical_destination(&record.destination)? != record.destination
+        || record.fingerprints.len() != record.selected_files.len()
+    {
+        return Err(VR_DOWNLOAD_STALE);
+    }
+    let target = current_target(record, selected_index)?;
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > record.selected_files[selected_index].size
+                || fs::canonicalize(&target).ok().as_deref() != Some(target.as_path())
+                || file_fingerprint(&target)? != record.fingerprints[selected_index]
+            {
+                return Err(VR_DOWNLOAD_STALE);
+            }
+            Ok(CleanupFileState::Present)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(CleanupFileState::AbsentBeforeCleanup)
+        }
+        Err(_) => Err(VR_DOWNLOAD_STALE),
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn validate_cleanup_boundary_data(record: &TransferRecord) -> Result<(), &'static str> {
+    let selected_file_ids = record
+        .selected_file_ids()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let boundary_segments = record
+        .boundary_segments
+        .lock()
+        .map_err(|_| VR_DOWNLOAD_STALE)?;
+    if boundary_segments.iter().any(|(file_id, segments)| {
+        selected_file_ids.contains(file_id)
+            || segments.is_empty()
+            || segments.iter().any(|segment| segment.bytes.is_empty())
+    }) {
+        return Err(VR_DOWNLOAD_STALE);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn cleanup_target_is_owned_elsewhere(
+    context: &VrDownloadContext,
+    persistence_path: &Path,
+    transfer_id: &str,
+    target: &Path,
+) -> Result<bool, &'static str> {
+    for transfer in &context.transfers {
+        match transfer {
+            StoredTransfer::Valid(record) if record.transfer_id != transfer_id => {
+                if transfer_record_owns_path(record, target).map_err(|_| VR_DOWNLOAD_STALE)? {
+                    return Ok(true);
+                }
+            }
+            StoredTransfer::Valid(_) => {}
+            StoredTransfer::Corrupt(_) => return Err(VR_DOWNLOAD_STALE),
+        }
+    }
+    if organization_plan_owns_path(context, target).map_err(|_| VR_DOWNLOAD_STALE)? {
+        return Ok(true);
+    }
+    for path in terminal_recovery_paths(persistence_path)? {
+        let record = parse_terminal_recovery(persistence_path, &path).ok_or(VR_DOWNLOAD_STALE)?;
+        if transfer_record_owns_path(&record, target).map_err(|_| VR_DOWNLOAD_STALE)? {
+            return Ok(true);
+        }
+    }
+    for path in cleanup_recovery_paths(persistence_path)? {
+        let recovery = parse_cleanup_recovery(persistence_path, &path).ok_or(VR_DOWNLOAD_STALE)?;
+        if recovery.record.transfer_id != transfer_id
+            && transfer_record_owns_path(&recovery.record, target).map_err(|_| VR_DOWNLOAD_STALE)?
+        {
+            return Ok(true);
+        }
+    }
+    let mut destinations = [
+        context.future_folder.clone(),
+        context.adult_future_folder.clone(),
+        context.movie_future_folder.clone(),
+        context.tv_future_folder.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<BTreeSet<_>>();
+    if let Some(record) = context
+        .transfers
+        .iter()
+        .find_map(|transfer| match transfer {
+            StoredTransfer::Valid(record) if record.transfer_id == transfer_id => Some(record),
+            StoredTransfer::Valid(_) | StoredTransfer::Corrupt(_) => None,
+        })
+    {
+        destinations.insert(record.destination.clone());
+    }
+    for destination in destinations {
+        if fs::metadata(&destination).is_ok_and(|metadata| metadata.is_dir())
+            && durable_organization_recovery_owns_path(&destination, target)
+                .map_err(|_| VR_DOWNLOAD_STALE)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn persisted_cancelled_record_is_exact(
+    persistence_path: &Path,
+    expected: &TransferRecord,
+) -> Result<bool, &'static str> {
+    let persisted = read_persisted_transfers(persistence_path)?;
+    let mut matching = persisted.iter().filter_map(|transfer| match transfer {
+        StoredTransfer::Valid(record) if record.transfer_id == expected.transfer_id => Some(record),
+        StoredTransfer::Valid(_) | StoredTransfer::Corrupt(_) => None,
+    });
+    let Some(record) = matching.next() else {
+        return Ok(false);
+    };
+    Ok(matching.next().is_none()
+        && record.state == TransferState::Cancelled
+        && record.pending_action.is_none()
+        && record.handle.is_none()
+        && same_terminal_authority(record, expected))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn cleanup_cancelled_download_with(
+    state: &VrDownloadState,
+    persistence_path: &Path,
+    transfer_id: &str,
+    mut delete_file: impl FnMut(&Path, &str) -> Result<(), &'static str>,
+    mut persist_recovery: impl FnMut(&Path, &CleanupRecovery) -> Result<(), &'static str>,
+    mut persist_primary: impl FnMut(&Path, &[StoredTransfer]) -> Result<(), &'static str>,
+    mut remove_recovery: impl FnMut(&Path, &CleanupRecovery) -> Result<(), &'static str>,
+) -> Result<Vec<String>, &'static str> {
+    let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    if context.cleanup_transfer_id.is_some() {
+        return Err(VR_DOWNLOAD_ACTION_INVALID);
+    }
+    context.cleanup_transfer_id = Some(transfer_id.to_owned());
+    let result = (|| {
+        if !context.transfers_loaded
+            || context.transfers_loading
+            || context.persistence_path.as_deref() != Some(persistence_path)
+        {
+            return Err(VR_DOWNLOAD_ACTION_INVALID);
+        }
+        let position = context
+            .transfers
+            .iter()
+            .position(|transfer| {
+                matches!(transfer, StoredTransfer::Valid(record) if record.transfer_id == transfer_id)
+            })
+            .ok_or(VR_DOWNLOAD_STALE)?;
+        let StoredTransfer::Valid(current) = &context.transfers[position] else {
+            return Err(VR_DOWNLOAD_STALE);
+        };
+
+        let mut recovery = if current.state == TransferState::Cleanup {
+            let path = cleanup_recovery_path(persistence_path, current)?;
+            let recovery = parse_cleanup_recovery(persistence_path, &path)
+                .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+            if !same_terminal_authority(current, &recovery.record) {
+                return Err(VR_DOWNLOAD_STALE);
+            }
+            recovery
+        } else {
+            if current.state != TransferState::Cancelled
+                || current.handle.is_some()
+                || current.pending_action.is_some()
+                || current.terminal_recovery_generation.is_some()
+                || current.organization_state != OrganizationState::None
+                || !persisted_cancelled_record_is_exact(persistence_path, current)?
+            {
+                return Err(VR_DOWNLOAD_ACTION_INVALID);
+            }
+            let previous = current.clone();
+            validate_cleanup_boundary_data(&previous)?;
+            let files = (0..previous.selected_files.len())
+                .map(|selected_index| {
+                    let target = current_target(&previous, selected_index)?;
+                    let file = cleanup_target_state(&previous, selected_index)?;
+                    if cleanup_target_is_owned_elsewhere(
+                        &context,
+                        persistence_path,
+                        transfer_id,
+                        &target,
+                    )? {
+                        return Err(VR_DOWNLOAD_STALE);
+                    }
+                    Ok(file)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut cleanup_record = previous.clone();
+            cleanup_record.state = TransferState::Cleanup;
+            let recovery = CleanupRecovery {
+                record: cleanup_record.clone(),
+                files,
+            };
+            persist_recovery(persistence_path, &recovery)?;
+            context.transfers[position] = StoredTransfer::Valid(cleanup_record);
+            if let Err(error) = persist_primary(persistence_path, &context.transfers) {
+                if remove_recovery(persistence_path, &recovery).is_ok() {
+                    context.transfers[position] = StoredTransfer::Valid(previous);
+                }
+                return Err(error);
+            }
+            recovery
+        };
+
+        validate_cleanup_boundary_data(&recovery.record)?;
+        for selected_index in 0..recovery.files.len() {
+            let target = current_target(&recovery.record, selected_index)?;
+            if cleanup_target_is_owned_elsewhere(&context, persistence_path, transfer_id, &target)?
+            {
+                return Err(VR_DOWNLOAD_STALE);
+            }
+            match recovery.files[selected_index] {
+                CleanupFileState::Deleted | CleanupFileState::AbsentBeforeCleanup => {
+                    match fs::symlink_metadata(&target) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        _ => return Err(VR_DOWNLOAD_STALE),
+                    }
+                }
+                CleanupFileState::Present => match fs::symlink_metadata(&target) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        recovery.files[selected_index] = CleanupFileState::Deleted;
+                        persist_recovery(persistence_path, &recovery)?;
+                    }
+                    Ok(_) => {
+                        if cleanup_target_state(&recovery.record, selected_index)?
+                            != CleanupFileState::Present
+                        {
+                            return Err(VR_DOWNLOAD_STALE);
+                        }
+                        delete_file(&target, &recovery.record.fingerprints[selected_index])?;
+                        match fs::symlink_metadata(&target) {
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            _ => return Err(VR_DOWNLOAD_STALE),
+                        }
+                        sync_parent_directory(&target);
+                        recovery.files[selected_index] = CleanupFileState::Deleted;
+                        persist_recovery(persistence_path, &recovery)?;
+                    }
+                    Err(_) => return Err(VR_DOWNLOAD_STALE),
+                },
+            }
+        }
+
+        recovery.record.boundary_segments = Arc::new(Mutex::new(BTreeMap::new()));
+        persist_recovery(persistence_path, &recovery)?;
+        let category = recovery.record.category;
+        let current_folder =
+            configured_folder(&context, category) == Some(&recovery.record.destination);
+        let StoredTransfer::Valid(current) = &mut context.transfers[position] else {
+            return Err(VR_DOWNLOAD_STALE);
+        };
+        current.boundary_segments = recovery.record.boundary_segments.clone();
+        invalidate_organization_plan(&mut context);
+        let removed = context.transfers.remove(position);
+        if let Err(error) = persist_primary(persistence_path, &context.transfers) {
+            context.transfers.insert(position, removed);
+            return Err(error);
+        }
+        if let Err(error) = remove_recovery(persistence_path, &recovery) {
+            context.transfers.insert(position, removed);
+            return Err(error);
+        }
+        Ok(vec![
+            category.as_str().to_owned(),
+            current_folder.to_string(),
+        ])
+    })();
+    context.cleanup_transfer_id = None;
+    result
+}
+
+#[cfg(target_os = "windows")]
+pub fn cleanup_cancelled_download(
+    state: &VrDownloadState,
+    persistence_path: &Path,
+    transfer_id: &str,
+) -> Result<Vec<String>, &'static str> {
+    cleanup_cancelled_download_with(
+        state,
+        persistence_path,
+        transfer_id,
+        delete_exact_windows_cleanup_file,
+        write_cleanup_recovery,
+        write_persisted_transfers,
+        remove_cleanup_recovery,
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn cleanup_cancelled_download(
+    _state: &VrDownloadState,
+    _persistence_path: &Path,
+    _transfer_id: &str,
+) -> Result<Vec<String>, &'static str> {
+    Err(VR_DOWNLOAD_ACTION_INVALID)
 }
 
 pub fn dismiss_download(
@@ -5384,6 +6211,49 @@ mod tests {
 
     fn transfer_rows(state: &VrDownloadState) -> Vec<String> {
         download_rows(&mut state.0.lock().expect("state must lock"))
+    }
+
+    fn cancelled_cleanup_state(
+        record: TransferRecord,
+        persistence_path: &Path,
+    ) -> (VrDownloadState, String) {
+        let transfer_id = record.transfer_id.clone();
+        write_persisted_transfers(persistence_path, &[StoredTransfer::Valid(record.clone())])
+            .expect("cancelled cleanup authority must persist");
+        let state = VrDownloadState::default();
+        {
+            let mut context = state.0.lock().expect("state must lock");
+            configure_category_context(&mut context, record.category, record.destination.clone());
+            context.transfers_loaded = true;
+            context.persistence_path = Some(persistence_path.to_owned());
+            context.transfers.push(StoredTransfer::Valid(record));
+        }
+        (state, transfer_id)
+    }
+
+    fn configure_category_context(
+        context: &mut VrDownloadContext,
+        category: TransferCategory,
+        destination: PathBuf,
+    ) {
+        match category {
+            TransferCategory::Adult => context.adult_future_folder = Some(destination),
+            TransferCategory::Movie => context.movie_future_folder = Some(destination),
+            TransferCategory::Tv => context.tv_future_folder = Some(destination),
+            TransferCategory::Vr => context.future_folder = Some(destination),
+        }
+    }
+
+    fn cancelled_record_for_category(
+        fixture: &FilesystemFixture,
+        category: TransferCategory,
+        label: &str,
+    ) -> TransferRecord {
+        let mut record = terminal_record_for_category(fixture, category, label);
+        record.state = TransferState::Cancelled;
+        record.handle = None;
+        record.pending_action = None;
+        record
     }
 
     fn terminal_record_for_category(
@@ -10327,11 +11197,11 @@ mod tests {
             &fixture.path.join("limit"),
         ))
         .expect("category-matched recoveries must load");
-        assert_eq!(rows.len(), 56);
+        assert_eq!(rows.len(), 64);
         assert_eq!(rows[1], "vr");
-        assert_eq!(rows[15], "adult");
-        assert_eq!(rows[29], "movie");
-        assert_eq!(rows[43], "tv");
+        assert_eq!(rows[17], "adult");
+        assert_eq!(rows[33], "movie");
+        assert_eq!(rows[49], "tv");
     }
 
     #[test]
@@ -12580,6 +13450,999 @@ mod tests {
             assert_eq!(transfer_rows(&state), corrupt_rows);
         }
         assert!(!dispatched.get());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn permanent_cleanup_is_unavailable_without_mutation_off_windows() {
+        let fixture = FilesystemFixture::new();
+        let record =
+            cancelled_record_for_category(&fixture, TransferCategory::Vr, "non-windows-cleanup");
+        let target = current_target(&record, 0).expect("selected target must resolve");
+        let persistence_path = fixture.path.join("non-windows.downloads");
+        let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+        let before = transfer_snapshots(&state);
+
+        assert_eq!(
+            cleanup_cancelled_download(&state, &persistence_path, &transfer_id),
+            Err(VR_DOWNLOAD_ACTION_INVALID)
+        );
+        assert_eq!(transfer_snapshots(&state), before);
+        assert_eq!(
+            fs::read(target).expect("selected bytes must remain"),
+            vec![b'p'; 5]
+        );
+        assert!(cleanup_recovery_paths(&persistence_path)
+            .expect("cleanup recovery directory must be readable")
+            .is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_final_handle_deletion_preserves_a_path_replacement_and_cleanup_row() {
+        let fixture = FilesystemFixture::new();
+        let record =
+            cancelled_record_for_category(&fixture, TransferCategory::Vr, "windows-handle-race");
+        let target = current_target(&record, 0).expect("selected target must resolve");
+        let displaced = record.destination.join("displaced-original.mp4");
+        let persistence_path = fixture.path.join("downloads");
+        let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |path, fingerprint| {
+                    delete_exact_windows_cleanup_file_with(path, fingerprint, || {
+                        fs::rename(path, &displaced)?;
+                        fs::write(path, b"replacement")
+                    })
+                },
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            ),
+            Err(VR_DOWNLOAD_STALE)
+        );
+        assert_eq!(
+            fs::read(&target).expect("replacement must survive"),
+            b"replacement"
+        );
+        assert!(!displaced.exists());
+        assert_eq!(transfer_rows(&state)[8], "cleanup");
+        assert_eq!(
+            read_cleanup_recoveries(&persistence_path).expect("cleanup recovery must remain")[0]
+                .files,
+            vec![CleanupFileState::Present]
+        );
+    }
+
+    #[test]
+    fn cleanup_accepts_only_exact_durably_cancelled_or_recovery_rows() {
+        for lifecycle in [
+            TransferState::Queued,
+            TransferState::Downloading,
+            TransferState::Paused,
+            TransferState::Completed,
+            TransferState::Offline,
+            TransferState::Failed,
+        ] {
+            let fixture = FilesystemFixture::new();
+            let mut record =
+                cancelled_record_for_category(&fixture, TransferCategory::Vr, lifecycle.as_str());
+            record.state = lifecycle;
+            let target = current_target(&record, 0).expect("selected target must resolve");
+            let persistence_path = fixture.path.join("downloads");
+            let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+            let before = transfer_snapshots(&state);
+            let dispatches = Cell::new(0);
+
+            assert_eq!(
+                cleanup_cancelled_download_with(
+                    &state,
+                    &persistence_path,
+                    &transfer_id,
+                    |_, _| {
+                        dispatches.set(dispatches.get() + 1);
+                        Ok(())
+                    },
+                    write_cleanup_recovery,
+                    write_persisted_transfers,
+                    remove_cleanup_recovery,
+                ),
+                Err(VR_DOWNLOAD_ACTION_INVALID)
+            );
+            assert_eq!(dispatches.get(), 0);
+            assert_eq!(transfer_snapshots(&state), before);
+            assert!(target.is_file());
+            assert!(cleanup_recovery_paths(&persistence_path)
+                .expect("cleanup recovery directory must be readable")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn cancelled_movie_tv_adult_and_vr_cleanup_deletes_only_selected_files() {
+        for category in [
+            TransferCategory::Movie,
+            TransferCategory::Tv,
+            TransferCategory::Adult,
+            TransferCategory::Vr,
+        ] {
+            let fixture = FilesystemFixture::new();
+            let record = cancelled_record_for_category(
+                &fixture,
+                category,
+                &format!("{}-cleanup", category.as_str()),
+            );
+            let destination = record.destination.clone();
+            let target = current_target(&record, 0).expect("selected target must resolve");
+            let unrelated = destination.join("unrelated.bin");
+            fs::write(&unrelated, b"unrelated").expect("unrelated fixture must exist");
+            let persistence_path = fixture.path.join("downloads");
+            let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+
+            assert_eq!(
+                cleanup_cancelled_download_with(
+                    &state,
+                    &persistence_path,
+                    &transfer_id,
+                    |path, _| fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED),
+                    write_cleanup_recovery,
+                    write_persisted_transfers,
+                    remove_cleanup_recovery,
+                )
+                .expect("cancelled cleanup must finish"),
+                vec![category.as_str(), "true"]
+            );
+            assert!(!target.exists());
+            assert_eq!(
+                fs::read(&unrelated).expect("unrelated bytes must remain"),
+                b"unrelated"
+            );
+            assert!(destination.is_dir());
+            assert!(read_persisted_transfers(&persistence_path)
+                .expect("empty primary must remain valid")
+                .is_empty());
+        }
+
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("selected-members");
+        fs::create_dir(&destination).expect("destination must exist");
+        let destination = fs::canonicalize(destination).expect("destination must canonicalize");
+        let source = movie_organization_source(
+            "Exact Movie",
+            Some("1999-04-19"),
+            "Exact Movie",
+            &[
+                ("Provider/media.mkv", 5),
+                ("Provider/notes.txt", 3),
+                ("Provider/deselected.bin", 9),
+            ],
+            &[0, 1],
+        );
+        let mut record = completed_organization_record_for_category(
+            TransferCategory::Movie,
+            &destination,
+            source,
+        );
+        record.state = TransferState::Cancelled;
+        record.downloaded_bytes = 6;
+        record
+            .boundary_segments
+            .lock()
+            .expect("boundary data must lock")
+            .insert(
+                2,
+                vec![SparseSegment {
+                    offset: 1,
+                    bytes: vec![7, 8],
+                }],
+            );
+        let media = current_target(&record, 0).expect("media target must resolve");
+        let non_media = current_target(&record, 1).expect("non-media target must resolve");
+        let deselected = destination.join("Provider/deselected.bin");
+        fs::write(&deselected, b"deselected").expect("deselected bytes must exist");
+        let persistence_path = fixture.path.join("members.downloads");
+        let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+
+        cleanup_cancelled_download_with(
+            &state,
+            &persistence_path,
+            &transfer_id,
+            |path, _| fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED),
+            write_cleanup_recovery,
+            write_persisted_transfers,
+            remove_cleanup_recovery,
+        )
+        .expect("selected media and non-media cleanup must finish");
+        assert!(!media.exists());
+        assert!(!non_media.exists());
+        assert_eq!(
+            fs::read(deselected).expect("deselected bytes must remain"),
+            b"deselected"
+        );
+    }
+
+    #[test]
+    fn cleanup_authority_failures_do_not_dispatch_or_change_cancelled_state() {
+        for fail_primary in [false, true] {
+            let fixture = FilesystemFixture::new();
+            let record = cancelled_record_for_category(
+                &fixture,
+                TransferCategory::Vr,
+                if fail_primary {
+                    "primary-failure"
+                } else {
+                    "recovery-failure"
+                },
+            );
+            let target = current_target(&record, 0).expect("selected target must resolve");
+            let persistence_path = fixture.path.join("downloads");
+            let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+            let before = transfer_snapshots(&state);
+            let dispatches = Cell::new(0);
+            let result = if fail_primary {
+                cleanup_cancelled_download_with(
+                    &state,
+                    &persistence_path,
+                    &transfer_id,
+                    |_, _| {
+                        dispatches.set(dispatches.get() + 1);
+                        Ok(())
+                    },
+                    write_cleanup_recovery,
+                    |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+                    remove_cleanup_recovery,
+                )
+            } else {
+                cleanup_cancelled_download_with(
+                    &state,
+                    &persistence_path,
+                    &transfer_id,
+                    |_, _| {
+                        dispatches.set(dispatches.get() + 1);
+                        Ok(())
+                    },
+                    |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+                    write_persisted_transfers,
+                    remove_cleanup_recovery,
+                )
+            };
+            assert_eq!(result, Err(VR_DOWNLOAD_PERSISTENCE_FAILED));
+            assert_eq!(dispatches.get(), 0);
+            assert_eq!(transfer_snapshots(&state), before);
+            assert!(target.is_file());
+            assert!(cleanup_recovery_paths(&persistence_path)
+                .expect("cleanup recovery directory must be readable")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn retained_cleanup_recovery_overrides_cancelled_primary_after_restart() {
+        let fixture = FilesystemFixture::new();
+        let record =
+            cancelled_record_for_category(&fixture, TransferCategory::Vr, "retained-authority");
+        let target = current_target(&record, 0).expect("selected target must resolve");
+        let destination = record.destination.clone();
+        let persistence_path = fixture.path.join("downloads");
+        let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+        let dispatches = Cell::new(0);
+
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |_, _| {
+                    dispatches.set(dispatches.get() + 1);
+                    Ok(())
+                },
+                write_cleanup_recovery,
+                |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+                |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+            ),
+            Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+        );
+        assert_eq!(dispatches.get(), 0);
+        assert!(target.is_file());
+        assert_eq!(transfer_rows(&state)[8], "cleanup");
+        assert!(matches!(
+            &read_persisted_transfers(&persistence_path)
+                .expect("cancelled primary must remain")[0],
+            StoredTransfer::Valid(record) if record.state == TransferState::Cancelled
+        ));
+
+        let restarted = VrDownloadState::default();
+        configure_category_folder(&restarted, TransferCategory::Vr, &destination);
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("retained cleanup recovery must reload");
+        assert_eq!(rows[8], "cleanup");
+        cleanup_cancelled_download_with(
+            &restarted,
+            &persistence_path,
+            &transfer_id,
+            |path, _| fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED),
+            write_cleanup_recovery,
+            write_persisted_transfers,
+            remove_cleanup_recovery,
+        )
+        .expect("retained cleanup recovery must remain retryable");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn absent_and_durable_recovery_owned_paths_fail_closed_without_dispatch() {
+        let fixture = FilesystemFixture::new();
+        let record =
+            cancelled_record_for_category(&fixture, TransferCategory::Vr, "absent-replacement");
+        let target = current_target(&record, 0).expect("selected target must resolve");
+        fs::remove_file(&target).expect("selected target must start absent");
+        let persistence_path = fixture.path.join("absent.downloads");
+        let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+        let recovery_writes = Cell::new(0);
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |_, _| panic!("an absent-before-cleanup file must not dispatch"),
+                |path, recovery| {
+                    recovery_writes.set(recovery_writes.get() + 1);
+                    if recovery_writes.get() == 2 {
+                        Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+                    } else {
+                        write_cleanup_recovery(path, recovery)
+                    }
+                },
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            ),
+            Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+        );
+        fs::write(&target, b"replacement").expect("absent-path replacement must exist");
+        let dispatches = Cell::new(0);
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |_, _| {
+                    dispatches.set(dispatches.get() + 1);
+                    Ok(())
+                },
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            ),
+            Err(VR_DOWNLOAD_STALE)
+        );
+        assert_eq!(dispatches.get(), 0);
+        assert_eq!(
+            fs::read(&target).expect("replacement must survive"),
+            b"replacement"
+        );
+
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("recovery-owned");
+        fs::create_dir(&destination).expect("destination must exist");
+        let destination = fs::canonicalize(destination).expect("destination must canonicalize");
+        let mut cleanup = completed_organization_record_for_category(
+            TransferCategory::Vr,
+            &destination,
+            persistable_fixture_source(),
+        );
+        cleanup.state = TransferState::Cancelled;
+        let owner = completed_organization_record_for_category(
+            TransferCategory::Adult,
+            &destination,
+            persistable_adult_fixture_source(),
+        );
+        write_organization_recovery(&owner, &owner.current_paths, None)
+            .expect("organization recovery must persist");
+        let target = current_target(&cleanup, 0).expect("shared target must resolve");
+        let persistence_path = fixture.path.join("owned.downloads");
+        let (state, transfer_id) = cancelled_cleanup_state(cleanup, &persistence_path);
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |_, _| {
+                    dispatches.set(dispatches.get() + 1);
+                    Ok(())
+                },
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            ),
+            Err(VR_DOWNLOAD_STALE)
+        );
+        assert_eq!(dispatches.get(), 0);
+        assert!(target.is_file());
+        assert!(organization_recovery_path(&owner).is_file());
+    }
+
+    #[test]
+    fn interrupted_cleanup_restarts_with_exact_remaining_files_and_boundary_data() {
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("restart-cleanup");
+        fs::create_dir(&destination).expect("destination must exist");
+        let destination = fs::canonicalize(destination).expect("destination must canonicalize");
+        let source = movie_organization_source(
+            "Exact Movie",
+            Some("1999-04-19"),
+            "Exact Movie",
+            &[
+                ("Provider/media.mkv", 5),
+                ("Provider/notes.txt", 3),
+                ("Provider/deselected.bin", 9),
+            ],
+            &[0, 1],
+        );
+        let mut record = completed_organization_record_for_category(
+            TransferCategory::Movie,
+            &destination,
+            source,
+        );
+        record.state = TransferState::Cancelled;
+        record
+            .boundary_segments
+            .lock()
+            .expect("boundary data must lock")
+            .insert(
+                2,
+                vec![SparseSegment {
+                    offset: 3,
+                    bytes: vec![4, 5, 6],
+                }],
+            );
+        let deleted = current_target(&record, 0).expect("first target must resolve");
+        let remaining = current_target(&record, 1).expect("second target must resolve");
+        let deselected = destination.join("Provider/deselected.bin");
+        fs::write(&deselected, b"deselected").expect("deselected bytes must exist");
+        let persistence_path = fixture.path.join("downloads");
+        let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+        let dispatches = Cell::new(0);
+
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |path, _| {
+                    dispatches.set(dispatches.get() + 1);
+                    if dispatches.get() == 2 {
+                        return Err(VR_DOWNLOAD_CLEANUP_FAILED);
+                    }
+                    fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)
+                },
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            ),
+            Err(VR_DOWNLOAD_CLEANUP_FAILED)
+        );
+        assert!(!deleted.exists());
+        assert!(remaining.is_file());
+        let durable = read_cleanup_recoveries(&persistence_path)
+            .expect("partial cleanup recovery must remain");
+        assert_eq!(
+            durable[0].files,
+            vec![CleanupFileState::Deleted, CleanupFileState::Present]
+        );
+        assert_eq!(
+            encoded_boundary_segments(&durable[0].record).expect("boundary data must encode"),
+            "2:3:040506"
+        );
+
+        fs::write(&deleted, b"replacement").expect("replacement must exist");
+        let restarted = VrDownloadState::default();
+        configure_movie_download_folder(&restarted, Some(destination.clone()))
+            .expect("Movies folder must configure");
+        let rows = tauri::async_runtime::block_on(load_downloads_with_persistence(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("session"),
+            &fixture.path.join("limit"),
+            |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+        ))
+        .expect("cleanup recovery must remain visible during primary failure");
+        assert_eq!(rows[8], "cleanup");
+        let retry_dispatches = Cell::new(0);
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &restarted,
+                &persistence_path,
+                &transfer_id,
+                |_, _| {
+                    retry_dispatches.set(retry_dispatches.get() + 1);
+                    Ok(())
+                },
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            ),
+            Err(VR_DOWNLOAD_STALE)
+        );
+        assert_eq!(retry_dispatches.get(), 0);
+        assert_eq!(
+            fs::read(&deleted).expect("replacement must survive"),
+            b"replacement"
+        );
+        assert!(remaining.is_file());
+        fs::remove_file(&deleted).expect("replacement fixture must be removed");
+
+        cleanup_cancelled_download_with(
+            &restarted,
+            &persistence_path,
+            &transfer_id,
+            |path, _| fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED),
+            write_cleanup_recovery,
+            write_persisted_transfers,
+            remove_cleanup_recovery,
+        )
+        .expect("exact remaining cleanup must finish");
+        assert!(!remaining.exists());
+        assert_eq!(
+            fs::read(deselected).expect("deselected bytes must remain"),
+            b"deselected"
+        );
+        assert!(read_persisted_transfers(&persistence_path)
+            .expect("empty primary must remain valid")
+            .is_empty());
+    }
+
+    #[test]
+    fn cleanup_rejects_replacements_and_cross_owned_paths_without_dispatch() {
+        let fixture = FilesystemFixture::new();
+        let record =
+            cancelled_record_for_category(&fixture, TransferCategory::Vr, "replacement-cleanup");
+        let target = current_target(&record, 0).expect("selected target must resolve");
+        let persistence_path = fixture.path.join("replacement.downloads");
+        let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+        fs::remove_file(&target).expect("original must be removed");
+        fs::write(&target, b"replacement").expect("replacement must exist");
+        let dispatches = Cell::new(0);
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |_, _| {
+                    dispatches.set(dispatches.get() + 1);
+                    Ok(())
+                },
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            ),
+            Err(VR_DOWNLOAD_STALE)
+        );
+        assert_eq!(dispatches.get(), 0);
+        assert_eq!(
+            fs::read(&target).expect("replacement must survive"),
+            b"replacement"
+        );
+
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("shared");
+        fs::create_dir(&destination).expect("shared destination must exist");
+        let destination = fs::canonicalize(destination).expect("destination must canonicalize");
+        let mut cleanup = completed_organization_record_for_category(
+            TransferCategory::Vr,
+            &destination,
+            persistable_fixture_source(),
+        );
+        cleanup.state = TransferState::Cancelled;
+        let mut owner = completed_organization_record_for_category(
+            TransferCategory::Adult,
+            &destination,
+            persistable_adult_fixture_source(),
+        );
+        owner.state = TransferState::Cancelled;
+        let target = current_target(&cleanup, 0).expect("shared target must resolve");
+        let transfer_id = cleanup.transfer_id.clone();
+        let persistence_path = fixture.path.join("shared.downloads");
+        write_persisted_transfers(
+            &persistence_path,
+            &[
+                StoredTransfer::Valid(cleanup.clone()),
+                StoredTransfer::Valid(owner.clone()),
+            ],
+        )
+        .expect("shared ownership must persist");
+        let state = VrDownloadState::default();
+        {
+            let mut context = state.0.lock().expect("state must lock");
+            context.future_folder = Some(destination.clone());
+            context.adult_future_folder = Some(destination);
+            context.transfers_loaded = true;
+            context.persistence_path = Some(persistence_path.clone());
+            context
+                .transfers
+                .extend([StoredTransfer::Valid(cleanup), StoredTransfer::Valid(owner)]);
+        }
+        let before = transfer_snapshots(&state);
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |_, _| {
+                    dispatches.set(dispatches.get() + 1);
+                    Ok(())
+                },
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            ),
+            Err(VR_DOWNLOAD_STALE)
+        );
+        assert_eq!(dispatches.get(), 0);
+        assert_eq!(transfer_snapshots(&state), before);
+        assert_eq!(
+            fs::read(target).expect("shared bytes must remain"),
+            vec![b'a'; 5]
+        );
+    }
+
+    #[test]
+    fn cleanup_replacement_race_and_global_reservation_preserve_all_rows() {
+        let fixture = FilesystemFixture::new();
+        let record = cancelled_record_for_category(&fixture, TransferCategory::Vr, "deletion-race");
+        let target = current_target(&record, 0).expect("selected target must resolve");
+        let persistence_path = fixture.path.join("race.downloads");
+        let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+        {
+            state.0.lock().expect("state must lock").cleanup_transfer_id =
+                Some("another-transfer".to_owned());
+        }
+        let before = transfer_snapshots(&state);
+        let dispatches = Cell::new(0);
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |_, _| {
+                    dispatches.set(dispatches.get() + 1);
+                    Ok(())
+                },
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            ),
+            Err(VR_DOWNLOAD_ACTION_INVALID)
+        );
+        assert_eq!(dispatches.get(), 0);
+        assert_eq!(transfer_snapshots(&state), before);
+        state.0.lock().expect("state must lock").cleanup_transfer_id = None;
+
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |path, _| {
+                    fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+                    fs::write(path, b"replacement").map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)
+                },
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            ),
+            Err(VR_DOWNLOAD_STALE)
+        );
+        assert_eq!(
+            fs::read(&target).expect("replacement must survive"),
+            b"replacement"
+        );
+        assert_eq!(transfer_rows(&state)[8], "cleanup");
+        assert_eq!(
+            read_cleanup_recoveries(&persistence_path).expect("cleanup recovery must remain")[0]
+                .files,
+            vec![CleanupFileState::Present]
+        );
+    }
+
+    #[test]
+    fn final_primary_and_recovery_removal_failures_restart_as_retryable_cleanup() {
+        for fail_recovery_removal in [false, true] {
+            let fixture = FilesystemFixture::new();
+            let record = cancelled_record_for_category(
+                &fixture,
+                TransferCategory::Vr,
+                if fail_recovery_removal {
+                    "recovery-removal-failure"
+                } else {
+                    "final-primary-failure"
+                },
+            );
+            let target = current_target(&record, 0).expect("selected target must resolve");
+            let persistence_path = fixture.path.join("downloads");
+            let (state, transfer_id) = cancelled_cleanup_state(record, &persistence_path);
+            let primary_writes = Cell::new(0);
+            let result = cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |path, _| fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED),
+                write_cleanup_recovery,
+                |path, transfers| {
+                    primary_writes.set(primary_writes.get() + 1);
+                    if !fail_recovery_removal && primary_writes.get() == 2 {
+                        Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+                    } else {
+                        write_persisted_transfers(path, transfers)
+                    }
+                },
+                |path, recovery| {
+                    if fail_recovery_removal {
+                        Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+                    } else {
+                        remove_cleanup_recovery(path, recovery)
+                    }
+                },
+            );
+            assert_eq!(result, Err(VR_DOWNLOAD_PERSISTENCE_FAILED));
+            assert!(!target.exists());
+            assert_eq!(transfer_rows(&state)[8], "cleanup");
+
+            let restarted = VrDownloadState::default();
+            let destination = state
+                .0
+                .lock()
+                .expect("state must lock")
+                .transfers
+                .iter()
+                .find_map(|transfer| match transfer {
+                    StoredTransfer::Valid(record) => Some(record.destination.clone()),
+                    StoredTransfer::Corrupt(_) => None,
+                })
+                .expect("cleanup row must remain");
+            configure_category_folder(&restarted, TransferCategory::Vr, &destination);
+            let rows = tauri::async_runtime::block_on(load_downloads(
+                &restarted,
+                &persistence_path,
+                &fixture.path.join("session"),
+                &fixture.path.join("limit"),
+            ))
+            .expect("durable cleanup must reload");
+            assert_eq!(rows[8], "cleanup");
+            let retry_dispatches = Cell::new(0);
+            cleanup_cancelled_download_with(
+                &restarted,
+                &persistence_path,
+                &transfer_id,
+                |_, _| {
+                    retry_dispatches.set(retry_dispatches.get() + 1);
+                    Ok(())
+                },
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            )
+            .expect("restart retry must remove durable row");
+            assert_eq!(retry_dispatches.get(), 0);
+            assert!(read_persisted_transfers(&persistence_path)
+                .expect("empty primary must remain valid")
+                .is_empty());
+            assert!(cleanup_recovery_paths(&persistence_path)
+                .expect("cleanup recovery directory must be readable")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn cleanup_authority_reserves_every_category_start_until_durable_removal() {
+        let fixture = FilesystemFixture::new();
+        let destination = fixture.path.join("shared-cleanup-start");
+        fs::create_dir(&destination).expect("shared destination must exist");
+        let destination = fs::canonicalize(destination).expect("destination must canonicalize");
+        let vr_source = persistable_fixture_source();
+        let mut cleanup = completed_organization_record_for_category(
+            TransferCategory::Vr,
+            &destination,
+            vr_source.clone(),
+        );
+        cleanup.state = TransferState::Cancelled;
+        let target = current_target(&cleanup, 0).expect("selected target must resolve");
+        let persistence_path = fixture.path.join("downloads");
+        let session_folder = fixture.path.join("session");
+        let (state, transfer_id) = cancelled_cleanup_state(cleanup, &persistence_path);
+        {
+            let mut context = state.0.lock().expect("state must lock");
+            context.future_folder = Some(destination.clone());
+            context.adult_future_folder = Some(destination.clone());
+            context.movie_future_folder = Some(destination.clone());
+            context.tv_future_folder = Some(destination.clone());
+            context.download_limit = DownloadLimitState::Loaded(None);
+        }
+
+        assert_eq!(
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |path, _| fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED),
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+            ),
+            Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+        );
+        assert!(!target.exists());
+        assert_eq!(transfer_rows(&state)[8], "cleanup");
+        let recovery_path = cleanup_recovery_paths(&persistence_path)
+            .expect("cleanup recovery paths must remain readable")
+            .into_iter()
+            .next()
+            .expect("cleanup recovery must remain durable");
+        let primary_before =
+            fs::read(&persistence_path).expect("primary state must remain readable");
+        let recovery_before =
+            fs::read(&recovery_path).expect("recovery state must remain readable");
+        let transfers_before = transfer_snapshots(&state);
+
+        let proposals = [
+            (
+                TransferCategory::Vr,
+                vr_source.clone(),
+                VR_DOWNLOAD_DUPLICATE,
+            ),
+            (
+                TransferCategory::Adult,
+                persistable_adult_fixture_source(),
+                VR_DOWNLOAD_DESTINATION_CONFLICT,
+            ),
+            (
+                TransferCategory::Movie,
+                movie_organization_source(
+                    "Exact Movie",
+                    Some("1999-04-19"),
+                    "Exact Provider Movie",
+                    &[("Movie  A.mp4", 5)],
+                    &[0],
+                ),
+                VR_DOWNLOAD_DESTINATION_CONFLICT,
+            ),
+            (
+                TransferCategory::Tv,
+                tv_download_source(&[("Movie  A.mp4", 5)], &[0]),
+                VR_DOWNLOAD_DESTINATION_CONFLICT,
+            ),
+        ];
+        tauri::async_runtime::block_on(async {
+            for (category, source, expected_error) in proposals {
+                assert_eq!(
+                    start_download_source(
+                        &state,
+                        &persistence_path,
+                        &session_folder,
+                        category,
+                        source,
+                    )
+                    .await,
+                    Err(expected_error),
+                    "{} Start ignored cleanup authority",
+                    category.as_str()
+                );
+                assert!(!target.exists());
+                assert_eq!(transfer_snapshots(&state), transfers_before);
+                assert_eq!(
+                    fs::read(&persistence_path).expect("blocked Start must not rewrite primary"),
+                    primary_before
+                );
+                assert_eq!(
+                    fs::read(&recovery_path).expect("blocked Start must not rewrite recovery"),
+                    recovery_before
+                );
+                let context = state.0.lock().expect("state must lock");
+                assert_eq!(context.transfers.len(), 1);
+                assert!(context.session.is_none());
+                assert!(!context.session_starting);
+                assert!(context.transfers.iter().all(|transfer| {
+                    matches!(transfer, StoredTransfer::Valid(record) if record.handle.is_none())
+                }));
+                drop(context);
+                assert!(!session_folder.exists());
+            }
+
+            cleanup_cancelled_download_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |_, _| panic!("durably deleted files must not be dispatched again"),
+                write_cleanup_recovery,
+                write_persisted_transfers,
+                remove_cleanup_recovery,
+            )
+            .expect("cleanup retry must durably remove its exact authority");
+            assert!(transfer_rows(&state).is_empty());
+            assert!(read_persisted_transfers(&persistence_path)
+                .expect("empty primary must remain readable")
+                .is_empty());
+            assert!(cleanup_recovery_paths(&persistence_path)
+                .expect("cleanup recovery directory must remain readable")
+                .is_empty());
+
+            let started_transfer_id = start_download_source(
+                &state,
+                &persistence_path,
+                &session_folder,
+                TransferCategory::Vr,
+                vr_source,
+            )
+            .await
+            .expect("Start must become available after durable cleanup removal");
+            assert_eq!(started_transfer_id, transfer_id);
+            assert!(target.is_file());
+            assert_eq!(transfer_rows(&state).len(), 16);
+            assert!(state.0.lock().expect("state must lock").session.is_some());
+            cancel_download(&state, &persistence_path, &started_transfer_id)
+                .await
+                .expect("replacement transfer must cancel without deleting files");
+        });
+    }
+
+    #[test]
+    fn corrupt_or_unavailable_cleanup_ownership_blocks_start_without_side_effects() {
+        for unavailable_directory in [false, true] {
+            let fixture = FilesystemFixture::new();
+            let destination = fixture.path.join("destination");
+            fs::create_dir(&destination).expect("destination must exist");
+            let destination = fs::canonicalize(destination).expect("destination must canonicalize");
+            let persistence_path = fixture.path.join("downloads");
+            let session_folder = fixture.path.join("session");
+            let recovery_directory =
+                cleanup_recovery_directory(&persistence_path).expect("recovery path must resolve");
+            if unavailable_directory {
+                fs::write(&recovery_directory, b"not a directory")
+                    .expect("unavailable recovery directory fixture must exist");
+            } else {
+                fs::create_dir(&recovery_directory).expect("cleanup recovery directory must exist");
+                fs::write(
+                    recovery_directory.join(format!(
+                        "{CLEANUP_RECOVERY_PREFIX}{}{TERMINAL_RECOVERY_SUFFIX}",
+                        "0".repeat(40)
+                    )),
+                    b"corrupt cleanup recovery",
+                )
+                .expect("corrupt cleanup recovery must exist");
+            }
+            let state = VrDownloadState::default();
+            {
+                let mut context = state.0.lock().expect("state must lock");
+                context.future_folder = Some(destination.clone());
+                context.download_limit = DownloadLimitState::Loaded(None);
+                context.transfers_loaded = true;
+                context.persistence_path = Some(persistence_path.clone());
+            }
+
+            assert_eq!(
+                tauri::async_runtime::block_on(start_download_source(
+                    &state,
+                    &persistence_path,
+                    &session_folder,
+                    TransferCategory::Vr,
+                    persistable_fixture_source(),
+                )),
+                Err(VR_DOWNLOAD_STALE)
+            );
+            assert!(transfer_rows(&state).is_empty());
+            assert!(state.0.lock().expect("state must lock").session.is_none());
+            assert!(!session_folder.exists());
+            assert!(!destination.join("Movie  A.mp4").exists());
+            assert!(!persistence_path.exists());
+        }
     }
 
     #[test]

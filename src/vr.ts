@@ -68,7 +68,8 @@ export type VrDownloadState =
   | "completed"
   | "cancelled"
   | "offline"
-  | "failed";
+  | "failed"
+  | "cleanup";
 
 export type VrDownload = {
   transferId: string;
@@ -85,6 +86,8 @@ export type VrDownload = {
   organizationRelativeDirectory: string | null;
   canOrganize: boolean;
   terminalRecovery: boolean;
+  selectedFiles?: string[];
+  cleanupAvailable?: boolean;
 };
 
 export type VrOrganizationPreviewEntry = {
@@ -871,12 +874,51 @@ const vrDownloadStates = new Set<VrDownloadState>([
   "cancelled",
   "offline",
   "failed",
+  "cleanup",
 ]);
 
+function decodeDownloadPaths(value: string, expectedCount: number) {
+  if (value === "" && expectedCount === 0) {
+    return [];
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const paths = value.split(",").map((encoded) => {
+    if (
+      encoded.length === 0 ||
+      encoded.length % 2 !== 0 ||
+      !/^[0-9a-f]+$/.test(encoded)
+    ) {
+      throw new Error("The native download store returned invalid data.");
+    }
+    const bytes = new Uint8Array(encoded.length / 2);
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Number.parseInt(encoded.slice(index * 2, index * 2 + 2), 16);
+    }
+    try {
+      return decoder.decode(bytes);
+    } catch {
+      throw new Error("The native download store returned invalid data.");
+    }
+  });
+  if (paths.length !== expectedCount || new Set(paths).size !== paths.length) {
+    throw new Error("The native download store returned invalid data.");
+  }
+  return paths;
+}
+
 function parseVrDownloads(value: unknown): VrDownload[] {
+  const hasCleanupFields =
+    Array.isArray(value) &&
+    value.length % 16 === 0 &&
+    value.every(
+      (entry, index) =>
+        typeof entry === "string" &&
+        (index % 16 !== 15 || entry === "true" || entry === "false"),
+    );
+  const fieldCount = hasCleanupFields ? 16 : 14;
   if (
     !Array.isArray(value) ||
-    value.length % 14 !== 0 ||
+    value.length % fieldCount !== 0 ||
     !value.every((entry) => typeof entry === "string")
   ) {
     throw new Error("The native download store returned invalid data.");
@@ -884,7 +926,7 @@ function parseVrDownloads(value: unknown): VrDownload[] {
 
   const downloads: VrDownload[] = [];
   const transferIds = new Set<string>();
-  for (let index = 0; index < value.length; index += 14) {
+  for (let index = 0; index < value.length; index += fieldCount) {
     const [
       transferId,
       category,
@@ -900,8 +942,13 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       organizationRelativeDirectory,
       canOrganize,
       terminalRecovery,
-    ] = value.slice(index, index + 14) as string[];
+      encodedSelectedFiles,
+      cleanupAvailable,
+    ] = value.slice(index, index + fieldCount) as string[];
     const count = Number(selectedFileCount);
+    const selectedFiles = hasCleanupFields
+      ? decodeDownloadPaths(encodedSelectedFiles, count)
+      : undefined;
     const canonicalCode = canonicalizeProductCode(identity);
     const movieOrganizationPath = organizationRelativeDirectory.endsWith("/")
       ? organizationRelativeDirectory.slice(0, -1)
@@ -954,7 +1001,8 @@ function parseVrDownloads(value: unknown): VrDownload[] {
           organizationStatus !== "none" ||
           organizationRelativeDirectory !== "" ||
           canOrganize !== "false" ||
-          terminalRecovery !== "false")) ||
+          terminalRecovery !== "false" ||
+          (hasCleanupFields && cleanupAvailable !== "false"))) ||
       releaseName.trim() === "" ||
       !Number.isSafeInteger(count) ||
       count < 0 ||
@@ -987,7 +1035,12 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       (terminalRecovery === "true" &&
         (state !== "failed" ||
           organizationStatus !== "none" ||
-          canOrganize !== "false"))
+          canOrganize !== "false")) ||
+      (hasCleanupFields &&
+        cleanupAvailable !== "true" &&
+        cleanupAvailable !== "false") ||
+      (cleanupAvailable === "true" &&
+        (!selectedFiles || !["cancelled", "cleanup"].includes(state)))
     ) {
       throw new Error("The native download store returned invalid data.");
     }
@@ -1010,6 +1063,10 @@ function parseVrDownloads(value: unknown): VrDownload[] {
           : organizationRelativeDirectory,
       canOrganize: canOrganize === "true",
       terminalRecovery: terminalRecovery === "true",
+      ...(selectedFiles === undefined ? {} : { selectedFiles }),
+      ...(hasCleanupFields
+        ? { cleanupAvailable: cleanupAvailable === "true" }
+        : {}),
     });
   }
   return downloads;
@@ -1234,6 +1291,28 @@ export function resumeVrDownload(transferId: string) {
 
 export function cancelVrDownload(transferId: string) {
   return runVrDownloadCommand("cancel_vr_download", transferId);
+}
+
+export async function cleanupCancelledVrDownload(transferId: string) {
+  if (transferId === "") {
+    throw new Error("A transfer identity is required.");
+  }
+  const result = await window.__TAURI__.core.invoke<unknown>(
+    "cleanup_cancelled_vr_download",
+    { transferId },
+  );
+  if (
+    !Array.isArray(result) ||
+    result.length !== 2 ||
+    !["adult", "movie", "tv", "vr"].includes(result[0] as string) ||
+    (result[1] !== "true" && result[1] !== "false")
+  ) {
+    throw new Error("The native transfer cleanup response was invalid.");
+  }
+  return {
+    category: result[0] as "adult" | "movie" | "tv" | "vr",
+    isCurrentFolder: result[1] === "true",
+  };
 }
 
 export function dismissVrDownload(transferId: string) {

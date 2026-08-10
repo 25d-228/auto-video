@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyVrOrganization,
   canonicalizeProductCode,
+  cleanupCancelledVrDownload,
   dismissVrOrganization,
   fetchExactJavdbAdultItem,
   fetchExactJavdbVrItem,
@@ -1367,6 +1368,111 @@ describe("trusted VR download boundary", () => {
       invokeMock.mockResolvedValueOnce(invalidRow);
       await expect(loadVrDownloads()).rejects.toThrow("invalid data");
     }
+  });
+
+  it("parses exact Windows cleanup files only for cancelled or recovery rows", async () => {
+    const exactReleaseName = "【VR】 MDVR-419  Exact — 特別版";
+    const encode = (value: string) =>
+      Array.from(new TextEncoder().encode(value), (byte) =>
+        byte.toString(16).padStart(2, "0"),
+      ).join("");
+    const selectedFiles = [
+      "Provider/Exact  Movie — 特別版.MKV",
+      "Provider/notes  01.txt",
+    ];
+    invokeMock.mockResolvedValue([
+      "cancelled-transfer-419",
+      "movie",
+      "tt0123456",
+      "Exact  Movie — 特別版",
+      "2",
+      "12",
+      "7",
+      "0",
+      "cancelled",
+      "true",
+      "none",
+      "",
+      "false",
+      "false",
+      selectedFiles.map(encode).join(","),
+      "true",
+      "cleanup-transfer-419",
+      "vr",
+      "MDVR-419",
+      exactReleaseName,
+      "1",
+      "7",
+      "7",
+      "0",
+      "cleanup",
+      "true",
+      "none",
+      "",
+      "false",
+      "false",
+      encode("Provider/MDVR-419.mp4"),
+      "true",
+    ]);
+
+    await expect(loadVrDownloads()).resolves.toEqual([
+      expect.objectContaining({
+        transferId: "cancelled-transfer-419",
+        state: "cancelled",
+        selectedFiles,
+        cleanupAvailable: true,
+      }),
+      expect.objectContaining({
+        transferId: "cleanup-transfer-419",
+        state: "cleanup",
+        selectedFiles: ["Provider/MDVR-419.mp4"],
+        cleanupAvailable: true,
+      }),
+    ]);
+
+    const invalid = [
+      "active-transfer-419",
+      "vr",
+      "MDVR-419",
+      exactReleaseName,
+      "1",
+      "7",
+      "3",
+      "12",
+      "downloading",
+      "true",
+      "none",
+      "",
+      "false",
+      "false",
+      encode("Provider/MDVR-419.mp4"),
+      "true",
+    ];
+    invokeMock.mockResolvedValueOnce(invalid);
+    await expect(loadVrDownloads()).rejects.toThrow("invalid data");
+    invalid[8] = "cancelled";
+    invalid[14] = "ff";
+    invokeMock.mockResolvedValueOnce(invalid);
+    await expect(loadVrDownloads()).rejects.toThrow("invalid data");
+  });
+
+  it("submits only the transfer identity to permanent cleanup", async () => {
+    invokeMock.mockResolvedValue(["tv", "true"]);
+
+    await expect(cleanupCancelledVrDownload("transfer-123")).resolves.toEqual({
+      category: "tv",
+      isCurrentFolder: true,
+    });
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cleanup_cancelled_vr_download",
+      { transferId: "transfer-123" },
+    );
+
+    invokeMock.mockClear();
+    await expect(cleanupCancelledVrDownload("")).rejects.toThrow(
+      "transfer identity",
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("parses exact native organization previews and applies only the plan identity", async () => {

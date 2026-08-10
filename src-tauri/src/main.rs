@@ -38,7 +38,7 @@ use tv_release::{
     TV_TMDB_MALFORMED, TV_TMDB_UNAUTHORIZED,
 };
 use vr_download::{
-    acquire_tv_metainfo, apply_organization, cancel_download,
+    acquire_tv_metainfo, apply_organization, cancel_download, cleanup_cancelled_download,
     clear_vr_folder as clear_trusted_vr_folder, configure_adult_download_folder,
     configure_movie_download_folder, configure_tv_download_folder, configured_vr_folder,
     dismiss_download, dismiss_organization, list_downloads, load_download_limit, load_downloads,
@@ -1824,6 +1824,21 @@ async fn cancel_vr_download(
 }
 
 #[tauri::command]
+async fn cleanup_cancelled_vr_download(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    state: tauri::State<'_, VrDownloadState>,
+) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    let persistence_path = vr_downloads_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        cleanup_cancelled_download(&state, &persistence_path, &transfer_id).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| vr_download::VR_DOWNLOAD_CLEANUP_FAILED.to_owned())?
+}
+
+#[tauri::command]
 fn dismiss_vr_download(
     app: tauri::AppHandle,
     transfer_id: String,
@@ -2386,6 +2401,7 @@ fn main() {
             pause_vr_download,
             resume_vr_download,
             cancel_vr_download,
+            cleanup_cancelled_vr_download,
             dismiss_vr_download,
             preview_vr_organization,
             apply_vr_organization,

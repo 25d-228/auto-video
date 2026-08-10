@@ -161,6 +161,9 @@ let resumeVrDownloadMock: Mock<
 let cancelVrDownloadMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
+let cleanupCancelledVrDownloadMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
 let dismissVrDownloadMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
@@ -459,6 +462,8 @@ function vrDownloadFixture({
   organizationRelativeDirectory = "",
   organizationStatus = "none",
   terminalRecovery = "false",
+  selectedFiles,
+  cleanupAvailable = "false",
 }: {
   canOrganize?: string;
   category?: string;
@@ -474,8 +479,10 @@ function vrDownloadFixture({
   organizationRelativeDirectory?: string;
   organizationStatus?: string;
   terminalRecovery?: string;
+  selectedFiles?: string[];
+  cleanupAvailable?: string;
 }) {
-  return [
+  const row = [
     transferId,
     category,
     code,
@@ -490,6 +497,20 @@ function vrDownloadFixture({
     organizationRelativeDirectory,
     canOrganize,
     terminalRecovery,
+  ];
+  if (selectedFiles === undefined) {
+    return row;
+  }
+  return [
+    ...row,
+    selectedFiles
+      .map((path) =>
+        Array.from(new TextEncoder().encode(path), (byte) =>
+          byte.toString(16).padStart(2, "0"),
+        ).join(""),
+      )
+      .join(","),
+    cleanupAvailable,
   ];
 }
 
@@ -805,6 +826,9 @@ beforeEach(() => {
   pauseVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   resumeVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   cancelVrDownloadMock = vi.fn().mockResolvedValue(undefined);
+  cleanupCancelledVrDownloadMock = vi
+    .fn()
+    .mockResolvedValue(["vr", "true"]);
   dismissVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   previewVrOrganizationMock = vi.fn().mockImplementation((parameters) =>
     Promise.resolve([
@@ -987,6 +1011,8 @@ beforeEach(() => {
           return resumeVrDownloadMock(parameters);
         case "cancel_vr_download":
           return cancelVrDownloadMock(parameters);
+        case "cleanup_cancelled_vr_download":
+          return cleanupCancelledVrDownloadMock(parameters);
         case "dismiss_vr_download":
           return dismissVrDownloadMock(parameters);
         case "preview_vr_organization":
@@ -10132,6 +10158,228 @@ describe("aggregate Movie, TV, Adult, and VR download limit and transfer summari
     expect(queryVrStorageMock).toHaveBeenCalledOnce();
     expect(scanTvLibraryMock).toHaveBeenCalledOnce();
     expect(queryTvStorageMock).toHaveBeenCalledOnce();
+  });
+
+  it("confirms exact Windows cleanup files with safe focus and serializes every cleanup row", async () => {
+    savedMoviesFolder = "/Movies";
+    savedVrFolder = "/VR";
+    const movieFiles = [
+      "Provider/Exact  Movie — 特別版.MKV",
+      "Provider/notes  01.txt",
+    ];
+    const initialRows = [
+      ...vrDownloadFixture({
+        category: "movie",
+        cleanupAvailable: "true",
+        code: "tt0123456",
+        releaseName: "Cancelled Movie transfer",
+        selectedFileCount: "2",
+        selectedFiles: movieFiles,
+        speedBytesPerSecond: "0",
+        state: "cancelled",
+        transferId: "cancelled-movie",
+      }),
+      ...vrDownloadFixture({
+        cleanupAvailable: "true",
+        releaseName: "Cancelled VR transfer",
+        selectedFiles: ["Provider/MDVR-419.mp4"],
+        speedBytesPerSecond: "0",
+        state: "cancelled",
+        transferId: "cancelled-vr",
+      }),
+    ];
+    loadVrDownloadsMock.mockResolvedValue(initialRows);
+    listVrDownloadsMock.mockResolvedValue([]);
+    const pendingCleanup = createDeferred<string[]>();
+    cleanupCancelledVrDownloadMock.mockReturnValue(pendingCleanup.promise);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+
+    const movieCard = (
+      await screen.findByRole("heading", { name: "Cancelled Movie transfer" })
+    ).closest("article") as HTMLElement;
+    const vrCard = screen
+      .getByRole("heading", { name: "Cancelled VR transfer" })
+      .closest("article") as HTMLElement;
+    const trigger = within(movieCard).getByRole("button", {
+      name: "Permanently clean transfer files",
+    });
+    fireEvent.click(trigger);
+    let confirmation = await screen.findByRole("alertdialog");
+    expect(
+      within(confirmation).getByRole("heading", {
+        name: "Permanently delete these selected files?",
+      }),
+    ).toBeTruthy();
+    for (const path of movieFiles) {
+      expect(
+        within(confirmation).getByText((_, element) => element?.textContent === path),
+      ).toBeTruthy();
+    }
+    const keepFiles = within(confirmation).getByRole("button", {
+      name: "Keep files",
+    });
+    await waitFor(() => expect(document.activeElement).toBe(keepFiles));
+    fireEvent.click(keepFiles);
+    expect(cleanupCancelledVrDownloadMock).not.toHaveBeenCalled();
+
+    fireEvent.click(trigger);
+    confirmation = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(confirmation).getByRole("button", {
+        name: "Permanently delete selected files",
+      }),
+    );
+    expect(cleanupCancelledVrDownloadMock).toHaveBeenCalledWith({
+      transferId: "cancelled-movie",
+    });
+    expect(
+      (
+        within(vrCard).getByRole("button", {
+          name: "Permanently clean transfer files",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+
+    await act(async () => {
+      pendingCleanup.resolve(["movie", "true"]);
+      await pendingCleanup.promise;
+    });
+    expect(
+      await screen.findByText(
+        "The exact selected transfer files were permanently deleted.",
+      ),
+    ).toBeTruthy();
+    expect(listVrDownloadsMock).toHaveBeenCalledOnce();
+    await waitFor(() => {
+      expect(scanMoviesMock).toHaveBeenCalledTimes(2);
+      expect(queryMoviesStorageMock).toHaveBeenCalledTimes(2);
+    });
+    expect(scanVrLibraryMock).toHaveBeenCalledOnce();
+    expect(queryVrStorageMock).toHaveBeenCalledOnce();
+  });
+
+  it("does not expose permanent cleanup without native Windows capability", async () => {
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        releaseName: "Cancelled on macOS",
+        speedBytesPerSecond: "0",
+        state: "cancelled",
+        transferId: "cancelled-macos",
+      }),
+    );
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const card = (
+      await screen.findByRole("heading", { name: "Cancelled on macOS" })
+    ).closest("article") as HTMLElement;
+
+    expect(
+      within(card).queryByRole("button", {
+        name: "Permanently clean transfer files",
+      }),
+    ).toBeNull();
+    expect(within(card).getByRole("button", { name: "Dismiss" })).toBeTruthy();
+    expect(cleanupCancelledVrDownloadMock).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/Cancel stops a transfer and keeps every downloaded file/),
+    ).toBeTruthy();
+  });
+
+  it("keeps completed cleanup truthful and focuses Refresh when reconciliation needs a retry", async () => {
+    savedVrFolder = "/VR";
+    const initialRows = vrDownloadFixture({
+      cleanupAvailable: "true",
+      releaseName: "Cancelled VR cleanup",
+      selectedFiles: ["Provider/MDVR-419.mp4"],
+      speedBytesPerSecond: "0",
+      state: "cancelled",
+      transferId: "cancelled-vr",
+    });
+    loadVrDownloadsMock
+      .mockResolvedValueOnce(initialRows)
+      .mockResolvedValueOnce([]);
+    listVrDownloadsMock.mockRejectedValueOnce("vr_download_persistence_failed");
+    cleanupCancelledVrDownloadMock.mockResolvedValue(["vr", "true"]);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Permanently clean transfer files",
+      }),
+    );
+    const confirmation = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(confirmation).getByRole("button", {
+        name: "Permanently delete selected files",
+      }),
+    );
+
+    expect(
+      await screen.findByText(
+        "The exact selected transfer files were permanently deleted, but Downloads still needs reconciliation.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Cleanup needs reconciliation" }),
+    ).toBeTruthy();
+    expect(cleanupCancelledVrDownloadMock).toHaveBeenCalledOnce();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Refresh" }),
+      );
+    });
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
+      expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(loadVrDownloadsMock).toHaveBeenCalledTimes(2));
+    expect(cleanupCancelledVrDownloadMock).toHaveBeenCalledOnce();
+  });
+
+  it("retries a durable cleanup row without exposing Dismiss or another confirmation", async () => {
+    const cleanupRows = vrDownloadFixture({
+      cleanupAvailable: "true",
+      downloadedBytes: "7",
+      releaseName: "Interrupted cleanup",
+      selectedFiles: ["Provider/MDVR-419.mp4"],
+      speedBytesPerSecond: "0",
+      state: "cleanup",
+      transferId: "cleanup-vr",
+    });
+    loadVrDownloadsMock.mockResolvedValue(cleanupRows);
+    listVrDownloadsMock.mockResolvedValue(cleanupRows);
+    cleanupCancelledVrDownloadMock.mockRejectedValue(
+      "vr_download_cleanup_failed",
+    );
+    render(<App />);
+    const summary = within(
+      await screen.findByRole("region", { name: "Downloads" }),
+    ).getByLabelText("Transfer summary");
+    const attention = within(summary).getByText("Needs attention").closest("div");
+    expect(within(attention as HTMLElement).getByText("1")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const card = (
+      await screen.findByRole("heading", { name: "Interrupted cleanup" })
+    ).closest("article") as HTMLElement;
+    expect(within(card).queryByRole("button", { name: "Dismiss" })).toBeNull();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    fireEvent.click(
+      within(card).getByRole("button", { name: "Retry permanent cleanup" }),
+    );
+
+    expect(cleanupCancelledVrDownloadMock).toHaveBeenCalledWith({
+      transferId: "cleanup-vr",
+    });
+    expect(
+      await within(card).findByText(
+        "Permanent cleanup could not finish. Retry only from the current Downloads state.",
+      ),
+    ).toBeTruthy();
+    expect(within(card).getByText("Cleanup needs attention")).toBeTruthy();
+    expect(listVrDownloadsMock).toHaveBeenCalledOnce();
   });
 
   it("ignores a late save result after relaunch", async () => {
