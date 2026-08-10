@@ -887,6 +887,7 @@ describe("trusted VR download boundary", () => {
       "none",
       "",
       "false",
+      "false",
       "adult-transfer-123",
       "adult",
       "ADLT-123",
@@ -900,6 +901,21 @@ describe("trusted VR download boundary", () => {
       "none",
       "",
       "false",
+      "false",
+      "recovered-transfer-419",
+      "vr",
+      "MDVR-419",
+      "【VR】 MDVR-419 recovered terminal",
+      "1",
+      "7",
+      "7",
+      "0",
+      "failed",
+      "true",
+      "none",
+      "",
+      "false",
+      "true",
       "movie-transfer-419",
       "movie",
       "tt0123456",
@@ -912,6 +928,7 @@ describe("trusted VR download boundary", () => {
       "true",
       "none",
       "",
+      "false",
       "false",
     ]);
 
@@ -930,6 +947,7 @@ describe("trusted VR download boundary", () => {
         organizationStatus: "none",
         organizationRelativeDirectory: null,
         canOrganize: false,
+        terminalRecovery: false,
       },
       {
         transferId: "adult-transfer-123",
@@ -945,6 +963,23 @@ describe("trusted VR download boundary", () => {
         organizationStatus: "none",
         organizationRelativeDirectory: null,
         canOrganize: false,
+        terminalRecovery: false,
+      },
+      {
+        transferId: "recovered-transfer-419",
+        category: "vr",
+        identity: "MDVR-419",
+        releaseName: "【VR】 MDVR-419 recovered terminal",
+        selectedFileCount: 1,
+        totalBytes: "7",
+        downloadedBytes: "7",
+        speedBytesPerSecond: "0",
+        state: "failed",
+        isCurrentFolder: true,
+        organizationStatus: "none",
+        organizationRelativeDirectory: null,
+        canOrganize: false,
+        terminalRecovery: true,
       },
       {
         transferId: "movie-transfer-419",
@@ -960,6 +995,7 @@ describe("trusted VR download boundary", () => {
         organizationStatus: "none",
         organizationRelativeDirectory: null,
         canOrganize: false,
+        terminalRecovery: false,
       },
     ]);
     expect(invokeMock).toHaveBeenCalledWith("load_vr_downloads");
@@ -980,12 +1016,14 @@ describe("trusted VR download boundary", () => {
       "none",
       "",
       "false",
+      "false",
     ];
     for (const [fieldIndex, invalidValue] of [
       [2, "MDVR-419"],
       [10, "organized"],
       [11, "tt0123456/"],
       [12, "true"],
+      [13, "true"],
     ] as const) {
       const malformed = [...validMovieRow];
       malformed[fieldIndex] = invalidValue;
@@ -1009,6 +1047,7 @@ describe("trusted VR download boundary", () => {
       "none",
       "",
       "true",
+      "false",
       "adult-recovery-123",
       "adult",
       "ADLT-123",
@@ -1022,6 +1061,7 @@ describe("trusted VR download boundary", () => {
       "attention",
       "ADLT-123/",
       "true",
+      "false",
     ]);
 
     await expect(loadVrDownloads()).resolves.toEqual([
@@ -1056,6 +1096,7 @@ describe("trusted VR download boundary", () => {
       "none",
       "",
       "true",
+      "false",
       "movie-attention-419",
       "movie",
       "tt0123456",
@@ -1069,6 +1110,7 @@ describe("trusted VR download boundary", () => {
       "attention",
       "Exact  Movie — 特別版 (1999)/",
       "true",
+      "false",
       "movie-organized-419",
       "movie",
       "tt0123456",
@@ -1081,6 +1123,7 @@ describe("trusted VR download boundary", () => {
       "true",
       "organized",
       "Exact  Movie — 特別版 (1999)/",
+      "false",
       "false",
     ]);
 
@@ -1125,6 +1168,7 @@ describe("trusted VR download boundary", () => {
         "attention",
         directory,
         "true",
+        "false",
       ]);
       await expect(loadVrDownloads()).rejects.toThrow("invalid data");
     }
@@ -1145,6 +1189,7 @@ describe("trusted VR download boundary", () => {
       "none",
       "",
       "false",
+      "false",
     ]);
 
     await expect(loadVrDownloads()).resolves.toEqual([
@@ -1162,6 +1207,7 @@ describe("trusted VR download boundary", () => {
         organizationStatus: "none",
         organizationRelativeDirectory: null,
         canOrganize: false,
+        terminalRecovery: false,
       },
     ]);
 
@@ -1169,6 +1215,7 @@ describe("trusted VR download boundary", () => {
       [8, "paused"],
       [10, "attention"],
       [12, "true"],
+      [13, "true"],
     ] as const) {
       const invalidRow = [
         "corrupt-1",
@@ -1183,6 +1230,7 @@ describe("trusted VR download boundary", () => {
         "false",
         "none",
         "",
+        "false",
         "false",
       ];
       invalidRow[fieldIndex] = invalidValue;
