@@ -179,6 +179,46 @@ describe("conservative parsed TV Library identity", () => {
     expect(items.every((item) => item.files.length === 1)).toBe(true);
   });
 
+  it("uses only an exact canonical show and matching season parent for retained episode basenames", async () => {
+    invokeMock.mockResolvedValue([
+      "10",
+      "/TV/Exact  Show — 特別版/Season 02/S02E03.Cut.mp4",
+      "Exact  Show — 特別版/Season 02/S02E03.Cut.mp4",
+      "3",
+      "/TV/Exact  Show — 特別版/Season 02/S02E03 — Alternate.MKV",
+      "Exact  Show — 特別版/Season 02/S02E03 — Alternate.MKV",
+      "4",
+      "/TV/Exact  Show — 特別版/Season 02/No episode marker.mp4",
+      "Exact  Show — 特別版/Season 02/No episode marker.mp4",
+      "5",
+      "/TV/Wrong Parent/Season 03/S02E03.mp4",
+      "Wrong Parent/Season 03/S02E03.mp4",
+      "6",
+      "/TV/Exact  Show — 特別版/Season 02/Exact  Show — 特別版 - S02E03 - 第三話  —  Exact Episode.MP4",
+      "Exact  Show — 特別版/Season 02/Exact  Show — 特別版 - S02E03 - 第三話  —  Exact Episode.MP4",
+      "7",
+    ]);
+
+    const { items } = await scanTvLibrary();
+    const exactShow = items.find(
+      (item) => item.showTitle === "Exact  Show — 特別版",
+    );
+    expect(exactShow?.files).toHaveLength(3);
+    expect(exactShow?.files.map((file) => file.filename)).toEqual(
+      expect.arrayContaining([
+        "S02E03.Cut.mp4",
+        "S02E03 — Alternate.MKV",
+        "Exact  Show — 特別版 - S02E03 - 第三話  —  Exact Episode.MP4",
+      ]),
+    );
+    expect(exactShow?.files.every((file) => file.season === 2 && file.episode === 3))
+      .toBe(true);
+    expect(
+      items.find((item) => item.title === "No episode marker")?.showTitle,
+    ).toBeNull();
+    expect(items.find((item) => item.title === "S02E03")?.showTitle).toBeNull();
+  });
+
   it("rejects malformed rows, duplicate paths, traversal, unsupported files, and oversized sizes", async () => {
     for (const response of [
       [],

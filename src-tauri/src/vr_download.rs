@@ -1322,7 +1322,6 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
                 || !code.is_empty()
                 || release_name != identity.release_name
                 || infohash != identity.infohash
-                || organization_state != OrganizationState::None
             {
                 return None;
             }
@@ -1398,8 +1397,10 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
         terminal_recovery_generation: None,
         pending_action: None,
     };
-    if record.category == TransferCategory::Movie
-        && record.organization_state != OrganizationState::None
+    if matches!(
+        record.category,
+        TransferCategory::Movie | TransferCategory::Tv
+    ) && record.organization_state != OrganizationState::None
     {
         let eligible_media = record
             .selected_files
@@ -1425,11 +1426,6 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
                 return None;
             }
         }
-    }
-    if record.category == TransferCategory::Tv
-        && record.organization_state != OrganizationState::None
-    {
-        return None;
     }
     Some(record)
 }
@@ -2171,7 +2167,9 @@ fn organization_plan_owns_path(
         || plan.identity
             != organization_identity(record)
                 .map_err(|_| VrLibraryTrashOwnershipError::Unavailable)?
-        || plan.plan_id != organization_plan_id(plan.generation, record, &plan.entries)
+        || plan.plan_id
+            != organization_plan_id(plan.generation, record, &plan.entries)
+                .map_err(|_| VrLibraryTrashOwnershipError::Unavailable)?
     {
         return Err(VrLibraryTrashOwnershipError::Unavailable);
     }
@@ -3517,6 +3515,28 @@ fn validate_movie_organization_identity(record: &TransferRecord) -> Result<(), &
     Ok(())
 }
 
+fn validate_tv_organization_identity(record: &TransferRecord) -> Result<(), &'static str> {
+    let identity = record
+        .tv_identity
+        .as_deref()
+        .ok_or(VR_ORGANIZATION_INELIGIBLE)?;
+    let source = revalidate_persisted_tv_download_source(
+        &record.metainfo,
+        identity,
+        &record.infohash,
+        &record.selected_file_ids(),
+    )
+    .map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
+    if source.selected_files != record.selected_files
+        || source.release_name != record.release_name
+        || source.tv_identity.as_ref() != Some(identity)
+        || transfer_identity(record.category, &source, &record.destination) != record.transfer_id
+    {
+        return Err(VR_ORGANIZATION_INELIGIBLE);
+    }
+    Ok(())
+}
+
 fn movie_release_year(release_date: &str) -> Option<&str> {
     let bytes = release_date.as_bytes();
     if bytes.len() != 10
@@ -3544,7 +3564,7 @@ fn movie_release_year(release_date: &str) -> Option<&str> {
     (year > 0 && day > 0 && day <= days).then_some(&release_date[..4])
 }
 
-fn validate_movie_organization_component_length(value: &str) -> Result<(), &'static str> {
+fn validate_organization_component_length(value: &str) -> Result<(), &'static str> {
     if value.len() > 255 || value.encode_utf16().count() > 255 {
         Err(VR_ORGANIZATION_INELIGIBLE)
     } else {
@@ -3552,11 +3572,8 @@ fn validate_movie_organization_component_length(value: &str) -> Result<(), &'sta
     }
 }
 
-fn portable_movie_organization_directory(
-    identity: &MovieDownloadIdentity,
-) -> Result<String, &'static str> {
-    let title = identity.tmdb_title.as_str();
-    let reserved_base = title.split('.').next().unwrap_or(title);
+fn validate_portable_organization_component(value: &str) -> Result<(), &'static str> {
+    let reserved_base = value.split('.').next().unwrap_or(value);
     let reserved_name = reserved_base.to_ascii_uppercase();
     let is_reserved = matches!(
         reserved_name.as_str(),
@@ -3590,26 +3607,42 @@ fn portable_movie_organization_directory(
             | "LPT²"
             | "LPT³"
     );
-    if title.is_empty()
-        || matches!(title, "." | "..")
-        || title.ends_with(' ')
-        || title.ends_with('.')
+    if value.is_empty()
+        || matches!(value, "." | "..")
+        || value.ends_with(' ')
+        || value.ends_with('.')
         || is_reserved
-        || title
+        || value
             .chars()
             .any(|character| character.is_control() || r#"<>:"/\|?*"#.contains(character))
     {
         return Err(VR_ORGANIZATION_INELIGIBLE);
     }
+    validate_organization_component_length(value)
+}
+
+fn portable_movie_organization_directory(
+    identity: &MovieDownloadIdentity,
+) -> Result<String, &'static str> {
+    let title = identity.tmdb_title.as_str();
+    validate_portable_organization_component(title)?;
     let year = identity
         .release_date
         .as_deref()
         .and_then(movie_release_year)
         .ok_or(VR_ORGANIZATION_INELIGIBLE)?;
     let directory = format!("{title} ({year})");
-    validate_movie_organization_component_length(&directory)?;
+    validate_portable_organization_component(&directory)?;
     relative_file_path(&directory).map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
     Ok(directory)
+}
+
+fn tv_organization_directory(identity: &TvDownloadIdentity) -> Result<String, &'static str> {
+    validate_portable_organization_component(&identity.show_name)?;
+    validate_portable_organization_component(&identity.episode_name)?;
+    let season_directory = format!("Season {:02}", identity.season_number);
+    validate_portable_organization_component(&season_directory)?;
+    Ok(format!("{}/{season_directory}", identity.show_name))
 }
 
 fn organization_identity(record: &TransferRecord) -> Result<String, &'static str> {
@@ -3620,7 +3653,16 @@ fn organization_identity(record: &TransferRecord) -> Result<String, &'static str
             .as_ref()
             .map(|identity| identity.imdb_id.clone())
             .ok_or(VR_ORGANIZATION_INELIGIBLE),
-        TransferCategory::Tv => Err(VR_ORGANIZATION_INELIGIBLE),
+        TransferCategory::Tv => record
+            .tv_identity
+            .as_ref()
+            .map(|identity| {
+                format!(
+                    "{} · S{:02}E{:02}",
+                    identity.imdb_id, identity.season_number, identity.episode_number
+                )
+            })
+            .ok_or(VR_ORGANIZATION_INELIGIBLE),
     }
 }
 
@@ -3633,52 +3675,110 @@ fn organization_directory_name(record: &TransferRecord) -> Result<String, &'stat
                 .as_deref()
                 .ok_or(VR_ORGANIZATION_INELIGIBLE)?,
         ),
-        TransferCategory::Tv => Err(VR_ORGANIZATION_INELIGIBLE),
+        TransferCategory::Tv => tv_organization_directory(
+            record
+                .tv_identity
+                .as_deref()
+                .ok_or(VR_ORGANIZATION_INELIGIBLE)?,
+        ),
     }
+}
+
+fn organization_collision_key(value: &str) -> String {
+    let mut key = String::new();
+    for character in value.chars().flat_map(char::to_lowercase) {
+        let decomposition = match character {
+            'à' => Some("a\u{300}"),
+            'á' => Some("a\u{301}"),
+            'â' => Some("a\u{302}"),
+            'ã' => Some("a\u{303}"),
+            'ä' => Some("a\u{308}"),
+            'å' => Some("a\u{30a}"),
+            'ç' => Some("c\u{327}"),
+            'è' => Some("e\u{300}"),
+            'é' => Some("e\u{301}"),
+            'ê' => Some("e\u{302}"),
+            'ë' => Some("e\u{308}"),
+            'ì' => Some("i\u{300}"),
+            'í' => Some("i\u{301}"),
+            'î' => Some("i\u{302}"),
+            'ï' => Some("i\u{308}"),
+            'ñ' => Some("n\u{303}"),
+            'ò' => Some("o\u{300}"),
+            'ó' => Some("o\u{301}"),
+            'ô' => Some("o\u{302}"),
+            'õ' => Some("o\u{303}"),
+            'ö' => Some("o\u{308}"),
+            'ù' => Some("u\u{300}"),
+            'ú' => Some("u\u{301}"),
+            'û' => Some("u\u{302}"),
+            'ü' => Some("u\u{308}"),
+            'ý' => Some("y\u{301}"),
+            'ÿ' => Some("y\u{308}"),
+            _ => None,
+        };
+        if let Some(decomposition) = decomposition {
+            key.push_str(decomposition);
+        } else {
+            key.push(character);
+        }
+    }
+    key
 }
 
 fn validate_organization_directory(
     destination: &Path,
     directory_name: &str,
 ) -> Result<Option<PathBuf>, &'static str> {
-    for entry in fs::read_dir(destination).map_err(|_| VR_ORGANIZATION_INELIGIBLE)? {
-        let entry = entry.map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
-        let name = entry
-            .file_name()
-            .to_str()
-            .ok_or(VR_ORGANIZATION_CONFLICT)?
-            .to_owned();
-        if name.to_lowercase() == directory_name.to_lowercase() && name != directory_name {
-            return Err(VR_ORGANIZATION_CONFLICT);
-        }
-    }
-    let directory = destination.join(directory_name);
-    match fs::symlink_metadata(&directory) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            Err(VR_ORGANIZATION_CONFLICT)
-        }
-        Ok(_) => {
-            let canonical = fs::canonicalize(&directory).map_err(|_| VR_ORGANIZATION_CONFLICT)?;
-            if canonical != directory || !canonical.starts_with(destination) {
+    let relative = relative_file_path(directory_name).map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
+    let mut parent = destination.to_owned();
+    for component in relative.components() {
+        let Component::Normal(expected) = component else {
+            return Err(VR_ORGANIZATION_INELIGIBLE);
+        };
+        let expected = expected.to_str().ok_or(VR_ORGANIZATION_INELIGIBLE)?;
+        let expected_key = organization_collision_key(expected);
+        for entry in fs::read_dir(&parent).map_err(|_| VR_ORGANIZATION_INELIGIBLE)? {
+            let entry = entry.map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
+            let name = entry
+                .file_name()
+                .to_str()
+                .ok_or(VR_ORGANIZATION_CONFLICT)?
+                .to_owned();
+            if organization_collision_key(&name) == expected_key && name != expected {
                 return Err(VR_ORGANIZATION_CONFLICT);
             }
-            Ok(Some(directory))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(VR_ORGANIZATION_CONFLICT),
+        let directory = parent.join(expected);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(VR_ORGANIZATION_CONFLICT);
+            }
+            Ok(_) => {
+                let canonical =
+                    fs::canonicalize(&directory).map_err(|_| VR_ORGANIZATION_CONFLICT)?;
+                if canonical != directory || !canonical.starts_with(destination) {
+                    return Err(VR_ORGANIZATION_CONFLICT);
+                }
+                parent = directory;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(VR_ORGANIZATION_CONFLICT),
+        }
     }
+    Ok(Some(parent))
 }
 
 fn destination_has_case_collision(directory: &Path, file_name: &str) -> Result<bool, &'static str> {
-    let expected = file_name.to_lowercase();
+    let expected = organization_collision_key(file_name);
     for entry in fs::read_dir(directory).map_err(|_| VR_ORGANIZATION_CONFLICT)? {
         let entry = entry.map_err(|_| VR_ORGANIZATION_CONFLICT)?;
         let existing = entry
             .file_name()
             .to_str()
             .ok_or(VR_ORGANIZATION_CONFLICT)?
-            .to_lowercase();
-        if existing == expected {
+            .to_owned();
+        if organization_collision_key(&existing) == expected {
             return Ok(true);
         }
     }
@@ -3714,7 +3814,7 @@ fn organization_destination_relative(
     let destination_name = match record.category {
         TransferCategory::Movie if eligible_media == 1 => {
             let destination_name = format!("{directory_name}.{extension}");
-            validate_movie_organization_component_length(&destination_name)?;
+            validate_organization_component_length(&destination_name)?;
             destination_name
         }
         TransferCategory::Movie => source_name.to_owned(),
@@ -3725,7 +3825,7 @@ fn organization_destination_relative(
                 }
                 TransferCategory::Vr => media_name_matches_product_code(source_title, &record.code),
                 TransferCategory::Movie => unreachable!(),
-                TransferCategory::Tv => return Err(VR_ORGANIZATION_INELIGIBLE),
+                TransferCategory::Tv => unreachable!(),
             };
             if !identity_matches {
                 return Err(VR_ORGANIZATION_INELIGIBLE);
@@ -3738,7 +3838,26 @@ fn organization_destination_relative(
                 source_name.to_owned()
             }
         }
-        TransferCategory::Tv => return Err(VR_ORGANIZATION_INELIGIBLE),
+        TransferCategory::Tv => {
+            let identity = record
+                .tv_identity
+                .as_deref()
+                .ok_or(VR_ORGANIZATION_INELIGIBLE)?;
+            validate_portable_organization_component(source_name)?;
+            if eligible_media == 1 {
+                let destination_name = format!(
+                    "{} - S{:02}E{:02} - {}.{extension}",
+                    identity.show_name,
+                    identity.season_number,
+                    identity.episode_number,
+                    identity.episode_name
+                );
+                validate_portable_organization_component(&destination_name)?;
+                destination_name
+            } else {
+                source_name.to_owned()
+            }
+        }
     };
     let destination_relative = format!("{directory_name}/{destination_name}");
     relative_file_path(&destination_relative).map_err(|_| VR_ORGANIZATION_CONFLICT)?;
@@ -3761,8 +3880,10 @@ fn organization_entries(
     {
         return Err(VR_ORGANIZATION_INELIGIBLE);
     }
-    if record.category == TransferCategory::Movie {
-        validate_movie_organization_identity(record)?;
+    match record.category {
+        TransferCategory::Movie => validate_movie_organization_identity(record)?,
+        TransferCategory::Tv => validate_tv_organization_identity(record)?,
+        TransferCategory::Adult | TransferCategory::Vr => {}
     }
 
     let eligible_media = record
@@ -3778,7 +3899,7 @@ fn organization_entries(
     let current_paths = record
         .current_paths
         .iter()
-        .map(|path| path.to_lowercase())
+        .map(|path| organization_collision_key(path))
         .collect::<BTreeSet<_>>();
     let mut proposed_paths = BTreeSet::new();
     let mut entries = Vec::with_capacity(record.selected_files.len());
@@ -3800,7 +3921,7 @@ fn organization_entries(
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or(VR_ORGANIZATION_CONFLICT)?;
-        let destination_key = destination_relative.to_lowercase();
+        let destination_key = organization_collision_key(&destination_relative);
         if !proposed_paths.insert(destination_key.clone()) {
             return Err(VR_ORGANIZATION_CONFLICT);
         }
@@ -3833,10 +3954,11 @@ fn organization_plan_id(
     generation: u64,
     record: &TransferRecord,
     entries: &[OrganizationEntry],
-) -> String {
+) -> Result<String, &'static str> {
     let mut identity = generation.to_be_bytes().to_vec();
     identity_field(&mut identity, record.transfer_id.as_bytes());
     identity_field(&mut identity, record.category.as_str().as_bytes());
+    identity_field(&mut identity, encoded_boundary_segments(record)?.as_bytes());
     for entry in entries {
         identity.extend_from_slice(&(entry.selected_index as u64).to_be_bytes());
         identity_field(&mut identity, entry.kind.as_str().as_bytes());
@@ -3854,7 +3976,7 @@ fn organization_plan_id(
             record.fingerprints[entry.selected_index].as_bytes(),
         );
     }
-    format!("{generation}-{}", hex_sha1(&identity))
+    Ok(format!("{generation}-{}", hex_sha1(&identity)))
 }
 
 fn organization_plan_response(plan: &OrganizationPlan) -> Vec<String> {
@@ -3897,7 +4019,8 @@ pub fn preview_organization(
         .ok_or(VR_ORGANIZATION_STALE)?;
     let entries = organization_entries(record, configured_folder(&context, record.category))?;
     let plan = OrganizationPlan {
-        plan_id: organization_plan_id(generation, record, &entries),
+        plan_id: organization_plan_id(generation, record, &entries)
+            .map_err(|_| VR_ORGANIZATION_FAILED)?,
         generation,
         transfer_id: record.transfer_id.clone(),
         category: record.category,
@@ -3995,6 +4118,29 @@ fn rollback_organization_moves(
     restored
 }
 
+fn organization_directory_paths(
+    destination: &Path,
+    directory_name: &str,
+) -> Result<Vec<PathBuf>, &'static str> {
+    let relative = relative_file_path(directory_name).map_err(|_| VR_ORGANIZATION_INELIGIBLE)?;
+    let mut current = destination.to_owned();
+    let mut paths = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(VR_ORGANIZATION_INELIGIBLE);
+        };
+        current.push(component);
+        paths.push(current.clone());
+    }
+    Ok(paths)
+}
+
+fn remove_created_organization_directories(paths: &[PathBuf]) {
+    for path in paths.iter().rev() {
+        let _ = fs::remove_dir(path);
+    }
+}
+
 fn apply_organization_with_persistence(
     state: &VrDownloadState,
     persistence_path: &Path,
@@ -4016,7 +4162,7 @@ fn apply_organization_with_persistence(
     let current_folder = match plan.category {
         TransferCategory::Adult => context.adult_future_folder.clone(),
         TransferCategory::Movie => context.movie_future_folder.clone(),
-        TransferCategory::Tv => return Err(VR_ORGANIZATION_INELIGIBLE),
+        TransferCategory::Tv => context.tv_future_folder.clone(),
         TransferCategory::Vr => context.future_folder.clone(),
     };
     let record_index = context
@@ -4031,9 +4177,12 @@ fn apply_organization_with_persistence(
         StoredTransfer::Corrupt(_) => return Err(VR_ORGANIZATION_STALE),
     };
     let entries = organization_entries(record, current_folder.as_deref())?;
+    let current_plan_id = organization_plan_id(plan.generation, record, &entries)
+        .map_err(|_| VR_ORGANIZATION_FAILED)?;
     if plan.category != record.category
         || plan.identity != organization_identity(record)?
         || plan.entries != entries
+        || plan.plan_id != current_plan_id
     {
         return Err(VR_ORGANIZATION_STALE);
     }
@@ -4041,7 +4190,8 @@ fn apply_organization_with_persistence(
     let original_paths = record.current_paths.clone();
     let destination_root = record.destination.clone();
     let directory_name = organization_directory_name(record)?;
-    let organization_directory = destination_root.join(&directory_name);
+    let organization_directories =
+        organization_directory_paths(&destination_root, &directory_name)?;
     let move_entries = entries
         .iter()
         .filter(|entry| entry.kind == OrganizationEntryKind::Move)
@@ -4059,16 +4209,37 @@ fn apply_organization_with_persistence(
         })
         .collect::<Result<Vec<_>, &'static str>>()?;
 
-    let mut created_directory = false;
-    if !move_entries.is_empty()
-        && validate_organization_directory(&destination_root, &directory_name)?.is_none()
-    {
-        match fs::create_dir(&organization_directory) {
-            Ok(()) => created_directory = true,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                validate_organization_directory(&destination_root, &directory_name)?;
+    let mut created_directories = Vec::new();
+    if !move_entries.is_empty() {
+        validate_organization_directory(&destination_root, &directory_name)?;
+        for directory in &organization_directories {
+            match fs::symlink_metadata(directory) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    remove_created_organization_directories(&created_directories);
+                    return Err(VR_ORGANIZATION_CONFLICT);
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match fs::create_dir(directory) {
+                        Ok(()) => created_directories.push(directory.clone()),
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(_) => {
+                            remove_created_organization_directories(&created_directories);
+                            return Err(VR_ORGANIZATION_FAILED);
+                        }
+                    }
+                }
+                Err(_) => {
+                    remove_created_organization_directories(&created_directories);
+                    return Err(VR_ORGANIZATION_CONFLICT);
+                }
             }
-            Err(_) => return Err(VR_ORGANIZATION_FAILED),
+            if fs::canonicalize(directory).ok().as_deref() != Some(directory.as_path())
+                || !directory.starts_with(&destination_root)
+            {
+                remove_created_organization_directories(&created_directories);
+                return Err(VR_ORGANIZATION_CONFLICT);
+            }
         }
     }
 
@@ -4077,9 +4248,7 @@ fn apply_organization_with_persistence(
         StoredTransfer::Corrupt(_) => Err(VR_ORGANIZATION_STALE),
     };
     if let Err(error) = recovery_result {
-        if created_directory {
-            let _ = fs::remove_dir(&organization_directory);
-        }
+        remove_created_organization_directories(&created_directories);
         return Err(error);
     }
 
@@ -4093,9 +4262,7 @@ fn apply_organization_with_persistence(
                 &mut current_paths,
                 &mut move_file,
             );
-            if created_directory {
-                let _ = fs::remove_dir(&organization_directory);
-            }
+            remove_created_organization_directories(&created_directories);
             let recovery_saved = {
                 let StoredTransfer::Valid(record) = &mut context.transfers[record_index] else {
                     return Err(VR_ORGANIZATION_FAILED);
@@ -4144,9 +4311,7 @@ fn apply_organization_with_persistence(
             &mut current_paths,
             &mut move_file,
         );
-        if created_directory {
-            let _ = fs::remove_dir(&organization_directory);
-        }
+        remove_created_organization_directories(&created_directories);
         let recovery_saved = {
             let StoredTransfer::Valid(record) = &mut context.transfers[record_index] else {
                 return Err(VR_ORGANIZATION_FAILED);
@@ -5181,6 +5346,13 @@ mod tests {
         source: VerifiedDownloadSource,
     ) -> TransferRecord {
         completed_organization_record_for_category(TransferCategory::Movie, destination, source)
+    }
+
+    fn completed_tv_organization_record(
+        destination: &Path,
+        source: VerifiedDownloadSource,
+    ) -> TransferRecord {
+        completed_organization_record_for_category(TransferCategory::Tv, destination, source)
     }
 
     fn organization_state(record: TransferRecord) -> (VrDownloadState, String) {
@@ -6545,7 +6717,9 @@ mod tests {
                 TransferCategory::Movie => {
                     context.movie_future_folder = Some(recovery_destination.clone())
                 }
-                TransferCategory::Tv => unreachable!(),
+                TransferCategory::Tv => {
+                    context.tv_future_folder = Some(recovery_destination.clone())
+                }
                 TransferCategory::Vr => unreachable!(),
             }
             context.transfers_loaded = true;
@@ -6947,6 +7121,534 @@ mod tests {
         assert!(!destination
             .join("Exact  Movie — 特別版 (1999)/Exact  Movie — 特別版 (1999).mp4")
             .exists());
+    }
+
+    #[test]
+    fn tv_preview_applies_reloads_and_dismisses_the_exact_episode_single_file() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = tv_download_source(&[("Provider/Unrelated  Name.MP4", 5)], &[0]);
+        let record = completed_tv_organization_record(&destination, source);
+        let expected_identity = record.tv_identity.clone();
+        let expected_boundary = encoded_boundary_segments(&record).expect("boundary must encode");
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(
+            &preview[1..5],
+            &[&transfer_id, "tt0123456 · S02E03", "1", "1"]
+        );
+        assert_eq!(
+            &preview[5..],
+            &[
+                "move",
+                "Provider/Unrelated  Name.MP4",
+                "Exact  Show — 特別版/Season 02/Exact  Show — 特別版 - S02E03 - 第三話  —  Exact Episode.MP4",
+            ]
+        );
+        assert!(destination.join("Provider/Unrelated  Name.MP4").is_file());
+        assert!(!organization_recovery_path(
+            match &state.0.lock().expect("state must lock").transfers[0] {
+                StoredTransfer::Valid(record) => record,
+                StoredTransfer::Corrupt(_) => panic!("TV transfer must remain valid"),
+            }
+        )
+        .exists());
+
+        apply_organization(&state, &persistence_path, &preview[0])
+            .expect("TV organization must succeed");
+        let organized_file = destination.join(
+            "Exact  Show — 特別版/Season 02/Exact  Show — 特別版 - S02E03 - 第三話  —  Exact Episode.MP4",
+        );
+        assert_eq!(
+            fs::read(&organized_file).expect("organized TV media must remain readable"),
+            vec![b'a'; 5]
+        );
+
+        let restarted = VrDownloadState::default();
+        configure_tv_download_folder(&restarted, Some(destination.clone()))
+            .expect("TV folder must restore");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("tv-organized-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("organized TV transfer must reload");
+        assert_eq!(rows[1], "tv");
+        assert_eq!(rows[2], "tt0123456 · S02E03");
+        assert_eq!(
+            &rows[8..13],
+            &[
+                "completed",
+                "true",
+                "organized",
+                "Exact  Show — 特別版/Season 02/",
+                "false",
+            ]
+        );
+        let context = restarted.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("organized TV transfer must remain valid");
+        };
+        assert_eq!(record.tv_identity, expected_identity);
+        assert_eq!(
+            encoded_boundary_segments(record).expect("restarted boundary must encode"),
+            expected_boundary
+        );
+        assert!(
+            context.session.is_none(),
+            "organized TV restarted a session"
+        );
+        drop(context);
+
+        dismiss_download(&restarted, &persistence_path, &transfer_id)
+            .expect("organized TV row must dismiss");
+        let dismissed = VrDownloadState::default();
+        configure_tv_download_folder(&dismissed, Some(destination))
+            .expect("TV folder must restore after dismissal");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &dismissed,
+            &persistence_path,
+            &fixture.path.join("tv-dismissed-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("dismissed TV transfer must remain absent");
+        assert!(rows.is_empty());
+        assert_eq!(
+            fs::read(organized_file).expect("dismissal must retain organized TV media"),
+            vec![b'a'; 5]
+        );
+    }
+
+    #[test]
+    fn tv_multi_media_keeps_exact_basenames_and_non_media_at_its_original_path() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = tv_download_source(
+            &[
+                ("Provider/Cut  A.S02E03.mp4", 3),
+                ("Provider/別  Cut.S02E03.MKV", 4),
+                ("Provider/notes  exact.txt", 5),
+            ],
+            &[0, 1, 2],
+        );
+        let record = completed_tv_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+        fs::create_dir(destination.join("Exact  Show — 特別版"))
+            .expect("canonical show directory must already exist");
+        fs::create_dir(destination.join("Exact  Show — 特別版/Season 02"))
+            .expect("canonical season directory must already exist");
+
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        assert_eq!(&preview[3..5], &["2", "3"]);
+        assert_eq!(
+            &preview[5..],
+            &[
+                "move",
+                "Provider/Cut  A.S02E03.mp4",
+                "Exact  Show — 特別版/Season 02/Cut  A.S02E03.mp4",
+                "move",
+                "Provider/別  Cut.S02E03.MKV",
+                "Exact  Show — 特別版/Season 02/別  Cut.S02E03.MKV",
+                "non-media-unchanged",
+                "Provider/notes  exact.txt",
+                "",
+            ]
+        );
+        apply_organization(&state, &fixture.path.join("downloads"), &preview[0])
+            .expect("TV multi-file organization must succeed");
+        for path in [
+            "Exact  Show — 特別版/Season 02/Cut  A.S02E03.mp4",
+            "Exact  Show — 特別版/Season 02/別  Cut.S02E03.MKV",
+            "Provider/notes  exact.txt",
+        ] {
+            assert!(destination.join(path).is_file(), "missing {path:?}");
+        }
+        assert!(!destination
+            .join("Exact  Show — 特別版/Season 02/Exact  Show — 特別版 - S02E03 - 第三話  —  Exact Episode.mp4")
+            .exists());
+    }
+
+    #[test]
+    fn tv_complete_filename_limit_accepts_the_boundary_and_rejects_the_next_unit() {
+        for (episode_length, expected) in [(238, Ok(())), (239, Err(VR_ORGANIZATION_INELIGIBLE))] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let mut source = tv_download_source(&[("Provider/Episode.MP4", 3)], &[0]);
+            let identity = source.tv_identity.as_mut().expect("TV identity must exist");
+            identity.show_name = "A".to_owned();
+            identity.episode_name = "B".repeat(episode_length);
+            let record = completed_tv_organization_record(&destination, source);
+            let (state, transfer_id) = organization_state(record);
+            let result = preview_organization(&state, &transfer_id);
+            match expected {
+                Ok(()) => {
+                    let preview = result.expect("255-unit TV filename must preview");
+                    let filename = preview[7]
+                        .rsplit_once('/')
+                        .expect("TV target must have a parent")
+                        .1;
+                    assert_eq!(filename.len(), 255);
+                    assert_eq!(filename.encode_utf16().count(), 255);
+                }
+                Err(error) => assert_eq!(result, Err(error)),
+            }
+            assert_eq!(
+                fs::read(destination.join("Provider/Episode.MP4"))
+                    .expect("rejected preview must retain source"),
+                vec![b'a'; 3]
+            );
+        }
+    }
+
+    #[test]
+    fn tv_preview_rejects_unsafe_names_and_changed_exact_identity_before_mutation() {
+        for (show_name, episode_name) in [
+            ("Unsafe/Show", "Exact Episode"),
+            ("Exact Show", "Unsafe:Episode"),
+            ("CON", "Exact Episode"),
+            ("Exact Show", "NUL"),
+            ("Trailing ", "Exact Episode"),
+            ("Exact Show", "Trailing."),
+            ("Exact\u{7}Show", "Exact Episode"),
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let mut source = tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]);
+            let identity = source.tv_identity.as_mut().expect("TV identity must exist");
+            identity.show_name = show_name.to_owned();
+            identity.episode_name = episode_name.to_owned();
+            let record = completed_tv_organization_record(&destination, source);
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE),
+                "unsafe TV identity {show_name:?} / {episode_name:?} was eligible"
+            );
+            assert_eq!(
+                fs::read(destination.join("Provider/Episode.mp4"))
+                    .expect("unsafe preview must retain source"),
+                vec![b'a'; 3]
+            );
+        }
+
+        for alteration in 0..12 {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let source = tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]);
+            let mut record = completed_tv_organization_record(&destination, source);
+            let identity = record.tv_identity.as_mut().expect("TV identity must exist");
+            match alteration {
+                0 => identity.tmdb_tv_id += 1,
+                1 => identity.show_name.push_str(" changed"),
+                2 => identity.provider_season_id += 1,
+                3 => identity.season_number += 1,
+                4 => identity.provider_episode_id += 1,
+                5 => identity.episode_number += 1,
+                6 => identity.episode_name.push_str(" changed"),
+                7 => identity.imdb_id = "tt7654321".to_owned(),
+                8 => identity.provider_item_id = "1002".to_owned(),
+                9 => identity.category = "208".to_owned(),
+                10 => identity.release_name.push_str(" changed"),
+                11 => identity.infohash = "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                _ => unreachable!(),
+            }
+            let source_path = destination.join("Provider/Episode.mp4");
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE),
+                "changed TV identity field {alteration} was eligible"
+            );
+            assert_eq!(
+                fs::read(source_path).expect("changed identity must retain source"),
+                vec![b'a'; 3]
+            );
+        }
+    }
+
+    #[test]
+    fn tv_apply_rejects_changed_retained_boundary_authority_before_move_dispatch() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let record = completed_tv_organization_record(
+            &destination,
+            tv_download_source(
+                &[("Provider/Episode.mp4", 3), ("Provider/unselected.bin", 5)],
+                &[0],
+            ),
+        );
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        {
+            let context = state.0.lock().expect("state must lock");
+            let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                panic!("TV transfer must remain valid");
+            };
+            record
+                .boundary_segments
+                .lock()
+                .expect("boundary state must lock")
+                .insert(
+                    1,
+                    vec![SparseSegment {
+                        offset: 0,
+                        bytes: vec![b'x'],
+                    }],
+                );
+        }
+
+        let mut move_calls = 0;
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |source, destination| {
+                    move_calls += 1;
+                    fs::rename(source, destination)
+                },
+            ),
+            Err(VR_ORGANIZATION_STALE)
+        );
+        assert_eq!(move_calls, 0);
+        assert_eq!(
+            fs::read(destination.join("Provider/Episode.mp4"))
+                .expect("stale Apply must retain TV media"),
+            vec![b'a'; 3]
+        );
+    }
+
+    #[test]
+    fn tv_preview_rejects_case_and_unicode_normalization_collisions() {
+        for existing_show in ["exact  show — 特別版", "Exact  Show — 特別版"] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let record = completed_tv_organization_record(
+                &destination,
+                tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]),
+            );
+            fs::create_dir(destination.join(existing_show)).expect("show fixture must exist");
+            if existing_show == "Exact  Show — 特別版" {
+                fs::create_dir(destination.join(existing_show).join("season 02"))
+                    .expect("season fixture must exist");
+            }
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_CONFLICT)
+            );
+        }
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let mut source = tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]);
+        source
+            .tv_identity
+            .as_mut()
+            .expect("TV identity must exist")
+            .show_name = "Café".to_owned();
+        let record = completed_tv_organization_record(&destination, source);
+        fs::create_dir(destination.join("Cafe\u{301}"))
+            .expect("normalization-colliding show must exist");
+        let (state, transfer_id) = organization_state(record);
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_CONFLICT)
+        );
+    }
+
+    #[test]
+    fn tv_preview_rejects_noncompleted_recovered_old_folder_and_organized_rows() {
+        for transfer_state in [
+            TransferState::Queued,
+            TransferState::Downloading,
+            TransferState::Paused,
+            TransferState::Cancelled,
+            TransferState::Offline,
+            TransferState::Failed,
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let mut record = completed_tv_organization_record(
+                &destination,
+                tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]),
+            );
+            record.state = transfer_state;
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE),
+                "noncompleted TV state {transfer_state:?} was eligible"
+            );
+        }
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let mut recovered = completed_tv_organization_record(
+            &destination,
+            tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]),
+        );
+        recovered.state = TransferState::Failed;
+        recovered.terminal_recovery_generation = Some(7);
+        let (state, transfer_id) = organization_state(recovered);
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+
+        let fixture = FilesystemFixture::new();
+        let current = fixture.path.join("current");
+        let old = fixture.path.join("old");
+        fs::create_dir(&current).expect("current TV folder must exist");
+        fs::create_dir(&old).expect("old TV folder must exist");
+        let current = fs::canonicalize(current).expect("current TV folder must canonicalize");
+        let old = fs::canonicalize(old).expect("old TV folder must canonicalize");
+        let old_record = completed_tv_organization_record(
+            &old,
+            tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]),
+        );
+        let (state, transfer_id) = organization_state(old_record);
+        configure_tv_download_folder(&state, Some(current)).expect("TV folder must change");
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let mut organized = completed_tv_organization_record(
+            &destination,
+            tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]),
+        );
+        organized.organization_state = OrganizationState::Organized;
+        let (state, transfer_id) = organization_state(organized);
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+    }
+
+    #[test]
+    fn tv_persistence_and_rollback_failure_recovers_exact_paths_and_dismisses_durably() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = tv_download_source(
+            &[
+                ("Provider/Episode  A.S02E03.mp4", 3),
+                ("Provider/Episode  B.S02E03.MKV", 4),
+            ],
+            &[0, 1],
+        );
+        let record = completed_tv_organization_record(&destination, source);
+        let expected_identity = record.tv_identity.clone();
+        let expected_boundary = encoded_boundary_segments(&record).expect("boundary must encode");
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+        {
+            let context = state.0.lock().expect("state must lock");
+            write_persisted_transfers(&persistence_path, &context.transfers)
+                .expect("original TV paths must persist");
+        }
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let mut move_calls = 0;
+        assert_eq!(
+            apply_organization_with_persistence(
+                &state,
+                &persistence_path,
+                &preview[0],
+                |source, destination| {
+                    move_calls += 1;
+                    if move_calls == 4 {
+                        Err(io::Error::other("injected TV rollback failure"))
+                    } else {
+                        fs::rename(source, destination)
+                    }
+                },
+                |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+            ),
+            Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+        );
+        assert_eq!(move_calls, 4);
+        let moved_path = destination.join("Exact  Show — 特別版/Season 02/Episode  A.S02E03.mp4");
+        let unmoved_path = destination.join("Provider/Episode  B.S02E03.MKV");
+        assert_eq!(
+            fs::read(&moved_path).expect("moved TV media must remain"),
+            vec![b'a'; 3]
+        );
+        assert_eq!(
+            fs::read(&unmoved_path).expect("unmoved TV media must remain"),
+            vec![b'b'; 4]
+        );
+
+        let restarted = VrDownloadState::default();
+        configure_tv_download_folder(&restarted, Some(destination.clone()))
+            .expect("TV folder must restore");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("tv-recovery-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("TV attention recovery must load");
+        assert_eq!(rows[1], "tv");
+        assert_eq!(
+            &rows[8..13],
+            &[
+                "completed",
+                "true",
+                "attention",
+                "Exact  Show — 特別版/Season 02/",
+                "true",
+            ]
+        );
+        let context = restarted.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("recovered TV transfer must remain valid");
+        };
+        assert_eq!(record.tv_identity, expected_identity);
+        assert_eq!(
+            record.current_paths,
+            [
+                "Exact  Show — 特別版/Season 02/Episode  A.S02E03.mp4",
+                "Provider/Episode  B.S02E03.MKV",
+            ]
+        );
+        assert_eq!(
+            encoded_boundary_segments(record).expect("recovery boundary must encode"),
+            expected_boundary
+        );
+        assert!(context.session.is_none(), "TV recovery started a session");
+        drop(context);
+
+        dismiss_download(&restarted, &persistence_path, &transfer_id)
+            .expect("TV attention row must dismiss");
+        let dismissed = VrDownloadState::default();
+        configure_tv_download_folder(&dismissed, Some(destination))
+            .expect("TV folder must restore after dismissal");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &dismissed,
+            &persistence_path,
+            &fixture.path.join("tv-recovery-dismissed"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("dismissed TV recovery must remain absent");
+        assert!(rows.is_empty());
+        assert_eq!(
+            fs::read(moved_path).expect("dismissed moved TV media must remain"),
+            vec![b'a'; 3]
+        );
+        assert_eq!(
+            fs::read(unmoved_path).expect("dismissed unmoved TV media must remain"),
+            vec![b'b'; 4]
+        );
     }
 
     #[test]
@@ -8617,14 +9319,18 @@ mod tests {
         let fixture = FilesystemFixture::new();
         let adult_destination = fixture.path.join("Adult");
         let movie_destination = fixture.path.join("Movies");
+        let tv_destination = fixture.path.join("TV");
         let vr_destination = fixture.path.join("VR");
         fs::create_dir(&adult_destination).expect("Adult destination must exist");
         fs::create_dir(&movie_destination).expect("Movies destination must exist");
+        fs::create_dir(&tv_destination).expect("TV destination must exist");
         fs::create_dir(&vr_destination).expect("VR destination must exist");
         let adult_destination =
             fs::canonicalize(adult_destination).expect("Adult destination must canonicalize");
         let movie_destination =
             fs::canonicalize(movie_destination).expect("Movies destination must canonicalize");
+        let tv_destination =
+            fs::canonicalize(tv_destination).expect("TV destination must canonicalize");
         let vr_destination =
             fs::canonicalize(vr_destination).expect("VR destination must canonicalize");
         let adult_record = completed_adult_organization_record(
@@ -8643,10 +9349,16 @@ mod tests {
                 &[0],
             ),
         );
+        let tv_record = completed_tv_organization_record(
+            &tv_destination,
+            tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]),
+        );
         write_organization_recovery(&adult_record, &adult_record.current_paths, None)
             .expect("Adult recovery must persist");
         write_organization_recovery(&movie_record, &movie_record.current_paths, None)
             .expect("Movie recovery must persist");
+        write_organization_recovery(&tv_record, &tv_record.current_paths, None)
+            .expect("TV recovery must persist");
         write_organization_recovery(&vr_record, &vr_record.current_paths, None)
             .expect("VR recovery must persist");
         let persistence_path = fixture.path.join("downloads");
@@ -8654,8 +9366,9 @@ mod tests {
         let swapped = VrDownloadState::default();
         {
             let mut context = swapped.0.lock().expect("state must lock");
-            context.adult_future_folder = Some(vr_destination.clone());
+            context.adult_future_folder = Some(tv_destination.clone());
             context.movie_future_folder = Some(adult_destination.clone());
+            context.tv_future_folder = Some(vr_destination.clone());
             context.future_folder = Some(movie_destination.clone());
         }
         let rows = tauri::async_runtime::block_on(load_downloads(
@@ -8672,6 +9385,7 @@ mod tests {
             let mut context = current.0.lock().expect("state must lock");
             context.adult_future_folder = Some(adult_destination);
             context.movie_future_folder = Some(movie_destination);
+            context.tv_future_folder = Some(tv_destination);
             context.future_folder = Some(vr_destination);
         }
         let rows = tauri::async_runtime::block_on(load_downloads(
@@ -8681,10 +9395,11 @@ mod tests {
             &fixture.path.join("limit"),
         ))
         .expect("category-matched recoveries must load");
-        assert_eq!(rows.len(), 42);
+        assert_eq!(rows.len(), 56);
         assert_eq!(rows[1], "vr");
         assert_eq!(rows[15], "adult");
         assert_eq!(rows[29], "movie");
+        assert_eq!(rows[43], "tv");
     }
 
     #[test]
@@ -10824,6 +11539,11 @@ mod tests {
     #[test]
     fn vr_library_trash_rejects_shared_movie_transfer_organization_and_recovery_paths() {
         assert_shared_category_vr_trash_ownership(TransferCategory::Movie);
+    }
+
+    #[test]
+    fn vr_library_trash_rejects_shared_tv_transfer_organization_and_recovery_paths() {
+        assert_shared_category_vr_trash_ownership(TransferCategory::Tv);
     }
 
     #[test]

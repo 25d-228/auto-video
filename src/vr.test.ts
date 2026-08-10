@@ -1031,6 +1031,74 @@ describe("trusted VR download boundary", () => {
     expect(invokeMock).toHaveBeenCalledWith("load_vr_downloads");
   });
 
+  it("accepts eligible, attention, and organized TV rows only in the canonical season directory", async () => {
+    invokeMock.mockResolvedValue([
+      "tv-ready-701-2-3",
+      "tv",
+      "tt0123456 · S02E03",
+      "Exact Show S02E03",
+      "1",
+      "7",
+      "7",
+      "0",
+      "completed",
+      "true",
+      "none",
+      "",
+      "true",
+      "false",
+      "tv-attention-701-2-3",
+      "tv",
+      "tt0123456 · S02E03",
+      "Exact Show S02E03",
+      "2",
+      "14",
+      "14",
+      "0",
+      "completed",
+      "true",
+      "attention",
+      "Exact  Show — 特別版/Season 02/",
+      "true",
+      "false",
+      "tv-organized-701-2-3",
+      "tv",
+      "tt0123456 · S02E03",
+      "Exact Show S02E03",
+      "1",
+      "7",
+      "7",
+      "0",
+      "completed",
+      "true",
+      "organized",
+      "Exact  Show — 特別版/Season 02/",
+      "false",
+      "false",
+    ]);
+
+    await expect(loadVrDownloads()).resolves.toEqual([
+      expect.objectContaining({
+        transferId: "tv-ready-701-2-3",
+        category: "tv",
+        organizationStatus: "none",
+        canOrganize: true,
+      }),
+      expect.objectContaining({
+        transferId: "tv-attention-701-2-3",
+        organizationStatus: "attention",
+        organizationRelativeDirectory: "Exact  Show — 特別版/Season 02/",
+        canOrganize: true,
+      }),
+      expect.objectContaining({
+        transferId: "tv-organized-701-2-3",
+        organizationStatus: "organized",
+        organizationRelativeDirectory: "Exact  Show — 特別版/Season 02/",
+        canOrganize: false,
+      }),
+    ]);
+  });
+
   it("rejects TV rows with fabricated episode identity or organization state", async () => {
     const validTvRow = [
       "tv-transfer-701-2-3",
@@ -1053,8 +1121,8 @@ describe("trusted VR download boundary", () => {
       [2, "tt0123456 · S00E03"],
       [2, "tt0123456 · S02E00"],
       [10, "attention"],
-      [11, "Exact Show/"],
-      [12, "true"],
+      [11, "Exact Show/Season 03/"],
+      [12, "invalid"],
     ] as const) {
       const malformed = [...validTvRow];
       malformed[fieldIndex] = invalidValue;
@@ -1346,6 +1414,93 @@ describe("trusted VR download boundary", () => {
     invokeMock.mockResolvedValueOnce(undefined);
     await expect(dismissVrOrganization()).resolves.toBeUndefined();
     expect(invokeMock).toHaveBeenNthCalledWith(3, "dismiss_vr_organization");
+  });
+
+  it("accepts only a structurally consistent native TV organization plan", async () => {
+    invokeMock.mockResolvedValueOnce([
+      "tv-plan-701-2-3",
+      "tv-transfer-701-2-3",
+      "tt0123456 · S02E03",
+      "1",
+      "3",
+      "move",
+      "Provider/Episode  A.mp4",
+      "Exact  Show — 特別版/Season 02/Episode  A.mp4",
+      "media-unchanged",
+      "Exact  Show — 特別版/Season 02/Episode  B.MKV",
+      "Exact  Show — 特別版/Season 02/Episode  B.MKV",
+      "non-media-unchanged",
+      "Provider/notes.txt",
+      "",
+    ]);
+
+    await expect(previewVrOrganization("tv-transfer-701-2-3")).resolves.toEqual({
+      planId: "tv-plan-701-2-3",
+      transferId: "tv-transfer-701-2-3",
+      identity: "tt0123456 · S02E03",
+      moveCount: 1,
+      entries: [
+        {
+          kind: "move",
+          sourceRelativePath: "Provider/Episode  A.mp4",
+          destinationRelativePath:
+            "Exact  Show — 特別版/Season 02/Episode  A.mp4",
+        },
+        {
+          kind: "media-unchanged",
+          sourceRelativePath:
+            "Exact  Show — 特別版/Season 02/Episode  B.MKV",
+          destinationRelativePath:
+            "Exact  Show — 特別版/Season 02/Episode  B.MKV",
+        },
+        {
+          kind: "non-media-unchanged",
+          sourceRelativePath: "Provider/notes.txt",
+          destinationRelativePath: null,
+        },
+      ],
+    });
+
+    for (const response of [
+      [
+        "tv-plan-701-2-3",
+        "tv-transfer-701-2-3",
+        "tt0123456 · S02E03",
+        "1",
+        "1",
+        "move",
+        "Provider/Episode.mp4",
+        "Exact  Show — 特別版/Season 03/Episode.mp4",
+      ],
+      [
+        "tv-plan-701-2-3",
+        "tv-transfer-701-2-3",
+        "tt0123456 · S02E03",
+        "1",
+        "1",
+        "move",
+        "Provider/Episode.mp4",
+        "Exact  Show — 特別版/Episode.mp4",
+      ],
+      [
+        "tv-plan-701-2-3",
+        "tv-transfer-701-2-3",
+        "tt0123456 · S02E03",
+        "2",
+        "2",
+        "move",
+        "Provider/Episode A.mp4",
+        "Exact  Show — 特別版/Season 02/Episode A.mp4",
+        "move",
+        "Provider/Episode B.mp4",
+        "Other Show/Season 02/Episode B.mp4",
+      ],
+    ]) {
+      invokeMock.mockResolvedValueOnce(response);
+      await expect(previewVrOrganization("tv-transfer-701-2-3")).rejects.toThrow(
+        "invalid data",
+      );
+    }
   });
 
   it("preserves compact Adult multipart basenames in native previews", async () => {

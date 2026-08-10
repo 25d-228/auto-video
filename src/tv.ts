@@ -105,8 +105,13 @@ function parsedEpisodeIdentity(stem: string, relativePath: string) {
 
   const components = relativePath.split(/[\\/]/);
   const parentTitle = components.length > 1 ? components.at(-2) ?? "" : "";
-  return usableShowTitle(parentTitle)
-    ? { episode, season, showTitle: parentTitle }
+  if (usableShowTitle(parentTitle)) {
+    return { episode, season, showTitle: parentTitle };
+  }
+  const canonicalSeasonDirectory = `Season ${String(season).padStart(2, "0")}`;
+  const grandparentTitle = components.length > 2 ? components.at(-3) ?? "" : "";
+  return parentTitle === canonicalSeasonDirectory && usableShowTitle(grandparentTitle)
+    ? { episode, season, showTitle: grandparentTitle }
     : null;
 }
 
