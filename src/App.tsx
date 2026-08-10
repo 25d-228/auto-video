@@ -8750,9 +8750,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           ? "The exact selected transfer files were permanently deleted."
           : "The exact selected transfer files were permanently deleted, but Downloads still needs reconciliation.",
       );
-      if (downloadsReconciled) {
-        setVrDownloadFocusTarget("vr-downloads-refresh");
-      }
+      setVrDownloadFocusTarget("vr-downloads-refresh");
     } catch (error: unknown) {
       await refreshVrDownloads();
       const message = (() => {

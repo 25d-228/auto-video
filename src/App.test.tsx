@@ -10286,7 +10286,7 @@ describe("aggregate Movie, TV, Adult, and VR download limit and transfer summari
     ).toBeTruthy();
   });
 
-  it("keeps completed cleanup truthful when Downloads reconciliation needs a retry", async () => {
+  it("keeps completed cleanup truthful and focuses Refresh when reconciliation needs a retry", async () => {
     savedVrFolder = "/VR";
     const initialRows = vrDownloadFixture({
       cleanupAvailable: "true",
@@ -10324,6 +10324,11 @@ describe("aggregate Movie, TV, Adult, and VR download limit and transfer summari
       screen.getByRole("heading", { name: "Cleanup needs reconciliation" }),
     ).toBeTruthy();
     expect(cleanupCancelledVrDownloadMock).toHaveBeenCalledOnce();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Refresh" }),
+      );
+    });
     await waitFor(() => {
       expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
       expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
