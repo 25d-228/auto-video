@@ -140,6 +140,11 @@ describe("conservative parsed TV Library identity", () => {
       "Show.1x02-03.mp4",
       "Show.S123E456-E457.mp4",
       "Show.S123E456-E-457.mkv",
+      "Show.S123E456-x457.mp4",
+      "Show.S123E456 x 457.mkv",
+      "Show.123x456-x457.mp4",
+      "Show.123x456-(X)-457.mkv",
+      "Show.123x456/x457.mp4",
       "Show.S0123E456.mp4",
       "Show.S123E0456.mkv",
       "Show.S9007199254740992E456.mp4",
@@ -157,11 +162,42 @@ describe("conservative parsed TV Library identity", () => {
     ]);
 
     const { items } = await scanTvLibrary();
+    const basenames = filenames.map((filename) => filename.split("/").at(-1));
 
     expect(items).toHaveLength(filenames.length);
     expect(items.every((item) => item.showTitle === null)).toBe(true);
-    expect(items.map((item) => item.files[0].filename)).toEqual(filenames);
+    expect(items.map((item) => item.files[0].filename)).toEqual(basenames);
     expect(items.every((item) => item.files[0].season === null)).toBe(true);
+  });
+
+  it("preserves valid quality and codec suffixes on one large episode identity", async () => {
+    const filenames = [
+      "Show.S123E456+720p.mp4",
+      "Show.S123E456.x264.mkv",
+      "Show.123x456+10bit.mp4",
+      "Show.123x456.x265.mkv",
+    ];
+    invokeMock.mockResolvedValue([
+      "9",
+      ...filenames.flatMap((filename, index) => [
+        `/TV/${filename}`,
+        filename,
+        String(index + 1),
+      ]),
+    ]);
+
+    const { items } = await scanTvLibrary();
+
+    expect(items).toHaveLength(1);
+    expect(items[0].showTitle).toBe("Show");
+    expect(items[0].files.map((file) => file.filename)).toEqual(
+      expect.arrayContaining(filenames),
+    );
+    expect(
+      items[0].files.every(
+        (file) => file.season === 123 && file.episode === 456,
+      ),
+    ).toBe(true);
   });
 
   it("does not merge prefix, substring, or neighboring show titles", async () => {
@@ -236,6 +272,15 @@ describe("conservative parsed TV Library identity", () => {
       "/TV/Wrong Parent/Season 124/S123E456.mp4",
       "Wrong Parent/Season 124/S123E456.mp4",
       "5",
+      "/TV/S123/S123E456.mkv",
+      "S123/S123E456.mkv",
+      "6",
+      "/TV/Exact Big Show/Season 123/Exact S01E02 Show - S123E456 - Exact Episode.mkv",
+      "Exact Big Show/Season 123/Exact S01E02 Show - S123E456 - Exact Episode.mkv",
+      "7",
+      "/TV/Exact Big Show/Season 123/Exact Big Show - S123E456 - Flashback 1x02.mkv",
+      "Exact Big Show/Season 123/Exact Big Show - S123E456 - Flashback 1x02.mkv",
+      "8",
     ]);
 
     const { items } = await scanTvLibrary();
@@ -250,7 +295,14 @@ describe("conservative parsed TV Library identity", () => {
         (file) => file.season === 123 && file.episode === 456,
       ),
     ).toBe(true);
-    expect(items.find((item) => item.title === "S123E456")?.showTitle).toBeNull();
+    const unassociated = items.filter((item) => item.showTitle === null);
+    expect(unassociated).toHaveLength(4);
+    expect(unassociated.map((item) => item.files[0].filename)).toEqual([
+      "S123E456.mp4",
+      "S123E456.mkv",
+      "Exact S01E02 Show - S123E456 - Exact Episode.mkv",
+      "Exact Big Show - S123E456 - Flashback 1x02.mkv",
+    ]);
   });
 
   it("rejects malformed rows, duplicate paths, traversal, unsupported files, and oversized sizes", async () => {

@@ -3638,9 +3638,76 @@ fn portable_movie_organization_directory(
     Ok(directory)
 }
 
+fn tv_episode_component_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start).copied()? {
+        b'0' => {
+            let end = start.checked_add(2)?;
+            matches!(bytes.get(start + 1), Some(b'1'..=b'9'))
+                .then_some(end)
+                .filter(|end| !bytes.get(*end).is_some_and(u8::is_ascii_digit))
+        }
+        b'1'..=b'9' => {
+            let mut end = start + 1;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            Some(end)
+        }
+        _ => None,
+    }
+}
+
+fn tv_name_contains_episode_marker(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (0..bytes.len()).any(|start| {
+        if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            return false;
+        }
+        let end = if matches!(bytes.get(start), Some(b'S' | b's')) {
+            tv_episode_component_end(bytes, start + 1).and_then(|season_end| {
+                matches!(bytes.get(season_end), Some(b'E' | b'e'))
+                    .then(|| tv_episode_component_end(bytes, season_end + 1))
+                    .flatten()
+            })
+        } else {
+            tv_episode_component_end(bytes, start).and_then(|season_end| {
+                matches!(bytes.get(season_end), Some(b'X' | b'x'))
+                    .then(|| tv_episode_component_end(bytes, season_end + 1))
+                    .flatten()
+            })
+        };
+        end.is_some_and(|end| end == bytes.len() || !bytes[end].is_ascii_alphanumeric())
+    })
+}
+
+fn tv_show_name_can_group(value: &str) -> bool {
+    let season_only = value.get(..6).is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case("season") && {
+            let suffix = value[6..].trim_start_matches(|character: char| {
+                character.is_whitespace() || matches!(character, '.' | '_' | '-')
+            });
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        }
+    });
+    let numbered_season = value.get(..1).is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case("s")
+            && !value[1..].is_empty()
+            && value[1..].bytes().all(|byte| byte.is_ascii_digit())
+    });
+    value.chars().any(char::is_alphanumeric)
+        && !season_only
+        && !numbered_season
+        && !tv_name_contains_episode_marker(value)
+}
+
 fn tv_organization_directory(identity: &TvDownloadIdentity) -> Result<String, &'static str> {
     validate_portable_organization_component(&identity.show_name)?;
     validate_portable_organization_component(&identity.episode_name)?;
+    if !tv_show_name_can_group(&identity.show_name)
+        || tv_name_contains_episode_marker(&identity.episode_name)
+    {
+        return Err(VR_ORGANIZATION_INELIGIBLE);
+    }
     let season_directory = format!("Season {:02}", identity.season_number);
     validate_portable_organization_component(&season_directory)?;
     Ok(format!("{}/{season_directory}", identity.show_name))
@@ -7333,6 +7400,86 @@ mod tests {
                 vec![b'a'; 3]
             );
         }
+    }
+
+    #[test]
+    fn tv_preview_rejects_exact_names_that_cannot_regroup_without_mutation() {
+        for (show_name, episode_name) in [
+            ("S123", "Exact Episode"),
+            ("Season 123", "Exact Episode"),
+            ("Exact S123E456 Show", "Exact Episode"),
+            ("Exact Show", "Flashback 123x456"),
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let mut source = tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]);
+            let identity = source.tv_identity.as_mut().expect("TV identity must exist");
+            identity.show_name = show_name.to_owned();
+            identity.episode_name = episode_name.to_owned();
+            let record = completed_tv_organization_record(&destination, source);
+            let recovery_path = organization_recovery_path(&record);
+            let recovery_successor_path = organization_recovery_successor_path(&record);
+            let source_path = destination.join("Provider/Episode.mp4");
+            let persistence_path = fixture.path.join("downloads");
+            let (state, transfer_id) = organization_state(record);
+            let before = transfer_snapshots(&state);
+
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE),
+                "unregroupable TV identity {show_name:?} / {episode_name:?} was eligible"
+            );
+            let mut move_calls = 0;
+            assert_eq!(
+                apply_organization_with(
+                    &state,
+                    &persistence_path,
+                    "fabricated-plan",
+                    |source, destination| {
+                        move_calls += 1;
+                        fs::rename(source, destination)
+                    },
+                ),
+                Err(VR_ORGANIZATION_STALE)
+            );
+
+            assert_eq!(move_calls, 0);
+            assert_eq!(
+                fs::read(source_path).expect("rejected TV identity must retain source bytes"),
+                vec![b'a'; 3]
+            );
+            assert!(!destination.join(show_name).exists());
+            assert_eq!(transfer_snapshots(&state), before);
+            assert!(!persistence_path.exists());
+            assert!(!recovery_path.exists());
+            assert!(!recovery_successor_path.exists());
+        }
+    }
+
+    #[test]
+    fn tv_large_single_episode_preview_uses_a_regroupable_canonical_path() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let mut source = tv_download_source(&[("Provider/Episode.MKV", 3)], &[0]);
+        let identity = source.tv_identity.as_mut().expect("TV identity must exist");
+        identity.show_name = "Exact Big Show".to_owned();
+        identity.season_number = 123;
+        identity.episode_number = 456;
+        identity.episode_name = "Exact Episode".to_owned();
+        identity.release_name = "Exact Big Show.S123E456+720p".to_owned();
+        source.release_name = identity.release_name.clone();
+        let record = completed_tv_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+
+        let preview = preview_organization(&state, &transfer_id)
+            .expect("large exact TV episode must preview");
+
+        assert_eq!(preview[2], "tt0123456 · S123E456");
+        assert_eq!(
+            preview[7],
+            "Exact Big Show/Season 123/Exact Big Show - S123E456 - Exact Episode.MKV"
+        );
     }
 
     #[test]

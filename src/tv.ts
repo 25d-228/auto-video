@@ -34,7 +34,7 @@ const maximumU64 = 18_446_744_073_709_551_615n;
 const episodeTokenPattern =
   /(^|[^A-Za-z0-9])(?:S([1-9][0-9]*|0[1-9])E([1-9][0-9]*|0[1-9])|([1-9][0-9]*|0[1-9])x([1-9][0-9]*|0[1-9]))(?=$|[^A-Za-z0-9])/gi;
 const compactEpisodeContinuationPattern =
-  /^[\s._+,&\p{Pd}]+(?:E[\s._+,&\p{Pd}]*)?[0-9]+(?=$|[^A-Za-z0-9])/iu;
+  /^[\s\p{P}\p{S}]+(?:(?:E|X(?!26[4-6](?=$|[\s\p{P}\p{S}])))[\s\p{P}\p{S}]*)?[0-9]+(?=$|[^A-Za-z0-9])/iu;
 
 function parseTvFolderState(value: unknown): TvFolderState {
   if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
@@ -73,7 +73,7 @@ function filenameStem(filename: string) {
 function usableShowTitle(value: string) {
   return /[\p{L}\p{N}]/u.test(value) &&
     !/^season[\s._-]*\d+$/iu.test(value) &&
-    !/^S\d{1,2}$/i.test(value) &&
+    !/^S\d+$/i.test(value) &&
     [...value.matchAll(episodeTokenPattern)].length === 0;
 }
 
