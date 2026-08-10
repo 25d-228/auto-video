@@ -3824,7 +3824,7 @@ fn reconcile_macos_cleanup_mutation(
 }
 
 fn reconcile_cleanup_mutations(
-    persistence_path: &Path,
+    _persistence_path: &Path,
     recovery: &mut CleanupRecovery,
 ) -> Result<(), &'static str> {
     for selected_index in 0..recovery.mutations.len() {
@@ -3832,7 +3832,7 @@ fn reconcile_cleanup_mutations(
             continue;
         }
         #[cfg(target_os = "macos")]
-        reconcile_macos_cleanup_mutation(persistence_path, recovery, selected_index)?;
+        reconcile_macos_cleanup_mutation(_persistence_path, recovery, selected_index)?;
         #[cfg(not(target_os = "macos"))]
         return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
     }
@@ -3890,7 +3890,8 @@ fn delete_exact_cleanup_file_with(
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(&target)
         .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
-    if open_file_fingerprint(&file).map_err(|_| VR_DOWNLOAD_STALE)? != expected_fingerprint {
+    if open_file_fingerprint(&file).map_err(|_| VR_DOWNLOAD_STALE)? != expected_fingerprint.as_str()
+    {
         return Err(VR_DOWNLOAD_STALE);
     }
     before_mutation().map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
