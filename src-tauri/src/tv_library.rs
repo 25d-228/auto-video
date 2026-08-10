@@ -38,6 +38,15 @@ pub const TV_FILE_TRASH_STALE: &str = "tv_file_trash_stale";
 pub const TV_FILE_TRASH_UNAVAILABLE: &str = "tv_file_trash_unavailable";
 pub const TV_FILE_TRASH_UNSUPPORTED: &str = "tv_file_trash_unsupported";
 
+const MAXIMUM_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TvLibraryIdentity {
+    pub(crate) show_title: String,
+    pub(crate) season: u64,
+    pub(crate) episode: u64,
+}
+
 #[derive(Clone)]
 struct TrustedTvFile {
     path: PathBuf,
@@ -181,6 +190,225 @@ fn is_supported_media(path: &Path) -> bool {
         })
 }
 
+fn episode_component_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start).copied()? {
+        b'0' => {
+            let end = start.checked_add(2)?;
+            matches!(bytes.get(start + 1), Some(b'1'..=b'9'))
+                .then_some(end)
+                .filter(|end| !bytes.get(*end).is_some_and(u8::is_ascii_digit))
+        }
+        b'1'..=b'9' => {
+            let mut end = start + 1;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            Some(end)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EpisodeMarker {
+    start: usize,
+    end: usize,
+    season: u64,
+    episode: u64,
+}
+
+fn episode_component(value: &str, start: usize, end: usize) -> Option<u64> {
+    value
+        .get(start..end)?
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number <= MAXIMUM_SAFE_INTEGER)
+}
+
+fn episode_markers(value: &str) -> Vec<EpisodeMarker> {
+    let bytes = value.as_bytes();
+    let mut markers = Vec::new();
+    for start in 0..bytes.len() {
+        if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let parsed = if matches!(bytes.get(start), Some(b'S' | b's')) {
+            let season_start = start + 1;
+            episode_component_end(bytes, season_start).and_then(|season_end| {
+                if !matches!(bytes.get(season_end), Some(b'E' | b'e')) {
+                    return None;
+                }
+                let episode_start = season_end + 1;
+                episode_component_end(bytes, episode_start)
+                    .map(|end| (season_start, season_end, episode_start, end))
+            })
+        } else {
+            episode_component_end(bytes, start).and_then(|season_end| {
+                if !matches!(bytes.get(season_end), Some(b'X' | b'x')) {
+                    return None;
+                }
+                let episode_start = season_end + 1;
+                episode_component_end(bytes, episode_start)
+                    .map(|end| (start, season_end, episode_start, end))
+            })
+        };
+        let Some((season_start, season_end, episode_start, end)) = parsed else {
+            continue;
+        };
+        if end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
+            continue;
+        }
+        let Some(season) = episode_component(value, season_start, season_end) else {
+            continue;
+        };
+        let Some(episode) = episode_component(value, episode_start, end) else {
+            continue;
+        };
+        markers.push(EpisodeMarker {
+            start,
+            end,
+            season,
+            episode,
+        });
+    }
+    markers
+}
+
+fn continuation_separator(character: char) -> bool {
+    character.is_whitespace() || !character.is_alphanumeric()
+}
+
+fn compact_episode_continuation(value: &str) -> bool {
+    let mut characters = value.char_indices().peekable();
+    if !characters
+        .peek()
+        .is_some_and(|(_, character)| continuation_separator(*character))
+    {
+        return false;
+    }
+    while characters
+        .peek()
+        .is_some_and(|(_, character)| continuation_separator(*character))
+    {
+        characters.next();
+    }
+    let mut number_start = characters
+        .peek()
+        .map(|(index, _)| *index)
+        .unwrap_or(value.len());
+    if characters
+        .peek()
+        .is_some_and(|(_, character)| matches!(character, 'E' | 'e' | 'X' | 'x'))
+    {
+        let (_, marker) = characters.next().expect("peeked marker must exist");
+        number_start = characters
+            .peek()
+            .map(|(index, _)| *index)
+            .unwrap_or(value.len());
+        if matches!(marker, 'X' | 'x') {
+            let suffix = &value[number_start..];
+            if ["264", "265", "266"].iter().any(|codec| {
+                suffix.strip_prefix(codec).is_some_and(|remaining| {
+                    remaining.is_empty()
+                        || remaining.chars().next().is_some_and(continuation_separator)
+                })
+            }) {
+                return false;
+            }
+        }
+        while characters
+            .peek()
+            .is_some_and(|(_, character)| continuation_separator(*character))
+        {
+            characters.next();
+        }
+        number_start = characters
+            .peek()
+            .map(|(index, _)| *index)
+            .unwrap_or(value.len());
+    }
+    let mut number_end = number_start;
+    while let Some((index, character)) = characters.peek().copied() {
+        if !character.is_ascii_digit() {
+            break;
+        }
+        number_end = index + character.len_utf8();
+        characters.next();
+    }
+    number_end > number_start
+        && characters
+            .peek()
+            .is_none_or(|(_, character)| !character.is_ascii_alphanumeric())
+}
+
+fn usable_show_title(value: &str) -> bool {
+    let season_only = value.get(..6).is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case("season") && {
+            let suffix = value[6..].trim_start_matches(|character: char| {
+                character.is_whitespace() || matches!(character, '.' | '_' | '-')
+            });
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        }
+    });
+    let numbered_season = value.get(..1).is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case("s")
+            && !value[1..].is_empty()
+            && value[1..].bytes().all(|byte| byte.is_ascii_digit())
+    });
+    value.chars().any(char::is_alphanumeric)
+        && !season_only
+        && !numbered_season
+        && episode_markers(value).is_empty()
+}
+
+pub(crate) fn parse_tv_relative_identity(relative_path: &str) -> Option<TvLibraryIdentity> {
+    let components = relative_path.split(['/', '\\']).collect::<Vec<_>>();
+    if relative_path.is_empty()
+        || relative_path.starts_with(['/', '\\'])
+        || components
+            .iter()
+            .any(|component| component.is_empty() || matches!(*component, "." | ".."))
+    {
+        return None;
+    }
+    let filename = *components.last()?;
+    let stem = filename
+        .rfind('.')
+        .filter(|index| *index > 0)
+        .map_or(filename, |index| &filename[..index]);
+    let markers = episode_markers(stem);
+    let [marker] = markers.as_slice() else {
+        return None;
+    };
+    if compact_episode_continuation(&stem[marker.end..]) {
+        return None;
+    }
+
+    let filename_title = stem[..marker.start].trim_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '.' | '_' | '-')
+    });
+    let show_title = if !filename_title.is_empty() && usable_show_title(filename_title) {
+        filename_title
+    } else {
+        let parent = components.get(components.len().checked_sub(2)?)?;
+        if usable_show_title(parent) {
+            parent
+        } else {
+            let grandparent = components.get(components.len().checked_sub(3)?)?;
+            let season_directory = format!("Season {:02}", marker.season);
+            if *parent != season_directory || !usable_show_title(grandparent) {
+                return None;
+            }
+            grandparent
+        }
+    };
+    Some(TvLibraryIdentity {
+        show_title: show_title.to_owned(),
+        season: marker.season,
+        episode: marker.episode,
+    })
+}
+
 fn collect_media_files(directory: &Path, files: &mut Vec<TrustedTvFile>) -> io::Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -226,7 +454,7 @@ pub fn scan_tv_library_with(state: &TvLibraryState) -> Result<Vec<String>, &'sta
     };
     let files = scan_media_files(&folder)?;
 
-    let mut response = Vec::with_capacity(1 + files.len() * 3);
+    let mut response = Vec::with_capacity(1 + files.len() * 6);
     response.push(generation.to_string());
     for file in &files {
         response.push(
@@ -235,16 +463,26 @@ pub fn scan_tv_library_with(state: &TvLibraryState) -> Result<Vec<String>, &'sta
                 .map(str::to_owned)
                 .ok_or(TV_LIBRARY_SCAN_FAILED)?,
         );
-        response.push(
-            file.path
-                .strip_prefix(&folder)
-                .ok()
-                .and_then(Path::to_str)
-                .map(str::to_owned)
-                .filter(|path| !path.is_empty())
-                .ok_or(TV_LIBRARY_SCAN_FAILED)?,
-        );
+        let relative_path = file
+            .path
+            .strip_prefix(&folder)
+            .ok()
+            .and_then(Path::to_str)
+            .map(str::to_owned)
+            .filter(|path| !path.is_empty())
+            .ok_or(TV_LIBRARY_SCAN_FAILED)?;
+        let identity = parse_tv_relative_identity(&relative_path);
+        response.push(relative_path);
         response.push(file.size.to_string());
+        if let Some(identity) = identity {
+            response.extend([
+                identity.show_title,
+                identity.season.to_string(),
+                identity.episode.to_string(),
+            ]);
+        } else {
+            response.extend([String::new(), String::new(), String::new()]);
+        }
     }
 
     let mut context = state.0.lock().map_err(|_| TV_LIBRARY_SCAN_FAILED)?;
@@ -558,14 +796,80 @@ mod tests {
                 first.to_string_lossy().into_owned(),
                 "A  Show.S01E02.mp4".to_owned(),
                 "3".to_owned(),
+                "A  Show".to_owned(),
+                "1".to_owned(),
+                "2".to_owned(),
                 second.to_string_lossy().into_owned(),
                 Path::new("番組  Name")
                     .join("S1E3.MKV")
                     .to_string_lossy()
                     .into_owned(),
                 "6".to_owned(),
+                "番組  Name".to_owned(),
+                "1".to_owned(),
+                "3".to_owned(),
             ])
         );
+    }
+
+    #[test]
+    fn conservative_identity_parser_accepts_exact_single_episode_paths() {
+        for (path, show_title, season, episode) in [
+            (
+                "Exact  Show — 特別版/Season 02/Exact  Show — 特別版 - S02E03 - Episode 4.MP4",
+                "Exact  Show — 特別版",
+                2,
+                3,
+            ),
+            (
+                "Exact Show/Season 02/Exact Show - S02E03 - Part 2.mkv",
+                "Exact Show",
+                2,
+                3,
+            ),
+            (
+                "Exact Big Show/Season 123/Exact Big Show - S123E456 - Exact Episode.MKV",
+                "Exact Big Show",
+                123,
+                456,
+            ),
+            ("Show.S123E456+720p.mp4", "Show", 123, 456),
+            ("Show.123x456.x265.mkv", "Show", 123, 456),
+        ] {
+            assert_eq!(
+                parse_tv_relative_identity(path),
+                Some(TvLibraryIdentity {
+                    show_title: show_title.to_owned(),
+                    season,
+                    episode,
+                }),
+                "single episode path {path:?} did not retain its exact identity"
+            );
+        }
+    }
+
+    #[test]
+    fn conservative_identity_parser_rejects_non_round_trippable_exact_names_and_markers() {
+        for path in [
+            "Exact Show/Season 02/Exact Show - S02E03 - 2.mp4",
+            "Exact Show/Season 02/Exact Show - S02E03 - 04.mp4",
+            "Exact Show/Season 02/Exact Show - S02E03 - E04.mp4",
+            "Exact Show/Season 02/Exact Show - S02E03 - x04.mp4",
+            "Exact Show/Season 02/Exact Show - S02E03 - #4.mp4",
+            "Exact S01E02 Show/Season 02/Exact S01E02 Show - S02E03 - Episode.mp4",
+            "Exact Show/Season 02/Exact Show - S02E03 - Flashback 1x02.mp4",
+            "S123/S123E456.mkv",
+            "Wrong Parent/Season 124/S123E456.mp4",
+            "Show.S01E02.S01E03.mp4",
+            "Show.S123E456-x457.mp4",
+            "Show.123x456/x457.mp4",
+        ] {
+            assert_eq!(
+                parse_tv_relative_identity(path),
+                None,
+                "ambiguous TV path {path:?} was associated"
+            );
+        }
     }
 
     #[test]

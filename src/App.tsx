@@ -5318,6 +5318,20 @@ function VrDownloadCard({
           : download.category === "vr"
             ? "accepted VR folder"
             : "accepted download folder";
+  const tvOrganizationDestination = organizationPreview?.entries
+    .find((entry) => entry.destinationRelativePath !== null)
+    ?.destinationRelativePath?.split("/");
+  const organizationDialogIdentity =
+    download.category === "tv" && tvOrganizationDestination?.length === 3
+      ? `${tvOrganizationDestination[0]} · ${tvOrganizationDestination[1]} · ${download.identity.split(" · ").at(-1)}`
+      : organizationPreview?.identity;
+  const tvOrganizationUnavailable =
+    download.category === "tv" &&
+    download.state === "completed" &&
+    download.isCurrentFolder &&
+    download.organizationStatus === "none" &&
+    !download.terminalRecovery &&
+    !download.canOrganize;
 
   return (
     <article
@@ -5453,7 +5467,7 @@ function VrDownloadCard({
                   >
                     <div className="trash-dialog__heading">
                       <AlertDialog.Title>
-                        Organize {organizationPreview.identity} files?
+                        Organize {organizationDialogIdentity} files?
                       </AlertDialog.Title>
                       <AlertDialog.Close
                         render={
@@ -5587,6 +5601,13 @@ function VrDownloadCard({
           </Button>
         )}
       </div>
+      {tvOrganizationUnavailable ? (
+        <p className="field-help" role="status">
+          {download.selectedFileCount > 1
+            ? "This TV transfer is not eligible for the single-media organization workflow. Nothing was moved."
+            : "The exact TV organization path cannot be verified for this transfer. Nothing was moved."}
+        </p>
+      ) : null}
       {error === null ? null : (
         <p className="field-error" role="alert">
           {error}
@@ -5844,6 +5865,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [tvTrashReconciliationState, setTvTrashReconciliationState] = useState<
     "pending" | "attention" | null
   >(null);
+  const [tvOrganizationReconciliationState, setTvOrganizationReconciliationState] =
+    useState<"pending" | "attention" | null>(null);
   const [tvTrashPendingPath, setTvTrashPendingPath] = useState<string | null>(
     null,
   );
@@ -7587,6 +7610,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       if (requestId === tvFolderRequestId.current && selectedFolder !== null) {
         setTvTrashAnnouncement(null);
         setTvTrashReconciliationState(null);
+        setTvOrganizationReconciliationState(null);
         setTvTrashPendingPath(null);
         tvLibraryScanRequestId.current += 1;
         tvStorageRequestId.current += 1;
@@ -7608,6 +7632,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setIsRevalidatingTvFolder(false);
     setTvTrashAnnouncement(null);
     setTvTrashReconciliationState(null);
+    setTvOrganizationReconciliationState(null);
     setTvTrashPendingPath(null);
     tvLibraryScanRequestId.current += 1;
     tvStorageRequestId.current += 1;
@@ -7650,6 +7675,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setTvTrashAnnouncement(
       `${file.filename} was moved to Trash or the Recycle Bin.`,
     );
+    setTvOrganizationReconciliationState(null);
     setTvTrashReconciliationState("pending");
     setTvStorageState({ status: "loading" });
 
@@ -7710,6 +7736,62 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     );
   };
 
+  const reconcileTvOrganization = async () => {
+    const currentFolder = currentTvFolderState.current;
+    if (currentFolder.status !== "ready") {
+      setTvOrganizationReconciliationState("attention");
+      return;
+    }
+    setTvTrashReconciliationState(null);
+    setTvOrganizationReconciliationState("pending");
+    setTvStorageState({ status: "loading" });
+    const folderPath = currentFolder.path;
+    const scanRequestId = ++tvLibraryScanRequestId.current;
+    const storageRequestId = ++tvStorageRequestId.current;
+    const [scanResult, storageResult] = await Promise.allSettled([
+      scanTvLibrary(),
+      queryTvStorage(),
+    ]);
+    if (
+      currentTvFolderState.current.status !== "ready" ||
+      currentTvFolderState.current.path !== folderPath ||
+      scanRequestId !== tvLibraryScanRequestId.current ||
+      storageRequestId !== tvStorageRequestId.current
+    ) {
+      return;
+    }
+
+    let needsAttention = false;
+    if (scanResult.status === "fulfilled") {
+      const { generation, items } = scanResult.value;
+      const reconciledState: TvLibraryScanState =
+        items.length === 0
+          ? { status: "empty", generation }
+          : { status: "ready", generation, items };
+      currentTvLibraryScanState.current = reconciledState;
+      setTvLibraryScanState(reconciledState);
+    } else {
+      needsAttention = true;
+    }
+
+    if (storageResult.status === "fulfilled") {
+      setTvStorageState({
+        status: "ready",
+        totalBytes: storageResult.value.totalBytes,
+        freeBytes: storageResult.value.freeBytes,
+      });
+    } else {
+      needsAttention = true;
+      setTvStorageState({
+        status:
+          nativeErrorCode(storageResult.reason) === tvStorageUnavailable
+            ? "unavailable"
+            : "error",
+      });
+    }
+    setTvOrganizationReconciliationState(needsAttention ? "attention" : null);
+  };
+
   const refreshTvLibrary = () => {
     if (tvFolderState.status === "unavailable") {
       if (isRevalidatingTvFolder) {
@@ -7741,6 +7823,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       return;
     }
     setTvTrashReconciliationState(null);
+    setTvOrganizationReconciliationState(null);
     tvLibraryScanRequestId.current += 1;
     tvStorageRequestId.current += 1;
     setTvLibraryScanState({ status: "scanning" });
@@ -8160,10 +8243,12 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       if (requestId === vrDownloadsRequestId.current) {
         setVrDownloadsState({ status: "ready", downloads });
       }
+      return true;
     } catch {
       if (requestId === vrDownloadsRequestId.current) {
         setVrDownloadsState({ status: "error", reason });
       }
+      return false;
     }
   };
 
@@ -8288,7 +8373,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       case "vr_organization_conflict":
         return "The complete organization plan conflicts with an existing or duplicate destination.";
       case "vr_organization_ineligible":
-        return `This transfer is no longer eligible for organization in the current ${category === "adult" ? "Adult" : category === "movie" ? "Movies" : "VR"} folder.`;
+        return category === "tv"
+          ? "The exact TV organization path can no longer be verified. Nothing was moved."
+          : `This transfer is no longer eligible for organization in the current ${category === "adult" ? "Adult" : category === "movie" ? "Movies" : "VR"} folder.`;
       case "vr_organization_stale":
         return "The organization plan is stale because its transfer, folder, or files changed.";
       default:
@@ -8409,11 +8496,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         return;
       }
       setVrOrganizationPreview(null);
-      await refreshVrDownloads();
+      await refreshVrDownloads(
+        currentDownload.category === "tv" ? "reconciliation" : undefined,
+      );
       if (currentDownload.category === "adult") {
         refreshAdultLibrary();
       } else if (currentDownload.category === "movie") {
         refreshMovies();
+      } else if (currentDownload.category === "tv") {
+        await reconcileTvOrganization();
       } else {
         refreshVrLibrary();
       }
@@ -10098,6 +10189,21 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     dashboardTvMessage +=
       " A moved file remains removed, but Library or storage reconciliation needs a retry.";
     dashboardTvRole = "alert";
+  } else if (
+    (tvLibraryScanState.status === "ready" ||
+      tvLibraryScanState.status === "empty") &&
+    tvOrganizationReconciliationState === "pending"
+  ) {
+    dashboardTvMessage += " Organized files are being reconciled with Library and storage.";
+    dashboardTvRole = "status";
+  } else if (
+    (tvLibraryScanState.status === "ready" ||
+      tvLibraryScanState.status === "empty") &&
+    tvOrganizationReconciliationState === "attention"
+  ) {
+    dashboardTvMessage +=
+      " Organization succeeded, but Library or storage reconciliation needs a retry.";
+    dashboardTvRole = "alert";
   }
 
   let dashboardTvStorageHeading = "Waiting for TV folder configuration";
@@ -11495,6 +11601,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         tvLibraryScanState.status === "scanning" ||
                         isRevalidatingTvFolder ||
                         tvTrashReconciliationState === "pending" ||
+                        tvOrganizationReconciliationState === "pending" ||
                         tvTrashPendingPath !== null
                       }
                       onClick={refreshTvLibrary}
@@ -11691,6 +11798,33 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     The file move succeeded, but the TV Library or storage could
                     not be refreshed. The moved file remains removed from this
                     result.
+                  </p>
+                  <Button
+                    onClick={refreshTvLibrary}
+                    type="button"
+                    variant="outline"
+                  >
+                    <AppIcon name="refresh" />
+                    Retry reconciliation
+                  </Button>
+                </div>
+              ) : null}
+              {libraryCategory === "tv" &&
+              tvOrganizationReconciliationState === "pending" ? (
+                <p
+                  aria-atomic="true"
+                  className="library-action-status"
+                  role="status"
+                >
+                  Organization succeeded. Updating the TV Library and storage…
+                </p>
+              ) : null}
+              {libraryCategory === "tv" &&
+              tvOrganizationReconciliationState === "attention" ? (
+                <div className="library-action-attention" role="alert">
+                  <p>
+                    Organization succeeded, but the TV Library or storage could
+                    not be refreshed. The organized transfer remains truthful.
                   </p>
                   <Button
                     onClick={refreshTvLibrary}

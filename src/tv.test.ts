@@ -17,6 +17,22 @@ beforeEach(() => {
   vi.stubGlobal("__TAURI__", { core: { invoke: invokeMock } });
 });
 
+function tvScanFile(
+  path: string,
+  relativePath: string,
+  sizeBytes: string,
+  identity?: { showTitle: string; season: number; episode: number },
+) {
+  return [
+    path,
+    relativePath,
+    sizeBytes,
+    identity?.showTitle ?? "",
+    identity?.season.toString() ?? "",
+    identity?.episode.toString() ?? "",
+  ];
+}
+
 describe("TV folder and storage boundaries", () => {
   it("loads every native folder state without changing its exact path", async () => {
     invokeMock.mockResolvedValueOnce(["unconfigured"]);
@@ -61,18 +77,30 @@ describe("conservative parsed TV Library identity", () => {
   it("groups ordinary marker and padding variants while preserving exact file data", async () => {
     invokeMock.mockResolvedValue([
       "7",
-      "/TV/Series/星  Show.S01E02 — Pilot.mp4",
-      "Series/星  Show.S01E02 — Pilot.mp4",
-      "10",
-      "/TV/Series/星  Show.s1e3.MKV",
-      "Series/星  Show.s1e3.MKV",
-      "20",
-      "/TV/Folder  Show/1x04.mp4",
-      "Folder  Show/1x04.mp4",
-      "30",
-      "/TV/Folder  Show/01x05.MKV",
-      "Folder  Show/01x05.MKV",
-      "40",
+      ...tvScanFile(
+        "/TV/Series/星  Show.S01E02 — Pilot.mp4",
+        "Series/星  Show.S01E02 — Pilot.mp4",
+        "10",
+        { showTitle: "星  Show", season: 1, episode: 2 },
+      ),
+      ...tvScanFile(
+        "/TV/Series/星  Show.s1e3.MKV",
+        "Series/星  Show.s1e3.MKV",
+        "20",
+        { showTitle: "星  Show", season: 1, episode: 3 },
+      ),
+      ...tvScanFile(
+        "/TV/Folder  Show/1x04.mp4",
+        "Folder  Show/1x04.mp4",
+        "30",
+        { showTitle: "Folder  Show", season: 1, episode: 4 },
+      ),
+      ...tvScanFile(
+        "/TV/Folder  Show/01x05.MKV",
+        "Folder  Show/01x05.MKV",
+        "40",
+        { showTitle: "Folder  Show", season: 1, episode: 5 },
+      ),
     ]);
 
     const scan = await scanTvLibrary();
@@ -138,6 +166,16 @@ describe("conservative parsed TV Library identity", () => {
       "Show.S01E02-E03.mp4",
       "Show.S01E02-03.mkv",
       "Show.1x02-03.mp4",
+      "Show.S123E456-E457.mp4",
+      "Show.S123E456-E-457.mkv",
+      "Show.S123E456-x457.mp4",
+      "Show.S123E456 x 457.mkv",
+      "Show.123x456-x457.mp4",
+      "Show.123x456-(X)-457.mkv",
+      "Show.123x456/x457.mp4",
+      "Show.S0123E456.mp4",
+      "Show.S123E0456.mkv",
+      "Show.S9007199254740992E456.mp4",
       "S01E02.mp4",
       "Show.S00E02.mp4",
       "Show.S01E00.mp4",
@@ -148,35 +186,188 @@ describe("conservative parsed TV Library identity", () => {
         `/TV/${filename}`,
         filename,
         String(index + 1),
+        "",
+        "",
+        "",
+      ]),
+    ]);
+
+    const { items } = await scanTvLibrary();
+    const basenames = filenames.map((filename) => filename.split("/").at(-1));
+
+    expect(items).toHaveLength(filenames.length);
+    expect(items.every((item) => item.showTitle === null)).toBe(true);
+    expect(items.map((item) => item.files[0].filename)).toEqual(basenames);
+    expect(items.every((item) => item.files[0].season === null)).toBe(true);
+  });
+
+  it("preserves valid quality and codec suffixes on one large episode identity", async () => {
+    const filenames = [
+      "Show.S123E456+720p.mp4",
+      "Show.S123E456.x264.mkv",
+      "Show.123x456+10bit.mp4",
+      "Show.123x456.x265.mkv",
+    ];
+    invokeMock.mockResolvedValue([
+      "9",
+      ...filenames.flatMap((filename, index) => [
+        `/TV/${filename}`,
+        filename,
+        String(index + 1),
+        "Show",
+        "123",
+        "456",
       ]),
     ]);
 
     const { items } = await scanTvLibrary();
 
-    expect(items).toHaveLength(filenames.length);
-    expect(items.every((item) => item.showTitle === null)).toBe(true);
-    expect(items.map((item) => item.files[0].filename)).toEqual(filenames);
-    expect(items.every((item) => item.files[0].season === null)).toBe(true);
+    expect(items).toHaveLength(1);
+    expect(items[0].showTitle).toBe("Show");
+    expect(items[0].files.map((file) => file.filename)).toEqual(
+      expect.arrayContaining(filenames),
+    );
+    expect(
+      items[0].files.every(
+        (file) => file.season === 123 && file.episode === 456,
+      ),
+    ).toBe(true);
   });
 
   it("does not merge prefix, substring, or neighboring show titles", async () => {
     invokeMock.mockResolvedValue([
       "9",
-      "/TV/Show.S01E02.mp4",
-      "Show.S01E02.mp4",
-      "1",
-      "/TV/Showtime.S01E02.mp4",
-      "Showtime.S01E02.mp4",
-      "2",
-      "/TV/Show 2.S01E02.mp4",
-      "Show 2.S01E02.mp4",
-      "3",
+      ...tvScanFile("/TV/Show.S01E02.mp4", "Show.S01E02.mp4", "1", {
+        showTitle: "Show",
+        season: 1,
+        episode: 2,
+      }),
+      ...tvScanFile(
+        "/TV/Showtime.S01E02.mp4",
+        "Showtime.S01E02.mp4",
+        "2",
+        { showTitle: "Showtime", season: 1, episode: 2 },
+      ),
+      ...tvScanFile(
+        "/TV/Show 2.S01E02.mp4",
+        "Show 2.S01E02.mp4",
+        "3",
+        { showTitle: "Show 2", season: 1, episode: 2 },
+      ),
     ]);
 
     const { items } = await scanTvLibrary();
 
     expect(items.map((item) => item.title)).toEqual(["Show", "Showtime", "Show 2"]);
     expect(items.every((item) => item.files.length === 1)).toBe(true);
+  });
+
+  it("uses only an exact canonical show and matching season parent for retained episode basenames", async () => {
+    invokeMock.mockResolvedValue([
+      "10",
+      ...tvScanFile(
+        "/TV/Exact  Show — 特別版/Season 02/S02E03.Cut.mp4",
+        "Exact  Show — 特別版/Season 02/S02E03.Cut.mp4",
+        "3",
+        { showTitle: "Exact  Show — 特別版", season: 2, episode: 3 },
+      ),
+      ...tvScanFile(
+        "/TV/Exact  Show — 特別版/Season 02/S02E03 — Alternate.MKV",
+        "Exact  Show — 特別版/Season 02/S02E03 — Alternate.MKV",
+        "4",
+        { showTitle: "Exact  Show — 特別版", season: 2, episode: 3 },
+      ),
+      ...tvScanFile(
+        "/TV/Exact  Show — 特別版/Season 02/No episode marker.mp4",
+        "Exact  Show — 特別版/Season 02/No episode marker.mp4",
+        "5",
+      ),
+      ...tvScanFile(
+        "/TV/Wrong Parent/Season 03/S02E03.mp4",
+        "Wrong Parent/Season 03/S02E03.mp4",
+        "6",
+      ),
+      ...tvScanFile(
+        "/TV/Exact  Show — 特別版/Season 02/Exact  Show — 特別版 - S02E03 - 第三話  —  Exact Episode.MP4",
+        "Exact  Show — 特別版/Season 02/Exact  Show — 特別版 - S02E03 - 第三話  —  Exact Episode.MP4",
+        "7",
+        { showTitle: "Exact  Show — 特別版", season: 2, episode: 3 },
+      ),
+    ]);
+
+    const { items } = await scanTvLibrary();
+    const exactShow = items.find(
+      (item) => item.showTitle === "Exact  Show — 特別版",
+    );
+    expect(exactShow?.files).toHaveLength(3);
+    expect(exactShow?.files.map((file) => file.filename)).toEqual(
+      expect.arrayContaining([
+        "S02E03.Cut.mp4",
+        "S02E03 — Alternate.MKV",
+        "Exact  Show — 特別版 - S02E03 - 第三話  —  Exact Episode.MP4",
+      ]),
+    );
+    expect(exactShow?.files.every((file) => file.season === 2 && file.episode === 3))
+      .toBe(true);
+    expect(
+      items.find((item) => item.title === "No episode marker")?.showTitle,
+    ).toBeNull();
+    expect(items.find((item) => item.title === "S02E03")?.showTitle).toBeNull();
+  });
+
+  it("recognizes positive season and episode numbers above 99 only with an exact matching parent", async () => {
+    invokeMock.mockResolvedValue([
+      "11",
+      ...tvScanFile(
+        "/TV/Exact Big Show/Season 123/Exact Big Show - S123E456 - Exact Episode.MKV",
+        "Exact Big Show/Season 123/Exact Big Show - S123E456 - Exact Episode.MKV",
+        "3",
+        { showTitle: "Exact Big Show", season: 123, episode: 456 },
+      ),
+      ...tvScanFile(
+        "/TV/Exact Big Show/Season 123/S123E456.Cut.mp4",
+        "Exact Big Show/Season 123/S123E456.Cut.mp4",
+        "4",
+        { showTitle: "Exact Big Show", season: 123, episode: 456 },
+      ),
+      ...tvScanFile(
+        "/TV/Wrong Parent/Season 124/S123E456.mp4",
+        "Wrong Parent/Season 124/S123E456.mp4",
+        "5",
+      ),
+      ...tvScanFile("/TV/S123/S123E456.mkv", "S123/S123E456.mkv", "6"),
+      ...tvScanFile(
+        "/TV/Exact Big Show/Season 123/Exact S01E02 Show - S123E456 - Exact Episode.mkv",
+        "Exact Big Show/Season 123/Exact S01E02 Show - S123E456 - Exact Episode.mkv",
+        "7",
+      ),
+      ...tvScanFile(
+        "/TV/Exact Big Show/Season 123/Exact Big Show - S123E456 - Flashback 1x02.mkv",
+        "Exact Big Show/Season 123/Exact Big Show - S123E456 - Flashback 1x02.mkv",
+        "8",
+      ),
+    ]);
+
+    const { items } = await scanTvLibrary();
+    const exactShow = items.find((item) => item.showTitle === "Exact Big Show");
+    expect(exactShow?.files).toHaveLength(2);
+    expect(exactShow?.files.map((file) => file.filename)).toEqual([
+      "Exact Big Show - S123E456 - Exact Episode.MKV",
+      "S123E456.Cut.mp4",
+    ]);
+    expect(
+      exactShow?.files.every(
+        (file) => file.season === 123 && file.episode === 456,
+      ),
+    ).toBe(true);
+    const unassociated = items.filter((item) => item.showTitle === null);
+    expect(unassociated).toHaveLength(4);
+    expect(unassociated.map((item) => item.files[0].filename)).toEqual([
+      "S123E456.mp4",
+      "S123E456.mkv",
+      "Exact S01E02 Show - S123E456 - Exact Episode.mkv",
+      "Exact Big Show - S123E456 - Flashback 1x02.mkv",
+    ]);
   });
 
   it("rejects malformed rows, duplicate paths, traversal, unsupported files, and oversized sizes", async () => {
@@ -186,20 +377,70 @@ describe("conservative parsed TV Library identity", () => {
       ["1", "/TV/Show.S01E02.mp4"],
       [
         "1",
-        "/TV/Show.S01E02.mp4",
-        "Show.S01E02.mp4",
-        "1",
-        "/TV/Show.S01E02.mp4",
-        "Show.S01E02.mp4",
-        "1",
+        ...tvScanFile("/TV/Show.S01E02.mp4", "Show.S01E02.mp4", "1", {
+          showTitle: "Show",
+          season: 1,
+          episode: 2,
+        }),
+        ...tvScanFile("/TV/Show.S01E02.mp4", "Show.S01E02.mp4", "1", {
+          showTitle: "Show",
+          season: 1,
+          episode: 2,
+        }),
       ],
-      ["1", "/TV/Show.S01E02.mp4", "../Show.S01E02.mp4", "1"],
-      ["1", "/TV/Show.S01E02.avi", "Show.S01E02.avi", "1"],
+      [
+        "1",
+        ...tvScanFile(
+          "/TV/Show.S01E02.mp4",
+          "../Show.S01E02.mp4",
+          "1",
+          { showTitle: "Show", season: 1, episode: 2 },
+        ),
+      ],
+      [
+        "1",
+        ...tvScanFile(
+          "/TV/Show.S01E02.avi",
+          "Show.S01E02.avi",
+          "1",
+          { showTitle: "Show", season: 1, episode: 2 },
+        ),
+      ],
+      [
+        "1",
+        ...tvScanFile(
+          "/TV/Show.S01E02.mp4",
+          "Show.S01E02.mp4",
+          "18446744073709551616",
+          { showTitle: "Show", season: 1, episode: 2 },
+        ),
+      ],
       [
         "1",
         "/TV/Show.S01E02.mp4",
         "Show.S01E02.mp4",
-        "18446744073709551616",
+        "1",
+        "Show",
+        "1",
+        "",
+      ],
+      [
+        "1",
+        "/TV/Show.S01E02.mp4",
+        "Show.S01E02.mp4",
+        "1",
+        "Show",
+        "9007199254740992",
+        "2",
+      ],
+      [
+        "1",
+        "/TV/Show.S01E02.mp4",
+        "Show.S01E02.mp4",
+        "1",
+        "---",
+        "1",
+        "2",
       ],
     ]) {
       invokeMock.mockResolvedValueOnce(response);
