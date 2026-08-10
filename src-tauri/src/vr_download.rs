@@ -15,6 +15,7 @@ use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, PeerConnectionOptions,
     Session, SessionOptions, TorrentStatsState,
 };
+use unicode_normalization::UnicodeNormalization;
 
 use crate::tv_release::{TvDownloadIdentity, TvReleaseState};
 use crate::vr_library::is_supported_media;
@@ -3685,45 +3686,7 @@ fn organization_directory_name(record: &TransferRecord) -> Result<String, &'stat
 }
 
 fn organization_collision_key(value: &str) -> String {
-    let mut key = String::new();
-    for character in value.chars().flat_map(char::to_lowercase) {
-        let decomposition = match character {
-            'à' => Some("a\u{300}"),
-            'á' => Some("a\u{301}"),
-            'â' => Some("a\u{302}"),
-            'ã' => Some("a\u{303}"),
-            'ä' => Some("a\u{308}"),
-            'å' => Some("a\u{30a}"),
-            'ç' => Some("c\u{327}"),
-            'è' => Some("e\u{300}"),
-            'é' => Some("e\u{301}"),
-            'ê' => Some("e\u{302}"),
-            'ë' => Some("e\u{308}"),
-            'ì' => Some("i\u{300}"),
-            'í' => Some("i\u{301}"),
-            'î' => Some("i\u{302}"),
-            'ï' => Some("i\u{308}"),
-            'ñ' => Some("n\u{303}"),
-            'ò' => Some("o\u{300}"),
-            'ó' => Some("o\u{301}"),
-            'ô' => Some("o\u{302}"),
-            'õ' => Some("o\u{303}"),
-            'ö' => Some("o\u{308}"),
-            'ù' => Some("u\u{300}"),
-            'ú' => Some("u\u{301}"),
-            'û' => Some("u\u{302}"),
-            'ü' => Some("u\u{308}"),
-            'ý' => Some("y\u{301}"),
-            'ÿ' => Some("y\u{308}"),
-            _ => None,
-        };
-        if let Some(decomposition) = decomposition {
-            key.push_str(decomposition);
-        } else {
-            key.push(character);
-        }
-    }
-    key
+    value.nfd().flat_map(char::to_lowercase).nfd().collect()
 }
 
 fn validate_organization_directory(
@@ -7446,6 +7409,74 @@ mod tests {
             );
         }
 
+        for (show_name, existing_show) in [
+            ("Café", "Cafe\u{301}"),
+            ("Ḋ Show", "D\u{307} Show"),
+            ("A\u{323}\u{307} Show", "A\u{307}\u{323} Show"),
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let mut source = tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]);
+            source
+                .tv_identity
+                .as_mut()
+                .expect("TV identity must exist")
+                .show_name = show_name.to_owned();
+            let record = completed_tv_organization_record(&destination, source);
+            fs::create_dir(destination.join(existing_show))
+                .expect("normalization-colliding show must exist");
+            let source_path = destination.join("Provider/Episode.mp4");
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_CONFLICT),
+                "canonically equivalent show {show_name:?} / {existing_show:?} was eligible"
+            );
+            assert_eq!(
+                fs::read(source_path).expect("colliding show must retain source media"),
+                vec![b'a'; 3]
+            );
+        }
+
+        for (source_name, existing_name) in [
+            ("Cut Ḋ.S02E03.mp4", "Cut D\u{307}.S02E03.mp4"),
+            (
+                "Cut A\u{323}\u{307}.S02E03.mp4",
+                "Cut A\u{307}\u{323}.S02E03.mp4",
+            ),
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let source = tv_download_source(
+                &[
+                    (&format!("Provider/{source_name}"), 3),
+                    ("Provider/Second.S02E03.MKV", 4),
+                ],
+                &[0, 1],
+            );
+            let record = completed_tv_organization_record(&destination, source);
+            let season_directory = destination.join("Exact  Show — 特別版/Season 02");
+            fs::create_dir_all(&season_directory).expect("canonical TV directories must exist");
+            fs::write(season_directory.join(existing_name), vec![b'x'; 3])
+                .expect("normalization-colliding target must exist");
+            let source_path = destination.join("Provider").join(source_name);
+            let (state, transfer_id) = organization_state(record);
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_CONFLICT),
+                "canonically equivalent filename {source_name:?} / {existing_name:?} was eligible"
+            );
+            assert_eq!(
+                fs::read(source_path).expect("colliding target must retain source media"),
+                vec![b'a'; 3]
+            );
+        }
+    }
+
+    #[test]
+    fn tv_apply_rejects_late_canonical_collisions_before_creation_or_move_dispatch() {
         let fixture = FilesystemFixture::new();
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
         let mut source = tv_download_source(&[("Provider/Episode.mp4", 3)], &[0]);
@@ -7453,14 +7484,77 @@ mod tests {
             .tv_identity
             .as_mut()
             .expect("TV identity must exist")
-            .show_name = "Café".to_owned();
+            .show_name = "Ḋ Show".to_owned();
         let record = completed_tv_organization_record(&destination, source);
-        fs::create_dir(destination.join("Cafe\u{301}"))
-            .expect("normalization-colliding show must exist");
         let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let existing_show = destination.join("D\u{307} Show");
+        fs::create_dir(&existing_show).expect("late normalization-colliding show must exist");
+
+        let mut move_calls = 0;
         assert_eq!(
-            preview_organization(&state, &transfer_id),
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |source, destination| {
+                    move_calls += 1;
+                    fs::rename(source, destination)
+                },
+            ),
             Err(VR_ORGANIZATION_CONFLICT)
+        );
+        assert_eq!(move_calls, 0);
+        assert!(!existing_show.join("Season 02").exists());
+        assert_eq!(
+            fs::read(destination.join("Provider/Episode.mp4"))
+                .expect("late directory collision must retain source"),
+            vec![b'a'; 3]
+        );
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = tv_download_source(
+            &[
+                ("Provider/Cut A\u{323}\u{307}.S02E03.mp4", 3),
+                ("Provider/Second.S02E03.MKV", 4),
+            ],
+            &[0, 1],
+        );
+        let record = completed_tv_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let season_directory = destination.join("Exact  Show — 特別版/Season 02");
+        fs::create_dir_all(&season_directory).expect("canonical TV directories must exist");
+        fs::write(
+            season_directory.join("Cut A\u{307}\u{323}.S02E03.mp4"),
+            vec![b'x'; 3],
+        )
+        .expect("late normalization-colliding target must exist");
+
+        let mut move_calls = 0;
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |source, destination| {
+                    move_calls += 1;
+                    fs::rename(source, destination)
+                },
+            ),
+            Err(VR_ORGANIZATION_CONFLICT)
+        );
+        assert_eq!(move_calls, 0);
+        assert_eq!(
+            fs::read(destination.join("Provider/Cut A\u{323}\u{307}.S02E03.mp4"))
+                .expect("late collision must retain first source"),
+            vec![b'a'; 3]
+        );
+        assert_eq!(
+            fs::read(destination.join("Provider/Second.S02E03.MKV"))
+                .expect("late collision must retain second source"),
+            vec![b'b'; 4]
         );
     }
 

@@ -32,9 +32,9 @@ export type TvVolumeStorage = {
 const unsignedU64Pattern = /^\d{1,20}$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const episodeTokenPattern =
-  /(^|[^A-Za-z0-9])(?:S([0-9]{1,2})E([0-9]{1,2})|([0-9]{1,2})x([0-9]{1,2}))(?=$|[^A-Za-z0-9])/gi;
+  /(^|[^A-Za-z0-9])(?:S([1-9][0-9]*|0[1-9])E([1-9][0-9]*|0[1-9])|([1-9][0-9]*|0[1-9])x([1-9][0-9]*|0[1-9]))(?=$|[^A-Za-z0-9])/gi;
 const compactEpisodeContinuationPattern =
-  /^[\s._+,&\p{Pd}]+E?[0-9]{1,2}(?=$|[^A-Za-z0-9])/iu;
+  /^[\s._+,&\p{Pd}]+(?:E[\s._+,&\p{Pd}]*)?[0-9]+(?=$|[^A-Za-z0-9])/iu;
 
 function parseTvFolderState(value: unknown): TvFolderState {
   if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
@@ -91,7 +91,7 @@ function parsedEpisodeIdentity(stem: string, relativePath: string) {
   const episodeText = match[3] ?? match[5];
   const season = Number(seasonText);
   const episode = Number(episodeText);
-  if (season === 0 || episode === 0) {
+  if (!Number.isSafeInteger(season) || !Number.isSafeInteger(episode)) {
     return null;
   }
 

@@ -138,6 +138,11 @@ describe("conservative parsed TV Library identity", () => {
       "Show.S01E02-E03.mp4",
       "Show.S01E02-03.mkv",
       "Show.1x02-03.mp4",
+      "Show.S123E456-E457.mp4",
+      "Show.S123E456-E-457.mkv",
+      "Show.S0123E456.mp4",
+      "Show.S123E0456.mkv",
+      "Show.S9007199254740992E456.mp4",
       "S01E02.mp4",
       "Show.S00E02.mp4",
       "Show.S01E00.mp4",
@@ -217,6 +222,35 @@ describe("conservative parsed TV Library identity", () => {
       items.find((item) => item.title === "No episode marker")?.showTitle,
     ).toBeNull();
     expect(items.find((item) => item.title === "S02E03")?.showTitle).toBeNull();
+  });
+
+  it("recognizes positive season and episode numbers above 99 only with an exact matching parent", async () => {
+    invokeMock.mockResolvedValue([
+      "11",
+      "/TV/Exact Big Show/Season 123/Exact Big Show - S123E456 - Exact Episode.MKV",
+      "Exact Big Show/Season 123/Exact Big Show - S123E456 - Exact Episode.MKV",
+      "3",
+      "/TV/Exact Big Show/Season 123/S123E456.Cut.mp4",
+      "Exact Big Show/Season 123/S123E456.Cut.mp4",
+      "4",
+      "/TV/Wrong Parent/Season 124/S123E456.mp4",
+      "Wrong Parent/Season 124/S123E456.mp4",
+      "5",
+    ]);
+
+    const { items } = await scanTvLibrary();
+    const exactShow = items.find((item) => item.showTitle === "Exact Big Show");
+    expect(exactShow?.files).toHaveLength(2);
+    expect(exactShow?.files.map((file) => file.filename)).toEqual([
+      "Exact Big Show - S123E456 - Exact Episode.MKV",
+      "S123E456.Cut.mp4",
+    ]);
+    expect(
+      exactShow?.files.every(
+        (file) => file.season === 123 && file.episode === 456,
+      ),
+    ).toBe(true);
+    expect(items.find((item) => item.title === "S123E456")?.showTitle).toBeNull();
   });
 
   it("rejects malformed rows, duplicate paths, traversal, unsupported files, and oversized sizes", async () => {

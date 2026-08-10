@@ -14,3 +14,4 @@ librqbit = { version = "=8.1.1", default-features = false, features = ["disable-
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-dialog = "=2.7.2"
 tauri-plugin-opener = "=2.5.4"
+unicode-normalization = "=0.1.25"
