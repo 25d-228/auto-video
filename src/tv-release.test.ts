@@ -7,6 +7,7 @@ import {
   invalidateVerifiedTvTorrent,
   saveVerifiedTvTorrent,
   selectVerifiedApiBayTvRelease,
+  startVerifiedTvDownload,
 } from "./tv-release";
 
 const invokeMock = vi.fn<
@@ -229,6 +230,34 @@ describe("verified API Bay TV release boundary", () => {
     });
     expect(invokeMock).toHaveBeenNthCalledWith(13, "invalidate_verified_tv_torrent");
     expect(invokeMock).toHaveBeenNthCalledWith(14, "invalidate_tv_release_context");
+  });
+
+  it("starts only an exact inspection with explicit unique selected file IDs", async () => {
+    invokeMock.mockResolvedValue("tv-transfer-123");
+
+    await expect(startVerifiedTvDownload("tv-1-1-1001", [1, 0])).resolves.toBe(
+      "tv-transfer-123",
+    );
+    expect(invokeMock).toHaveBeenCalledWith("start_verified_tv_download", {
+      inspectionId: "tv-1-1-1001",
+      selectedFileIds: [1, 0],
+    });
+
+    for (const [inspectionId, selectedFileIds] of [
+      ["", [0]],
+      ["   ", [0]],
+      ["tv-1", []],
+      ["tv-1", [0, 0]],
+      ["tv-1", [-1]],
+      ["tv-1", [1.5]],
+    ] as const) {
+      await expect(
+        startVerifiedTvDownload(inspectionId, [...selectedFileIds]),
+      ).rejects.toThrow(
+        "A current TV inspection and valid file selection are required.",
+      );
+    }
+    expect(invokeMock).toHaveBeenCalledTimes(1);
   });
 
   it("preserves a native no-match without inventing release rows", async () => {

@@ -29,8 +29,9 @@ use tauri_plugin_dialog::DialogExt;
 use tv_library::{
     clear_tv_folder as clear_trusted_tv_folder, configured_tv_folder, load_tv_folder_with,
     open_tv_file_with, reveal_tv_file_with, scan_tv_library_with, set_tv_folder,
-    trash_tv_file_with, TvLibraryState, TV_FILE_OPEN_FAILED, TV_FILE_REVEAL_FAILED,
-    TV_FILE_TRASH_FAILED, TV_FOLDER_STORAGE_FAILED, TV_FOLDER_UNAVAILABLE, TV_LIBRARY_SCAN_FAILED,
+    trash_tv_file_with_download_ownership, TvLibraryState, TV_FILE_OPEN_FAILED,
+    TV_FILE_REVEAL_FAILED, TV_FILE_TRASH_FAILED, TV_FOLDER_STORAGE_FAILED, TV_FOLDER_UNAVAILABLE,
+    TV_LIBRARY_SCAN_FAILED,
 };
 use tv_release::{
     fetch_apibay_tv_releases_for_state_with, TvReleaseState, TV_APIBAY_PROVIDER_ERROR,
@@ -39,12 +40,13 @@ use tv_release::{
 use vr_download::{
     acquire_tv_metainfo, apply_organization, cancel_download,
     clear_vr_folder as clear_trusted_vr_folder, configure_adult_download_folder,
-    configure_movie_download_folder, configured_vr_folder, dismiss_download, dismiss_organization,
-    list_downloads, load_download_limit, load_downloads, load_vr_folder_with, pause_download,
-    preview_organization, resume_download, save_download_limit, set_vr_folder,
-    start_adult_download, start_download, start_movie_download, TvMetainfoAcquisitionError,
-    VrDownloadState, VR_DOWNLOAD_FAILED, VR_DOWNLOAD_LIMIT_STORAGE_FAILED,
-    VR_DOWNLOAD_PERSISTENCE_FAILED, VR_FOLDER_STORAGE_FAILED, VR_FOLDER_UNAVAILABLE,
+    configure_movie_download_folder, configure_tv_download_folder, configured_vr_folder,
+    dismiss_download, dismiss_organization, list_downloads, load_download_limit, load_downloads,
+    load_vr_folder_with, pause_download, preview_organization, resume_download,
+    save_download_limit, set_vr_folder, start_adult_download, start_download, start_movie_download,
+    start_tv_download, TvMetainfoAcquisitionError, VrDownloadState, VR_DOWNLOAD_FAILED,
+    VR_DOWNLOAD_LIMIT_STORAGE_FAILED, VR_DOWNLOAD_PERSISTENCE_FAILED, VR_FOLDER_STORAGE_FAILED,
+    VR_FOLDER_UNAVAILABLE,
 };
 use vr_library::{
     invalidate_vr_library, open_vr_file_with, reveal_vr_file_with, scan_vr_library_with,
@@ -1137,14 +1139,28 @@ async fn reveal_movie(path: String) -> Result<(), String> {
 fn load_tv_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, TvLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
 ) -> Result<Vec<String>, String> {
-    load_tv_folder_with(state.inner(), &tv_folder_path(&app)?).map_err(str::to_owned)
+    let response = match load_tv_folder_with(state.inner(), &tv_folder_path(&app)?) {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = configure_tv_download_folder(download_state.inner(), None);
+            return Err(error.to_owned());
+        }
+    };
+    configure_tv_download_folder(
+        download_state.inner(),
+        configured_tv_folder(state.inner()).map_err(str::to_owned)?,
+    )
+    .map_err(str::to_owned)?;
+    Ok(response)
 }
 
 #[tauri::command]
 async fn choose_tv_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, TvLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
 ) -> Result<Option<String>, String> {
     let dialog_app = app.clone();
     let selected_folder = tauri::async_runtime::spawn_blocking(move || {
@@ -1162,17 +1178,24 @@ async fn choose_tv_folder(
     let folder = selected_folder
         .into_path()
         .map_err(|_| TV_FOLDER_UNAVAILABLE.to_owned())?;
-    set_tv_folder(state.inner(), &tv_folder_path(&app)?, folder)
-        .map(Some)
-        .map_err(str::to_owned)
+    let folder =
+        set_tv_folder(state.inner(), &tv_folder_path(&app)?, folder).map_err(str::to_owned)?;
+    configure_tv_download_folder(
+        download_state.inner(),
+        configured_tv_folder(state.inner()).map_err(str::to_owned)?,
+    )
+    .map_err(str::to_owned)?;
+    Ok(Some(folder))
 }
 
 #[tauri::command]
 fn clear_tv_folder(
     app: tauri::AppHandle,
     state: tauri::State<'_, TvLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
 ) -> Result<(), String> {
-    clear_trusted_tv_folder(state.inner(), &tv_folder_path(&app)?).map_err(str::to_owned)
+    clear_trusted_tv_folder(state.inner(), &tv_folder_path(&app)?).map_err(str::to_owned)?;
+    configure_tv_download_folder(download_state.inner(), None).map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -1246,14 +1269,22 @@ async fn reveal_tv_file(
 async fn trash_tv_file(
     path: String,
     scan_generation: String,
-    state: tauri::State<'_, TvLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
+    library_state: tauri::State<'_, TvLibraryState>,
 ) -> Result<(), String> {
     let scan_generation = scan_generation
         .parse::<u64>()
         .map_err(|_| tv_library::TV_FILE_TRASH_STALE.to_owned())?;
-    let state = state.inner().clone();
+    let download_state = download_state.inner().clone();
+    let library_state = library_state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        trash_tv_file_with(Path::new(&path), scan_generation, &state, move_to_os_trash)
+        trash_tv_file_with_download_ownership(
+            Path::new(&path),
+            scan_generation,
+            &download_state,
+            &library_state,
+            move_to_os_trash,
+        )
     })
     .await
     .map_err(|_| TV_FILE_TRASH_FAILED.to_owned())?
@@ -1728,6 +1759,28 @@ async fn start_verified_movie_download(
     start_movie_download(
         download_state.inner(),
         torrent_state.inner(),
+        &vr_downloads_path(&app)?,
+        &vr_session_folder(&app)?,
+        &inspection_id,
+        &selected_file_ids,
+    )
+    .await
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn start_verified_tv_download(
+    app: tauri::AppHandle,
+    inspection_id: String,
+    selected_file_ids: Vec<usize>,
+    download_state: tauri::State<'_, VrDownloadState>,
+    torrent_state: tauri::State<'_, TvTorrentState>,
+    release_state: tauri::State<'_, TvReleaseState>,
+) -> Result<String, String> {
+    start_tv_download(
+        download_state.inner(),
+        torrent_state.inner(),
+        release_state.inner(),
         &vr_downloads_path(&app)?,
         &vr_session_folder(&app)?,
         &inspection_id,
@@ -2329,6 +2382,7 @@ fn main() {
             start_verified_vr_download,
             start_verified_adult_download,
             start_verified_movie_download,
+            start_verified_tv_download,
             pause_vr_download,
             resume_vr_download,
             cancel_vr_download,

@@ -888,6 +888,20 @@ describe("trusted VR download boundary", () => {
       "",
       "false",
       "false",
+      "tv-transfer-701-2-3",
+      "tv",
+      "tt0123456 · S02E03",
+      "Exact  Show — 特別版.S02E03+720p.第三話",
+      "2",
+      "12",
+      "4",
+      "256",
+      "paused",
+      "true",
+      "none",
+      "",
+      "false",
+      "false",
       "adult-transfer-123",
       "adult",
       "ADLT-123",
@@ -950,6 +964,22 @@ describe("trusted VR download boundary", () => {
         terminalRecovery: false,
       },
       {
+        transferId: "tv-transfer-701-2-3",
+        category: "tv",
+        identity: "tt0123456 · S02E03",
+        releaseName: "Exact  Show — 特別版.S02E03+720p.第三話",
+        selectedFileCount: 2,
+        totalBytes: "12",
+        downloadedBytes: "4",
+        speedBytesPerSecond: "256",
+        state: "paused",
+        isCurrentFolder: true,
+        organizationStatus: "none",
+        organizationRelativeDirectory: null,
+        canOrganize: false,
+        terminalRecovery: false,
+      },
+      {
         transferId: "adult-transfer-123",
         category: "adult",
         identity: "ADLT-123",
@@ -999,6 +1029,38 @@ describe("trusted VR download boundary", () => {
       },
     ]);
     expect(invokeMock).toHaveBeenCalledWith("load_vr_downloads");
+  });
+
+  it("rejects TV rows with fabricated episode identity or organization state", async () => {
+    const validTvRow = [
+      "tv-transfer-701-2-3",
+      "tv",
+      "tt0123456 · S02E03",
+      "Exact Show S02E03",
+      "1",
+      "7",
+      "3",
+      "512",
+      "downloading",
+      "true",
+      "none",
+      "",
+      "false",
+      "false",
+    ];
+    for (const [fieldIndex, invalidValue] of [
+      [2, "tt0123456"],
+      [2, "tt0123456 · S00E03"],
+      [2, "tt0123456 · S02E00"],
+      [10, "attention"],
+      [11, "Exact Show/"],
+      [12, "true"],
+    ] as const) {
+      const malformed = [...validTvRow];
+      malformed[fieldIndex] = invalidValue;
+      invokeMock.mockResolvedValueOnce(malformed);
+      await expect(loadVrDownloads()).rejects.toThrow("invalid data");
+    }
   });
 
   it("rejects Movie rows with fabricated identity or organization state", async () => {
