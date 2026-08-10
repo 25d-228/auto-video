@@ -5223,10 +5223,13 @@ mod tests {
         );
         let transfer_id = record.transfer_id.clone();
         let destination = record.destination.clone();
+        let media_path = current_target(&record, 0).expect("selected path must resolve");
+        let media_bytes = fs::read(&media_path).expect("selected media must remain readable");
         let persistence_path = fixture.path.join("downloads");
         write_persisted_transfers(&persistence_path, &[StoredTransfer::Valid(record)])
             .expect("active primary authority must persist");
         let mut context = VrDownloadContext {
+            movie_future_folder: Some(destination.clone()),
             transfers_loaded: true,
             transfers: read_persisted_transfers(&persistence_path)
                 .expect("active primary authority must reload"),
@@ -5274,6 +5277,7 @@ mod tests {
                     && record.handle.is_none()
                     && record.terminal_recovery_generation.is_none()
         ));
+        let current_rows = download_rows(&mut context);
         assert!(matches!(
             &read_persisted_transfers(&persistence_path)
                 .expect("completed primary authority must remain readable")[0],
@@ -5289,6 +5293,7 @@ mod tests {
             &fixture.path.join("download-limit"),
         ))
         .expect("durable completion must remain visible during cleanup failure");
+        assert_eq!(rows, current_rows);
         assert_eq!(rows[0], transfer_id);
         assert_eq!(rows[1], "movie");
         assert_eq!(rows[8], "completed");
@@ -5299,6 +5304,10 @@ mod tests {
             .expect("state must lock")
             .session
             .is_none());
+        assert_eq!(
+            fs::read(media_path).expect("completed media must remain readable"),
+            media_bytes
+        );
         fs::remove_dir(&recovery_path).expect("cleanup fixture must be removable");
     }
 

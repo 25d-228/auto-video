@@ -9602,7 +9602,7 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
     expect(listVrDownloadsMock).toHaveBeenCalledOnce();
   });
 
-  it("shows recovered terminal authority as attention and retries Dismiss without a success refresh", async () => {
+  it("shows old-folder terminal recovery as attention and retries Dismiss without a current-folder refresh", async () => {
     savedMoviesFolder = "/Movies";
     savedAdultFolder = "/Adult";
     savedVrFolder = "/VR";
@@ -9614,6 +9614,7 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
         releaseName: "Recovered Movie transfer",
         speedBytesPerSecond: "0",
         state: "failed",
+        isCurrentFolder: "false",
         terminalRecovery: "true",
         transferId: "recovered-movie",
       }),
@@ -9624,6 +9625,7 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
         releaseName: "Recovered Adult transfer",
         speedBytesPerSecond: "0",
         state: "failed",
+        isCurrentFolder: "false",
         terminalRecovery: "true",
         transferId: "recovered-adult",
       }),
@@ -9632,6 +9634,7 @@ describe("aggregate Adult and VR download limit and transfer summaries", () => {
         releaseName: "Recovered VR transfer",
         speedBytesPerSecond: "0",
         state: "failed",
+        isCurrentFolder: "false",
         terminalRecovery: "true",
         transferId: "recovered-vr",
       }),
