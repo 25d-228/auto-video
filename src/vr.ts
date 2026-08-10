@@ -913,6 +913,21 @@ function parseVrDownloads(value: unknown): VrDownload[] {
       organizationRelativeDirectory.startsWith(`${releaseName} (`)
         ? organizationRelativeDirectory.slice(releaseName.length + 2, -2)
         : null;
+    const tvIdentity = identity.match(
+      /^tt\d{7,10} · S(0[1-9]|[1-9]\d*)E(0[1-9]|[1-9]\d*)$/,
+    );
+    const tvOrganizationPath = organizationRelativeDirectory.endsWith("/")
+      ? organizationRelativeDirectory.slice(0, -1)
+      : null;
+    const tvOrganizationParts = tvOrganizationPath?.split("/") ?? [];
+    const tvOrganizationDirectory =
+      tvIdentity !== null &&
+      tvOrganizationPath !== null &&
+      safeOrganizationRelativePath(tvOrganizationPath) &&
+      tvOrganizationParts.length === 2 &&
+      tvOrganizationParts[1] === `Season ${tvIdentity[1]}`
+        ? tvOrganizationPath
+        : null;
     if (
       transferId === "" ||
       transferIds.has(transferId) ||
@@ -926,12 +941,9 @@ function parseVrDownloads(value: unknown): VrDownload[] {
             (movieOrganizationDirectory === null ||
               !/^(?!0000)\d{4}$/.test(movieOrganizationDirectory))))) ||
       (category === "tv" &&
-        (!/^tt\d{7,10} · S(?:0[1-9]|[1-9]\d*)E(?:0[1-9]|[1-9]\d*)$/.test(
-          identity,
-        ) ||
-          organizationStatus !== "none" ||
-          organizationRelativeDirectory !== "" ||
-          canOrganize !== "false")) ||
+        (tvIdentity === null ||
+          (organizationStatus !== "none" &&
+            tvOrganizationDirectory === null))) ||
       (category === "unknown" &&
         (count !== 0 ||
           totalBytes !== "0" ||
@@ -963,7 +975,9 @@ function parseVrDownloads(value: unknown): VrDownload[] {
         (state !== "completed" ||
           (category === "movie"
             ? movieOrganizationDirectory === null
-            : organizationRelativeDirectory !== `${identity}/`))) ||
+            : category === "tv"
+              ? tvOrganizationDirectory === null
+              : organizationRelativeDirectory !== `${identity}/`))) ||
       (canOrganize !== "true" && canOrganize !== "false") ||
       (canOrganize === "true" &&
         (state !== "completed" ||
@@ -1023,10 +1037,13 @@ function parseVrOrganizationPreview(value: unknown): VrOrganizationPreview {
   const entryCount = Number(entryCountValue);
   const productIdentity = canonicalizeProductCode(identity) === identity;
   const movieIdentity = /^tt\d{7,10}$/.test(identity);
+  const tvIdentity = identity.match(
+    /^tt\d{7,10} · S(0[1-9]|[1-9]\d*)E(0[1-9]|[1-9]\d*)$/,
+  );
   if (
     planId === "" ||
     transferId === "" ||
-    (!productIdentity && !movieIdentity) ||
+    (!productIdentity && !movieIdentity && tvIdentity === null) ||
     !Number.isSafeInteger(moveCount) ||
     moveCount < 0 ||
     !Number.isSafeInteger(entryCount) ||
@@ -1057,7 +1074,15 @@ function parseVrOrganizationPreview(value: unknown): VrOrganizationPreview {
     }
     if (kind !== "non-media-unchanged") {
       const destinationParts = destinationRelativePath.split("/");
-      const directory = destinationParts.length === 2 ? destinationParts[0] : null;
+      const directory =
+        tvIdentity === null
+          ? destinationParts.length === 2
+            ? destinationParts[0]
+            : null
+          : destinationParts.length === 3 &&
+              destinationParts[1] === `Season ${tvIdentity[1]}`
+            ? destinationParts.slice(0, 2).join("/")
+            : null;
       if (
         directory === null ||
         (productIdentity && directory !== identity) ||
