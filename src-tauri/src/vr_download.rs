@@ -52,7 +52,8 @@ const LEGACY_PERSISTENCE_HEADER: &[u8] = b"AUTO_VIDEO_VR_DOWNLOADS_V1\n";
 const ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_ORGANIZATION_V2\n";
 const LEGACY_ORGANIZATION_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_VR_ORGANIZATION_V1\n";
 const TERMINAL_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_TRANSFER_TERMINAL_V1\n";
-const CLEANUP_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_TRANSFER_CLEANUP_V1\n";
+const CLEANUP_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_TRANSFER_CLEANUP_V2\n";
+const LEGACY_CLEANUP_RECOVERY_HEADER: &[u8] = b"AUTO_VIDEO_TRANSFER_CLEANUP_V1\n";
 const ORGANIZATION_RECOVERY_PREFIX: &str = ".auto-video-organization-";
 const ORGANIZATION_RECOVERY_SUFFIX: &str = ".recovery";
 const ORGANIZATION_RECOVERY_SUCCESSOR_SUFFIX: &str = ".recovery.next";
@@ -243,10 +244,62 @@ impl CleanupFileState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupMutationPhase {
+    TemporaryCreationPrepared,
+    TemporaryCreated,
+    SwapPrepared,
+    Swapped,
+    ExactDeletionPrepared,
+    ExactDeleted,
+    TemporaryRelocationPrepared,
+    TemporaryRelocated,
+    TemporaryCleanupPrepared,
+}
+
+impl CleanupMutationPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TemporaryCreationPrepared => "temporary-creation-prepared",
+            Self::TemporaryCreated => "temporary-created",
+            Self::SwapPrepared => "swap-prepared",
+            Self::Swapped => "swapped",
+            Self::ExactDeletionPrepared => "exact-deletion-prepared",
+            Self::ExactDeleted => "exact-deleted",
+            Self::TemporaryRelocationPrepared => "temporary-relocation-prepared",
+            Self::TemporaryRelocated => "temporary-relocated",
+            Self::TemporaryCleanupPrepared => "temporary-cleanup-prepared",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "temporary-creation-prepared" => Some(Self::TemporaryCreationPrepared),
+            "temporary-created" => Some(Self::TemporaryCreated),
+            "swap-prepared" => Some(Self::SwapPrepared),
+            "swapped" => Some(Self::Swapped),
+            "exact-deletion-prepared" => Some(Self::ExactDeletionPrepared),
+            "exact-deleted" => Some(Self::ExactDeleted),
+            "temporary-relocation-prepared" => Some(Self::TemporaryRelocationPrepared),
+            "temporary-relocated" => Some(Self::TemporaryRelocated),
+            "temporary-cleanup-prepared" => Some(Self::TemporaryCleanupPrepared),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CleanupMutation {
+    temporary_path: PathBuf,
+    temporary_fingerprint: Option<String>,
+    phase: CleanupMutationPhase,
+}
+
 #[derive(Clone)]
 struct CleanupRecovery {
     record: TransferRecord,
     files: Vec<CleanupFileState>,
+    mutations: Vec<Option<CleanupMutation>>,
     stopped: bool,
 }
 
@@ -1941,6 +1994,93 @@ fn cleanup_recovery_path(
     )))
 }
 
+fn cleanup_temporary_path(
+    record: &TransferRecord,
+    selected_index: usize,
+) -> Result<PathBuf, &'static str> {
+    Ok(current_target(record, selected_index)?
+        .parent()
+        .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?
+        .join(format!(
+            ".auto-video-cleanup-{}-{selected_index}.delete",
+            record.transfer_id
+        )))
+}
+
+fn encode_cleanup_mutations(recovery: &CleanupRecovery) -> String {
+    recovery
+        .mutations
+        .iter()
+        .map(|mutation| match mutation {
+            None => "-".to_owned(),
+            Some(mutation) => format!(
+                "{}:{}:{}",
+                mutation.phase.as_str(),
+                encode_hex(mutation.temporary_path.to_string_lossy().as_bytes()),
+                mutation
+                    .temporary_fingerprint
+                    .as_deref()
+                    .map(|fingerprint| encode_hex(fingerprint.as_bytes()))
+                    .unwrap_or_else(|| "-".to_owned())
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_cleanup_mutations(value: &[u8]) -> Option<Vec<Option<CleanupMutation>>> {
+    std::str::from_utf8(value)
+        .ok()?
+        .split(',')
+        .map(|entry| {
+            if entry == "-" {
+                return Some(None);
+            }
+            let mut fields = entry.split(':');
+            let phase = CleanupMutationPhase::from_str(fields.next()?)?;
+            let temporary_path = PathBuf::from(decode_text(fields.next()?.as_bytes())?);
+            let temporary_fingerprint = match fields.next()? {
+                "-" => None,
+                fingerprint => Some(decode_text(fingerprint.as_bytes())?),
+            };
+            if fields.next().is_some() {
+                return None;
+            }
+            Some(Some(CleanupMutation {
+                temporary_path,
+                temporary_fingerprint,
+                phase,
+            }))
+        })
+        .collect()
+}
+
+fn validate_cleanup_mutations(recovery: &CleanupRecovery) -> Result<(), &'static str> {
+    if recovery.mutations.len() != recovery.record.selected_files.len()
+        || recovery
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.is_some())
+            .count()
+            > 1
+    {
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+    }
+    for (selected_index, mutation) in recovery.mutations.iter().enumerate() {
+        let Some(mutation) = mutation else { continue };
+        if recovery.files[selected_index] != CleanupFileState::Present
+            || mutation.temporary_path != cleanup_temporary_path(&recovery.record, selected_index)?
+            || (mutation.phase == CleanupMutationPhase::TemporaryCreationPrepared
+                && mutation.temporary_fingerprint.is_some())
+            || (mutation.phase != CleanupMutationPhase::TemporaryCreationPrepared
+                && mutation.temporary_fingerprint.is_none())
+        {
+            return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+        }
+    }
+    Ok(())
+}
+
 fn encoded_cleanup_recovery(recovery: &CleanupRecovery) -> Result<Vec<u8>, &'static str> {
     if recovery.record.state != TransferState::Cleanup
         || recovery.record.organization_state != OrganizationState::None
@@ -1949,6 +2089,7 @@ fn encoded_cleanup_recovery(recovery: &CleanupRecovery) -> Result<Vec<u8>, &'sta
     {
         return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
     }
+    validate_cleanup_mutations(recovery)?;
     let stopped = if recovery.stopped {
         b"true".as_slice()
     } else {
@@ -1960,10 +2101,13 @@ fn encoded_cleanup_recovery(recovery: &CleanupRecovery) -> Result<Vec<u8>, &'sta
         .map(|state| state.as_str())
         .collect::<Vec<_>>()
         .join(",");
+    let mutations = encode_cleanup_mutations(recovery);
     let encoded_record = encode_transfer(&recovery.record)?;
     let mut checksum_input = stopped.to_vec();
     checksum_input.push(b'\n');
     checksum_input.extend_from_slice(states.as_bytes());
+    checksum_input.push(b'\n');
+    checksum_input.extend_from_slice(mutations.as_bytes());
     checksum_input.push(b'\n');
     checksum_input.extend_from_slice(&encoded_record);
     let mut bytes = CLEANUP_RECOVERY_HEADER.to_vec();
@@ -1986,12 +2130,45 @@ fn parse_cleanup_recovery(persistence_path: &Path, path: &Path) -> Option<Cleanu
         return None;
     }
     let bytes = fs::read(path).ok()?;
-    let fields = bytes
-        .strip_prefix(CLEANUP_RECOVERY_HEADER)?
-        .split(|byte| *byte == b'\n')
-        .collect::<Vec<_>>();
-    let [checksum, stopped, states, encoded_record, trailing] = fields.as_slice() else {
-        return None;
+    let (legacy, fields) = if let Some(bytes) = bytes.strip_prefix(CLEANUP_RECOVERY_HEADER) {
+        (
+            false,
+            bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>(),
+        )
+    } else {
+        (
+            true,
+            bytes
+                .strip_prefix(LEGACY_CLEANUP_RECOVERY_HEADER)?
+                .split(|byte| *byte == b'\n')
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (checksum, stopped, states, mutations, encoded_record, trailing) = if legacy {
+        let [checksum, stopped, states, encoded_record, trailing] = fields.as_slice() else {
+            return None;
+        };
+        (
+            *checksum,
+            *stopped,
+            *states,
+            None,
+            *encoded_record,
+            *trailing,
+        )
+    } else {
+        let [checksum, stopped, states, mutations, encoded_record, trailing] = fields.as_slice()
+        else {
+            return None;
+        };
+        (
+            *checksum,
+            *stopped,
+            *states,
+            Some(*mutations),
+            *encoded_record,
+            *trailing,
+        )
     };
     if !trailing.is_empty() || checksum.len() != 40 {
         return None;
@@ -2000,11 +2177,15 @@ fn parse_cleanup_recovery(persistence_path: &Path, path: &Path) -> Option<Cleanu
     checksum_input.push(b'\n');
     checksum_input.extend_from_slice(states);
     checksum_input.push(b'\n');
+    if let Some(mutations) = mutations {
+        checksum_input.extend_from_slice(mutations);
+        checksum_input.push(b'\n');
+    }
     checksum_input.extend_from_slice(encoded_record);
-    if checksum != &hex_sha1(&checksum_input).as_bytes() {
+    if checksum != hex_sha1(&checksum_input).as_bytes() {
         return None;
     }
-    let stopped = match *stopped {
+    let stopped = match stopped {
         b"true" => true,
         b"false" => false,
         _ => return None,
@@ -2014,10 +2195,15 @@ fn parse_cleanup_recovery(persistence_path: &Path, path: &Path) -> Option<Cleanu
         .split(',')
         .map(CleanupFileState::from_str)
         .collect::<Option<Vec<_>>>()?;
+    let mutations = match mutations {
+        Some(mutations) => decode_cleanup_mutations(mutations)?,
+        None => vec![None; files.len()],
+    };
     let record = parse_transfer_line(encoded_record, false)?;
     if record.state != TransferState::Cleanup
         || record.organization_state != OrganizationState::None
         || files.len() != record.selected_files.len()
+        || mutations.len() != record.selected_files.len()
         || cleanup_recovery_path(persistence_path, &record)
             .ok()?
             .as_path()
@@ -2025,11 +2211,14 @@ fn parse_cleanup_recovery(persistence_path: &Path, path: &Path) -> Option<Cleanu
     {
         return None;
     }
-    Some(CleanupRecovery {
+    let recovery = CleanupRecovery {
         record,
         files,
+        mutations,
         stopped,
-    })
+    };
+    validate_cleanup_mutations(&recovery).ok()?;
+    Some(recovery)
 }
 
 fn cleanup_recovery_paths(persistence_path: &Path) -> Result<Vec<PathBuf>, &'static str> {
@@ -2120,6 +2309,7 @@ fn remove_cleanup_recovery(
         parse_cleanup_recovery(persistence_path, &path).ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
     if !same_transfer_authority(&current.record, &expected.record)
         || current.files != expected.files
+        || current.mutations != expected.mutations
         || current.stopped != expected.stopped
     {
         return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
@@ -2483,7 +2673,13 @@ fn durable_cleanup_recovery_owns_path(
     {
         let recovery = parse_cleanup_recovery(persistence_path, &path)
             .ok_or(VrLibraryTrashOwnershipError::Unavailable)?;
-        if transfer_record_owns_path(&recovery.record, requested_path)? {
+        if transfer_record_owns_path(&recovery.record, requested_path)?
+            || recovery
+                .mutations
+                .iter()
+                .flatten()
+                .any(|mutation| mutation.temporary_path == requested_path)
+        {
             return Ok(true);
         }
     }
@@ -3196,37 +3392,6 @@ fn macos_rename_exact(source: &Path, destination: &Path, flags: u32) -> io::Resu
 }
 
 #[cfg(target_os = "macos")]
-fn create_cleanup_placeholder(target: &Path) -> io::Result<(PathBuf, File, String)> {
-    const MAX_CLEANUP_PLACEHOLDER_ATTEMPTS: usize = 32;
-    let parent = target
-        .parent()
-        .ok_or_else(|| io::Error::other("cleanup target has no parent"))?;
-    for attempt in 0..MAX_CLEANUP_PLACEHOLDER_ATTEMPTS {
-        let path = parent.join(format!(
-            ".auto-video-cleanup-{}-{attempt}.delete",
-            std::process::id()
-        ));
-        match OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-        {
-            Ok(file) => {
-                let fingerprint = open_file_fingerprint(&file)?;
-                return Ok((path, file, fingerprint));
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "cleanup placeholder names are unavailable",
-    ))
-}
-
-#[cfg(target_os = "macos")]
 fn open_macos_cleanup_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -3242,80 +3407,435 @@ fn open_macos_cleanup_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(target_os = "macos")]
-fn delete_exact_cleanup_file_with(
-    target: &Path,
+fn macos_cleanup_path_fingerprint(path: &Path) -> Result<Option<String>, &'static str> {
+    match open_macos_cleanup_file(path) {
+        Ok(file) => open_file_fingerprint(&file)
+            .map(Some)
+            .map_err(|_| VR_DOWNLOAD_STALE),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(VR_DOWNLOAD_STALE),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_exact_macos_cleanup_path(
+    path: &Path,
     expected_fingerprint: &str,
-    before_mutation: impl FnOnce() -> io::Result<()>,
+) -> Result<(), &'static str> {
+    match macos_cleanup_path_fingerprint(path)? {
+        None => Ok(()),
+        Some(fingerprint) if fingerprint == expected_fingerprint => {
+            fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                _ => Err(VR_DOWNLOAD_STALE),
+            }
+        }
+        Some(_) => Err(VR_DOWNLOAD_STALE),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn persist_cleanup_mutation_phase(
+    persistence_path: &Path,
+    recovery: &mut CleanupRecovery,
+    selected_index: usize,
+    temporary_path: &Path,
+    temporary_fingerprint: Option<&str>,
+    phase: CleanupMutationPhase,
+) -> Result<(), &'static str> {
+    recovery.mutations[selected_index] = Some(CleanupMutation {
+        temporary_path: temporary_path.to_owned(),
+        temporary_fingerprint: temporary_fingerprint.map(str::to_owned),
+        phase,
+    });
+    write_cleanup_recovery(persistence_path, recovery)
+}
+
+#[cfg(target_os = "macos")]
+fn clear_cleanup_mutation(
+    persistence_path: &Path,
+    recovery: &mut CleanupRecovery,
+    selected_index: usize,
+    state: CleanupFileState,
+) -> Result<(), &'static str> {
+    recovery.files[selected_index] = state;
+    recovery.mutations[selected_index] = None;
+    write_cleanup_recovery(persistence_path, recovery)
+}
+
+#[cfg(target_os = "macos")]
+fn delete_exact_cleanup_file_with(
+    persistence_path: &Path,
+    recovery: &mut CleanupRecovery,
+    selected_index: usize,
+    before_swap: impl FnOnce() -> io::Result<()>,
+    mut after_phase: impl FnMut(CleanupMutationPhase) -> io::Result<()>,
 ) -> Result<(), &'static str> {
     const RENAME_SWAP: u32 = 0x0000_0002;
     const RENAME_EXCL: u32 = 0x0000_0004;
 
-    let target_file = open_macos_cleanup_file(target).map_err(|_| VR_DOWNLOAD_STALE)?;
+    let target = current_target(&recovery.record, selected_index)?;
+    let expected_fingerprint = recovery.record.fingerprints[selected_index].clone();
+    let target_file = open_macos_cleanup_file(&target).map_err(|_| VR_DOWNLOAD_STALE)?;
     if open_file_fingerprint(&target_file).map_err(|_| VR_DOWNLOAD_STALE)? != expected_fingerprint {
         return Err(VR_DOWNLOAD_STALE);
     }
-    let (placeholder_path, placeholder_file, placeholder_fingerprint) =
-        create_cleanup_placeholder(target).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
-    if before_mutation().is_err() {
-        drop(placeholder_file);
-        let _ = fs::remove_file(&placeholder_path);
-        return Err(VR_DOWNLOAD_CLEANUP_FAILED);
-    }
+    let temporary_path = cleanup_temporary_path(&recovery.record, selected_index)?;
+    persist_cleanup_mutation_phase(
+        persistence_path,
+        recovery,
+        selected_index,
+        &temporary_path,
+        None,
+        CleanupMutationPhase::TemporaryCreationPrepared,
+    )?;
+    let placeholder_file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&temporary_path)
+        .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    placeholder_file
+        .sync_all()
+        .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    sync_parent_directory(&temporary_path);
+    let placeholder_fingerprint =
+        open_file_fingerprint(&placeholder_file).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    persist_cleanup_mutation_phase(
+        persistence_path,
+        recovery,
+        selected_index,
+        &temporary_path,
+        Some(&placeholder_fingerprint),
+        CleanupMutationPhase::TemporaryCreated,
+    )?;
+    after_phase(CleanupMutationPhase::TemporaryCreated).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    before_swap().map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    persist_cleanup_mutation_phase(
+        persistence_path,
+        recovery,
+        selected_index,
+        &temporary_path,
+        Some(&placeholder_fingerprint),
+        CleanupMutationPhase::SwapPrepared,
+    )?;
 
-    if macos_rename_exact(target, &placeholder_path, RENAME_SWAP).is_err() {
-        drop(placeholder_file);
-        let _ = fs::remove_file(&placeholder_path);
-        return Err(VR_DOWNLOAD_CLEANUP_FAILED);
-    }
-    let swapped_fingerprint = match open_macos_cleanup_file(&placeholder_path)
+    macos_rename_exact(&target, &temporary_path, RENAME_SWAP)
+        .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    let swapped_fingerprint = match open_macos_cleanup_file(&temporary_path)
         .and_then(|file| open_file_fingerprint(&file))
     {
         Ok(fingerprint) => fingerprint,
         Err(_) => {
-            if macos_rename_exact(target, &placeholder_path, RENAME_SWAP).is_ok() {
-                drop(placeholder_file);
-                let _ = fs::remove_file(&placeholder_path);
-            }
             return Err(VR_DOWNLOAD_CLEANUP_FAILED);
         }
     };
     if swapped_fingerprint != expected_fingerprint {
-        if macos_rename_exact(target, &placeholder_path, RENAME_SWAP).is_err() {
-            return Err(VR_DOWNLOAD_CLEANUP_FAILED);
-        }
-        drop(placeholder_file);
-        let _ = fs::remove_file(&placeholder_path);
+        let _ = reconcile_macos_cleanup_mutation(persistence_path, recovery, selected_index);
         return Err(VR_DOWNLOAD_STALE);
+    }
+    persist_cleanup_mutation_phase(
+        persistence_path,
+        recovery,
+        selected_index,
+        &temporary_path,
+        Some(&placeholder_fingerprint),
+        CleanupMutationPhase::Swapped,
+    )?;
+    after_phase(CleanupMutationPhase::Swapped).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+
+    persist_cleanup_mutation_phase(
+        persistence_path,
+        recovery,
+        selected_index,
+        &temporary_path,
+        Some(&placeholder_fingerprint),
+        CleanupMutationPhase::ExactDeletionPrepared,
+    )?;
+    remove_exact_macos_cleanup_path(&temporary_path, &expected_fingerprint)?;
+    drop(target_file);
+    persist_cleanup_mutation_phase(
+        persistence_path,
+        recovery,
+        selected_index,
+        &temporary_path,
+        Some(&placeholder_fingerprint),
+        CleanupMutationPhase::ExactDeleted,
+    )?;
+    after_phase(CleanupMutationPhase::ExactDeleted).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+
+    persist_cleanup_mutation_phase(
+        persistence_path,
+        recovery,
+        selected_index,
+        &temporary_path,
+        Some(&placeholder_fingerprint),
+        CleanupMutationPhase::TemporaryRelocationPrepared,
+    )?;
+    macos_rename_exact(&target, &temporary_path, RENAME_EXCL)
+        .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    persist_cleanup_mutation_phase(
+        persistence_path,
+        recovery,
+        selected_index,
+        &temporary_path,
+        Some(&placeholder_fingerprint),
+        CleanupMutationPhase::TemporaryRelocated,
+    )?;
+    after_phase(CleanupMutationPhase::TemporaryRelocated)
+        .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    persist_cleanup_mutation_phase(
+        persistence_path,
+        recovery,
+        selected_index,
+        &temporary_path,
+        Some(&placeholder_fingerprint),
+        CleanupMutationPhase::TemporaryCleanupPrepared,
+    )?;
+    after_phase(CleanupMutationPhase::TemporaryCleanupPrepared)
+        .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    drop(placeholder_file);
+    remove_exact_macos_cleanup_path(&temporary_path, &placeholder_fingerprint)?;
+    sync_parent_directory(&target);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn finish_reconciled_macos_deletion(
+    persistence_path: &Path,
+    recovery: &mut CleanupRecovery,
+    selected_index: usize,
+) -> Result<(), &'static str> {
+    const RENAME_EXCL: u32 = 0x0000_0004;
+
+    let target = current_target(&recovery.record, selected_index)?;
+    let expected_fingerprint = recovery.record.fingerprints[selected_index].clone();
+    let mutation = recovery.mutations[selected_index]
+        .clone()
+        .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    let temporary_path = mutation.temporary_path;
+    let placeholder_fingerprint = mutation
+        .temporary_fingerprint
+        .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+
+    if macos_cleanup_path_fingerprint(&temporary_path)?.as_deref()
+        == Some(expected_fingerprint.as_str())
+    {
+        persist_cleanup_mutation_phase(
+            persistence_path,
+            recovery,
+            selected_index,
+            &temporary_path,
+            Some(&placeholder_fingerprint),
+            CleanupMutationPhase::ExactDeletionPrepared,
+        )?;
+        remove_exact_macos_cleanup_path(&temporary_path, &expected_fingerprint)?;
+        persist_cleanup_mutation_phase(
+            persistence_path,
+            recovery,
+            selected_index,
+            &temporary_path,
+            Some(&placeholder_fingerprint),
+            CleanupMutationPhase::ExactDeleted,
+        )?;
     }
 
-    if fs::remove_file(&placeholder_path).is_err() {
-        let _ = macos_rename_exact(target, &placeholder_path, RENAME_SWAP);
-        return Err(VR_DOWNLOAD_CLEANUP_FAILED);
-    }
-    drop(target_file);
-    if macos_rename_exact(target, &placeholder_path, RENAME_EXCL).is_err() {
-        return Err(VR_DOWNLOAD_CLEANUP_FAILED);
-    }
-    let moved_placeholder_fingerprint = match open_macos_cleanup_file(&placeholder_path)
-        .and_then(|file| open_file_fingerprint(&file))
+    let mut target_fingerprint = macos_cleanup_path_fingerprint(&target)?;
+    let mut temporary_fingerprint = macos_cleanup_path_fingerprint(&temporary_path)?;
+    if temporary_fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| fingerprint != placeholder_fingerprint)
     {
-        Ok(fingerprint) => fingerprint,
-        Err(_) => {
-            if fs::symlink_metadata(target).is_err() {
-                let _ = fs::rename(&placeholder_path, target);
-            }
-            return Err(VR_DOWNLOAD_CLEANUP_FAILED);
-        }
-    };
-    if moved_placeholder_fingerprint != placeholder_fingerprint {
-        if fs::symlink_metadata(target).is_err() {
-            let _ = fs::rename(&placeholder_path, target);
-        }
         return Err(VR_DOWNLOAD_STALE);
     }
-    drop(placeholder_file);
-    fs::remove_file(&placeholder_path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
-    sync_parent_directory(target);
+    if target_fingerprint.as_deref() == Some(placeholder_fingerprint.as_str()) {
+        if temporary_fingerprint.is_some() {
+            return Err(VR_DOWNLOAD_STALE);
+        }
+        persist_cleanup_mutation_phase(
+            persistence_path,
+            recovery,
+            selected_index,
+            &temporary_path,
+            Some(&placeholder_fingerprint),
+            CleanupMutationPhase::TemporaryRelocationPrepared,
+        )?;
+        macos_rename_exact(&target, &temporary_path, RENAME_EXCL)
+            .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+        persist_cleanup_mutation_phase(
+            persistence_path,
+            recovery,
+            selected_index,
+            &temporary_path,
+            Some(&placeholder_fingerprint),
+            CleanupMutationPhase::TemporaryRelocated,
+        )?;
+        target_fingerprint = macos_cleanup_path_fingerprint(&target)?;
+        temporary_fingerprint = macos_cleanup_path_fingerprint(&temporary_path)?;
+    }
+    if target_fingerprint.as_deref() == Some(expected_fingerprint.as_str()) {
+        return Err(VR_DOWNLOAD_STALE);
+    }
+    if temporary_fingerprint.as_deref() == Some(placeholder_fingerprint.as_str()) {
+        persist_cleanup_mutation_phase(
+            persistence_path,
+            recovery,
+            selected_index,
+            &temporary_path,
+            Some(&placeholder_fingerprint),
+            CleanupMutationPhase::TemporaryCleanupPrepared,
+        )?;
+        remove_exact_macos_cleanup_path(&temporary_path, &placeholder_fingerprint)?;
+    }
+    clear_cleanup_mutation(
+        persistence_path,
+        recovery,
+        selected_index,
+        CleanupFileState::Deleted,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_macos_cleanup_mutation(
+    persistence_path: &Path,
+    recovery: &mut CleanupRecovery,
+    selected_index: usize,
+) -> Result<(), &'static str> {
+    const RENAME_SWAP: u32 = 0x0000_0002;
+
+    let mutation = recovery.mutations[selected_index]
+        .clone()
+        .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    let target = current_target(&recovery.record, selected_index)?;
+    let expected_fingerprint = recovery.record.fingerprints[selected_index].clone();
+    let temporary_path = mutation.temporary_path;
+    if mutation.phase == CleanupMutationPhase::TemporaryCreationPrepared {
+        if macos_cleanup_path_fingerprint(&target)?.as_deref()
+            != Some(expected_fingerprint.as_str())
+            || macos_cleanup_path_fingerprint(&temporary_path)?.is_some()
+        {
+            return Err(VR_DOWNLOAD_STALE);
+        }
+        return clear_cleanup_mutation(
+            persistence_path,
+            recovery,
+            selected_index,
+            CleanupFileState::Present,
+        );
+    }
+    let placeholder_fingerprint = mutation
+        .temporary_fingerprint
+        .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    if matches!(
+        mutation.phase,
+        CleanupMutationPhase::ExactDeleted
+            | CleanupMutationPhase::TemporaryRelocationPrepared
+            | CleanupMutationPhase::TemporaryRelocated
+            | CleanupMutationPhase::TemporaryCleanupPrepared
+    ) {
+        return finish_reconciled_macos_deletion(persistence_path, recovery, selected_index);
+    }
+
+    let target_fingerprint = macos_cleanup_path_fingerprint(&target)?;
+    let temporary_fingerprint = macos_cleanup_path_fingerprint(&temporary_path)?;
+    match (
+        target_fingerprint.as_deref(),
+        temporary_fingerprint.as_deref(),
+    ) {
+        (Some(target_identity), Some(temporary_identity))
+            if target_identity == expected_fingerprint
+                && temporary_identity == placeholder_fingerprint =>
+        {
+            remove_exact_macos_cleanup_path(&temporary_path, &placeholder_fingerprint)?;
+            clear_cleanup_mutation(
+                persistence_path,
+                recovery,
+                selected_index,
+                CleanupFileState::Present,
+            )
+        }
+        (Some(target_identity), Some(temporary_identity))
+            if target_identity == placeholder_fingerprint
+                && temporary_identity == expected_fingerprint =>
+        {
+            macos_rename_exact(&target, &temporary_path, RENAME_SWAP)
+                .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+            remove_exact_macos_cleanup_path(&temporary_path, &placeholder_fingerprint)?;
+            clear_cleanup_mutation(
+                persistence_path,
+                recovery,
+                selected_index,
+                CleanupFileState::Present,
+            )
+        }
+        (Some(target_identity), Some(_)) if target_identity == placeholder_fingerprint => {
+            macos_rename_exact(&target, &temporary_path, RENAME_SWAP)
+                .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+            remove_exact_macos_cleanup_path(&temporary_path, &placeholder_fingerprint)?;
+            clear_cleanup_mutation(
+                persistence_path,
+                recovery,
+                selected_index,
+                CleanupFileState::Present,
+            )
+        }
+        (_, Some(temporary_identity)) if temporary_identity == expected_fingerprint => {
+            persist_cleanup_mutation_phase(
+                persistence_path,
+                recovery,
+                selected_index,
+                &temporary_path,
+                Some(&placeholder_fingerprint),
+                CleanupMutationPhase::ExactDeletionPrepared,
+            )?;
+            remove_exact_macos_cleanup_path(&temporary_path, &expected_fingerprint)?;
+            persist_cleanup_mutation_phase(
+                persistence_path,
+                recovery,
+                selected_index,
+                &temporary_path,
+                Some(&placeholder_fingerprint),
+                CleanupMutationPhase::ExactDeleted,
+            )?;
+            finish_reconciled_macos_deletion(persistence_path, recovery, selected_index)
+        }
+        (Some(target_identity), None) if target_identity == placeholder_fingerprint => {
+            persist_cleanup_mutation_phase(
+                persistence_path,
+                recovery,
+                selected_index,
+                &temporary_path,
+                Some(&placeholder_fingerprint),
+                CleanupMutationPhase::ExactDeleted,
+            )?;
+            finish_reconciled_macos_deletion(persistence_path, recovery, selected_index)
+        }
+        (Some(target_identity), None) if target_identity == expected_fingerprint => {
+            clear_cleanup_mutation(
+                persistence_path,
+                recovery,
+                selected_index,
+                CleanupFileState::Present,
+            )
+        }
+        _ => Err(VR_DOWNLOAD_STALE),
+    }
+}
+
+fn reconcile_cleanup_mutations(
+    persistence_path: &Path,
+    recovery: &mut CleanupRecovery,
+) -> Result<(), &'static str> {
+    for selected_index in 0..recovery.mutations.len() {
+        if recovery.mutations[selected_index].is_none() {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        reconcile_macos_cleanup_mutation(persistence_path, recovery, selected_index)?;
+        #[cfg(not(target_os = "macos"))]
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+    }
     Ok(())
 }
 
@@ -3339,9 +3859,11 @@ extern "system" {
 
 #[cfg(target_os = "windows")]
 fn delete_exact_cleanup_file_with(
-    target: &Path,
-    expected_fingerprint: &str,
+    _persistence_path: &Path,
+    recovery: &mut CleanupRecovery,
+    selected_index: usize,
     before_mutation: impl FnOnce() -> io::Result<()>,
+    _after_phase: impl FnMut(CleanupMutationPhase) -> io::Result<()>,
 ) -> Result<(), &'static str> {
     use std::{
         mem::size_of,
@@ -3356,7 +3878,9 @@ fn delete_exact_cleanup_file_with(
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
 
-    let metadata = fs::symlink_metadata(target).map_err(|_| VR_DOWNLOAD_STALE)?;
+    let target = current_target(&recovery.record, selected_index)?;
+    let expected_fingerprint = &recovery.record.fingerprints[selected_index];
+    let metadata = fs::symlink_metadata(&target).map_err(|_| VR_DOWNLOAD_STALE)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(VR_DOWNLOAD_STALE);
     }
@@ -3364,7 +3888,7 @@ fn delete_exact_cleanup_file_with(
         .access_mode(DELETE | FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(target)
+        .open(&target)
         .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
     if open_file_fingerprint(&file).map_err(|_| VR_DOWNLOAD_STALE)? != expected_fingerprint {
         return Err(VR_DOWNLOAD_STALE);
@@ -3383,7 +3907,7 @@ fn delete_exact_cleanup_file_with(
         return Err(VR_DOWNLOAD_CLEANUP_FAILED);
     }
     drop(file);
-    match fs::symlink_metadata(target) {
+    match fs::symlink_metadata(&target) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         _ => Err(VR_DOWNLOAD_STALE),
     }
@@ -3391,18 +3915,27 @@ fn delete_exact_cleanup_file_with(
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn delete_exact_cleanup_file_with(
-    _target: &Path,
-    _expected_fingerprint: &str,
+    _persistence_path: &Path,
+    _recovery: &mut CleanupRecovery,
+    _selected_index: usize,
     _before_mutation: impl FnOnce() -> io::Result<()>,
+    _after_phase: impl FnMut(CleanupMutationPhase) -> io::Result<()>,
 ) -> Result<(), &'static str> {
     Err(VR_DOWNLOAD_CLEANUP_FAILED)
 }
 
 fn delete_exact_cleanup_file(
-    target: &Path,
-    expected_fingerprint: &str,
+    persistence_path: &Path,
+    recovery: &mut CleanupRecovery,
+    selected_index: usize,
 ) -> Result<(), &'static str> {
-    delete_exact_cleanup_file_with(target, expected_fingerprint, || Ok(()))
+    delete_exact_cleanup_file_with(
+        persistence_path,
+        recovery,
+        selected_index,
+        || Ok(()),
+        |_| Ok(()),
+    )
 }
 
 fn capture_fingerprints(record: &TransferRecord) -> Result<Vec<String>, &'static str> {
@@ -3809,7 +4342,7 @@ async fn load_downloads_with_persistence(
             return Err(error);
         }
     };
-    let cleanup_recoveries = match read_cleanup_recoveries(persistence_path) {
+    let mut cleanup_recoveries = match read_cleanup_recoveries(persistence_path) {
         Ok(recoveries) => recoveries,
         Err(error) => {
             state
@@ -3820,6 +4353,12 @@ async fn load_downloads_with_persistence(
             return Err(error);
         }
     };
+    for recovery in &mut cleanup_recoveries {
+        let _ = reconcile_cleanup_mutations(persistence_path, recovery);
+        let path = cleanup_recovery_path(persistence_path, &recovery.record)?;
+        *recovery = parse_cleanup_recovery(persistence_path, &path)
+            .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    }
     let has_durable_recovery =
         !recoveries.is_empty() || !terminal_recoveries.is_empty() || !cleanup_recoveries.is_empty();
     let mut transfers = match persisted_transfers {
@@ -5617,7 +6156,13 @@ fn cleanup_target_is_owned_elsewhere(
     for path in cleanup_recovery_paths(persistence_path)? {
         let recovery = parse_cleanup_recovery(persistence_path, &path).ok_or(VR_DOWNLOAD_STALE)?;
         if recovery.record.transfer_id != transfer_id
-            && transfer_record_owns_path(&recovery.record, target).map_err(|_| VR_DOWNLOAD_STALE)?
+            && (transfer_record_owns_path(&recovery.record, target)
+                .map_err(|_| VR_DOWNLOAD_STALE)?
+                || recovery
+                    .mutations
+                    .iter()
+                    .flatten()
+                    .any(|mutation| mutation.temporary_path == target))
         {
             return Ok(true);
         }
@@ -5656,7 +6201,7 @@ fn delete_cleanup_files_with(
     state: &VrDownloadState,
     persistence_path: &Path,
     transfer_id: &str,
-    mut delete_file: impl FnMut(&Path, &str) -> Result<(), &'static str>,
+    mut delete_file: impl FnMut(&Path, &mut CleanupRecovery, usize) -> Result<(), &'static str>,
 ) -> Result<Vec<String>, &'static str> {
     let mut context = state.0.lock().map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
     let position = context
@@ -5675,6 +6220,7 @@ fn delete_cleanup_files_with(
     if !same_transfer_authority(current, &recovery.record) || !recovery.stopped {
         return Err(VR_DOWNLOAD_CLEANUP_FAILED);
     }
+    reconcile_cleanup_mutations(persistence_path, &mut recovery)?;
     validate_cleanup_boundary_data(&recovery.record)?;
 
     for selected_index in 0..recovery.files.len() {
@@ -5704,13 +6250,14 @@ fn delete_cleanup_files_with(
                     {
                         return Err(VR_DOWNLOAD_STALE);
                     }
-                    delete_file(&target, &recovery.record.fingerprints[selected_index])?;
+                    delete_file(persistence_path, &mut recovery, selected_index)?;
                     match fs::symlink_metadata(&target) {
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         _ => return Err(VR_DOWNLOAD_STALE),
                     }
                     sync_parent_directory(&target);
                     recovery.files[selected_index] = CleanupFileState::Deleted;
+                    recovery.mutations[selected_index] = None;
                     write_cleanup_recovery(persistence_path, &recovery)?;
                 }
                 Err(_) => return Err(VR_DOWNLOAD_STALE),
@@ -6017,6 +6564,7 @@ fn establish_cleanup_authority_with(
     cleanup_record.pending_action = None;
     let recovery = CleanupRecovery {
         record: cleanup_record.clone(),
+        mutations: vec![None; files.len()],
         files,
         stopped: preparation.handle.is_none(),
     };
@@ -13977,6 +14525,7 @@ mod tests {
         let recovery = CleanupRecovery {
             record: record.clone(),
             files: vec![CleanupFileState::Present, CleanupFileState::Present],
+            mutations: vec![None, None],
             stopped: true,
         };
         write_cleanup_recovery(&persistence_path, &recovery)
@@ -13998,13 +14547,19 @@ mod tests {
         }
         let calls = Cell::new(0);
         assert_eq!(
-            delete_cleanup_files_with(&state, &persistence_path, &transfer_id, |path, _| {
-                calls.set(calls.get() + 1);
-                if calls.get() == 2 {
-                    return Err(VR_DOWNLOAD_CLEANUP_FAILED);
+            delete_cleanup_files_with(
+                &state,
+                &persistence_path,
+                &transfer_id,
+                |_, recovery, index| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 2 {
+                        return Err(VR_DOWNLOAD_CLEANUP_FAILED);
+                    }
+                    fs::remove_file(current_target(&recovery.record, index)?)
+                        .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)
                 }
-                fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)
-            }),
+            ),
             Err(VR_DOWNLOAD_CLEANUP_FAILED)
         );
         assert!(!destination.join("Provider/Exact Movie.mkv").exists());
@@ -14039,9 +14594,15 @@ mod tests {
         .expect("durable cleanup must reload");
         assert_eq!(rows[8], "cleanup");
         assert_eq!(
-            delete_cleanup_files_with(&restarted, &persistence_path, &transfer_id, |path, _| {
-                fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)
-            })
+            delete_cleanup_files_with(
+                &restarted,
+                &persistence_path,
+                &transfer_id,
+                |_, recovery, index| {
+                    fs::remove_file(current_target(&recovery.record, index)?)
+                        .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)
+                }
+            )
             .expect("restart retry must finish"),
             vec!["movie", "true"]
         );
@@ -14071,6 +14632,7 @@ mod tests {
         let recovery = CleanupRecovery {
             record: record.clone(),
             files: vec![CleanupFileState::Present],
+            mutations: vec![None],
             stopped: true,
         };
         write_cleanup_recovery(&persistence_path, &recovery)
@@ -14099,7 +14661,7 @@ mod tests {
         }
         let dispatches = Cell::new(0);
         assert_eq!(
-            delete_cleanup_files_with(&state, &persistence_path, &transfer_id, |_, _| {
+            delete_cleanup_files_with(&state, &persistence_path, &transfer_id, |_, _, _| {
                 dispatches.set(dispatches.get() + 1);
                 Ok(())
             }),
@@ -14115,7 +14677,7 @@ mod tests {
         fs::remove_file(destination.join("Movie  A.mp4")).unwrap();
         fs::write(destination.join("Movie  A.mp4"), b"other").unwrap();
         assert_eq!(
-            delete_cleanup_files_with(&state, &persistence_path, &transfer_id, |_, _| {
+            delete_cleanup_files_with(&state, &persistence_path, &transfer_id, |_, _, _| {
                 dispatches.set(dispatches.get() + 1);
                 Ok(())
             }),
@@ -14537,11 +15099,14 @@ mod tests {
         record.state = TransferState::Cleanup;
         let transfer_id = record.transfer_id.clone();
         let target = current_target(&record, 0).expect("target must resolve");
+        let temporary_path =
+            cleanup_temporary_path(&record, 0).expect("temporary path must resolve");
         let displaced = destination.join("displaced-original.mp4");
         let persistence_path = fixture.path.join("final-race.downloads");
         let recovery = CleanupRecovery {
             record: record.clone(),
             files: vec![CleanupFileState::Present],
+            mutations: vec![None],
             stopped: true,
         };
         write_cleanup_recovery(&persistence_path, &recovery)
@@ -14562,12 +15127,20 @@ mod tests {
                 &state,
                 &persistence_path,
                 &transfer_id,
-                |path, fingerprint| delete_exact_cleanup_file_with(path, fingerprint, || {
-                    fs::rename(path, &displaced)?;
-                    fs::write(path, b"other")?;
-                    raced.set(true);
-                    Ok(())
-                }),
+                |persistence_path, recovery, selected_index| {
+                    delete_exact_cleanup_file_with(
+                        persistence_path,
+                        recovery,
+                        selected_index,
+                        || {
+                            fs::rename(&target, &displaced)?;
+                            fs::write(&target, b"other")?;
+                            raced.set(true);
+                            Ok(())
+                        },
+                        |_| Ok(()),
+                    )
+                },
             ),
             Err(VR_DOWNLOAD_STALE)
         );
@@ -14581,12 +15154,186 @@ mod tests {
             read_cleanup_recoveries(&persistence_path).expect("cleanup authority must remain");
         assert_eq!(durable.len(), 1);
         assert_eq!(durable[0].files, vec![CleanupFileState::Present]);
+        assert!(durable[0].mutations.iter().all(Option::is_none));
+        assert!(!temporary_path.exists());
         assert!(matches!(
             &read_persisted_transfers(&persistence_path)
                 .expect("cleanup row must remain")[0],
             StoredTransfer::Valid(record)
                 if record.transfer_id == transfer_id && record.state == TransferState::Cleanup
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cleanup_interruption_phases_reconcile_exactly_after_restart() {
+        for interruption in [
+            CleanupMutationPhase::TemporaryCreated,
+            CleanupMutationPhase::Swapped,
+            CleanupMutationPhase::ExactDeleted,
+            CleanupMutationPhase::TemporaryRelocated,
+            CleanupMutationPhase::TemporaryCleanupPrepared,
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination = fixture.path.join(interruption.as_str());
+            fs::create_dir(&destination).expect("destination must exist");
+            let destination = fs::canonicalize(destination).expect("destination must canonicalize");
+            let mut record = completed_organization_record_for_category(
+                TransferCategory::Vr,
+                &destination,
+                persistable_fixture_source(),
+            );
+            record.state = TransferState::Cleanup;
+            let transfer_id = record.transfer_id.clone();
+            let target = current_target(&record, 0).expect("target must resolve");
+            let temporary_path =
+                cleanup_temporary_path(&record, 0).expect("temporary path must resolve");
+            let unrelated = destination.join("unrelated.bin");
+            fs::write(&unrelated, b"unrelated").expect("unrelated file must exist");
+            let persistence_path = fixture.path.join("downloads");
+            let recovery = CleanupRecovery {
+                record: record.clone(),
+                files: vec![CleanupFileState::Present],
+                mutations: vec![None],
+                stopped: true,
+            };
+            write_cleanup_recovery(&persistence_path, &recovery)
+                .expect("cleanup recovery must persist");
+            write_persisted_transfers(&persistence_path, &[StoredTransfer::Valid(record.clone())])
+                .expect("cleanup row must persist");
+            let state = VrDownloadState::default();
+            {
+                let mut context = state.0.lock().expect("state must lock");
+                context.future_folder = Some(destination.clone());
+                context.transfers_loaded = true;
+                context.persistence_path = Some(persistence_path.clone());
+                context.transfers.push(StoredTransfer::Valid(record));
+            }
+
+            assert_eq!(
+                delete_cleanup_files_with(
+                    &state,
+                    &persistence_path,
+                    &transfer_id,
+                    |persistence_path, recovery, selected_index| {
+                        delete_exact_cleanup_file_with(
+                            persistence_path,
+                            recovery,
+                            selected_index,
+                            || Ok(()),
+                            |phase| {
+                                if phase == interruption {
+                                    Err(io::Error::other("deterministic interruption"))
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )
+                    },
+                ),
+                Err(VR_DOWNLOAD_CLEANUP_FAILED)
+            );
+            let current_rows = transfer_rows(&state);
+            assert_eq!(current_rows[7], "0");
+            assert_eq!(current_rows[8], "cleanup");
+            let interrupted = read_cleanup_recoveries(&persistence_path)
+                .expect("interrupted cleanup authority must remain");
+            assert_eq!(interrupted.len(), 1);
+            assert_eq!(
+                interrupted[0].mutations[0]
+                    .as_ref()
+                    .expect("mutation phase must remain")
+                    .phase,
+                interruption
+            );
+
+            let replacement = matches!(
+                interruption,
+                CleanupMutationPhase::ExactDeleted
+                    | CleanupMutationPhase::TemporaryRelocated
+                    | CleanupMutationPhase::TemporaryCleanupPrepared
+            );
+            if replacement {
+                if target.exists() {
+                    fs::remove_file(&target).expect("placeholder must be replaceable");
+                }
+                fs::write(&target, b"replacement").expect("replacement must exist");
+            }
+
+            let restarted = VrDownloadState::default();
+            configure_category_folder(&restarted, TransferCategory::Vr, &destination);
+            let restarted_rows = tauri::async_runtime::block_on(load_downloads(
+                &restarted,
+                &persistence_path,
+                &fixture.path.join("session"),
+                &fixture.path.join("limit"),
+            ))
+            .expect("interrupted cleanup must reload");
+            assert_eq!(restarted_rows, current_rows);
+            assert_eq!(restarted_rows[7], "0");
+            assert_eq!(restarted_rows[8], "cleanup");
+            {
+                let mut context = restarted.0.lock().expect("restarted state must lock");
+                let record = find_valid_record_mut(&mut context.transfers, &transfer_id)
+                    .expect("cleanup row must remain");
+                assert_eq!(record.state, TransferState::Cleanup);
+                assert!(record.handle.is_none());
+                assert_eq!(record.pending_action, None);
+            }
+            assert!(!temporary_path.exists(), "temporary file must reconcile");
+            assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+            let reconciled = read_cleanup_recoveries(&persistence_path)
+                .expect("reconciled cleanup authority must remain");
+            assert_eq!(reconciled.len(), 1);
+            assert!(reconciled[0].mutations.iter().all(Option::is_none));
+            let deleted_before_restart = matches!(
+                interruption,
+                CleanupMutationPhase::ExactDeleted
+                    | CleanupMutationPhase::TemporaryRelocated
+                    | CleanupMutationPhase::TemporaryCleanupPrepared
+            );
+            assert_eq!(
+                reconciled[0].files,
+                vec![if deleted_before_restart {
+                    CleanupFileState::Deleted
+                } else {
+                    CleanupFileState::Present
+                }]
+            );
+
+            if replacement {
+                assert_eq!(fs::read(&target).unwrap(), b"replacement");
+                assert_eq!(
+                    delete_cleanup_files_with(
+                        &restarted,
+                        &persistence_path,
+                        &transfer_id,
+                        delete_exact_cleanup_file,
+                    ),
+                    Err(VR_DOWNLOAD_STALE)
+                );
+                assert_eq!(fs::read(&target).unwrap(), b"replacement");
+                assert_eq!(transfer_rows(&restarted)[8], "cleanup");
+                fs::remove_file(&target).expect("fixture replacement must be removable");
+            }
+            delete_cleanup_files_with(
+                &restarted,
+                &persistence_path,
+                &transfer_id,
+                delete_exact_cleanup_file,
+            )
+            .expect("durably reconciled cleanup may complete");
+            assert!(!target.exists());
+            assert!(!temporary_path.exists());
+            assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+            assert!(transfer_rows(&restarted).is_empty());
+            assert!(read_persisted_transfers(&persistence_path)
+                .expect("empty primary must remain readable")
+                .is_empty());
+            assert!(cleanup_recovery_paths(&persistence_path)
+                .expect("cleanup recovery directory must remain readable")
+                .is_empty());
+        }
     }
 
     #[test]
