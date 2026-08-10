@@ -1424,11 +1424,11 @@ describe("trusted VR download boundary", () => {
       "1",
       "3",
       "move",
-      "Provider/Episode  A.mp4",
-      "Exact  Show — 特別版/Season 02/Episode  A.mp4",
+      "Provider/Exact  Show — 特別版.S02E03.Cut  A.mp4",
+      "Exact  Show — 特別版/Season 02/Exact  Show — 特別版.S02E03.Cut  A.mp4",
       "media-unchanged",
-      "Exact  Show — 特別版/Season 02/Episode  B.MKV",
-      "Exact  Show — 特別版/Season 02/Episode  B.MKV",
+      "Exact  Show — 特別版/Season 02/S02E03 — Cut  B.MKV",
+      "Exact  Show — 特別版/Season 02/S02E03 — Cut  B.MKV",
       "non-media-unchanged",
       "Provider/notes.txt",
       "",
@@ -1442,16 +1442,17 @@ describe("trusted VR download boundary", () => {
       entries: [
         {
           kind: "move",
-          sourceRelativePath: "Provider/Episode  A.mp4",
+          sourceRelativePath:
+            "Provider/Exact  Show — 特別版.S02E03.Cut  A.mp4",
           destinationRelativePath:
-            "Exact  Show — 特別版/Season 02/Episode  A.mp4",
+            "Exact  Show — 特別版/Season 02/Exact  Show — 特別版.S02E03.Cut  A.mp4",
         },
         {
           kind: "media-unchanged",
           sourceRelativePath:
-            "Exact  Show — 特別版/Season 02/Episode  B.MKV",
+            "Exact  Show — 特別版/Season 02/S02E03 — Cut  B.MKV",
           destinationRelativePath:
-            "Exact  Show — 特別版/Season 02/Episode  B.MKV",
+            "Exact  Show — 特別版/Season 02/S02E03 — Cut  B.MKV",
         },
         {
           kind: "non-media-unchanged",

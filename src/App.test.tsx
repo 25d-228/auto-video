@@ -10561,7 +10561,7 @@ describe("completed download organization", () => {
 
     expect(
       await screen.findByText(
-        "This TV transfer is not eligible for the single-media organization workflow. Nothing was moved.",
+        "Every selected TV media file must retain the same exact episode identity before organization. Nothing was moved.",
       ),
     ).toBeTruthy();
     expect(
@@ -10685,6 +10685,152 @@ describe("completed download organization", () => {
     expect(applyVrOrganizationMock).toHaveBeenCalledWith({
       planId: "tv-plan-701-2-3",
     });
+  });
+
+  it("previews and applies one complete retained-basename multi-media TV plan", async () => {
+    savedTvFolder = "/TV";
+    const releaseName = "Exact  Show — 特別版.S02E03+720p.第三話";
+    const firstSource =
+      "Provider/Exact  Show — 特別版.S02E03.Cut  A — 特別.MP4";
+    const secondSource = "Provider/S02E03 — Cut  B.MkV";
+    const firstDestination =
+      "Exact  Show — 特別版/Season 02/Exact  Show — 特別版.S02E03.Cut  A — 特別.MP4";
+    const secondDestination =
+      "Exact  Show — 特別版/Season 02/S02E03 — Cut  B.MkV";
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        canOrganize: "true",
+        category: "tv",
+        code: "tt0123456 · S02E03",
+        downloadedBytes: "12",
+        releaseName,
+        selectedFileCount: "3",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        totalBytes: "12",
+        transferId: "tv-multi-701-2-3",
+      }),
+    );
+    listVrDownloadsMock.mockResolvedValueOnce(
+      vrDownloadFixture({
+        category: "tv",
+        code: "tt0123456 · S02E03",
+        downloadedBytes: "12",
+        organizationRelativeDirectory:
+          "Exact  Show — 特別版/Season 02/",
+        organizationStatus: "organized",
+        releaseName,
+        selectedFileCount: "3",
+        speedBytesPerSecond: "0",
+        state: "completed",
+        totalBytes: "12",
+        transferId: "tv-multi-701-2-3",
+      }),
+    );
+    previewVrOrganizationMock.mockResolvedValueOnce([
+      "tv-multi-plan-701-2-3",
+      "tv-multi-701-2-3",
+      "tt0123456 · S02E03",
+      "2",
+      "3",
+      "move",
+      firstSource,
+      firstDestination,
+      "move",
+      secondSource,
+      secondDestination,
+      "non-media-unchanged",
+      "Provider/notes exact.txt",
+      "",
+    ]);
+    scanTvLibraryMock
+      .mockResolvedValueOnce([
+        `/TV/${firstSource}`,
+        firstSource,
+        "3",
+        `/TV/${secondSource}`,
+        secondSource,
+        "4",
+      ])
+      .mockResolvedValueOnce([
+        `/TV/${firstDestination}`,
+        firstDestination,
+        "3",
+        `/TV/${secondDestination}`,
+        secondDestination,
+        "4",
+      ]);
+
+    render(<App />);
+    await waitFor(() => {
+      expect(scanTvLibraryMock).toHaveBeenCalledOnce();
+      expect(queryTvStorageMock).toHaveBeenCalledOnce();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const trigger = await screen.findByRole("button", { name: "Organize files" });
+    fireEvent.click(trigger);
+    const confirmation = await screen.findByRole("alertdialog");
+    expect(
+      within(confirmation).getByRole("heading", {
+        name: /Organize Exact Show — 特別版 · Season 02 · S02E03 files/,
+      }),
+    ).toBeTruthy();
+    for (const sourcePath of [firstSource, secondSource]) {
+      expect(
+        within(confirmation).getByText(
+          (_, element) =>
+            element?.tagName === "SPAN" &&
+            element.textContent === sourcePath,
+        ),
+      ).toBeTruthy();
+    }
+    expect(
+      within(confirmation).getByText(
+        (_, element) =>
+          element?.tagName === "SPAN" &&
+          element.textContent === `Move to: ${firstDestination}`,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(confirmation).getByText(
+        (_, element) =>
+          element?.tagName === "SPAN" &&
+          element.textContent === `Move to: ${secondDestination}`,
+      ),
+    ).toBeTruthy();
+    expect(within(confirmation).getByText("Unchanged non-media file")).toBeTruthy();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        within(confirmation).getByRole("button", { name: "Cancel" }),
+      ),
+    );
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "Organize 2 files" }),
+    );
+
+    const organizedCard = (
+      await screen.findByRole("heading", {
+        name: "Exact Show — 特別版.S02E03+720p.第三話",
+      })
+    ).closest("article") as HTMLElement;
+    expect(within(organizedCard).getByText("Organized")).toBeTruthy();
+    await waitFor(() => {
+      expect(listVrDownloadsMock).toHaveBeenCalledOnce();
+      expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
+      expect(queryTvStorageMock).toHaveBeenCalledTimes(2);
+    });
+    expect(previewVrOrganizationMock).toHaveBeenCalledWith({
+      transferId: "tv-multi-701-2-3",
+    });
+    expect(applyVrOrganizationMock).toHaveBeenCalledWith({
+      planId: "tv-multi-plan-701-2-3",
+    });
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(queryMoviesStorageMock).not.toHaveBeenCalled();
+    expect(scanAdultLibraryMock).not.toHaveBeenCalled();
+    expect(queryAdultStorageMock).not.toHaveBeenCalled();
+    expect(scanVrLibraryMock).not.toHaveBeenCalled();
+    expect(queryVrStorageMock).not.toHaveBeenCalled();
   });
 
   it("keeps durable TV organization truthful when reconciliation fails and retries without another Apply", async () => {

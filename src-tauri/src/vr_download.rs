@@ -3639,9 +3639,14 @@ fn portable_movie_organization_directory(
     Ok(directory)
 }
 
-fn tv_organization_directory(identity: &TvDownloadIdentity) -> Result<String, &'static str> {
+fn tv_organization_directory(
+    identity: &TvDownloadIdentity,
+    requires_portable_episode_name: bool,
+) -> Result<String, &'static str> {
     validate_portable_organization_component(&identity.show_name)?;
-    validate_portable_organization_component(&identity.episode_name)?;
+    if requires_portable_episode_name {
+        validate_portable_organization_component(&identity.episode_name)?;
+    }
     let season_directory = format!("Season {:02}", identity.season_number);
     validate_portable_organization_component(&season_directory)?;
     Ok(format!("{}/{season_directory}", identity.show_name))
@@ -3677,12 +3682,20 @@ fn organization_directory_name(record: &TransferRecord) -> Result<String, &'stat
                 .as_deref()
                 .ok_or(VR_ORGANIZATION_INELIGIBLE)?,
         ),
-        TransferCategory::Tv => tv_organization_directory(
-            record
-                .tv_identity
-                .as_deref()
-                .ok_or(VR_ORGANIZATION_INELIGIBLE)?,
-        ),
+        TransferCategory::Tv => {
+            let media_count = record
+                .selected_files
+                .iter()
+                .filter(|file| is_supported_media(Path::new(&file.path)))
+                .count();
+            tv_organization_directory(
+                record
+                    .tv_identity
+                    .as_deref()
+                    .ok_or(VR_ORGANIZATION_INELIGIBLE)?,
+                media_count == 1,
+            )
+        }
     }
 }
 
@@ -3802,7 +3815,7 @@ fn organization_destination_relative(
                 source_name.to_owned()
             }
         }
-        TransferCategory::Tv => {
+        TransferCategory::Tv if eligible_media == 1 => {
             let identity = record
                 .tv_identity
                 .as_deref()
@@ -3816,6 +3829,10 @@ fn organization_destination_relative(
             );
             validate_portable_organization_component(&destination_name)?;
             destination_name
+        }
+        TransferCategory::Tv => {
+            validate_portable_organization_component(source_name)?;
+            source_name.to_owned()
         }
     };
     let destination_relative = format!("{directory_name}/{destination_name}");
@@ -3864,7 +3881,7 @@ fn organization_entries(
         .iter()
         .filter(|file| is_supported_media(Path::new(&file.path)))
         .count();
-    if eligible_media == 0 || (record.category == TransferCategory::Tv && eligible_media != 1) {
+    if eligible_media == 0 {
         return Err(VR_ORGANIZATION_INELIGIBLE);
     }
     let directory_name = organization_directory_name(record)?;
@@ -7274,58 +7291,360 @@ mod tests {
     }
 
     #[test]
-    fn tv_multi_media_is_ineligible_without_a_partial_plan_or_mutation() {
+    fn tv_multi_media_preserves_exact_basenames_and_regroups_every_episode_file() {
         let fixture = FilesystemFixture::new();
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
         let source = tv_download_source(
             &[
-                ("Provider/Cut  A.S02E03.mp4", 3),
-                ("Provider/別  Cut.S02E03.MKV", 4),
-                ("Provider/notes  exact.txt", 5),
+                ("Provider/Exact  Show — 特別版.S02E03.Cut  A — 特別.MP4", 3),
+                ("Provider/S02E03 — Cut  B.MkV", 4),
+                ("Exact  Show — 特別版/Season 02/S02E03 — Existing.mkv", 5),
+                ("Provider/notes  exact.txt", 6),
             ],
-            &[0, 1, 2],
+            &[0, 1, 2, 3],
         );
         let record = completed_tv_organization_record(&destination, source);
-        let recovery_path = organization_recovery_path(&record);
-        let recovery_successor_path = organization_recovery_successor_path(&record);
+        let expected_boundary = encoded_boundary_segments(&record).expect("boundary must encode");
         let (state, transfer_id) = organization_state(record);
-        let before = transfer_snapshots(&state);
         let persistence_path = fixture.path.join("downloads");
+        assert_eq!(transfer_rows(&state)[12], "true");
+
+        let preview = preview_organization(&state, &transfer_id)
+            .expect("every exact multi-media member must preview");
+        assert_eq!(
+            &preview[1..5],
+            &[&transfer_id, "tt0123456 · S02E03", "2", "4"]
+        );
+        assert_eq!(
+            &preview[5..],
+            &[
+                "move",
+                "Provider/Exact  Show — 特別版.S02E03.Cut  A — 特別.MP4",
+                "Exact  Show — 特別版/Season 02/Exact  Show — 特別版.S02E03.Cut  A — 特別.MP4",
+                "move",
+                "Provider/S02E03 — Cut  B.MkV",
+                "Exact  Show — 特別版/Season 02/S02E03 — Cut  B.MkV",
+                "media-unchanged",
+                "Exact  Show — 特別版/Season 02/S02E03 — Existing.mkv",
+                "Exact  Show — 特別版/Season 02/S02E03 — Existing.mkv",
+                "non-media-unchanged",
+                "Provider/notes  exact.txt",
+                "",
+            ]
+        );
+
+        apply_organization(&state, &persistence_path, &preview[0])
+            .expect("complete multi-media TV plan must apply");
+        for (path, bytes) in [
+            (
+                "Exact  Show — 特別版/Season 02/Exact  Show — 特別版.S02E03.Cut  A — 特別.MP4",
+                vec![b'a'; 3],
+            ),
+            (
+                "Exact  Show — 特別版/Season 02/S02E03 — Cut  B.MkV",
+                vec![b'b'; 4],
+            ),
+            (
+                "Exact  Show — 特別版/Season 02/S02E03 — Existing.mkv",
+                vec![b'c'; 5],
+            ),
+            ("Provider/notes  exact.txt", vec![b'd'; 6]),
+        ] {
+            assert_eq!(
+                fs::read(destination.join(path)).expect("organized member must remain exact"),
+                bytes
+            );
+        }
+        assert!(!destination
+            .join("Provider/Exact  Show — 特別版.S02E03.Cut  A — 特別.MP4")
+            .exists());
+        assert!(!destination.join("Provider/S02E03 — Cut  B.MkV").exists());
+
+        let library_state = TvLibraryState::default();
+        set_tv_folder(
+            &library_state,
+            &fixture.path.join("tv-multi-folder"),
+            destination.clone(),
+        )
+        .expect("TV Library folder must configure");
+        let scan = scan_tv_library_with(&library_state).expect("TV Library scan must succeed");
+        assert_eq!(scan.len(), 19);
+        for (relative_path, size) in [
+            (
+                "Exact  Show — 特別版/Season 02/Exact  Show — 特別版.S02E03.Cut  A — 特別.MP4",
+                "3",
+            ),
+            ("Exact  Show — 特別版/Season 02/S02E03 — Cut  B.MkV", "4"),
+            ("Exact  Show — 特別版/Season 02/S02E03 — Existing.mkv", "5"),
+        ] {
+            let fields = scan[1..]
+                .chunks_exact(6)
+                .find(|fields| fields[1] == relative_path)
+                .expect("organized TV member must be scanned");
+            assert_eq!(fields[2], size);
+            assert_eq!(fields[3], "Exact  Show — 特別版");
+            assert_eq!(fields[4], "2");
+            assert_eq!(fields[5], "3");
+        }
+        let context = state.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("organized TV transfer must remain valid");
+        };
+        assert_eq!(record.organization_state, OrganizationState::Organized);
+        assert_eq!(
+            encoded_boundary_segments(record).expect("organized boundary must encode"),
+            expected_boundary
+        );
+    }
+
+    #[test]
+    fn tv_multi_media_rejects_the_complete_plan_when_any_member_cannot_round_trip() {
+        for invalid_path in [
+            "Provider/No episode.MKV",
+            "Provider/Other Show.S02E03.MKV",
+            "Provider/S03E03.MKV",
+            "Provider/S02E04.MKV",
+            "Provider/S02E03.S02E03.MKV",
+            "Provider/S02E03-x04.MKV",
+            "Provider/Exact ShowS02E03.MKV",
+            "Provider/S02E003.MKV",
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let source = tv_download_source(
+                &[
+                    ("Provider/S02E03 — Valid Cut.MP4", 3),
+                    (invalid_path, 4),
+                    ("Provider/notes exact.txt", 5),
+                ],
+                &[0, 1, 2],
+            );
+            let record = completed_tv_organization_record(&destination, source);
+            let recovery_path = organization_recovery_path(&record);
+            let recovery_successor_path = organization_recovery_successor_path(&record);
+            let (state, transfer_id) = organization_state(record);
+            let before = transfer_snapshots(&state);
+            let persistence_path = fixture.path.join("downloads");
+            assert_eq!(
+                transfer_rows(&state)[12],
+                "false",
+                "invalid member {invalid_path:?} remained organizable"
+            );
+
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_INELIGIBLE),
+                "invalid member {invalid_path:?} exposed a partial plan"
+            );
+            assert!(
+                state
+                    .0
+                    .lock()
+                    .expect("state must lock")
+                    .organization_plan
+                    .is_none(),
+                "invalid member {invalid_path:?} retained a native plan"
+            );
+            let mut move_calls = 0;
+            assert_eq!(
+                apply_organization_with(
+                    &state,
+                    &persistence_path,
+                    "fabricated-plan",
+                    |source, destination| {
+                        move_calls += 1;
+                        fs::rename(source, destination)
+                    },
+                ),
+                Err(VR_ORGANIZATION_STALE)
+            );
+            assert_eq!(move_calls, 0);
+            for (path, bytes) in [
+                ("Provider/S02E03 — Valid Cut.MP4", vec![b'a'; 3]),
+                (invalid_path, vec![b'b'; 4]),
+                ("Provider/notes exact.txt", vec![b'c'; 5]),
+            ] {
+                assert_eq!(
+                    fs::read(destination.join(path))
+                        .expect("rejected plan must retain every selected file"),
+                    bytes
+                );
+            }
+            assert!(!destination.join("Exact  Show — 特別版").exists());
+            assert_eq!(transfer_snapshots(&state), before);
+            assert!(!persistence_path.exists());
+            assert!(!recovery_path.exists());
+            assert!(!recovery_successor_path.exists());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tv_multi_media_rejects_a_nonportable_retained_source_basename() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = tv_download_source(
+            &[
+                ("Provider/S02E03 — Valid Cut.MP4", 3),
+                ("Provider/S02E03?.MKV", 4),
+            ],
+            &[0, 1],
+        );
+        let record = completed_tv_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
 
         assert_eq!(
             preview_organization(&state, &transfer_id),
             Err(VR_ORGANIZATION_INELIGIBLE)
         );
+        assert_eq!(
+            fs::read(destination.join("Provider/S02E03?.MKV"))
+                .expect("unsafe retained basename must remain at its source"),
+            vec![b'b'; 4]
+        );
+        assert!(!destination.join("Exact  Show — 特別版").exists());
+    }
+
+    #[test]
+    fn tv_multi_media_rejects_unsafe_generated_components_without_using_the_episode_name() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let mut source = tv_download_source(
+            &[
+                ("Provider/S02E03 — Cut A.MP4", 3),
+                ("Provider/S02E03 — Cut B.MKV", 4),
+            ],
+            &[0, 1],
+        );
+        source
+            .tv_identity
+            .as_mut()
+            .expect("TV identity must exist")
+            .episode_name = "Episode?".to_owned();
+        let record = completed_tv_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+
+        preview_organization(&state, &transfer_id)
+            .expect("an unused episode name must not alter retained-basename eligibility");
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let mut source = tv_download_source(
+            &[
+                ("Provider/S02E03 — Cut A.MP4", 3),
+                ("Provider/S02E03 — Cut B.MKV", 4),
+            ],
+            &[0, 1],
+        );
+        source
+            .tv_identity
+            .as_mut()
+            .expect("TV identity must exist")
+            .show_name = "Unsafe? Show".to_owned();
+        let record = completed_tv_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+        assert!(!destination.join("Unsafe? Show").exists());
+    }
+
+    #[test]
+    fn tv_multi_media_rejects_duplicate_normalized_and_existing_retained_targets() {
+        for (first, second) in [
+            ("One/S02E03 — Same.MP4", "Two/S02E03 — Same.MP4"),
+            ("One/S02E03 — Case.MP4", "Two/s02e03 — case.mp4"),
+            ("One/S02E03 — Cut Ḋ.MP4", "Two/S02E03 — Cut D\u{307}.MP4"),
+        ] {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let source = tv_download_source(&[(first, 3), (second, 4)], &[0, 1]);
+            let record = completed_tv_organization_record(&destination, source);
+            let (state, transfer_id) = organization_state(record);
+
+            assert_eq!(
+                preview_organization(&state, &transfer_id),
+                Err(VR_ORGANIZATION_CONFLICT),
+                "conflicting retained basenames {first:?} / {second:?} were eligible"
+            );
+            assert_eq!(
+                fs::read(destination.join(first)).expect("first source must remain"),
+                vec![b'a'; 3]
+            );
+            assert_eq!(
+                fs::read(destination.join(second)).expect("second source must remain"),
+                vec![b'b'; 4]
+            );
+            assert!(!destination.join("Exact  Show — 特別版").exists());
+        }
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = tv_download_source(
+            &[
+                ("Provider/S02E03 — Existing.MP4", 3),
+                ("Provider/S02E03 — Other.MKV", 4),
+            ],
+            &[0, 1],
+        );
+        let record = completed_tv_organization_record(&destination, source);
+        let season_directory = destination.join("Exact  Show — 特別版/Season 02");
+        fs::create_dir_all(&season_directory).expect("canonical TV directories must exist");
+        fs::write(season_directory.join("s02e03 — existing.mp4"), b"unrelated")
+            .expect("existing case-fold target must exist");
+        let (state, transfer_id) = organization_state(record);
+
+        assert_eq!(
+            preview_organization(&state, &transfer_id),
+            Err(VR_ORGANIZATION_CONFLICT)
+        );
+        assert_eq!(
+            fs::read(destination.join("Provider/S02E03 — Existing.MP4"))
+                .expect("existing target conflict must retain source"),
+            vec![b'a'; 3]
+        );
+
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = tv_download_source(
+            &[
+                ("Provider/S02E03 — First.MP4", 3),
+                ("Provider/S02E03 — Second.MKV", 4),
+            ],
+            &[0, 1],
+        );
+        let record = completed_tv_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let season_directory = destination.join("Exact  Show — 特別版/Season 02");
+        fs::create_dir_all(&season_directory).expect("late target parent must exist");
+        let late_target = season_directory.join("S02E03 — Second.MKV");
+        fs::write(&late_target, b"unrelated").expect("late target must exist");
         let mut move_calls = 0;
+
         assert_eq!(
             apply_organization_with(
                 &state,
-                &persistence_path,
-                "fabricated-plan",
+                &fixture.path.join("downloads"),
+                &preview[0],
                 |source, destination| {
                     move_calls += 1;
                     fs::rename(source, destination)
                 },
             ),
-            Err(VR_ORGANIZATION_STALE)
+            Err(VR_ORGANIZATION_CONFLICT)
         );
-
         assert_eq!(move_calls, 0);
-        for (path, bytes) in [
-            ("Provider/Cut  A.S02E03.mp4", vec![b'a'; 3]),
-            ("Provider/別  Cut.S02E03.MKV", vec![b'b'; 4]),
-            ("Provider/notes  exact.txt", vec![b'c'; 5]),
-        ] {
-            assert_eq!(
-                fs::read(destination.join(path)).expect("selected file must remain unchanged"),
-                bytes
-            );
-        }
-        assert!(!destination.join("Exact  Show — 特別版").exists());
-        assert_eq!(transfer_snapshots(&state), before);
-        assert!(!persistence_path.exists());
-        assert!(!recovery_path.exists());
-        assert!(!recovery_successor_path.exists());
+        assert!(destination.join("Provider/S02E03 — First.MP4").is_file());
+        assert!(destination.join("Provider/S02E03 — Second.MKV").is_file());
+        assert_eq!(
+            fs::read(late_target).expect("late target must not be overwritten"),
+            b"unrelated"
+        );
     }
 
     #[test]
@@ -7544,6 +7863,68 @@ mod tests {
     }
 
     #[test]
+    fn tv_large_multi_media_preview_preserves_each_exact_episode_identity() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let mut source = tv_download_source(
+            &[
+                ("Provider/S123E456 — Cut A.MP4", 3),
+                ("Provider/123x456 — Cut B.MkV", 4),
+            ],
+            &[0, 1],
+        );
+        let identity = source.tv_identity.as_mut().expect("TV identity must exist");
+        identity.show_name = "Exact Big Show".to_owned();
+        identity.season_number = 123;
+        identity.episode_number = 456;
+        identity.episode_name = "Exact Episode".to_owned();
+        identity.release_name = "Exact Big Show.S123E456+720p".to_owned();
+        source.release_name = identity.release_name.clone();
+        let record = completed_tv_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+
+        let preview = preview_organization(&state, &transfer_id)
+            .expect("large exact multi-media episode must preview");
+
+        assert_eq!(preview[2], "tt0123456 · S123E456");
+        assert_eq!(
+            &preview[5..],
+            &[
+                "move",
+                "Provider/S123E456 — Cut A.MP4",
+                "Exact Big Show/Season 123/S123E456 — Cut A.MP4",
+                "move",
+                "Provider/123x456 — Cut B.MkV",
+                "Exact Big Show/Season 123/123x456 — Cut B.MkV",
+            ]
+        );
+    }
+
+    #[test]
+    fn tv_multi_media_retained_filename_accepts_the_portable_component_boundary() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let retained_name = format!("S02E03 {}.MP4", "A".repeat(244));
+        assert_eq!(retained_name.len(), 255);
+        assert_eq!(retained_name.encode_utf16().count(), 255);
+        let retained_path = format!("Provider/{retained_name}");
+        let source = tv_download_source(
+            &[(&retained_path, 3), ("Provider/S02E03 — Other.MKV", 4)],
+            &[0, 1],
+        );
+        let record = completed_tv_organization_record(&destination, source);
+        let (state, transfer_id) = organization_state(record);
+
+        let preview = preview_organization(&state, &transfer_id)
+            .expect("largest portable retained TV filename must preview");
+
+        assert_eq!(
+            preview[7],
+            format!("Exact  Show — 特別版/Season 02/{retained_name}")
+        );
+    }
+
+    #[test]
     fn tv_apply_rejects_changed_retained_boundary_authority_before_move_dispatch() {
         let fixture = FilesystemFixture::new();
         let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
@@ -7593,6 +7974,71 @@ mod tests {
                 .expect("stale Apply must retain TV media"),
             vec![b'a'; 3]
         );
+    }
+
+    #[test]
+    fn tv_multi_media_apply_rejects_changed_file_or_boundary_before_any_move() {
+        for alteration in 0..2 {
+            let fixture = FilesystemFixture::new();
+            let destination =
+                fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+            let record = completed_tv_organization_record(
+                &destination,
+                tv_download_source(
+                    &[
+                        ("Provider/S02E03 — Cut A.MP4", 3),
+                        ("Provider/S02E03 — Cut B.MKV", 4),
+                        ("Provider/unselected.bin", 5),
+                    ],
+                    &[0, 1],
+                ),
+            );
+            let (state, transfer_id) = organization_state(record);
+            let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+            if alteration == 0 {
+                let mut context = state.0.lock().expect("state must lock");
+                let StoredTransfer::Valid(record) = &mut context.transfers[0] else {
+                    panic!("TV transfer must remain valid");
+                };
+                record.fingerprints[1].push('0');
+            } else {
+                let context = state.0.lock().expect("state must lock");
+                let StoredTransfer::Valid(record) = &context.transfers[0] else {
+                    panic!("TV transfer must remain valid");
+                };
+                record
+                    .boundary_segments
+                    .lock()
+                    .expect("boundary state must lock")
+                    .insert(
+                        1,
+                        vec![SparseSegment {
+                            offset: 0,
+                            bytes: vec![b'x'],
+                        }],
+                    );
+            }
+            let mut move_calls = 0;
+
+            let result = apply_organization_with(
+                &state,
+                &fixture.path.join("downloads"),
+                &preview[0],
+                |source, destination| {
+                    move_calls += 1;
+                    fs::rename(source, destination)
+                },
+            );
+            assert_eq!(
+                result,
+                Err(VR_ORGANIZATION_STALE),
+                "alteration {alteration} reached move dispatch"
+            );
+            assert_eq!(move_calls, 0);
+            assert!(destination.join("Provider/S02E03 — Cut A.MP4").is_file());
+            assert!(destination.join("Provider/S02E03 — Cut B.MKV").is_file());
+            assert!(!destination.join("Exact  Show — 特別版").exists());
+        }
     }
 
     #[test]
@@ -7828,6 +8274,194 @@ mod tests {
         assert_eq!(
             preview_organization(&state, &transfer_id),
             Err(VR_ORGANIZATION_INELIGIBLE)
+        );
+    }
+
+    #[test]
+    fn tv_multi_media_move_failure_rolls_every_member_back_without_a_partial_result() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = tv_download_source(
+            &[
+                ("Provider/S02E03 — Cut A.MP4", 3),
+                ("Provider/S02E03 — Cut B.MKV", 4),
+                ("Provider/notes exact.txt", 5),
+            ],
+            &[0, 1, 2],
+        );
+        let record = completed_tv_organization_record(&destination, source);
+        let recovery_path = organization_recovery_path(&record);
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let mut move_calls = 0;
+
+        assert_eq!(
+            apply_organization_with(
+                &state,
+                &persistence_path,
+                &preview[0],
+                |source, destination| {
+                    move_calls += 1;
+                    if move_calls == 2 {
+                        Err(io::Error::other("injected second TV move failure"))
+                    } else {
+                        fs::rename(source, destination)
+                    }
+                },
+            ),
+            Err(VR_ORGANIZATION_FAILED)
+        );
+        assert_eq!(move_calls, 3);
+        for (path, bytes) in [
+            ("Provider/S02E03 — Cut A.MP4", vec![b'a'; 3]),
+            ("Provider/S02E03 — Cut B.MKV", vec![b'b'; 4]),
+            ("Provider/notes exact.txt", vec![b'c'; 5]),
+        ] {
+            assert_eq!(
+                fs::read(destination.join(path)).expect("rollback must restore every source"),
+                bytes
+            );
+        }
+        assert!(!destination.join("Exact  Show — 特別版").exists());
+        assert!(!recovery_path.exists());
+        let context = state.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("rolled-back TV transfer must remain valid");
+        };
+        assert_eq!(record.organization_state, OrganizationState::None);
+        assert_eq!(
+            record.current_paths,
+            [
+                "Provider/S02E03 — Cut A.MP4",
+                "Provider/S02E03 — Cut B.MKV",
+                "Provider/notes exact.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn tv_multi_media_rollback_failure_recovers_exact_paths_and_dismisses_without_moving_files() {
+        let fixture = FilesystemFixture::new();
+        let destination = fs::canonicalize(&fixture.path).expect("destination must canonicalize");
+        let source = tv_download_source(
+            &[
+                ("Provider/S02E03 — Cut A.MP4", 3),
+                ("Provider/S02E03 — Cut B.MKV", 4),
+                ("Provider/notes exact.txt", 5),
+            ],
+            &[0, 1, 2],
+        );
+        let record = completed_tv_organization_record(&destination, source);
+        let expected_boundary = encoded_boundary_segments(&record).expect("boundary must encode");
+        let (state, transfer_id) = organization_state(record);
+        let persistence_path = fixture.path.join("downloads");
+        {
+            let context = state.0.lock().expect("state must lock");
+            write_persisted_transfers(&persistence_path, &context.transfers)
+                .expect("original multi-media TV paths must persist");
+        }
+        let preview = preview_organization(&state, &transfer_id).expect("preview must succeed");
+        let mut move_calls = 0;
+
+        assert_eq!(
+            apply_organization_with_persistence(
+                &state,
+                &persistence_path,
+                &preview[0],
+                |source, destination| {
+                    move_calls += 1;
+                    if move_calls == 3 {
+                        Err(io::Error::other("injected multi-media rollback failure"))
+                    } else {
+                        fs::rename(source, destination)
+                    }
+                },
+                |_, _| Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+            ),
+            Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+        );
+        assert_eq!(move_calls, 4);
+        let first_source = destination.join("Provider/S02E03 — Cut A.MP4");
+        let second_destination =
+            destination.join("Exact  Show — 特別版/Season 02/S02E03 — Cut B.MKV");
+        let unchanged = destination.join("Provider/notes exact.txt");
+        assert_eq!(
+            fs::read(&first_source).expect("first media source must be restored"),
+            vec![b'a'; 3]
+        );
+        assert_eq!(
+            fs::read(&second_destination).expect("failed rollback path must remain exact"),
+            vec![b'b'; 4]
+        );
+        assert_eq!(
+            fs::read(&unchanged).expect("selected non-media must remain exact"),
+            vec![b'c'; 5]
+        );
+
+        let restarted = VrDownloadState::default();
+        configure_tv_download_folder(&restarted, Some(destination.clone()))
+            .expect("TV folder must restore");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &restarted,
+            &persistence_path,
+            &fixture.path.join("tv-multi-recovery-session"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("multi-media TV attention recovery must load");
+        assert_eq!(
+            &rows[8..13],
+            &[
+                "completed",
+                "true",
+                "attention",
+                "Exact  Show — 特別版/Season 02/",
+                "true",
+            ]
+        );
+        let context = restarted.0.lock().expect("state must lock");
+        let StoredTransfer::Valid(record) = &context.transfers[0] else {
+            panic!("recovered multi-media TV transfer must remain valid");
+        };
+        assert_eq!(
+            record.current_paths,
+            [
+                "Provider/S02E03 — Cut A.MP4",
+                "Exact  Show — 特別版/Season 02/S02E03 — Cut B.MKV",
+                "Provider/notes exact.txt",
+            ]
+        );
+        assert_eq!(
+            encoded_boundary_segments(record).expect("recovery boundary must encode"),
+            expected_boundary
+        );
+        assert!(context.session.is_none(), "TV recovery started a session");
+        drop(context);
+
+        dismiss_download(&restarted, &persistence_path, &transfer_id)
+            .expect("multi-media TV attention row must dismiss");
+        let dismissed = VrDownloadState::default();
+        configure_tv_download_folder(&dismissed, Some(destination))
+            .expect("TV folder must restore after dismissal");
+        let rows = tauri::async_runtime::block_on(load_downloads(
+            &dismissed,
+            &persistence_path,
+            &fixture.path.join("tv-multi-recovery-dismissed"),
+            &fixture.path.join("limit"),
+        ))
+        .expect("dismissed multi-media TV recovery must remain absent");
+        assert!(rows.is_empty());
+        assert_eq!(
+            fs::read(first_source).expect("dismiss must retain restored media"),
+            vec![b'a'; 3]
+        );
+        assert_eq!(
+            fs::read(second_destination).expect("dismiss must retain moved media"),
+            vec![b'b'; 4]
+        );
+        assert_eq!(
+            fs::read(unchanged).expect("dismiss must retain selected non-media"),
+            vec![b'c'; 5]
         );
     }
 
