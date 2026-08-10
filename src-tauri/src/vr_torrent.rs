@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::tv_release::{TrustedTvReleaseIdentity, TvReleaseState};
+use crate::tv_release::{TrustedTvReleaseIdentity, TvDownloadIdentity, TvReleaseState};
 
 const SUKEBEI_DOWNLOAD_PREFIX: &str = "https://sukebei.nyaa.si/download/";
 const SUKEBEI_VIEW_PREFIX: &str = "https://sukebei.nyaa.si/view/";
@@ -474,6 +474,48 @@ impl TvTorrentState {
         context.cached_torrent = None;
         Ok(())
     }
+
+    pub(crate) fn verified_download_source(
+        &self,
+        release_state: &TvReleaseState,
+        inspection_id: &str,
+        selected_file_ids: &[usize],
+    ) -> Result<VerifiedDownloadSource, VerifiedDownloadSourceError> {
+        let cached = {
+            let context = self
+                .0
+                .lock()
+                .map_err(|_| VerifiedDownloadSourceError::Context)?;
+            context
+                .cached_torrent
+                .as_ref()
+                .filter(|torrent| {
+                    torrent.inspection_id == inspection_id
+                        && torrent.generation == context.inspection_generation
+                        && release_state.contains(&torrent.identity)
+                })
+                .map(|torrent| {
+                    (
+                        TvDownloadIdentity::from(&torrent.identity),
+                        torrent.bytes.clone(),
+                        torrent.metadata.clone(),
+                    )
+                })
+                .ok_or(VerifiedDownloadSourceError::Context)?
+        };
+        let (identity, bytes, cached_metadata) = cached;
+        let metadata =
+            parse_torrent_metadata(&bytes).map_err(|_| VerifiedDownloadSourceError::Metainfo)?;
+        if metadata != cached_metadata || metadata.infohash != identity.infohash {
+            return Err(VerifiedDownloadSourceError::Metainfo);
+        }
+        revalidate_persisted_tv_download_source(
+            &bytes,
+            &identity,
+            &identity.infohash,
+            selected_file_ids,
+        )
+    }
 }
 
 impl MovieTorrentState {
@@ -773,6 +815,7 @@ impl TorrentState {
             infohash: metadata.infohash,
             release_name: artifact.release_name,
             movie_identity: None,
+            tv_identity: None,
             selected_files,
         })
     }
@@ -886,6 +929,7 @@ pub fn revalidate_persisted_download_source(
         infohash: metadata.infohash,
         release_name: release_name.to_owned(),
         movie_identity: None,
+        tv_identity: None,
         selected_files,
     })
 }
@@ -917,6 +961,33 @@ pub fn revalidate_persisted_movie_download_source(
         infohash: metadata.infohash,
         release_name: identity.tmdb_title.clone(),
         movie_identity: Some(identity.clone()),
+        tv_identity: None,
+        selected_files,
+    })
+}
+
+pub(crate) fn revalidate_persisted_tv_download_source(
+    bytes: &[u8],
+    identity: &TvDownloadIdentity,
+    expected_infohash: &str,
+    selected_file_ids: &[usize],
+) -> Result<VerifiedDownloadSource, VerifiedDownloadSourceError> {
+    if !identity.is_valid() || expected_infohash != identity.infohash {
+        return Err(VerifiedDownloadSourceError::Context);
+    }
+    let metadata =
+        parse_torrent_metadata(bytes).map_err(|_| VerifiedDownloadSourceError::Metainfo)?;
+    if metadata.infohash != expected_infohash {
+        return Err(VerifiedDownloadSourceError::Metainfo);
+    }
+    let selected_files = verified_selected_files(&metadata, selected_file_ids)?;
+    Ok(VerifiedDownloadSource {
+        bytes: bytes.to_vec(),
+        code: String::new(),
+        infohash: metadata.infohash,
+        release_name: identity.release_name.clone(),
+        movie_identity: None,
+        tv_identity: Some(identity.clone()),
         selected_files,
     })
 }
@@ -969,6 +1040,7 @@ pub struct VerifiedDownloadSource {
     pub infohash: String,
     pub release_name: String,
     pub movie_identity: Option<MovieDownloadIdentity>,
+    pub(crate) tv_identity: Option<TvDownloadIdentity>,
     pub selected_files: Vec<VerifiedDownloadFile>,
 }
 
@@ -3431,6 +3503,76 @@ mod tests {
                 |_, _| Ok(()),
             ),
             Err(VR_TORRENT_STALE)
+        );
+    }
+
+    #[test]
+    fn current_tv_inspection_authorizes_only_explicit_exact_selected_files() {
+        let bytes = multi_file_torrent();
+        let infohash = fixture_infohash(&bytes);
+        let release_state = selected_tv_release_state(&infohash);
+        let torrent_state = TvTorrentState::default();
+        let plan = match torrent_state
+            .begin_inspection(&release_state, 701, 9001, 9103, "1001")
+            .expect("the current selected release must be inspectable")
+        {
+            TvTorrentInspectionStart::Acquire(plan) => plan,
+            TvTorrentInspectionStart::Cached(_) => unreachable!(),
+        };
+        let response = torrent_state
+            .finish_inspection(&release_state, plan, bytes)
+            .expect("exact generated metainfo must verify");
+
+        for invalid_selection in [Vec::new(), vec![1, 1], vec![2]] {
+            assert_eq!(
+                torrent_state.verified_download_source(
+                    &release_state,
+                    &response[0],
+                    &invalid_selection,
+                ),
+                Err(VerifiedDownloadSourceError::Selection)
+            );
+        }
+        assert_eq!(
+            torrent_state.verified_download_source(&release_state, "movie-1", &[1]),
+            Err(VerifiedDownloadSourceError::Context)
+        );
+
+        let source = torrent_state
+            .verified_download_source(&release_state, &response[0], &[1])
+            .expect("the current TV inspection and explicit file must authorize Start");
+        let identity = source
+            .tv_identity
+            .as_ref()
+            .expect("the complete TV identity must remain attached");
+        assert_eq!(identity.tmdb_tv_id, 701);
+        assert_eq!(identity.show_name, "Exact  Show — 特別版");
+        assert_eq!(identity.provider_season_id, 9001);
+        assert_eq!(identity.season_number, 2);
+        assert_eq!(identity.provider_episode_id, 9103);
+        assert_eq!(identity.episode_number, 3);
+        assert_eq!(identity.episode_name, "第三話  —  Exact Episode");
+        assert_eq!(identity.imdb_id, "tt0123456");
+        assert_eq!(identity.provider_item_id, "1001");
+        assert_eq!(identity.category, "205");
+        assert_eq!(
+            identity.release_name,
+            "Exact  Show — 特別版.S02E03+720p.第三話"
+        );
+        assert_eq!(identity.infohash, infohash);
+        assert_eq!(source.infohash, infohash);
+        assert_eq!(source.release_name, identity.release_name);
+        assert_eq!(source.selected_files.len(), 1);
+        assert_eq!(source.selected_files[0].file_id, 1);
+        assert_eq!(source.selected_files[0].path, "Folder/特別版  B.mp4");
+        assert!(source.movie_identity.is_none());
+
+        release_state
+            .begin_release_lookup()
+            .expect("replacement release context must begin");
+        assert_eq!(
+            torrent_state.verified_download_source(&release_state, &response[0], &[1]),
+            Err(VerifiedDownloadSourceError::Context)
         );
     }
 

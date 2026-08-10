@@ -340,6 +340,33 @@ export async function saveVerifiedTvTorrent(inspectionId: string) {
   return saved;
 }
 
+export async function startVerifiedTvDownload(
+  inspectionId: string,
+  selectedFileIds: number[],
+) {
+  const uniqueIds = new Set(selectedFileIds);
+  if (
+    inspectionId.trim() === "" ||
+    selectedFileIds.length === 0 ||
+    uniqueIds.size !== selectedFileIds.length ||
+    selectedFileIds.some(
+      (fileId) => !Number.isSafeInteger(fileId) || fileId < 0,
+    )
+  ) {
+    throw new Error(
+      "A current TV inspection and valid file selection are required.",
+    );
+  }
+  const transferId = await window.__TAURI__.core.invoke<unknown>(
+    "start_verified_tv_download",
+    { inspectionId, selectedFileIds },
+  );
+  if (typeof transferId !== "string" || transferId === "") {
+    throw new Error("The native TV download response was invalid.");
+  }
+  return transferId;
+}
+
 export function invalidateVerifiedTvTorrent() {
   return window.__TAURI__.core.invoke<void>("invalidate_verified_tv_torrent");
 }

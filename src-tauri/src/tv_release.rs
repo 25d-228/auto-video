@@ -74,6 +74,63 @@ pub(crate) struct TrustedTvReleaseIdentity {
     pub(crate) infohash: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TvDownloadIdentity {
+    pub(crate) tmdb_tv_id: u64,
+    pub(crate) show_name: String,
+    pub(crate) provider_season_id: u64,
+    pub(crate) season_number: u64,
+    pub(crate) provider_episode_id: u64,
+    pub(crate) episode_number: u64,
+    pub(crate) episode_name: String,
+    pub(crate) imdb_id: String,
+    pub(crate) provider_item_id: String,
+    pub(crate) category: String,
+    pub(crate) release_name: String,
+    pub(crate) infohash: String,
+}
+
+impl TvDownloadIdentity {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.tmdb_tv_id > 0
+            && !self.show_name.trim().is_empty()
+            && self.provider_season_id > 0
+            && self.season_number > 0
+            && self.provider_episode_id > 0
+            && self.episode_number > 0
+            && !self.episode_name.trim().is_empty()
+            && canonical_imdb_id(&self.imdb_id).as_deref() == Some(self.imdb_id.as_str())
+            && self
+                .provider_item_id
+                .parse::<u64>()
+                .ok()
+                .filter(|item_id| *item_id > 0)
+                .is_some_and(|item_id| item_id.to_string() == self.provider_item_id)
+            && matches!(self.category.as_str(), "205" | "208")
+            && !self.release_name.trim().is_empty()
+            && canonical_infohash(&self.infohash).as_deref() == Some(self.infohash.as_str())
+    }
+}
+
+impl From<&TrustedTvReleaseIdentity> for TvDownloadIdentity {
+    fn from(identity: &TrustedTvReleaseIdentity) -> Self {
+        Self {
+            tmdb_tv_id: identity.tmdb_tv_id,
+            show_name: identity.show_name.clone(),
+            provider_season_id: identity.provider_season_id,
+            season_number: identity.season_number,
+            provider_episode_id: identity.provider_episode_id,
+            episode_number: identity.episode_number,
+            episode_name: identity.episode_name.clone(),
+            imdb_id: identity.imdb_id.clone(),
+            provider_item_id: identity.provider_item_id.clone(),
+            category: identity.category.clone(),
+            release_name: identity.release_name.clone(),
+            infohash: identity.infohash.clone(),
+        }
+    }
+}
+
 struct TrustedTvReleaseSet {
     generation: u64,
     context: TrustedEpisodeContext,

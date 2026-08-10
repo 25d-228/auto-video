@@ -6,6 +6,10 @@ use std::{
     time::SystemTime,
 };
 
+use crate::vr_download::{
+    with_unowned_tv_library_path, VrDownloadState, VrLibraryTrashOwnershipError,
+};
+
 pub const TV_FOLDER_STORAGE_FAILED: &str = "tv_folder_storage_failed";
 pub const TV_FOLDER_UNAVAILABLE: &str = "tv_folder_unavailable";
 pub const TV_LIBRARY_SCAN_FAILED: &str = "tv_library_scan_failed";
@@ -27,6 +31,8 @@ pub const TV_FILE_REVEAL_UNSUPPORTED: &str = "tv_file_reveal_unsupported";
 pub const TV_FILE_TRASH_FAILED: &str = "tv_file_trash_failed";
 pub const TV_FILE_TRASH_NOT_FILE: &str = "tv_file_trash_not_file";
 pub const TV_FILE_TRASH_NOT_FOUND: &str = "tv_file_trash_not_found";
+pub const TV_FILE_TRASH_OWNED: &str = "tv_file_trash_owned";
+pub const TV_FILE_TRASH_OWNERSHIP_UNAVAILABLE: &str = "tv_file_trash_ownership_unavailable";
 pub const TV_FILE_TRASH_OUTSIDE_FOLDER: &str = "tv_file_trash_outside_folder";
 pub const TV_FILE_TRASH_STALE: &str = "tv_file_trash_stale";
 pub const TV_FILE_TRASH_UNAVAILABLE: &str = "tv_file_trash_unavailable";
@@ -377,7 +383,7 @@ pub fn reveal_tv_file_with(
     })
 }
 
-pub fn trash_tv_file_with(
+fn trash_trusted_tv_file_with(
     path: &Path,
     scan_generation: u64,
     state: &TvLibraryState,
@@ -415,6 +421,40 @@ pub fn trash_tv_file_with(
         .files
         .retain(|file| file.path != path);
     Ok(())
+}
+
+pub fn trash_tv_file_with_download_ownership(
+    path: &Path,
+    scan_generation: u64,
+    download_state: &VrDownloadState,
+    library_state: &TvLibraryState,
+    dispatch: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    with_unowned_tv_library_path(download_state, path, |configured_download_folder| {
+        let configured_download_folder =
+            configured_download_folder.ok_or(TV_FILE_TRASH_UNAVAILABLE)?;
+        let configured_library_folder = configured_tv_folder(library_state)
+            .map_err(|_| TV_FILE_TRASH_UNAVAILABLE)?
+            .ok_or(TV_FILE_TRASH_UNAVAILABLE)?;
+        if configured_download_folder != configured_library_folder {
+            return Err(TV_FILE_TRASH_UNAVAILABLE);
+        }
+        trash_trusted_tv_file_with(path, scan_generation, library_state, dispatch)
+    })
+    .map_err(|error| match error {
+        VrLibraryTrashOwnershipError::Owned => TV_FILE_TRASH_OWNED,
+        VrLibraryTrashOwnershipError::Unavailable => TV_FILE_TRASH_OWNERSHIP_UNAVAILABLE,
+    })?
+}
+
+#[cfg(test)]
+fn trash_tv_file_with(
+    path: &Path,
+    scan_generation: u64,
+    state: &TvLibraryState,
+    dispatch: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    trash_trusted_tv_file_with(path, scan_generation, state, dispatch)
 }
 
 #[cfg(test)]
