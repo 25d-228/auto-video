@@ -5271,7 +5271,7 @@ function VrDownloadCard({
   isPending: boolean;
   organizationPreview: VrOrganizationPreview | null;
   onApplyOrganization: () => void;
-  onCancel: () => void;
+  onCancel: (choice: "keep-files" | "delete-files") => void;
   onCloseOrganization: () => void;
   onDismiss: () => void;
   onPause: () => void;
@@ -5279,12 +5279,15 @@ function VrDownloadCard({
   onResume: () => void;
 }) {
   const organizationCancelButton = useRef<HTMLButtonElement | null>(null);
+  const cancelDialogSafeButton = useRef<HTMLButtonElement | null>(null);
   const totalBytes = BigInt(download.totalBytes);
   const downloadedBytes = BigInt(download.downloadedBytes);
   const percent =
     totalBytes === 0n ? 0 : Number((downloadedBytes * 100n) / totalBytes);
   const stateLabel =
-    download.terminalRecovery
+    download.state === "cleanup"
+      ? "Cleanup needs attention"
+      : download.terminalRecovery
       ? "Persistence needs attention"
       : download.organizationStatus === "organized"
       ? "Organized"
@@ -5292,6 +5295,7 @@ function VrDownloadCard({
         ? "Organization needs attention"
         : download.state.charAt(0).toUpperCase() + download.state.slice(1);
   const stateClass =
+    download.state === "cleanup" ||
     download.terminalRecovery || download.organizationStatus === "attention"
       ? "attention"
       : download.organizationStatus === "organized"
@@ -5557,16 +5561,30 @@ function VrDownloadCard({
             <AlertDialog.Portal>
               <AlertDialog.Backdrop className="trash-dialog__backdrop" />
               <AlertDialog.Viewport className="trash-dialog__viewport">
-                <AlertDialog.Popup className="trash-dialog__popup">
+                <AlertDialog.Popup
+                  className="trash-dialog__popup"
+                  initialFocus={() => cancelDialogSafeButton.current}
+                >
                   <AlertDialog.Title>Cancel this download?</AlertDialog.Title>
                   <AlertDialog.Description>
                     The transfer will stop. Downloaded files and partial data
-                    will remain in the {acceptedFolderName}.
+                    will remain in the {acceptedFolderName} when you cancel and
+                    keep files. Permanent cleanup never uses Trash or the
+                    Recycle Bin.
                   </AlertDialog.Description>
+                  <ul aria-label={`Selected files for ${download.releaseName}`}>
+                    {(download.selectedFiles ?? []).map((path) => (
+                      <li key={path}>{path}</li>
+                    ))}
+                  </ul>
                   <div className="trash-dialog__actions">
                     <AlertDialog.Close
                       render={
-                        <Button type="button" variant="outline">
+                        <Button
+                          ref={cancelDialogSafeButton}
+                          type="button"
+                          variant="outline"
+                        >
                           Keep downloading
                         </Button>
                       }
@@ -5575,11 +5593,23 @@ function VrDownloadCard({
                       render={
                         <Button
                           disabled={isPending}
-                          onClick={onCancel}
+                          onClick={() => onCancel("keep-files")}
+                          type="button"
+                          variant="outline"
+                        >
+                          Cancel and keep files
+                        </Button>
+                      }
+                    />
+                    <AlertDialog.Close
+                      render={
+                        <Button
+                          disabled={isPending}
+                          onClick={() => onCancel("delete-files")}
                           type="button"
                           variant="destructive"
                         >
-                          Cancel download
+                          Permanently delete selected files
                         </Button>
                       }
                     />
@@ -5588,17 +5618,88 @@ function VrDownloadCard({
               </AlertDialog.Viewport>
             </AlertDialog.Portal>
           </AlertDialog.Root>
-        ) : (
+        ) : download.state === "cleanup" ? (
           <Button
             disabled={isPending}
-            id={`vr-download-dismiss-${download.transferId}`}
-            onClick={onDismiss}
+            id={`vr-download-cleanup-${download.transferId}`}
+            onClick={() => onCancel("delete-files")}
             type="button"
-            variant="outline"
+            variant="destructive"
           >
-            <AppIcon name="close" />
-            {isPending ? "Dismissing…" : "Dismiss"}
+            <AppIcon name="trash" />
+            {isPending ? "Retrying cleanup…" : "Retry permanent cleanup"}
           </Button>
+        ) : (
+          <>
+            {download.state === "cancelled" ? (
+              <AlertDialog.Root>
+                <AlertDialog.Trigger
+                  render={
+                    <Button disabled={isPending} type="button" variant="destructive">
+                      <AppIcon name="trash" />
+                      Delete transfer files
+                    </Button>
+                  }
+                />
+                <AlertDialog.Portal>
+                  <AlertDialog.Backdrop className="trash-dialog__backdrop" />
+                  <AlertDialog.Viewport className="trash-dialog__viewport">
+                    <AlertDialog.Popup
+                      className="trash-dialog__popup"
+                      initialFocus={() => cancelDialogSafeButton.current}
+                    >
+                      <AlertDialog.Title>
+                        Permanently delete these transfer files?
+                      </AlertDialog.Title>
+                      <AlertDialog.Description>
+                        Only the exact selected files listed below will be
+                        deleted. This cannot be undone.
+                      </AlertDialog.Description>
+                      <ul aria-label={`Selected files for ${download.releaseName}`}>
+                        {(download.selectedFiles ?? []).map((path) => (
+                          <li key={path}>{path}</li>
+                        ))}
+                      </ul>
+                      <div className="trash-dialog__actions">
+                        <AlertDialog.Close
+                          render={
+                            <Button
+                              ref={cancelDialogSafeButton}
+                              type="button"
+                              variant="outline"
+                            >
+                              Keep files
+                            </Button>
+                          }
+                        />
+                        <AlertDialog.Close
+                          render={
+                            <Button
+                              onClick={() => onCancel("delete-files")}
+                              type="button"
+                              variant="destructive"
+                            >
+                              Permanently delete selected files
+                            </Button>
+                          }
+                        />
+                      </div>
+                    </AlertDialog.Popup>
+                  </AlertDialog.Viewport>
+                </AlertDialog.Portal>
+              </AlertDialog.Root>
+            ) : null}
+            <Button
+              disabled={isPending}
+              id={`vr-download-dismiss-${download.transferId}`}
+              onClick={onDismiss}
+              type="button"
+              variant="outline"
+            >
+              <AppIcon name="close" />
+              {isPending ? "Dismissing…" : "Dismiss"}
+            </Button>
+          </>
         )}
       </div>
       {tvOrganizationUnavailable ? (
@@ -5618,6 +5719,12 @@ function VrDownloadCard({
           The transfer stopped safely. Its exact terminal state is stored in
           recovery metadata because the Downloads file could not be updated.
           Media and partial data remain untouched.
+        </p>
+      ) : null}
+      {download.state === "cleanup" ? (
+        <p className="field-error" role="alert">
+          The transfer is stopped. Permanent cleanup needs attention and can
+          retry only the exact remaining selected files.
         </p>
       ) : null}
     </article>
@@ -8532,7 +8639,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
   const runVrDownloadAction = async (
     download: VrDownload,
-    action: "pause" | "resume" | "cancel" | "dismiss",
+    action: "pause" | "resume" | "cancel-keep" | "delete" | "dismiss",
   ) => {
     if (vrDownloadActionsPending.current.has(download.transferId)) {
       return;
@@ -8548,9 +8655,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       currentDownload !== undefined &&
       ((action === "pause" && currentDownload.state === "downloading") ||
         (action === "resume" && currentDownload.state === "paused") ||
-        (action === "cancel" &&
+        (action === "cancel-keep" &&
           (activeVrDownloadStates.has(currentDownload.state) ||
             currentDownload.state === "offline")) ||
+        (action === "delete" &&
+          (activeVrDownloadStates.has(currentDownload.state) ||
+            currentDownload.state === "offline" ||
+            currentDownload.state === "cancelled" ||
+            currentDownload.state === "cleanup")) ||
         (action === "dismiss" &&
           !activeVrDownloadStates.has(currentDownload.state)));
     if (!actionIsCurrent) {
@@ -8571,23 +8683,45 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         await pauseVrDownload(download.transferId);
       } else if (action === "resume") {
         await resumeVrDownload(download.transferId);
-      } else if (action === "cancel") {
-        await cancelVrDownload(download.transferId);
+      } else if (action === "cancel-keep") {
+        await cancelVrDownload(download.transferId, "keep-files");
+      } else if (action === "delete") {
+        const cleaned = await cancelVrDownload(
+          download.transferId,
+          "delete-files",
+        );
+        if (cleaned?.isCurrentFolder) {
+          if (cleaned.category === "adult") {
+            refreshAdultLibrary();
+          } else if (cleaned.category === "movie") {
+            refreshMovies();
+          } else if (cleaned.category === "tv") {
+            await reconcileTvOrganization();
+          } else {
+            refreshVrLibrary();
+          }
+        }
       } else {
         await dismissVrDownload(download.transferId);
       }
       await refreshVrDownloads();
       const focusTarget = {
-        cancel: `vr-download-dismiss-${download.transferId}`,
+        "cancel-keep": `vr-download-dismiss-${download.transferId}`,
+        delete: "vr-downloads-refresh",
         dismiss: "vr-downloads-refresh",
         pause: `vr-download-resume-${download.transferId}`,
         resume: `vr-download-pause-${download.transferId}`,
       }[action];
       setVrDownloadFocusTarget(focusTarget);
     } catch {
+      if (action === "delete") {
+        await refreshVrDownloads();
+      }
       setVrDownloadErrors((errors) => ({
         ...errors,
-        [download.transferId]: `The ${action} action could not be completed for this transfer.`,
+        [download.transferId]: `The ${
+          action === "delete" ? "permanent cleanup" : action
+        } action could not be completed for this transfer.`,
       }));
     } finally {
       vrDownloadActionsPending.current.delete(download.transferId);
@@ -12223,8 +12357,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       onApplyOrganization={() =>
                         void applyDownloadOrganization()
                       }
-                      onCancel={() =>
-                        void runVrDownloadAction(download, "cancel")
+                      onCancel={(choice) =>
+                        void runVrDownloadAction(
+                          download,
+                          choice === "keep-files" ? "cancel-keep" : "delete",
+                        )
                       }
                       onCloseOrganization={closeDownloadOrganization}
                       onDismiss={() =>

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   applyVrOrganization,
+  cancelVrDownload,
   canonicalizeProductCode,
   dismissVrOrganization,
   fetchExactJavdbAdultItem,
@@ -1029,6 +1030,50 @@ describe("trusted VR download boundary", () => {
       },
     ]);
     expect(invokeMock).toHaveBeenCalledWith("load_vr_downloads");
+  });
+
+  it("parses exact cleanup members and submits only identity plus choice", async () => {
+    const paths = ["Exact/MDVR-419.mkv", "Exact/notes — keep.txt"];
+    const encoded = paths
+      .map((path) =>
+        [...new TextEncoder().encode(path)]
+          .map((byte) => byte.toString(16).padStart(2, "0"))
+          .join(""),
+      )
+      .join(",");
+    invokeMock.mockResolvedValueOnce([
+      "cleanup-419",
+      "vr",
+      "MDVR-419",
+      "Exact cleanup",
+      "2",
+      "12",
+      "7",
+      "0",
+      "cleanup",
+      "true",
+      "none",
+      "",
+      "false",
+      "false",
+      encoded,
+    ]);
+    await expect(loadVrDownloads()).resolves.toEqual([
+      expect.objectContaining({
+        transferId: "cleanup-419",
+        state: "cleanup",
+        selectedFiles: paths,
+      }),
+    ]);
+
+    invokeMock.mockResolvedValueOnce(["vr", "true"]);
+    await expect(
+      cancelVrDownload("cleanup-419", "delete-files"),
+    ).resolves.toEqual({ category: "vr", isCurrentFolder: true });
+    expect(invokeMock).toHaveBeenLastCalledWith("cancel_vr_download", {
+      transferId: "cleanup-419",
+      choice: "delete-files",
+    });
   });
 
   it("accepts eligible, attention, and organized TV rows only in the canonical season directory", async () => {

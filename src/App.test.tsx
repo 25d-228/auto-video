@@ -159,7 +159,7 @@ let resumeVrDownloadMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
 let cancelVrDownloadMock: Mock<
-  (parameters?: Record<string, unknown>) => Promise<void>
+  (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
 let dismissVrDownloadMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
@@ -459,6 +459,7 @@ function vrDownloadFixture({
   organizationRelativeDirectory = "",
   organizationStatus = "none",
   terminalRecovery = "false",
+  selectedFiles,
 }: {
   canOrganize?: string;
   category?: string;
@@ -474,7 +475,21 @@ function vrDownloadFixture({
   organizationRelativeDirectory?: string;
   organizationStatus?: string;
   terminalRecovery?: string;
+  selectedFiles?: string[];
 }) {
+  const fileCount = Number(selectedFileCount);
+  const paths =
+    selectedFiles ??
+    Array.from({ length: fileCount }, (_, index) =>
+      fileCount === 1 ? "Source/selected.mkv" : `Source/selected-${index + 1}.mkv`,
+    );
+  const encodedPaths = paths
+    .map((path) =>
+      [...new TextEncoder().encode(path)]
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join(""),
+    )
+    .join(",");
   return [
     transferId,
     category,
@@ -490,6 +505,7 @@ function vrDownloadFixture({
     organizationRelativeDirectory,
     canOrganize,
     terminalRecovery,
+    encodedPaths,
   ];
 }
 
@@ -804,7 +820,7 @@ beforeEach(() => {
   startVerifiedTvDownloadMock = vi.fn().mockResolvedValue("tv-transfer-123");
   pauseVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   resumeVrDownloadMock = vi.fn().mockResolvedValue(undefined);
-  cancelVrDownloadMock = vi.fn().mockResolvedValue(undefined);
+  cancelVrDownloadMock = vi.fn().mockResolvedValue([]);
   dismissVrDownloadMock = vi.fn().mockResolvedValue(undefined);
   previewVrOrganizationMock = vi.fn().mockImplementation((parameters) =>
     Promise.resolve([
@@ -3562,7 +3578,7 @@ describe("parsed VR Library and Dashboard", () => {
         state: "completed",
         transferId: "adult-current",
       }),
-      ...oldAdultCompletedRows.slice(14),
+      ...oldAdultCompletedRows.slice(15),
     ];
     loadVrDownloadsMock.mockResolvedValue(activeRows);
     listVrDownloadsMock
@@ -3621,7 +3637,7 @@ describe("parsed VR Library and Dashboard", () => {
       }),
     ];
     const oldFolderCompletedRows = [
-      ...activeRows.slice(0, 14),
+      ...activeRows.slice(0, 15),
       ...vrDownloadFixture({
         category: "movie",
         code: "tt0765432",
@@ -3643,7 +3659,7 @@ describe("parsed VR Library and Dashboard", () => {
         state: "completed",
         transferId: "movie-current",
       }),
-      ...oldFolderCompletedRows.slice(14),
+      ...oldFolderCompletedRows.slice(15),
     ];
     loadVrDownloadsMock.mockResolvedValue(activeRows);
     listVrDownloadsMock
@@ -3699,7 +3715,7 @@ describe("parsed VR Library and Dashboard", () => {
       }),
     ];
     const oldFolderCompletedRows = [
-      ...activeRows.slice(0, 14),
+      ...activeRows.slice(0, 15),
       ...vrDownloadFixture({
         category: "tv",
         code: "tt0123456 · S02E04",
@@ -3721,7 +3737,7 @@ describe("parsed VR Library and Dashboard", () => {
         state: "completed",
         transferId: "tv-current",
       }),
-      ...oldFolderCompletedRows.slice(14),
+      ...oldFolderCompletedRows.slice(15),
     ];
     loadVrDownloadsMock.mockResolvedValue(activeRows);
     listVrDownloadsMock
@@ -9574,9 +9590,10 @@ describe("VR Discover and verified release comparison", () => {
     cancelVrDownloadMock.mockImplementation(async () => {
       downloadRows[8] = "cancelled";
       downloadRows[7] = "0";
+      return [];
     });
     dismissVrDownloadMock.mockImplementation(async () => {
-      downloadRows = downloadRows.slice(14);
+      downloadRows = downloadRows.slice(15);
     });
     resumeVrDownloadMock.mockRejectedValueOnce("vr_download_failed");
     render(<App />);
@@ -9616,13 +9633,16 @@ describe("VR Discover and verified release comparison", () => {
     fireEvent.click(cancelTrigger);
     confirmation = await screen.findByRole("alertdialog");
     fireEvent.click(
-      within(confirmation).getByRole("button", { name: "Cancel download" }),
+      within(confirmation).getByRole("button", { name: "Cancel and keep files" }),
     );
     const dismissButton = await within(cardA).findByRole("button", {
       name: "Dismiss",
     });
     await waitFor(() => expect(document.activeElement).toBe(dismissButton));
-    expect(cancelVrDownloadMock).toHaveBeenCalledWith({ transferId: "transfer-a" });
+    expect(cancelVrDownloadMock).toHaveBeenCalledWith({
+      transferId: "transfer-a",
+      choice: "keep-files",
+    });
     fireEvent.click(dismissButton);
     await waitFor(() => expect(screen.queryByText(releaseA)).toBeNull());
     expect(document.activeElement).toBe(
@@ -9630,6 +9650,118 @@ describe("VR Discover and verified release comparison", () => {
     );
     expect(screen.getByRole("heading", { name: releaseB })).toBeTruthy();
     expect(dismissVrDownloadMock).toHaveBeenCalledWith({ transferId: "transfer-a" });
+  });
+
+  it("confirms exact permanent cleanup members and refreshes only the trusted category", async () => {
+    savedVrFolder = "/VR";
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        releaseName: "MDVR-419 cleanup",
+        selectedFileCount: "2",
+        selectedFiles: ["Exact/MDVR-419.mkv", "Exact/notes — keep.txt"],
+        state: "paused",
+        transferId: "cleanup-419",
+      }),
+    );
+    listVrDownloadsMock.mockResolvedValue([]);
+    cancelVrDownloadMock.mockResolvedValue(["vr", "true"]);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const card = (
+      await screen.findByRole("heading", { name: "MDVR-419 cleanup" })
+    ).closest("article") as HTMLElement;
+    fireEvent.click(within(card).getByRole("button", { name: "Cancel" }));
+    const confirmation = await screen.findByRole("alertdialog");
+    const safeAction = within(confirmation).getByRole("button", {
+      name: "Keep downloading",
+    });
+    await waitFor(() => expect(document.activeElement).toBe(safeAction));
+    expect(within(confirmation).getByText("Exact/MDVR-419.mkv")).toBeTruthy();
+    expect(within(confirmation).getByText("Exact/notes — keep.txt")).toBeTruthy();
+    fireEvent.click(
+      within(confirmation).getByRole("button", {
+        name: "Permanently delete selected files",
+      }),
+    );
+    await waitFor(() => expect(screen.queryByText("MDVR-419 cleanup")).toBeNull());
+    expect(cancelVrDownloadMock).toHaveBeenCalledWith({
+      transferId: "cleanup-419",
+      choice: "delete-files",
+    });
+    await waitFor(() => {
+      expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
+      expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
+    });
+    expect(scanMoviesMock).not.toHaveBeenCalled();
+    expect(scanAdultLibraryMock).not.toHaveBeenCalled();
+    expect(scanTvLibraryMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps cleanup attention local and retryable after a destructive failure", async () => {
+    const cleanupRows = vrDownloadFixture({
+      releaseName: "MDVR-419 cleanup attention",
+      selectedFiles: ["Exact/MDVR-419.mkv"],
+      speedBytesPerSecond: "0",
+      state: "cleanup",
+      transferId: "cleanup-attention-419",
+    });
+    loadVrDownloadsMock.mockResolvedValue(cleanupRows);
+    listVrDownloadsMock.mockResolvedValue(cleanupRows);
+    cancelVrDownloadMock.mockRejectedValue("vr_download_cleanup_failed");
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const card = (
+      await screen.findByRole("heading", {
+        name: "MDVR-419 cleanup attention",
+      })
+    ).closest("article") as HTMLElement;
+    expect(within(card).getByText("Cleanup needs attention")).toBeTruthy();
+    fireEvent.click(
+      within(card).getByRole("button", { name: "Retry permanent cleanup" }),
+    );
+    expect(cancelVrDownloadMock).toHaveBeenCalledWith({
+      transferId: "cleanup-attention-419",
+      choice: "delete-files",
+    });
+    expect(
+      await within(card).findByText(/permanent cleanup action could not be completed/),
+    ).toBeTruthy();
+    expect(within(card).queryByRole("button", { name: "Dismiss" })).toBeNull();
+  });
+
+  it("keeps Dismiss metadata-only and exposes separate cleanup on a cancelled row", async () => {
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        releaseName: "MDVR-419 cancelled files",
+        selectedFiles: ["Exact/MDVR-419.mkv"],
+        speedBytesPerSecond: "0",
+        state: "cancelled",
+        transferId: "cancelled-419",
+      }),
+    );
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    const card = (
+      await screen.findByRole("heading", { name: "MDVR-419 cancelled files" })
+    ).closest("article") as HTMLElement;
+    expect(within(card).getByRole("button", { name: "Dismiss" })).toBeTruthy();
+    fireEvent.click(
+      within(card).getByRole("button", { name: "Delete transfer files" }),
+    );
+    const confirmation = await screen.findByRole("alertdialog");
+    expect(
+      within(confirmation).getByRole("heading", {
+        name: "Permanently delete these transfer files?",
+      }),
+    ).toBeTruthy();
+    const keepFiles = within(confirmation).getByRole("button", {
+      name: "Keep files",
+    });
+    await waitFor(() => expect(document.activeElement).toBe(keepFiles));
+    expect(within(confirmation).getByText("Exact/MDVR-419.mkv")).toBeTruthy();
+    fireEvent.click(keepFiles);
+    expect(cancelVrDownloadMock).not.toHaveBeenCalled();
+    expect(dismissVrDownloadMock).not.toHaveBeenCalled();
   });
 });
 
@@ -10048,7 +10180,7 @@ describe("aggregate Movie, TV, Adult, and VR download limit and transfer summari
     dismissVrDownloadMock
       .mockReturnValueOnce(pendingDismiss.promise)
       .mockResolvedValueOnce(undefined);
-    listVrDownloadsMock.mockResolvedValue(recoveredRows.slice(14));
+    listVrDownloadsMock.mockResolvedValue(recoveredRows.slice(15));
     render(<App />);
 
     const dashboard = await screen.findByRole("region", { name: "Downloads" });

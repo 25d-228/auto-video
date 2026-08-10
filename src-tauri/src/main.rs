@@ -38,7 +38,7 @@ use tv_release::{
     TV_TMDB_MALFORMED, TV_TMDB_UNAUTHORIZED,
 };
 use vr_download::{
-    acquire_tv_metainfo, apply_organization, cancel_download,
+    acquire_tv_metainfo, apply_organization, cancel_or_delete_download,
     clear_vr_folder as clear_trusted_vr_folder, configure_adult_download_folder,
     configure_movie_download_folder, configure_tv_download_folder, configured_vr_folder,
     dismiss_download, dismiss_organization, list_downloads, load_download_limit, load_downloads,
@@ -1816,11 +1816,17 @@ async fn resume_vr_download(
 async fn cancel_vr_download(
     app: tauri::AppHandle,
     transfer_id: String,
+    choice: String,
     state: tauri::State<'_, VrDownloadState>,
-) -> Result<(), String> {
-    cancel_download(state.inner(), &vr_downloads_path(&app)?, &transfer_id)
-        .await
-        .map_err(str::to_owned)
+) -> Result<Vec<String>, String> {
+    cancel_or_delete_download(
+        state.inner(),
+        &vr_downloads_path(&app)?,
+        &transfer_id,
+        &choice,
+    )
+    .await
+    .map_err(str::to_owned)
 }
 
 #[tauri::command]
