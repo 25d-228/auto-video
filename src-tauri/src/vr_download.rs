@@ -7377,10 +7377,10 @@ mod tests {
             ("Exact  Show — 特別版/Season 02/S02E03 — Cut  B.MkV", "4"),
             ("Exact  Show — 特別版/Season 02/S02E03 — Existing.mkv", "5"),
         ] {
-            let relative_path = Path::new(relative_path).to_string_lossy();
+            let expected_relative_path = relative_path.split('/').collect::<PathBuf>();
             let fields = scan[1..]
                 .chunks_exact(6)
-                .find(|fields| fields[1] == relative_path.as_ref())
+                .find(|fields| Path::new(&fields[1]) == expected_relative_path)
                 .expect("organized TV member must be scanned");
             assert_eq!(fields[2], size);
             assert_eq!(fields[3], "Exact  Show — 特別版");
