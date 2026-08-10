@@ -5254,6 +5254,7 @@ function AdultLibraryCard({
 }
 
 function VrDownloadCard({
+  cleanupActionsDisabled,
   download,
   error,
   isPending,
@@ -5266,6 +5267,7 @@ function VrDownloadCard({
   onPreviewOrganization,
   onResume,
 }: {
+  cleanupActionsDisabled: boolean;
   download: VrDownload;
   error: string | null;
   isPending: boolean;
@@ -5604,7 +5606,7 @@ function VrDownloadCard({
                     <AlertDialog.Close
                       render={
                         <Button
-                          disabled={isPending}
+                          disabled={isPending || cleanupActionsDisabled}
                           onClick={() => onCancel("delete-files")}
                           type="button"
                           variant="destructive"
@@ -5620,7 +5622,7 @@ function VrDownloadCard({
           </AlertDialog.Root>
         ) : download.state === "cleanup" ? (
           <Button
-            disabled={isPending}
+            disabled={isPending || cleanupActionsDisabled}
             id={`vr-download-cleanup-${download.transferId}`}
             onClick={() => onCancel("delete-files")}
             type="button"
@@ -5635,7 +5637,11 @@ function VrDownloadCard({
               <AlertDialog.Root>
                 <AlertDialog.Trigger
                   render={
-                    <Button disabled={isPending} type="button" variant="destructive">
+                    <Button
+                      disabled={isPending || cleanupActionsDisabled}
+                      type="button"
+                      variant="destructive"
+                    >
                       <AppIcon name="trash" />
                       Delete transfer files
                     </Button>
@@ -5675,6 +5681,7 @@ function VrDownloadCard({
                         <AlertDialog.Close
                           render={
                             <Button
+                              disabled={cleanupActionsDisabled}
                               onClick={() => onCancel("delete-files")}
                               type="button"
                               variant="destructive"
@@ -6239,6 +6246,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [pendingVrDownloadIds, setPendingVrDownloadIds] = useState<Set<string>>(
     new Set(),
   );
+  const [pendingVrCleanupTransferId, setPendingVrCleanupTransferId] =
+    useState<string | null>(null);
   const [vrDownloadErrors, setVrDownloadErrors] = useState<
     Record<string, string>
   >({});
@@ -6299,6 +6308,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const vrDownloadsRefreshPending = useRef(false);
   const vrDownloadLimitSavePending = useRef(false);
   const vrDownloadActionsPending = useRef(new Set<string>());
+  const vrCleanupActionPending = useRef<string | null>(null);
   const trendingDiscoverResult = useRef<{
     refreshVersion: number;
     result: TmdbMoviesResult;
@@ -8641,7 +8651,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     download: VrDownload,
     action: "pause" | "resume" | "cancel-keep" | "delete" | "dismiss",
   ) => {
-    if (vrDownloadActionsPending.current.has(download.transferId)) {
+    if (
+      vrDownloadActionsPending.current.has(download.transferId) ||
+      (action === "delete" && vrCleanupActionPending.current !== null)
+    ) {
       return;
     }
     const currentState = currentVrDownloadsState.current;
@@ -8670,6 +8683,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
 
     vrDownloadActionsPending.current.add(download.transferId);
+    if (action === "delete") {
+      vrCleanupActionPending.current = download.transferId;
+      setPendingVrCleanupTransferId(download.transferId);
+    }
     setPendingVrDownloadIds(
       new Set(vrDownloadActionsPending.current),
     );
@@ -8725,6 +8742,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       }));
     } finally {
       vrDownloadActionsPending.current.delete(download.transferId);
+      if (
+        action === "delete" &&
+        vrCleanupActionPending.current === download.transferId
+      ) {
+        vrCleanupActionPending.current = null;
+        setPendingVrCleanupTransferId(null);
+      }
       setPendingVrDownloadIds(
         new Set(vrDownloadActionsPending.current),
       );
@@ -12305,8 +12329,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   <p className="card-eyebrow">Selected-file transfers</p>
                   <h2 id="vr-downloads-heading">Movie, TV, Adult, and VR downloads</h2>
                   <p>
-                    Each row is managed independently. Cancelling keeps all
-                    downloaded files and partial data.
+                    Cancel and keep files stops a transfer without removing
+                    downloaded files or partial data. Permanent cleanup is a
+                    separate confirmed action that deletes only exact selected
+                    transfer files.
                   </p>
                 </div>
                 <Button
@@ -12350,6 +12376,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                 <div className="vr-downloads__list">
                   {vrDownloadsState.downloads.map((download) => (
                     <VrDownloadCard
+                      cleanupActionsDisabled={
+                        pendingVrCleanupTransferId !== null
+                      }
                       download={download}
                       error={vrDownloadErrors[download.transferId] ?? null}
                       isPending={pendingVrDownloadIds.has(download.transferId)}

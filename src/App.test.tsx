@@ -9729,6 +9729,72 @@ describe("VR Discover and verified release comparison", () => {
     expect(within(card).queryByRole("button", { name: "Dismiss" })).toBeNull();
   });
 
+  it("disables destructive cleanup on every other row while one cleanup is pending", async () => {
+    const firstRelease = "MDVR-419 cleanup pending";
+    const secondRelease = "ADLT-123 cleanup blocked";
+    const rows = [
+      ...vrDownloadFixture({
+        releaseName: firstRelease,
+        selectedFiles: ["Exact/MDVR-419.mkv"],
+        speedBytesPerSecond: "0",
+        state: "cancelled",
+        transferId: "cleanup-first",
+      }),
+      ...vrDownloadFixture({
+        category: "adult",
+        code: "ADLT-123",
+        releaseName: secondRelease,
+        selectedFiles: ["Exact/ADLT-123.mp4"],
+        speedBytesPerSecond: "0",
+        state: "cancelled",
+        transferId: "cleanup-second",
+      }),
+    ];
+    const pendingCleanup = createDeferred<string[]>();
+    loadVrDownloadsMock.mockResolvedValue(rows);
+    listVrDownloadsMock.mockResolvedValue(rows);
+    cancelVrDownloadMock.mockReturnValue(pendingCleanup.promise);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+    expect(
+      await screen.findByText(/Cancel and keep files stops a transfer/),
+    ).toBeTruthy();
+    const firstCard = screen
+      .getByRole("heading", { name: firstRelease })
+      .closest("article") as HTMLElement;
+    const secondCard = screen
+      .getByRole("heading", { name: secondRelease })
+      .closest("article") as HTMLElement;
+    fireEvent.click(
+      within(firstCard).getByRole("button", { name: "Delete transfer files" }),
+    );
+    const confirmation = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(confirmation).getByRole("button", {
+        name: "Permanently delete selected files",
+      }),
+    );
+    await waitFor(() => expect(cancelVrDownloadMock).toHaveBeenCalledOnce());
+    expect(cancelVrDownloadMock).toHaveBeenCalledWith({
+      transferId: "cleanup-first",
+      choice: "delete-files",
+    });
+    expect(
+      within(secondCard).getByRole("button", { name: "Delete transfer files" }),
+    ).toHaveProperty("disabled", true);
+
+    await act(async () => {
+      pendingCleanup.resolve(["vr", "false"]);
+      await pendingCleanup.promise;
+    });
+    await waitFor(() =>
+      expect(
+        within(secondCard).getByRole("button", { name: "Delete transfer files" }),
+      ).toHaveProperty("disabled", false),
+    );
+    expect(cancelVrDownloadMock).toHaveBeenCalledOnce();
+  });
+
   it("keeps Dismiss metadata-only and exposes separate cleanup on a cancelled row", async () => {
     loadVrDownloadsMock.mockResolvedValue(
       vrDownloadFixture({
