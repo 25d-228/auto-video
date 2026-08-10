@@ -5604,7 +5604,7 @@ function VrDownloadCard({
       {tvOrganizationUnavailable ? (
         <p className="field-help" role="status">
           {download.selectedFileCount > 1
-            ? "This TV transfer is not eligible for the single-media organization workflow. Nothing was moved."
+            ? "Every selected TV media file must retain the same exact episode identity before organization. Nothing was moved."
             : "The exact TV organization path cannot be verified for this transfer. Nothing was moved."}
         </p>
       ) : null}
@@ -8374,7 +8374,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         return "The complete organization plan conflicts with an existing or duplicate destination.";
       case "vr_organization_ineligible":
         return category === "tv"
-          ? "The exact TV organization path can no longer be verified. Nothing was moved."
+          ? "The complete TV organization plan can no longer be verified. Nothing was moved."
           : `This transfer is no longer eligible for organization in the current ${category === "adult" ? "Adult" : category === "movie" ? "Movies" : "VR"} folder.`;
       case "vr_organization_stale":
         return "The organization plan is stale because its transfer, folder, or files changed.";
