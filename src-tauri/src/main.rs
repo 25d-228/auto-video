@@ -31,11 +31,16 @@ use adult_library::{
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tv_library::{
-    clear_tv_folder as clear_trusted_tv_folder, configured_tv_folder, load_tv_folder_with,
-    open_tv_file_with, reveal_tv_file_with, scan_tv_library_with, set_tv_folder,
-    trash_tv_file_with_download_ownership, TvLibraryState, TV_FILE_OPEN_FAILED,
+    begin_tv_metadata_search, begin_tv_metadata_verification,
+    clear_tv_folder as clear_trusted_tv_folder, clear_tv_metadata_match_with, configured_tv_folder,
+    finish_tv_metadata_search, finish_tv_metadata_verification,
+    invalidate_tv_metadata_client_context, invalidate_tv_metadata_context_for_state,
+    load_tv_folder_with, open_tv_file_with, parse_tv_metadata_candidates,
+    parse_verified_tv_metadata, percent_encode_tv_metadata_query, reveal_tv_file_with,
+    save_tv_metadata_match_with, scan_tv_library_with_metadata, set_tv_folder,
+    trash_tv_file_with_download_ownership_and_metadata, TvLibraryState, TV_FILE_OPEN_FAILED,
     TV_FILE_REVEAL_FAILED, TV_FILE_TRASH_FAILED, TV_FOLDER_STORAGE_FAILED, TV_FOLDER_UNAVAILABLE,
-    TV_LIBRARY_SCAN_FAILED,
+    TV_LIBRARY_SCAN_FAILED, TV_METADATA_CONTEXT_INVALID, TV_METADATA_PERSISTENCE_FAILED,
 };
 use tv_release::{
     fetch_apibay_tv_releases_for_state_with, TvReleaseState, TV_APIBAY_PROVIDER_ERROR,
@@ -75,6 +80,7 @@ const MOVIES_FOLDER_FILE_NAME: &str = ".movies-folder";
 const MOVIE_METADATA_FILE_NAME: &str = ".movie-library-metadata";
 const ADULT_FOLDER_FILE_NAME: &str = ".adult-folder";
 const TV_FOLDER_FILE_NAME: &str = ".tv-folder";
+const TV_METADATA_FILE_NAME: &str = ".tv-library-show-metadata";
 const VR_FOLDER_FILE_NAME: &str = ".vr-folder";
 const VR_DOWNLOADS_FILE_NAME: &str = ".vr-downloads";
 const VR_DOWNLOAD_LIMIT_FILE_NAME: &str = ".vr-download-limit";
@@ -120,6 +126,10 @@ const MOVIE_TMDB_NETWORK_ERROR: &str = "movie_tmdb_network_error";
 const MOVIE_TMDB_PROVIDER_ERROR: &str = "movie_tmdb_provider_error";
 const MOVIE_TMDB_RATE_LIMITED: &str = "movie_tmdb_rate_limited";
 const MOVIE_TMDB_UNAUTHORIZED: &str = "movie_tmdb_unauthorized";
+const TV_METADATA_TMDB_NETWORK_ERROR: &str = "tv_metadata_tmdb_network_error";
+const TV_METADATA_TMDB_PROVIDER_ERROR: &str = "tv_metadata_tmdb_provider_error";
+const TV_METADATA_TMDB_RATE_LIMITED: &str = "tv_metadata_tmdb_rate_limited";
+const TV_METADATA_TMDB_UNAUTHORIZED: &str = "tv_metadata_tmdb_unauthorized";
 const MOVIE_YTS_NETWORK_ERROR: &str = "movie_yts_network_error";
 const MOVIE_YTS_PROVIDER_ERROR: &str = "movie_yts_provider_error";
 const MOVIE_YTS_SOURCE_UNAVAILABLE: &str = "movie_yts_source_unavailable";
@@ -140,6 +150,8 @@ const JAVDB_CATALOG_URL: &str = "https://javdb.com/search?q=";
 const SUKEBEI_RELEASES_URL: &str = "https://sukebei.nyaa.si/?page=rss&q=%22";
 const TMDB_MOVIE_URL: &str = "https://api.themoviedb.org/3/movie/";
 const TMDB_MOVIE_SEARCH_URL: &str = "https://api.themoviedb.org/3/search/movie?query=";
+const TMDB_TV_URL: &str = "https://api.themoviedb.org/3/tv/";
+const TMDB_TV_SEARCH_URL: &str = "https://api.themoviedb.org/3/search/tv?query=";
 const YTS_MOVIES_URL: &str = "https://yts.mx/api/v2/list_movies.json?limit=50&query_term=";
 const MOVIE_METADATA_HEADER: &[u8] = b"AUTO_VIDEO_MOVIE_METADATA_V1\n";
 const MOVIE_METADATA_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -442,7 +454,7 @@ fn scan_movie_paths(folder: &Path) -> Result<Vec<String>, &'static str> {
 }
 
 #[cfg(unix)]
-fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'static str> {
+pub(crate) fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'static str> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = fs::symlink_metadata(path).map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
@@ -456,7 +468,7 @@ fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'stat
 }
 
 #[cfg(target_os = "windows")]
-fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'static str> {
+pub(crate) fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'static str> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
@@ -482,7 +494,7 @@ fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'stat
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
-fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'static str> {
+pub(crate) fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'static str> {
     let metadata = fs::symlink_metadata(path).map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
     if metadata.file_type().is_symlink()
         || (regular_file && !metadata.is_file())
@@ -520,7 +532,7 @@ fn validate_movie_components(folder: &Path, path: &Path) -> Result<(), &'static 
 }
 
 #[cfg(unix)]
-fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
+pub(crate) fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
 
     format!(
@@ -534,7 +546,7 @@ fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
+pub(crate) fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
     use std::os::windows::fs::MetadataExt;
 
     format!(
@@ -546,7 +558,7 @@ fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
-fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
+pub(crate) fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
     let modified = metadata
         .modified()
         .ok()
@@ -874,7 +886,7 @@ extern "system" {
 }
 
 #[cfg(target_os = "windows")]
-fn replace_movie_metadata_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_movie_metadata_file(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
@@ -902,7 +914,7 @@ fn replace_movie_metadata_file(source: &Path, destination: &Path) -> io::Result<
 }
 
 #[cfg(not(target_os = "windows"))]
-fn replace_movie_metadata_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_movie_metadata_file(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
 }
 
@@ -1737,6 +1749,17 @@ fn tmdb_movie_provider_error_code(error: MovieProviderRequestError) -> &'static 
     }
 }
 
+fn tmdb_tv_metadata_provider_error_code(error: MovieProviderRequestError) -> &'static str {
+    match error {
+        MovieProviderRequestError::Unauthorized => TV_METADATA_TMDB_UNAUTHORIZED,
+        MovieProviderRequestError::RateLimited => TV_METADATA_TMDB_RATE_LIMITED,
+        MovieProviderRequestError::Network => TV_METADATA_TMDB_NETWORK_ERROR,
+        MovieProviderRequestError::SourceUnavailable | MovieProviderRequestError::Provider => {
+            TV_METADATA_TMDB_PROVIDER_ERROR
+        }
+    }
+}
+
 fn yts_movie_provider_error_code(error: MovieProviderRequestError) -> &'static str {
     match error {
         MovieProviderRequestError::SourceUnavailable => MOVIE_YTS_SOURCE_UNAVAILABLE,
@@ -2246,6 +2269,13 @@ fn tv_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|_| TV_FOLDER_STORAGE_FAILED.to_owned())
 }
 
+fn tv_metadata_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(TV_METADATA_FILE_NAME))
+        .map_err(|_| TV_METADATA_PERSISTENCE_FAILED.to_owned())
+}
+
 fn vr_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -2503,10 +2533,14 @@ fn clear_tv_folder(
 }
 
 #[tauri::command]
-async fn scan_tv_library(state: tauri::State<'_, TvLibraryState>) -> Result<Vec<String>, String> {
+async fn scan_tv_library(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<Vec<String>, String> {
     let state = state.inner().clone();
+    let association_path = tv_metadata_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        scan_tv_library_with(&state).map_err(str::to_owned)
+        scan_tv_library_with_metadata(&state, &association_path).map_err(str::to_owned)
     })
     .await
     .map_err(|_| TV_LIBRARY_SCAN_FAILED.to_owned())?
@@ -2571,6 +2605,7 @@ async fn reveal_tv_file(
 
 #[tauri::command]
 async fn trash_tv_file(
+    app: tauri::AppHandle,
     path: String,
     scan_generation: String,
     download_state: tauri::State<'_, VrDownloadState>,
@@ -2581,12 +2616,14 @@ async fn trash_tv_file(
         .map_err(|_| tv_library::TV_FILE_TRASH_STALE.to_owned())?;
     let download_state = download_state.inner().clone();
     let library_state = library_state.inner().clone();
+    let association_path = tv_metadata_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        trash_tv_file_with_download_ownership(
+        trash_tv_file_with_download_ownership_and_metadata(
             Path::new(&path),
             scan_generation,
             &download_state,
             &library_state,
+            &association_path,
             move_to_os_trash,
         )
     })
@@ -2785,6 +2822,7 @@ fn save_tmdb_token(
     app: tauri::AppHandle,
     token: String,
     movie_library_state: tauri::State<'_, MoviesLibraryState>,
+    tv_library_state: tauri::State<'_, TvLibraryState>,
     tv_release_state: tauri::State<'_, TvReleaseState>,
     tv_torrent_state: tauri::State<'_, TvTorrentState>,
 ) -> Result<(), String> {
@@ -2795,6 +2833,7 @@ fn save_tmdb_token(
         .map_err(|_| MOVIE_METADATA_UNAVAILABLE.to_owned())?;
     invalidate_movie_metadata_context(&mut movie_library);
     drop(movie_library);
+    invalidate_tv_metadata_context_for_state(tv_library_state.inner()).map_err(str::to_owned)?;
     tv_release_state.invalidate().map_err(str::to_owned)?;
     tv_torrent_state
         .invalidate_inspection()
@@ -2805,6 +2844,7 @@ fn save_tmdb_token(
 fn clear_tmdb_token(
     app: tauri::AppHandle,
     movie_library_state: tauri::State<'_, MoviesLibraryState>,
+    tv_library_state: tauri::State<'_, TvLibraryState>,
     tv_release_state: tauri::State<'_, TvReleaseState>,
     tv_torrent_state: tauri::State<'_, TvTorrentState>,
 ) -> Result<(), String> {
@@ -2815,6 +2855,7 @@ fn clear_tmdb_token(
         .map_err(|_| MOVIE_METADATA_UNAVAILABLE.to_owned())?;
     invalidate_movie_metadata_context(&mut movie_library);
     drop(movie_library);
+    invalidate_tv_metadata_context_for_state(tv_library_state.inner()).map_err(str::to_owned)?;
     tv_release_state.invalidate().map_err(str::to_owned)?;
     tv_torrent_state
         .invalidate_inspection()
@@ -3404,6 +3445,132 @@ fn invalidate_movie_metadata_match_context(
 }
 
 #[tauri::command]
+async fn search_tv_show_metadata(
+    app: tauri::AppHandle,
+    group_id: String,
+    query: String,
+    context_generation: u64,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<Vec<String>, String> {
+    let token_path = tmdb_token_path(&app)?;
+    let token = load_tmdb_token_file(&token_path)
+        .map_err(str::to_owned)?
+        .ok_or_else(|| TV_METADATA_TMDB_UNAUTHORIZED.to_owned())?;
+    let state = state.inner().clone();
+    let (operation_generation, request_id) =
+        begin_tv_metadata_search(&state, &group_id, &query, &token, context_generation)
+            .map_err(str::to_owned)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let url = format!(
+            "{TMDB_TV_SEARCH_URL}{}",
+            percent_encode_tv_metadata_query(&query)
+        );
+        let document = fetch_movie_provider_document(&url, Some(&token))
+            .map_err(tmdb_tv_metadata_provider_error_code)?;
+        let candidates = parse_tv_metadata_candidates(&document)?;
+        if load_tmdb_token_file(&token_path).ok().flatten().as_deref() != Some(token.as_str()) {
+            return Err(TV_METADATA_CONTEXT_INVALID);
+        }
+        finish_tv_metadata_search(
+            &state,
+            operation_generation,
+            &request_id,
+            &token,
+            candidates,
+        )
+    })
+    .await
+    .map_err(|_| TV_METADATA_TMDB_PROVIDER_ERROR.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn verify_tv_show_metadata_candidate(
+    app: tauri::AppHandle,
+    matching_request_id: String,
+    tmdb_tv_id: u64,
+    context_generation: u64,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<Vec<String>, String> {
+    let token_path = tmdb_token_path(&app)?;
+    let token = load_tmdb_token_file(&token_path)
+        .map_err(str::to_owned)?
+        .ok_or_else(|| TV_METADATA_TMDB_UNAUTHORIZED.to_owned())?;
+    let state = state.inner().clone();
+    let (operation_generation, search) = begin_tv_metadata_verification(
+        &state,
+        &matching_request_id,
+        tmdb_tv_id,
+        &token,
+        context_generation,
+    )
+    .map_err(str::to_owned)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let details_url = format!("{TMDB_TV_URL}{tmdb_tv_id}");
+        let details = fetch_movie_provider_document(&details_url, Some(&token))
+            .map_err(tmdb_tv_metadata_provider_error_code)?;
+        let external_ids =
+            fetch_movie_provider_document(&format!("{details_url}/external_ids"), Some(&token))
+                .map_err(tmdb_tv_metadata_provider_error_code)?;
+        let association = parse_verified_tv_metadata(&search, tmdb_tv_id, &details, &external_ids)?;
+        if load_tmdb_token_file(&token_path).ok().flatten().as_deref() != Some(token.as_str()) {
+            return Err(TV_METADATA_CONTEXT_INVALID);
+        }
+        finish_tv_metadata_verification(
+            &state,
+            operation_generation,
+            &search,
+            tmdb_tv_id,
+            &token,
+            association,
+        )
+    })
+    .await
+    .map_err(|_| TV_METADATA_TMDB_PROVIDER_ERROR.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn save_tv_show_metadata_match(
+    app: tauri::AppHandle,
+    verification_id: String,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<Vec<String>, String> {
+    let persistence_path = tv_metadata_path(&app)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        save_tv_metadata_match_with(&state, &persistence_path, &verification_id)
+    })
+    .await
+    .map_err(|_| TV_METADATA_PERSISTENCE_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn clear_tv_show_metadata_match(
+    app: tauri::AppHandle,
+    group_id: String,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<(), String> {
+    let persistence_path = tv_metadata_path(&app)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        clear_tv_metadata_match_with(&state, &persistence_path, &group_id)
+    })
+    .await
+    .map_err(|_| TV_METADATA_PERSISTENCE_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn invalidate_tv_show_metadata_context(
+    context_generation: u64,
+    state: tauri::State<'_, TvLibraryState>,
+) -> Result<(), String> {
+    invalidate_tv_metadata_client_context(state.inner(), context_generation).map_err(str::to_owned)
+}
+
+#[tauri::command]
 async fn fetch_yts_movie_releases(
     app: tauri::AppHandle,
     tmdb_movie_id: u64,
@@ -3843,6 +4010,11 @@ fn main() {
             open_tv_file,
             reveal_tv_file,
             trash_tv_file,
+            search_tv_show_metadata,
+            verify_tv_show_metadata_candidate,
+            save_tv_show_metadata_match,
+            clear_tv_show_metadata_match,
+            invalidate_tv_show_metadata_context,
             load_adult_folder,
             choose_adult_folder,
             clear_adult_folder,

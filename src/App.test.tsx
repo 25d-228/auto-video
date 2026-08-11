@@ -70,6 +70,21 @@ let loadTvFolderMock: Mock<() => Promise<string[]>>;
 let chooseTvFolderMock: Mock<() => Promise<string | null>>;
 let clearTvFolderMock: Mock<() => Promise<void>>;
 let scanTvLibraryMock: Mock<() => Promise<string[]>>;
+let searchTvShowMetadataMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let verifyTvShowMetadataCandidateMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let saveTvShowMetadataMatchMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let clearTvShowMetadataMatchMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let invalidateTvShowMetadataContextMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
 let queryTvStorageMock: Mock<() => Promise<[string, string]>>;
 let openTvFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
 let revealTvFileMock: Mock<(parameters?: Record<string, unknown>) => Promise<void>>;
@@ -649,6 +664,76 @@ function fixtureNativeTvScan(rows: string[]) {
   });
 }
 
+type TvMetadataFixtureAssociation = {
+  tmdbTvId: string;
+  imdbId: string;
+  name: string;
+  originalName?: string;
+  firstAirDate?: string;
+  posterPath?: string;
+  overview?: string;
+  generation?: string;
+};
+
+function fixtureTvMetadataScan({
+  association,
+  generation = "7",
+  groupId = "3333333333333333333333333333333333333333",
+  members,
+  metadataState = "",
+  metadataStatus = "ready",
+  showTitle,
+}: {
+  association?: TvMetadataFixtureAssociation;
+  generation?: string;
+  groupId?: string;
+  members: Array<{ path: string; relativePath: string; size?: string }>;
+  metadataState?: "" | "ready" | "attention";
+  metadataStatus?: "ready" | "attention" | "unavailable";
+  showTitle: string | null;
+}) {
+  const associationFields = association === undefined
+    ? Array.from({ length: 8 }, () => "")
+    : [
+        association.tmdbTvId,
+        association.imdbId,
+        association.name,
+        association.originalName ?? "",
+        association.firstAirDate ?? "",
+        association.posterPath ?? "",
+        association.overview ?? "",
+        association.generation ?? "1",
+      ];
+  return [
+    "tv-library-metadata-v1",
+    metadataStatus,
+    generation,
+    members.length.toString(),
+    ...members.flatMap((member) => {
+      const identity = fixtureTvIdentity(member.relativePath);
+      if (showTitle === null || identity === null) {
+        return [
+          member.path,
+          member.relativePath,
+          member.size ?? "5",
+          ...Array.from({ length: 13 }, () => ""),
+        ];
+      }
+      return [
+        member.path,
+        member.relativePath,
+        member.size ?? "5",
+        showTitle,
+        identity.season.toString(),
+        identity.episode.toString(),
+        groupId,
+        metadataState,
+        ...associationFields,
+      ];
+    }),
+  ];
+}
+
 function setSystemPreference(prefersDark: boolean) {
   systemPrefersDark = prefersDark;
   act(() => {
@@ -791,6 +876,33 @@ beforeEach(() => {
   chooseTvFolderMock = vi.fn().mockResolvedValue(null);
   clearTvFolderMock = vi.fn().mockResolvedValue(undefined);
   scanTvLibraryMock = vi.fn().mockResolvedValue([]);
+  searchTvShowMetadataMock = vi.fn().mockResolvedValue([
+    "1111111111111111111111111111111111111111",
+    "0",
+  ]);
+  verifyTvShowMetadataCandidateMock = vi.fn().mockResolvedValue([
+    "2222222222222222222222222222222222222222",
+    "701",
+    "tt1234567",
+    "Matched TV Show",
+    "Original TV Show",
+    "2020-04-03",
+    "/matched-tv-poster.jpg",
+    "Verified TV show overview.",
+    "1",
+  ]);
+  saveTvShowMetadataMatchMock = vi.fn().mockResolvedValue([
+    "701",
+    "tt1234567",
+    "Matched TV Show",
+    "Original TV Show",
+    "2020-04-03",
+    "/matched-tv-poster.jpg",
+    "Verified TV show overview.",
+    "1",
+  ]);
+  clearTvShowMetadataMatchMock = vi.fn().mockResolvedValue(undefined);
+  invalidateTvShowMetadataContextMock = vi.fn().mockResolvedValue(undefined);
   queryTvStorageMock = vi
     .fn()
     .mockResolvedValue(["3298534883328", "1099511627776"]);
@@ -990,10 +1102,21 @@ beforeEach(() => {
             savedTvFolder = null;
           });
         case "scan_tv_library":
-          return scanTvLibraryMock().then((rows) => [
-            "1",
-            ...fixtureNativeTvScan(rows),
-          ]);
+          return scanTvLibraryMock().then((rows) =>
+            rows[0] === "tv-library-metadata-v1"
+              ? rows
+              : ["1", ...fixtureNativeTvScan(rows)],
+          );
+        case "search_tv_show_metadata":
+          return searchTvShowMetadataMock(parameters);
+        case "verify_tv_show_metadata_candidate":
+          return verifyTvShowMetadataCandidateMock(parameters);
+        case "save_tv_show_metadata_match":
+          return saveTvShowMetadataMatchMock(parameters);
+        case "clear_tv_show_metadata_match":
+          return clearTvShowMetadataMatchMock(parameters);
+        case "invalidate_tv_show_metadata_context":
+          return invalidateTvShowMetadataContextMock(parameters);
         case "query_tv_storage":
           return queryTvStorageMock();
         case "open_tv_file":
@@ -1783,6 +1906,229 @@ describe("parsed TV Library and Dashboard", () => {
     expect(queryTvStorageMock).toHaveBeenCalledTimes(3);
   });
 
+  it("suppresses final-anchor metadata while accepted Trash reconciliation needs retry", async () => {
+    savedTvFolder = "/TV";
+    const groupId = "6".repeat(40);
+    const anchorPath = "/TV/Exact Local Show.S01E01.mp4";
+    const laterMemberPath = "/TV/Exact Local Show.S01E02.mkv";
+    const providerName = "Canonical Provider Show";
+    const members = [
+      {
+        path: anchorPath,
+        relativePath: "Exact Local Show.S01E01.mp4",
+      },
+      {
+        path: laterMemberPath,
+        relativePath: "Exact Local Show.S01E02.mkv",
+      },
+    ];
+    scanTvLibraryMock
+      .mockResolvedValueOnce(
+        fixtureTvMetadataScan({
+          association: {
+            tmdbTvId: "701",
+            imdbId: "tt1234567",
+            name: providerName,
+          },
+          groupId,
+          members,
+          metadataState: "ready",
+          showTitle: "Exact Local Show",
+        }),
+      )
+      .mockRejectedValueOnce("tv_library_scan_failed")
+      .mockResolvedValueOnce(
+        fixtureTvMetadataScan({
+          generation: "8",
+          groupId,
+          members: [members[1]],
+          metadataState: "attention",
+          showTitle: "Exact Local Show",
+        }),
+      );
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    expect(
+      await screen.findByRole("heading", { name: providerName }),
+    ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
+      }),
+    );
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Confirm moving TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Exact Local Show" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: providerName })).toBeNull();
+    expect(
+      screen.queryByRole("button", {
+        name: `View show metadata details: ${providerName}`,
+      }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: `Copy title: ${providerName}` }),
+    ).toBeNull();
+    const localCopy = screen.getByRole("button", {
+      name: "Copy title: Exact Local Show",
+    });
+    fireEvent.click(localCopy);
+    expect(clipboardWriteMock).toHaveBeenCalledWith("Exact Local Show");
+    expect(
+      screen.getByRole("button", {
+        name: "Match show metadata: Exact Local Show",
+      }),
+    ).toHaveProperty("disabled", true);
+
+    const open = screen.getByRole("button", {
+      name: "Open TV file: Exact Local Show.S01E02.mkv",
+    });
+    const reveal = screen.getByRole("button", {
+      name: "Reveal TV file: Exact Local Show.S01E02.mkv",
+    });
+    const remainingTrash = screen.getByRole("button", {
+      name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E02.mkv",
+    });
+    expect(open).toHaveProperty("disabled", false);
+    expect(reveal).toHaveProperty("disabled", false);
+    expect(remainingTrash).toHaveProperty("disabled", false);
+    fireEvent.click(open);
+    await waitFor(() => {
+      expect(openTvFileMock).toHaveBeenCalledWith({ path: laterMemberPath });
+      expect(reveal).toHaveProperty("disabled", false);
+    });
+    fireEvent.click(reveal);
+    await waitFor(() => {
+      expect(revealTvFileMock).toHaveBeenCalledWith({ path: laterMemberPath });
+    });
+
+    const reconciliationAlert = screen
+      .getByText(/file move succeeded, but the TV Library or storage/)
+      .closest('[role="alert"]');
+    if (!(reconciliationAlert instanceof HTMLElement)) {
+      throw new Error("The TV reconciliation alert was not rendered.");
+    }
+    fireEvent.click(
+      within(reconciliationAlert).getByRole("button", {
+        name: "Retry reconciliation",
+      }),
+    );
+    expect(
+      await screen.findByText("Exact Local Show.S01E02.mkv"),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", {
+        name: "Match show metadata: Exact Local Show",
+      }),
+    ).toHaveProperty("disabled", true);
+    expect(trashTvFileMock).toHaveBeenCalledTimes(1);
+    expect(trashTvFileMock).toHaveBeenCalledWith({
+      path: anchorPath,
+      scanGeneration: "7",
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(3);
+    expect(searchTvShowMetadataMock).not.toHaveBeenCalled();
+  });
+
+  it("restores a valid association only after native Trash reconciliation succeeds", async () => {
+    savedTvFolder = "/TV";
+    const groupId = "7".repeat(40);
+    const removedPath = "/TV/Exact Local Show.S01E01.mp4";
+    const remainingPath = "/TV/Exact Local Show.S01E02.mkv";
+    const providerName = "Canonical Provider Show";
+    const members = [
+      {
+        path: removedPath,
+        relativePath: "Exact Local Show.S01E01.mp4",
+      },
+      {
+        path: remainingPath,
+        relativePath: "Exact Local Show.S01E02.mkv",
+      },
+    ];
+    const association = {
+      tmdbTvId: "701",
+      imdbId: "tt1234567",
+      name: providerName,
+    };
+    const reconciliation = createDeferred<string[]>();
+    scanTvLibraryMock
+      .mockResolvedValueOnce(
+        fixtureTvMetadataScan({
+          association,
+          groupId,
+          members,
+          metadataState: "ready",
+          showTitle: "Exact Local Show",
+        }),
+      )
+      .mockReturnValueOnce(reconciliation.promise);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    await screen.findByRole("heading", { name: providerName });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
+      }),
+    );
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Confirm moving TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Exact Local Show" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: providerName })).toBeNull();
+    expect(
+      screen.getByRole("button", {
+        name: "Match show metadata: Exact Local Show",
+      }),
+    ).toHaveProperty("disabled", true);
+    expect(
+      screen.getByRole("button", {
+        name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E02.mkv",
+      }),
+    ).toHaveProperty("disabled", false);
+
+    await act(async () => {
+      reconciliation.resolve(
+        fixtureTvMetadataScan({
+          association,
+          generation: "8",
+          groupId,
+          members: [members[1]],
+          metadataState: "ready",
+          showTitle: "Exact Local Show",
+        }),
+      );
+      await reconciliation.promise;
+    });
+    expect(
+      await screen.findByRole("heading", { name: providerName }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", {
+        name: `View show metadata details: ${providerName}`,
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: `Copy title: ${providerName}` }),
+    ).toBeTruthy();
+    expect(trashTvFileMock).toHaveBeenCalledTimes(1);
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     ["tv_file_trash_not_found", "This file is no longer available."],
     [
@@ -1887,6 +2233,656 @@ describe("parsed TV Library and Dashboard", () => {
       .toBeTruthy();
     expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
     expect(queryTvStorageMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("explicit TV Library TMDB show metadata matching", () => {
+  const groupId = "3333333333333333333333333333333333333333";
+  const matchingRequestId = "4444444444444444444444444444444444444444";
+  const verificationId = "5555555555555555555555555555555555555555";
+  const members = [
+    {
+      path: "/TV/Exact  Local — 番組.S01E01.mp4",
+      relativePath: "Exact  Local — 番組.S01E01.mp4",
+      size: "10",
+    },
+    {
+      path: "/TV/Exact  Local — 番組.S01E02.MKV",
+      relativePath: "Exact  Local — 番組.S01E02.MKV",
+      size: "20",
+    },
+  ];
+
+  function selectTvLibrary() {
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+  }
+
+  it("waits for explicit Search and manual selection before saving one exact show association", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        groupId,
+        members,
+        showTitle: "Exact  Local — 番組",
+      }),
+    );
+    searchTvShowMetadataMock.mockResolvedValue([
+      matchingRequestId,
+      "2",
+      "701",
+      "同じ  番組",
+      "Original One",
+      "2001-01-01",
+      "/one.jpg",
+      "702",
+      "同じ  番組",
+      "Original Two",
+      "2021-02-03",
+      "/two.jpg",
+    ]);
+    verifyTvShowMetadataCandidateMock.mockResolvedValue([
+      verificationId,
+      "702",
+      "tt7654321",
+      "Accepted  番組 — 特別版",
+      "Original Two",
+      "2021-02-03",
+      "/two.jpg",
+      "Exact verified show overview.",
+      "8",
+    ]);
+    saveTvShowMetadataMatchMock.mockResolvedValue([
+      "702",
+      "tt7654321",
+      "Accepted  番組 — 特別版",
+      "Original Two",
+      "2021-02-03",
+      "/two.jpg",
+      "Exact verified show overview.",
+      "8",
+    ]);
+
+    render(<App />);
+    selectTvLibrary();
+    const match = await screen.findByRole("button", {
+      name: "Match show metadata: Exact Local — 番組",
+    });
+    expect(searchTvShowMetadataMock).not.toHaveBeenCalled();
+    expect(verifyTvShowMetadataCandidateMock).not.toHaveBeenCalled();
+    expect(saveTvShowMetadataMatchMock).not.toHaveBeenCalled();
+    fireEvent.click(match);
+    const query = screen.getByRole("textbox", { name: "TV show title query" });
+    expect(query).toHaveProperty("value", "Exact  Local — 番組");
+    await waitFor(() => expect(document.activeElement).toBe(query));
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB TV shows" }));
+    expect(
+      await screen.findByText(
+        "2 TMDB TV show candidates were found. No candidate was selected automatically.",
+      ),
+    ).toBeTruthy();
+    expect(verifyTvShowMetadataCandidateMock).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Select TMDB TV show: 同じ 番組 (2021)",
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Verified show metadata match" }),
+    ).toBeTruthy();
+    expect(verifyTvShowMetadataCandidateMock).toHaveBeenCalledWith({
+      matchingRequestId,
+      tmdbTvId: 702,
+      contextGeneration: expect.any(Number),
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Save show metadata match" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Accepted 番組 — 特別版" }),
+    ).toBeTruthy();
+    expect(screen.getByText(/metadata was matched to the exact local TV show/)).toBeTruthy();
+    expect(saveTvShowMetadataMatchMock).toHaveBeenCalledWith({ verificationId });
+    expect(screen.getByText(/Season 1 · Episode 1/)).toBeTruthy();
+    expect(screen.getByText(/Season 1 · Episode 2/)).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Copy title: Accepted 番組 — 特別版" }),
+    );
+    expect(
+      await screen.findByRole("button", {
+        name: "Copied title: Accepted 番組 — 特別版",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "View show metadata details: Accepted 番組 — 特別版",
+      }),
+    );
+    const details = await screen.findByRole("dialog");
+    expect(
+      within(details).getByText(/Exact\s+Local — 番組/, { selector: "dd" }),
+    ).toBeTruthy();
+    expect(within(details).getByText("tt7654321")).toBeTruthy();
+    expect(
+      within(details).getByText(/S01E01\.mp4$/, { selector: "li" }),
+    ).toBeTruthy();
+    expect(
+      within(details).getByText(/S01E02\.MKV$/, { selector: "li" }),
+    ).toBeTruthy();
+  });
+
+  it("keeps persisted text usable offline, searches canonical and local identity, and clears metadata only", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        association: {
+          tmdbTvId: "702",
+          imdbId: "tt7654321",
+          name: "Offline Canonical Show",
+          firstAirDate: "2021-02-03",
+          overview: "Persisted text remains available.",
+          posterPath: "/offline.jpg",
+        },
+        groupId,
+        members,
+        metadataState: "ready",
+        showTitle: "Exact  Local — 番組",
+      }),
+    );
+    searchTvShowMetadataMock.mockRejectedValue("tv_metadata_tmdb_network_error");
+
+    render(<App />);
+    selectTvLibrary();
+    expect(
+      await screen.findByRole("heading", { name: "Offline Canonical Show" }),
+    ).toBeTruthy();
+    expect(searchTvShowMetadataMock).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "Exact  Local" },
+    });
+    expect(screen.getByRole("heading", { name: "Offline Canonical Show" })).toBeTruthy();
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "S01E02" },
+    });
+    expect(screen.getByRole("heading", { name: "Offline Canonical Show" })).toBeTruthy();
+    fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
+      target: { value: "Offline Canonical" },
+    });
+    const detailsTrigger = screen.getByRole("button", {
+      name: "View show metadata details: Offline Canonical Show",
+    });
+    fireEvent.click(detailsTrigger);
+    const details = await screen.findByRole("dialog");
+    fireEvent.error(within(details).getByAltText("TMDB poster for Offline Canonical Show"));
+    expect(within(details).getByText("Poster unavailable")).toBeTruthy();
+    expect(within(details).getByText("Persisted text remains available.")).toBeTruthy();
+    fireEvent.click(
+      within(details).getByRole("button", { name: "Clear show metadata match" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "No TV items match this search" }),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("textbox", { name: "Search titles" }),
+      ),
+    );
+    expect(clearTvShowMetadataMatchMock).toHaveBeenCalledWith({ groupId });
+    expect(openTvFileMock).not.toHaveBeenCalled();
+    expect(revealTvFileMock).not.toHaveBeenCalled();
+    expect(trashTvFileMock).not.toHaveBeenCalled();
+    expect(saveTmdbTokenMock).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes stale, unavailable, and persistence failures while saving TV show metadata", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        groupId,
+        members,
+        showTitle: "Exact  Local — 番組",
+      }),
+    );
+    searchTvShowMetadataMock.mockResolvedValue([
+      matchingRequestId,
+      "1",
+      "702",
+      "Current Show",
+      "",
+      "2021-02-03",
+      "",
+    ]);
+    verifyTvShowMetadataCandidateMock.mockResolvedValue([
+      verificationId,
+      "702",
+      "tt7654321",
+      "Current Show",
+      "",
+      "2021-02-03",
+      "",
+      "",
+      "1",
+    ]);
+    saveTvShowMetadataMatchMock
+      .mockRejectedValueOnce("tv_metadata_context_invalid")
+      .mockRejectedValueOnce("tv_metadata_unavailable")
+      .mockRejectedValueOnce("tv_metadata_persistence_failed");
+
+    render(<App />);
+    selectTvLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match show metadata: Exact Local — 番組",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB TV shows" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select TMDB TV show: Current Show (2021)",
+      }),
+    );
+    const save = await screen.findByRole("button", {
+      name: "Save show metadata match",
+    });
+    for (const message of [
+      "This TV show or verified metadata context is no longer current. The local show remains unchanged.",
+      "TV show metadata storage is unavailable. The association was not saved and the local show remains unchanged.",
+      "The exact show metadata association could not be persisted. The local show remains unchanged.",
+    ]) {
+      fireEvent.click(save);
+      expect((await screen.findByRole("alert")).textContent).toBe(message);
+      expect(
+        screen.getByRole("heading", {
+          hidden: true,
+          name: "Exact Local — 番組",
+        }),
+      ).toBeTruthy();
+      expect(
+        screen.getAllByRole("button", { hidden: true, name: /^Open TV file:/ }),
+      ).toHaveLength(2);
+    }
+    expect(saveTvShowMetadataMatchMock).toHaveBeenCalledTimes(3);
+    expect(openTvFileMock).not.toHaveBeenCalled();
+    expect(revealTvFileMock).not.toHaveBeenCalled();
+    expect(trashTvFileMock).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes stale, unavailable, and persistence failures while clearing TV show metadata", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        association: {
+          tmdbTvId: "702",
+          imdbId: "tt7654321",
+          name: "Current Show",
+        },
+        groupId,
+        members,
+        metadataState: "ready",
+        showTitle: "Exact  Local — 番組",
+      }),
+    );
+    clearTvShowMetadataMatchMock
+      .mockRejectedValueOnce("tv_metadata_stale")
+      .mockRejectedValueOnce("tv_metadata_unavailable")
+      .mockRejectedValueOnce("tv_metadata_persistence_failed");
+
+    render(<App />);
+    selectTvLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View show metadata details: Current Show",
+      }),
+    );
+    const clear = screen.getByRole("button", {
+      name: "Clear show metadata match",
+    });
+    for (const message of [
+      "This TV show or metadata association is no longer current. The local files and existing association remain unchanged.",
+      "TV show metadata storage is unavailable. The existing association and local files remain unchanged.",
+      "The show metadata removal could not be persisted. The existing association and local files remain unchanged.",
+    ]) {
+      fireEvent.click(clear);
+      expect((await screen.findByRole("alert")).textContent).toBe(message);
+      expect(screen.getByRole("heading", { name: "Current Show" })).toBeTruthy();
+      expect(
+        screen.getAllByRole("button", { hidden: true, name: /^Open TV file:/ }),
+      ).toHaveLength(2);
+    }
+    expect(clearTvShowMetadataMatchMock).toHaveBeenCalledTimes(3);
+    expect(openTvFileMock).not.toHaveBeenCalled();
+    expect(revealTvFileMock).not.toHaveBeenCalled();
+    expect(trashTvFileMock).not.toHaveBeenCalled();
+  });
+
+  it("drops late Search and verification results after their exact surface is stale", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({ groupId, members, showTitle: "Exact  Local — 番組" }),
+    );
+    const lateSearch = createDeferred<string[]>();
+    searchTvShowMetadataMock.mockReturnValueOnce(lateSearch.promise);
+
+    render(<App />);
+    selectTvLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match show metadata: Exact Local — 番組",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB TV shows" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Close show metadata matching" }),
+    );
+    await act(async () => {
+      lateSearch.resolve([
+        matchingRequestId,
+        "1",
+        "702",
+        "Late Show",
+        "",
+        "2021-02-03",
+        "",
+      ]);
+      await lateSearch.promise;
+    });
+    expect(screen.queryByText("Late Show")).toBeNull();
+    expect(invalidateTvShowMetadataContextMock).toHaveBeenCalled();
+
+    selectTvLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    searchTvShowMetadataMock.mockResolvedValue([
+      matchingRequestId,
+      "1",
+      "702",
+      "Current Show",
+      "",
+      "2021-02-03",
+      "",
+    ]);
+    const lateVerification = createDeferred<string[]>();
+    verifyTvShowMetadataCandidateMock.mockReturnValueOnce(lateVerification.promise);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match show metadata: Exact Local — 番組",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB TV shows" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select TMDB TV show: Current Show (2021)",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close show metadata matching" }));
+    await act(async () => {
+      lateVerification.resolve([
+        verificationId,
+        "702",
+        "tt7654321",
+        "Late Verified Show",
+        "",
+        "2021-02-03",
+        "",
+        "",
+        "1",
+      ]);
+      await lateVerification.promise;
+    });
+    expect(screen.queryByText("Late Verified Show")).toBeNull();
+    expect(saveTvShowMetadataMatchMock).not.toHaveBeenCalled();
+  });
+
+  it("reports no late Save or clear result in a closed or replaced surface and permits retry", async () => {
+    savedTvFolder = "/TV";
+    const unassociatedScan = fixtureTvMetadataScan({
+      groupId,
+      members,
+      showTitle: "Exact  Local — 番組",
+    });
+    scanTvLibraryMock.mockResolvedValue(unassociatedScan);
+    searchTvShowMetadataMock.mockResolvedValue([
+      matchingRequestId,
+      "1",
+      "702",
+      "Current Show",
+      "",
+      "2021-02-03",
+      "",
+    ]);
+    verifyTvShowMetadataCandidateMock.mockResolvedValue([
+      verificationId,
+      "702",
+      "tt7654321",
+      "Current Show",
+      "",
+      "2021-02-03",
+      "",
+      "",
+      "1",
+    ]);
+    const lateSave = createDeferred<string[]>();
+    saveTvShowMetadataMatchMock.mockReturnValueOnce(lateSave.promise);
+
+    render(<App />);
+    selectTvLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match show metadata: Exact Local — 番組",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB TV shows" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select TMDB TV show: Current Show (2021)",
+      }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Save show metadata match" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close show metadata matching" }));
+    await act(async () => {
+      lateSave.resolve([
+        "702",
+        "tt7654321",
+        "Late Saved Show",
+        "",
+        "2021-02-03",
+        "",
+        "",
+        "1",
+      ]);
+      await lateSave.promise;
+    });
+    expect(screen.queryByText(/Late Saved Show/)).toBeNull();
+    expect(screen.queryByText(/metadata was matched/)).toBeNull();
+
+    const associatedScan = fixtureTvMetadataScan({
+      association: {
+        tmdbTvId: "702",
+        imdbId: "tt7654321",
+        name: "Current Show",
+      },
+      groupId,
+      members,
+      metadataState: "ready",
+      showTitle: "Exact  Local — 番組",
+    });
+    scanTvLibraryMock.mockResolvedValue(associatedScan);
+    fireEvent.click(document.getElementById("tv-library-refresh")!);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View show metadata details: Current Show",
+      }),
+    );
+    const lateClear = createDeferred<void>();
+    clearTvShowMetadataMatchMock
+      .mockReturnValueOnce(lateClear.promise)
+      .mockResolvedValue(undefined);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear show metadata match" }),
+    );
+    fireEvent.click(screen.getByText("Settings").closest("button")!);
+    await act(async () => {
+      lateClear.resolve();
+      await lateClear.promise;
+    });
+    expect(screen.queryByText(/show metadata was cleared/)).toBeNull();
+    selectTvLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View show metadata details: Current Show",
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear show metadata match" }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Exact Local — 番組" }),
+    ).toBeTruthy();
+    expect(clearTvShowMetadataMatchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps unassociated files ineligible and isolates no-match and provider failures", async () => {
+    savedTvFolder = "/TV";
+    const groupedRows = fixtureTvMetadataScan({
+      groupId,
+      members: [members[0]],
+      showTitle: "Exact  Local — 番組",
+    }).slice(4);
+    const unassociatedRows = fixtureTvMetadataScan({
+      groupId,
+      members: [
+        {
+          path: "/TV/Ambiguous feature.mp4",
+          relativePath: "Ambiguous feature.mp4",
+        },
+      ],
+      showTitle: null,
+    }).slice(4);
+    scanTvLibraryMock.mockResolvedValue([
+      "tv-library-metadata-v1",
+      "ready",
+      "10",
+      "2",
+      ...groupedRows,
+      ...unassociatedRows,
+    ]);
+    searchTvShowMetadataMock
+      .mockResolvedValueOnce([matchingRequestId, "0"])
+      .mockRejectedValueOnce("tv_metadata_tmdb_network_error");
+
+    render(<App />);
+    selectTvLibrary();
+    expect(await screen.findByRole("heading", { name: "Ambiguous feature" })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /Match show metadata:/ })).toHaveLength(1);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Match show metadata: Exact Local — 番組",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB TV shows" }));
+    expect(
+      await screen.findByText(
+        "No TMDB TV shows matched this exact query. No show was selected.",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB TV shows" }));
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      "TMDB could not be reached. The local TV show remains available.",
+    );
+    expect(
+      screen.getByRole("heading", { name: "Exact Local — 番組", hidden: true }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Ambiguous feature", hidden: true }),
+    ).toBeTruthy();
+  });
+
+  it("keeps associations through the 25 to 7 to 10 responsive pager without provider requests", async () => {
+    savedTvFolder = "/TV";
+    const rows = Array.from({ length: 25 }, (_, index) => {
+      const localTitle = `Local Show ${String(index + 1).padStart(2, "0")}`;
+      const id = (index + 1).toString(16).padStart(40, "0");
+      return fixtureTvMetadataScan({
+        association: {
+          tmdbTvId: String(1000 + index),
+          imdbId: `tt${String(1000000 + index)}`,
+          name: `Canonical Show ${String(index + 1).padStart(2, "0")}`,
+        },
+        groupId: id,
+        members: [
+          {
+            path: `/TV/${localTitle}.S01E01.mp4`,
+            relativePath: `${localTitle}.S01E01.mp4`,
+          },
+        ],
+        metadataState: "ready",
+        showTitle: localTitle,
+      }).slice(4);
+    }).flat();
+    scanTvLibraryMock.mockResolvedValue([
+      "tv-library-metadata-v1",
+      "ready",
+      "9",
+      "25",
+      ...rows,
+    ]);
+
+    render(<App />);
+    selectTvLibrary();
+    await screen.findByRole("heading", { name: "Canonical Show 01" });
+    resizeGallery("library", 1088, 728);
+    expect(visibleCardCount("TV shows and unassociated files")).toBe(25);
+    resizeGallery("library", 1528, 136);
+    expect(visibleCardCount("TV shows and unassociated files")).toBe(7);
+    resizeGallery("library", 1088, 284);
+    expect(visibleCardCount("TV shows and unassociated files")).toBe(10);
+    expect(screen.getByRole("heading", { name: "Canonical Show 01" })).toBeTruthy();
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(1);
+    expect(searchTvShowMetadataMock).not.toHaveBeenCalled();
+    expect(verifyTvShowMetadataCandidateMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps explicit matching keyboard-usable at 720 by 520 in light, dark, and system modes", async () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 720 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 520 });
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({ groupId, members, showTitle: "Exact  Local — 番組" }),
+    );
+
+    for (const [appearance, resolvedTheme] of [
+      ["light", "light"],
+      ["dark", "dark"],
+      ["system", "dark"],
+    ] as const) {
+      cleanup();
+      window.localStorage.clear();
+      setSystemPreference(appearance === "system");
+      render(<App />);
+      selectSettings();
+      fireEvent.click(screen.getByRole("radio", { name: new RegExp(appearance, "i") }));
+      selectTvLibrary();
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Match show metadata: Exact Local — 番組",
+        }),
+      );
+      const dialog = await screen.findByRole("dialog");
+      const query = within(dialog).getByRole("textbox", { name: "TV show title query" });
+      await waitFor(() => expect(document.activeElement).toBe(query));
+      expect(document.documentElement.dataset.theme).toBe(resolvedTheme);
+      expect(dialog.closest(".movie-metadata__viewport")).not.toBeNull();
+      expect(
+        within(dialog).getByRole("button", { name: "Search TMDB TV shows" }),
+      ).toBeTruthy();
+      expect(
+        within(dialog).getByRole("button", { name: "Close show metadata matching" }),
+      ).toBeTruthy();
+    }
   });
 });
 
