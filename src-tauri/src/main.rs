@@ -8,9 +8,10 @@ mod vr_library;
 mod vr_torrent;
 
 use std::{
-    fs::{self, OpenOptions},
+    collections::HashSet,
+    fs::{self, File, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -54,10 +55,11 @@ use vr_library::{
     VR_FILE_TRASH_FAILED, VR_LIBRARY_SCAN_FAILED,
 };
 use vr_torrent::{
-    fetch_artifact_response, inspect_sukebei_adult_torrent_with, inspect_sukebei_torrent_with,
-    inspect_yts_movie_torrent_with, save_verified_adult_torrent_with,
-    save_verified_movie_torrent_with, save_verified_torrent_with, save_verified_tv_torrent_with,
-    verified_movie_imdb_id, write_new_torrent_file, AdultTorrentState,
+    canonical_imdb_id, fetch_artifact_response, hex_sha1, inspect_sukebei_adult_torrent_with,
+    inspect_sukebei_torrent_with, inspect_yts_movie_torrent_with, json_array, json_object,
+    json_string, json_u64, save_verified_adult_torrent_with, save_verified_movie_torrent_with,
+    save_verified_torrent_with, save_verified_tv_torrent_with, verified_movie_imdb_id,
+    write_new_torrent_file, AdultTorrentState, JsonParser, JsonValue,
     MovieTorrentInspectionRequest, MovieTorrentState, TorrentInspectionRequest,
     TvTorrentInspectionStart, TvTorrentState, VrTorrentState, ADULT_TORRENT_PROVIDER_ERROR,
     ADULT_TORRENT_SAVE_FAILED, MOVIE_TMDB_MALFORMED, MOVIE_TORRENT_PROVIDER_ERROR,
@@ -67,6 +69,7 @@ use vr_torrent::{
 };
 
 const MOVIES_FOLDER_FILE_NAME: &str = ".movies-folder";
+const MOVIE_METADATA_FILE_NAME: &str = ".movie-library-metadata";
 const ADULT_FOLDER_FILE_NAME: &str = ".adult-folder";
 const TV_FOLDER_FILE_NAME: &str = ".tv-folder";
 const VR_FOLDER_FILE_NAME: &str = ".vr-folder";
@@ -102,6 +105,11 @@ const MOVIE_TRASH_OUTSIDE_FOLDER: &str = "movie_trash_outside_folder";
 const MOVIE_TRASH_STALE: &str = "movie_trash_stale";
 const MOVIE_TRASH_UNAVAILABLE: &str = "movie_trash_unavailable";
 const MOVIE_TRASH_UNSUPPORTED: &str = "movie_trash_unsupported";
+const MOVIE_METADATA_CONTEXT_INVALID: &str = "movie_metadata_context_invalid";
+const MOVIE_METADATA_MALFORMED: &str = "movie_metadata_malformed_provider";
+const MOVIE_METADATA_PERSISTENCE_FAILED: &str = "movie_metadata_persistence_failed";
+const MOVIE_METADATA_STALE: &str = "movie_metadata_stale";
+const MOVIE_METADATA_UNAVAILABLE: &str = "movie_metadata_unavailable";
 const TMDB_TOKEN_FILE_NAME: &str = ".tmdb-api-read-access-token";
 const TMDB_TOKEN_INVALID: &str = "tmdb_token_invalid";
 const TMDB_TOKEN_STORAGE_FAILED: &str = "tmdb_token_storage_failed";
@@ -128,12 +136,103 @@ const PROVIDER_HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_co
 const JAVDB_CATALOG_URL: &str = "https://javdb.com/search?q=";
 const SUKEBEI_RELEASES_URL: &str = "https://sukebei.nyaa.si/?page=rss&q=%22";
 const TMDB_MOVIE_URL: &str = "https://api.themoviedb.org/3/movie/";
+const TMDB_MOVIE_SEARCH_URL: &str = "https://api.themoviedb.org/3/search/movie?query=";
 const YTS_MOVIES_URL: &str = "https://yts.mx/api/v2/list_movies.json?limit=50&query_term=";
+const MOVIE_METADATA_HEADER: &[u8] = b"AUTO_VIDEO_MOVIE_METADATA_V1\n";
+const MOVIE_METADATA_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const MOVIE_METADATA_MAX_RECORDS: usize = 10_000;
+const MOVIE_METADATA_MAX_QUERY_BYTES: usize = 512;
+const MOVIE_METADATA_MAX_CANDIDATES: usize = 100;
+
+#[derive(Clone, Debug, PartialEq)]
+struct MovieMetadataAssociation {
+    folder: PathBuf,
+    folder_identity: String,
+    relative_path: String,
+    file_identity: String,
+    fingerprint: String,
+    size: u64,
+    tmdb_movie_id: u64,
+    imdb_id: String,
+    title: String,
+    original_title: Option<String>,
+    release_date: Option<String>,
+    poster_path: Option<String>,
+    overview: Option<String>,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TrustedMovieFile {
+    file_id: String,
+    path: PathBuf,
+    relative_path: String,
+    file_identity: String,
+    fingerprint: String,
+    size: u64,
+    association: Option<MovieMetadataAssociation>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CompletedMovieScan {
+    folder: PathBuf,
+    folder_identity: String,
+    generation: u64,
+    files: Vec<TrustedMovieFile>,
+    association_status: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MovieMetadataCandidate {
+    tmdb_movie_id: u64,
+    title: String,
+    original_title: Option<String>,
+    release_date: Option<String>,
+    poster_path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MovieMetadataAuthority {
+    scan_generation: u64,
+    folder: PathBuf,
+    folder_identity: String,
+    file_id: String,
+    path: PathBuf,
+    relative_path: String,
+    file_identity: String,
+    fingerprint: String,
+    size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MovieMetadataSearch {
+    request_id: String,
+    operation_generation: u64,
+    authority: MovieMetadataAuthority,
+    query: String,
+    token_identity: String,
+    candidates: Vec<MovieMetadataCandidate>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MovieMetadataVerification {
+    verification_id: String,
+    operation_generation: u64,
+    matching_request_id: String,
+    authority: MovieMetadataAuthority,
+    association: MovieMetadataAssociation,
+    token_identity: String,
+}
 
 #[derive(Default)]
 struct MoviesLibraryContext {
     folder: Option<PathBuf>,
     movie_paths: Vec<String>,
+    generation: u64,
+    completed_scan: Option<CompletedMovieScan>,
+    metadata_operation_generation: u64,
+    metadata_search: Option<MovieMetadataSearch>,
+    metadata_verification: Option<MovieMetadataVerification>,
 }
 
 #[derive(Clone, Default)]
@@ -338,6 +437,552 @@ fn scan_movie_paths(folder: &Path) -> Result<Vec<String>, &'static str> {
         .collect()
 }
 
+#[cfg(unix)]
+fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'static str> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
+    if metadata.file_type().is_symlink()
+        || (regular_file && !metadata.is_file())
+        || (!regular_file && !metadata.is_dir())
+    {
+        return Err(MOVIE_METADATA_STALE);
+    }
+    Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct MovieWindowsFileInformation {
+    file_attributes: u32,
+    creation_time_low: u32,
+    creation_time_high: u32,
+    last_access_time_low: u32,
+    last_access_time_high: u32,
+    last_write_time_low: u32,
+    last_write_time_high: u32,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "Kernel32")]
+extern "system" {
+    #[link_name = "GetFileInformationByHandle"]
+    fn get_movie_file_information_by_handle(
+        file: *mut std::ffi::c_void,
+        information: *mut MovieWindowsFileInformation,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'static str> {
+    use std::{
+        mem::MaybeUninit,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    };
+
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let metadata = fs::symlink_metadata(path).map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
+    if metadata.file_type().is_symlink()
+        || (regular_file && !metadata.is_file())
+        || (!regular_file && !metadata.is_dir())
+    {
+        return Err(MOVIE_METADATA_STALE);
+    }
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
+    let mut information = MaybeUninit::<MovieWindowsFileInformation>::uninit();
+    let succeeded = unsafe {
+        get_movie_file_information_by_handle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if succeeded == 0 {
+        return Err(MOVIE_METADATA_UNAVAILABLE);
+    }
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
+    Ok(format!("{}:{file_index}", information.volume_serial_number))
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'static str> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
+    if metadata.file_type().is_symlink()
+        || (regular_file && !metadata.is_file())
+        || (!regular_file && !metadata.is_dir())
+    {
+        return Err(MOVIE_METADATA_STALE);
+    }
+    let modified = metadata
+        .modified()
+        .map_err(|_| MOVIE_METADATA_UNAVAILABLE)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
+    Ok(format!("{}:{}", modified.as_nanos(), metadata.len()))
+}
+
+fn validate_movie_components(folder: &Path, path: &Path) -> Result<(), &'static str> {
+    let relative = path
+        .strip_prefix(folder)
+        .map_err(|_| MOVIE_METADATA_STALE)?;
+    if relative.components().next().is_none() {
+        return Err(MOVIE_METADATA_STALE);
+    }
+    let mut current = folder.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(MOVIE_METADATA_STALE);
+        };
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current).map_err(|_| MOVIE_METADATA_STALE)?;
+        if metadata.file_type().is_symlink() {
+            return Err(MOVIE_METADATA_STALE);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+
+    format!(
+        "{}:{}:{}:{}:{}",
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
+    use std::os::windows::fs::MetadataExt;
+
+    format!(
+        "{}:{}:{}",
+        metadata.file_size(),
+        metadata.last_write_time(),
+        metadata.creation_time()
+    )
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    format!("{}:{modified}", metadata.len())
+}
+
+fn capture_trusted_movie_file(
+    folder: &Path,
+    folder_identity: &str,
+    generation: u64,
+    path: PathBuf,
+) -> Result<TrustedMovieFile, &'static str> {
+    validate_movie_components(folder, &path)?;
+    let metadata = fs::metadata(&path).map_err(|_| MOVIES_SCAN_FAILED)?;
+    if !metadata.is_file() || !is_supported_movie(&path) {
+        return Err(MOVIES_SCAN_FAILED);
+    }
+    let canonical_path = fs::canonicalize(&path).map_err(|_| MOVIES_SCAN_FAILED)?;
+    if canonical_path != path || !canonical_path.starts_with(folder) {
+        return Err(MOVIES_SCAN_FAILED);
+    }
+    let relative_path = path
+        .strip_prefix(folder)
+        .ok()
+        .and_then(Path::to_str)
+        .filter(|relative| !relative.is_empty())
+        .map(str::to_owned)
+        .ok_or(MOVIES_SCAN_FAILED)?;
+    let file_identity = movie_path_identity(&path, true).map_err(|_| MOVIES_SCAN_FAILED)?;
+    let fingerprint = movie_file_fingerprint(&metadata);
+    let size = metadata.len();
+    let file_id = hex_sha1(
+        format!(
+            "{generation}\0{folder_identity}\0{relative_path}\0{file_identity}\0{fingerprint}\0{size}"
+        )
+        .as_bytes(),
+    );
+    Ok(TrustedMovieFile {
+        file_id,
+        path,
+        relative_path,
+        file_identity,
+        fingerprint,
+        size,
+        association: None,
+    })
+}
+
+fn scan_trusted_movie_files(
+    folder: &Path,
+    generation: u64,
+) -> Result<(String, Vec<TrustedMovieFile>), &'static str> {
+    let canonical_folder = fs::canonicalize(folder).map_err(|_| MOVIES_FOLDER_UNAVAILABLE)?;
+    if canonical_folder != folder
+        || !fs::metadata(folder)
+            .map_err(|_| MOVIES_FOLDER_UNAVAILABLE)?
+            .is_dir()
+    {
+        return Err(MOVIES_FOLDER_UNAVAILABLE);
+    }
+    let folder_identity = movie_path_identity(folder, false).map_err(|_| MOVIES_SCAN_FAILED)?;
+    let paths = scan_movie_paths(folder)?;
+    let mut files = paths
+        .into_iter()
+        .map(PathBuf::from)
+        .map(|path| capture_trusted_movie_file(folder, &folder_identity, generation, path))
+        .collect::<Result<Vec<_>, _>>()?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((folder_identity, files))
+}
+
+fn encode_movie_metadata_text(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
+fn decode_movie_metadata_text(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        decoded.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn valid_movie_metadata_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
+
+fn valid_movie_metadata_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !path.is_absolute()
+        && path.components().next().is_some()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn validate_movie_metadata_association(
+    association: &MovieMetadataAssociation,
+) -> Result<(), &'static str> {
+    if !association.folder.is_absolute()
+        || association.folder.to_str().is_none()
+        || association.folder_identity.is_empty()
+        || association.folder_identity.len() > 256
+        || !valid_movie_metadata_relative_path(&association.relative_path)
+        || association.relative_path.len() > 32 * 1024
+        || association.file_identity.is_empty()
+        || association.file_identity.len() > 256
+        || association.fingerprint.is_empty()
+        || association.fingerprint.len() > 512
+        || association.tmdb_movie_id == 0
+        || canonical_imdb_id(&association.imdb_id).as_deref() != Some(association.imdb_id.as_str())
+        || association.title.trim().is_empty()
+        || association.title.len() > 16 * 1024
+        || association
+            .original_title
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 16 * 1024)
+        || association
+            .release_date
+            .as_deref()
+            .is_some_and(|value| !valid_movie_metadata_date(value))
+        || association.poster_path.as_ref().is_some_and(|value| {
+            !value.starts_with('/')
+                || value.len() > 16 * 1024
+                || value.chars().any(char::is_control)
+        })
+        || association
+            .overview
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 256 * 1024)
+        || association.generation == 0
+    {
+        return Err(MOVIE_METADATA_PERSISTENCE_FAILED);
+    }
+    Ok(())
+}
+
+fn encoded_movie_metadata_associations(
+    associations: &[MovieMetadataAssociation],
+) -> Result<Vec<u8>, &'static str> {
+    if associations.len() > MOVIE_METADATA_MAX_RECORDS {
+        return Err(MOVIE_METADATA_PERSISTENCE_FAILED);
+    }
+    let mut payload = format!("{}\n", associations.len());
+    for association in associations {
+        validate_movie_metadata_association(association)?;
+        let fields = [
+            encode_movie_metadata_text(
+                association
+                    .folder
+                    .to_str()
+                    .ok_or(MOVIE_METADATA_PERSISTENCE_FAILED)?,
+            ),
+            encode_movie_metadata_text(&association.folder_identity),
+            encode_movie_metadata_text(&association.relative_path),
+            encode_movie_metadata_text(&association.file_identity),
+            encode_movie_metadata_text(&association.fingerprint),
+            association.size.to_string(),
+            association.tmdb_movie_id.to_string(),
+            encode_movie_metadata_text(&association.imdb_id),
+            encode_movie_metadata_text(&association.title),
+            encode_movie_metadata_text(association.original_title.as_deref().unwrap_or("")),
+            encode_movie_metadata_text(association.release_date.as_deref().unwrap_or("")),
+            encode_movie_metadata_text(association.poster_path.as_deref().unwrap_or("")),
+            encode_movie_metadata_text(association.overview.as_deref().unwrap_or("")),
+            association.generation.to_string(),
+        ];
+        payload.push_str(&fields.join("\t"));
+        payload.push('\n');
+    }
+    let mut bytes = MOVIE_METADATA_HEADER.to_vec();
+    bytes.extend_from_slice(hex_sha1(payload.as_bytes()).as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(payload.as_bytes());
+    if bytes.len() as u64 > MOVIE_METADATA_MAX_BYTES {
+        return Err(MOVIE_METADATA_PERSISTENCE_FAILED);
+    }
+    Ok(bytes)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MovieMetadataReadError {
+    Invalid,
+    Unavailable,
+}
+
+fn parse_movie_metadata_associations(
+    bytes: &[u8],
+) -> Result<Vec<MovieMetadataAssociation>, MovieMetadataReadError> {
+    if bytes.len() as u64 > MOVIE_METADATA_MAX_BYTES {
+        return Err(MovieMetadataReadError::Invalid);
+    }
+    let content = bytes
+        .strip_prefix(MOVIE_METADATA_HEADER)
+        .ok_or(MovieMetadataReadError::Invalid)?;
+    let checksum_end = content
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or(MovieMetadataReadError::Invalid)?;
+    let checksum = std::str::from_utf8(&content[..checksum_end])
+        .map_err(|_| MovieMetadataReadError::Invalid)?;
+    let payload = &content[checksum_end + 1..];
+    if checksum.len() != 40 || checksum != hex_sha1(payload).as_str() {
+        return Err(MovieMetadataReadError::Invalid);
+    }
+    let payload = std::str::from_utf8(payload).map_err(|_| MovieMetadataReadError::Invalid)?;
+    let payload = payload
+        .strip_suffix('\n')
+        .ok_or(MovieMetadataReadError::Invalid)?;
+    let mut lines = payload.split('\n');
+    let count = lines
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count <= MOVIE_METADATA_MAX_RECORDS)
+        .ok_or(MovieMetadataReadError::Invalid)?;
+    let mut associations = Vec::with_capacity(count);
+    let mut path_keys = HashSet::new();
+    let mut generations = HashSet::new();
+    for _ in 0..count {
+        let fields = lines
+            .next()
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .ok_or(MovieMetadataReadError::Invalid)?;
+        let [folder, folder_identity, relative_path, file_identity, fingerprint, size, tmdb_movie_id, imdb_id, title, original_title, release_date, poster_path, overview, generation] =
+            fields.as_slice()
+        else {
+            return Err(MovieMetadataReadError::Invalid);
+        };
+        let optional_text = |value: &str| {
+            decode_movie_metadata_text(value)
+                .map(|value| (!value.is_empty()).then_some(value))
+                .ok_or(MovieMetadataReadError::Invalid)
+        };
+        let association = MovieMetadataAssociation {
+            folder: PathBuf::from(
+                decode_movie_metadata_text(folder).ok_or(MovieMetadataReadError::Invalid)?,
+            ),
+            folder_identity: decode_movie_metadata_text(folder_identity)
+                .ok_or(MovieMetadataReadError::Invalid)?,
+            relative_path: decode_movie_metadata_text(relative_path)
+                .ok_or(MovieMetadataReadError::Invalid)?,
+            file_identity: decode_movie_metadata_text(file_identity)
+                .ok_or(MovieMetadataReadError::Invalid)?,
+            fingerprint: decode_movie_metadata_text(fingerprint)
+                .ok_or(MovieMetadataReadError::Invalid)?,
+            size: size.parse().map_err(|_| MovieMetadataReadError::Invalid)?,
+            tmdb_movie_id: tmdb_movie_id
+                .parse()
+                .map_err(|_| MovieMetadataReadError::Invalid)?,
+            imdb_id: decode_movie_metadata_text(imdb_id).ok_or(MovieMetadataReadError::Invalid)?,
+            title: decode_movie_metadata_text(title).ok_or(MovieMetadataReadError::Invalid)?,
+            original_title: optional_text(original_title)?,
+            release_date: optional_text(release_date)?,
+            poster_path: optional_text(poster_path)?,
+            overview: optional_text(overview)?,
+            generation: generation
+                .parse()
+                .map_err(|_| MovieMetadataReadError::Invalid)?,
+        };
+        validate_movie_metadata_association(&association)
+            .map_err(|_| MovieMetadataReadError::Invalid)?;
+        let path_key = (
+            association.folder.clone(),
+            association.folder_identity.clone(),
+            association.relative_path.clone(),
+        );
+        if !path_keys.insert(path_key) || !generations.insert(association.generation) {
+            return Err(MovieMetadataReadError::Invalid);
+        }
+        associations.push(association);
+    }
+    if lines.next().is_some() {
+        return Err(MovieMetadataReadError::Invalid);
+    }
+    Ok(associations)
+}
+
+fn read_movie_metadata_associations(
+    path: &Path,
+) -> Result<Vec<MovieMetadataAssociation>, MovieMetadataReadError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(MovieMetadataReadError::Unavailable),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(MovieMetadataReadError::Invalid);
+    }
+    if metadata.len() > MOVIE_METADATA_MAX_BYTES {
+        return Err(MovieMetadataReadError::Invalid);
+    }
+    let bytes = fs::read(path).map_err(|_| MovieMetadataReadError::Unavailable)?;
+    parse_movie_metadata_associations(&bytes)
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "Kernel32")]
+extern "system" {
+    #[link_name = "MoveFileExW"]
+    fn replace_movie_metadata_file_windows(
+        existing_file_name: *const u16,
+        new_file_name: *const u16,
+        flags: u32,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn replace_movie_metadata_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let succeeded = unsafe {
+        replace_movie_metadata_file_windows(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    (succeeded != 0)
+        .then_some(())
+        .ok_or_else(io::Error::last_os_error)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_movie_metadata_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+fn write_movie_metadata_associations(
+    path: &Path,
+    associations: &[MovieMetadataAssociation],
+) -> Result<(), &'static str> {
+    let bytes = encoded_movie_metadata_associations(associations)?;
+    let parent = path.parent().ok_or(MOVIE_METADATA_PERSISTENCE_FAILED)?;
+    fs::create_dir_all(parent).map_err(|_| MOVIE_METADATA_PERSISTENCE_FAILED)?;
+    let file_name = path.file_name().ok_or(MOVIE_METADATA_PERSISTENCE_FAILED)?;
+    let mut replacement_name = file_name.to_os_string();
+    replacement_name.push(".next");
+    let replacement = path.with_file_name(replacement_name);
+    match fs::symlink_metadata(&replacement) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(MOVIE_METADATA_PERSISTENCE_FAILED);
+        }
+        Ok(_) => fs::remove_file(&replacement).map_err(|_| MOVIE_METADATA_PERSISTENCE_FAILED)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(MOVIE_METADATA_PERSISTENCE_FAILED),
+    }
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&replacement)
+            .map_err(|_| MOVIE_METADATA_PERSISTENCE_FAILED)?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| MOVIE_METADATA_PERSISTENCE_FAILED)?;
+        replace_movie_metadata_file(&replacement, path)
+            .map_err(|_| MOVIE_METADATA_PERSISTENCE_FAILED)?;
+        #[cfg(unix)]
+        let _ = File::open(parent).and_then(|directory| directory.sync_all());
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&replacement);
+    }
+    result
+}
+
 fn load_movies_folder_file(path: &Path) -> Result<Option<PathBuf>, &'static str> {
     match fs::read_to_string(path) {
         Ok(folder) if !folder.is_empty() => Ok(Some(PathBuf::from(folder))),
@@ -362,11 +1007,109 @@ fn clear_movies_folder_file(path: &Path) -> Result<(), &'static str> {
     }
 }
 
-fn scan_movies_library(library: &mut MoviesLibraryContext) -> Result<Vec<String>, &'static str> {
-    let folder = library.folder.as_deref().ok_or(MOVIES_FOLDER_UNAVAILABLE)?;
-    let movie_paths = scan_movie_paths(folder)?;
-    library.movie_paths.clone_from(&movie_paths);
-    Ok(movie_paths)
+fn invalidate_movie_metadata_context(library: &mut MoviesLibraryContext) {
+    library.metadata_operation_generation = library.metadata_operation_generation.wrapping_add(1);
+    library.metadata_search = None;
+    library.metadata_verification = None;
+}
+
+fn association_matches_file(
+    association: &MovieMetadataAssociation,
+    scan: &CompletedMovieScan,
+    file: &TrustedMovieFile,
+) -> bool {
+    association.folder == scan.folder
+        && association.folder_identity == scan.folder_identity
+        && association.relative_path == file.relative_path
+        && association.file_identity == file.file_identity
+        && association.fingerprint == file.fingerprint
+        && association.size == file.size
+}
+
+fn encode_movie_scan(scan: &CompletedMovieScan) -> Result<Vec<String>, &'static str> {
+    let mut response = Vec::with_capacity(3 + scan.files.len() * 13);
+    response.push("movie-library-v1".to_owned());
+    response.push(scan.association_status.to_owned());
+    response.push(scan.files.len().to_string());
+    for file in &scan.files {
+        response.push(file.file_id.clone());
+        response.push(
+            file.path
+                .to_str()
+                .map(str::to_owned)
+                .ok_or(MOVIES_SCAN_FAILED)?,
+        );
+        response.push(file.relative_path.clone());
+        response.push(file.size.to_string());
+        response.push(if file.association.is_some() {
+            "1".to_owned()
+        } else {
+            "0".to_owned()
+        });
+        if let Some(association) = &file.association {
+            response.push(association.tmdb_movie_id.to_string());
+            response.push(association.imdb_id.clone());
+            response.push(association.title.clone());
+            response.push(association.original_title.clone().unwrap_or_default());
+            response.push(association.release_date.clone().unwrap_or_default());
+            response.push(association.poster_path.clone().unwrap_or_default());
+            response.push(association.overview.clone().unwrap_or_default());
+            response.push(association.generation.to_string());
+        } else {
+            response.extend((0..8).map(|_| String::new()));
+        }
+    }
+    Ok(response)
+}
+
+fn scan_movies_library(
+    library: &mut MoviesLibraryContext,
+    association_path: &Path,
+) -> Result<Vec<String>, &'static str> {
+    let folder = library.folder.clone().ok_or(MOVIES_FOLDER_UNAVAILABLE)?;
+    library.generation = library.generation.wrapping_add(1);
+    let generation = library.generation;
+    library.completed_scan = None;
+    invalidate_movie_metadata_context(library);
+    let (folder_identity, mut files) = scan_trusted_movie_files(&folder, generation)?;
+    if library.folder.as_ref() != Some(&folder) || library.generation != generation {
+        return Err(MOVIE_METADATA_STALE);
+    }
+    let (associations, association_status) =
+        match read_movie_metadata_associations(association_path) {
+            Ok(associations) => (associations, "ready"),
+            Err(MovieMetadataReadError::Invalid) => (Vec::new(), "attention"),
+            Err(MovieMetadataReadError::Unavailable) => (Vec::new(), "unavailable"),
+        };
+    let scan_identity = CompletedMovieScan {
+        folder: folder.clone(),
+        folder_identity,
+        generation,
+        files: Vec::new(),
+        association_status,
+    };
+    for file in &mut files {
+        file.association = associations
+            .iter()
+            .find(|association| association_matches_file(association, &scan_identity, file))
+            .cloned();
+    }
+    library.movie_paths = files
+        .iter()
+        .map(|file| {
+            file.path
+                .to_str()
+                .map(str::to_owned)
+                .ok_or(MOVIES_SCAN_FAILED)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let scan = CompletedMovieScan {
+        files,
+        ..scan_identity
+    };
+    let response = encode_movie_scan(&scan)?;
+    library.completed_scan = Some(scan);
+    Ok(response)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -375,6 +1118,8 @@ enum MoviePathValidationError {
     Unavailable,
     NotFile,
     Unsupported,
+    OutsideFolder,
+    Stale,
 }
 
 impl MoviePathValidationError {
@@ -384,6 +1129,7 @@ impl MoviePathValidationError {
             Self::Unavailable => MOVIE_OPEN_UNAVAILABLE,
             Self::NotFile => MOVIE_OPEN_NOT_FILE,
             Self::Unsupported => MOVIE_OPEN_UNSUPPORTED,
+            Self::OutsideFolder | Self::Stale => MOVIE_OPEN_UNAVAILABLE,
         }
     }
 
@@ -393,6 +1139,7 @@ impl MoviePathValidationError {
             Self::Unavailable => MOVIE_REVEAL_UNAVAILABLE,
             Self::NotFile => MOVIE_REVEAL_NOT_FILE,
             Self::Unsupported => MOVIE_REVEAL_UNSUPPORTED,
+            Self::OutsideFolder | Self::Stale => MOVIE_REVEAL_UNAVAILABLE,
         }
     }
 
@@ -402,8 +1149,126 @@ impl MoviePathValidationError {
             Self::Unavailable => MOVIE_TRASH_UNAVAILABLE,
             Self::NotFile => MOVIE_TRASH_NOT_FILE,
             Self::Unsupported => MOVIE_TRASH_UNSUPPORTED,
+            Self::OutsideFolder => MOVIE_TRASH_OUTSIDE_FOLDER,
+            Self::Stale => MOVIE_TRASH_STALE,
         }
     }
+}
+
+fn validate_current_movie_file(
+    library: &MoviesLibraryContext,
+    requested_path: &Path,
+) -> Result<TrustedMovieFile, MoviePathValidationError> {
+    let folder = library
+        .folder
+        .as_deref()
+        .ok_or(MoviePathValidationError::Unavailable)?;
+    let scan = library
+        .completed_scan
+        .as_ref()
+        .ok_or(MoviePathValidationError::Stale)?;
+    if scan.folder != folder
+        || fs::canonicalize(folder).ok().as_deref() != Some(folder)
+        || movie_path_identity(folder, false).ok().as_deref() != Some(scan.folder_identity.as_str())
+    {
+        return Err(MoviePathValidationError::Stale);
+    }
+    let relative = requested_path
+        .strip_prefix(folder)
+        .map_err(|_| MoviePathValidationError::OutsideFolder)?;
+    let mut current = folder.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(MoviePathValidationError::OutsideFolder);
+        };
+        current.push(component);
+        let metadata =
+            fs::symlink_metadata(&current).map_err(|error| movie_metadata_error(&error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(MoviePathValidationError::NotFile);
+        }
+    }
+    let metadata = fs::metadata(requested_path).map_err(|error| movie_metadata_error(&error))?;
+    if !metadata.is_file() {
+        return Err(MoviePathValidationError::NotFile);
+    }
+    if !is_supported_movie(requested_path) {
+        return Err(MoviePathValidationError::Unsupported);
+    }
+    let canonical =
+        fs::canonicalize(requested_path).map_err(|error| movie_metadata_error(&error))?;
+    if canonical != requested_path || !canonical.starts_with(folder) {
+        return Err(MoviePathValidationError::OutsideFolder);
+    }
+    let trusted = scan
+        .files
+        .iter()
+        .find(|file| file.path == requested_path)
+        .cloned()
+        .ok_or(MoviePathValidationError::Stale)?;
+    if trusted.size != metadata.len()
+        || movie_path_identity(requested_path, true).ok().as_deref()
+            != Some(trusted.file_identity.as_str())
+        || movie_file_fingerprint(&metadata) != trusted.fingerprint
+    {
+        return Err(MoviePathValidationError::Stale);
+    }
+    Ok(trusted)
+}
+
+fn movie_metadata_authority(
+    library: &MoviesLibraryContext,
+    file_id: &str,
+) -> Result<MovieMetadataAuthority, &'static str> {
+    let scan = library
+        .completed_scan
+        .as_ref()
+        .ok_or(MOVIE_METADATA_STALE)?;
+    let file = scan
+        .files
+        .iter()
+        .find(|file| file.file_id == file_id)
+        .ok_or(MOVIE_METADATA_STALE)?;
+    let file =
+        validate_current_movie_file(library, &file.path).map_err(|_| MOVIE_METADATA_STALE)?;
+    Ok(MovieMetadataAuthority {
+        scan_generation: scan.generation,
+        folder: scan.folder.clone(),
+        folder_identity: scan.folder_identity.clone(),
+        file_id: file.file_id,
+        path: file.path,
+        relative_path: file.relative_path,
+        file_identity: file.file_identity,
+        fingerprint: file.fingerprint,
+        size: file.size,
+    })
+}
+
+fn validate_movie_metadata_authority(
+    library: &MoviesLibraryContext,
+    authority: &MovieMetadataAuthority,
+) -> Result<TrustedMovieFile, &'static str> {
+    let scan = library
+        .completed_scan
+        .as_ref()
+        .ok_or(MOVIE_METADATA_STALE)?;
+    if scan.generation != authority.scan_generation
+        || scan.folder != authority.folder
+        || scan.folder_identity != authority.folder_identity
+    {
+        return Err(MOVIE_METADATA_STALE);
+    }
+    let file =
+        validate_current_movie_file(library, &authority.path).map_err(|_| MOVIE_METADATA_STALE)?;
+    if file.file_id != authority.file_id
+        || file.relative_path != authority.relative_path
+        || file.file_identity != authority.file_identity
+        || file.fingerprint != authority.fingerprint
+        || file.size != authority.size
+    {
+        return Err(MOVIE_METADATA_STALE);
+    }
+    Ok(file)
 }
 
 fn movie_metadata_error(error: &io::Error) -> MoviePathValidationError {
@@ -414,6 +1279,7 @@ fn movie_metadata_error(error: &io::Error) -> MoviePathValidationError {
     }
 }
 
+#[cfg(test)]
 fn validate_movie_path(path: &Path) -> Result<(), MoviePathValidationError> {
     let metadata = fs::metadata(path).map_err(|error| movie_metadata_error(&error))?;
     if !metadata.is_file() {
@@ -426,6 +1292,7 @@ fn validate_movie_path(path: &Path) -> Result<(), MoviePathValidationError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn open_movie_path_with(
     path: &Path,
     dispatch: impl FnOnce(&Path) -> Result<(), ()>,
@@ -435,12 +1302,33 @@ fn open_movie_path_with(
     dispatch(path).map_err(|_| MOVIE_OPEN_FAILED)
 }
 
+#[cfg(test)]
 fn reveal_movie_path_with(
     path: &Path,
     dispatch: impl FnOnce(&Path) -> Result<(), ()>,
 ) -> Result<(), &'static str> {
     validate_movie_path(path).map_err(MoviePathValidationError::reveal_error_code)?;
 
+    dispatch(path).map_err(|_| MOVIE_REVEAL_FAILED)
+}
+
+fn open_movie_request_with(
+    path: &Path,
+    library: &MoviesLibraryContext,
+    dispatch: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    validate_current_movie_file(library, path)
+        .map_err(MoviePathValidationError::open_error_code)?;
+    dispatch(path).map_err(|_| MOVIE_OPEN_FAILED)
+}
+
+fn reveal_movie_request_with(
+    path: &Path,
+    library: &MoviesLibraryContext,
+    dispatch: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    validate_current_movie_file(library, path)
+        .map_err(MoviePathValidationError::reveal_error_code)?;
     dispatch(path).map_err(|_| MOVIE_REVEAL_FAILED)
 }
 
@@ -497,6 +1385,8 @@ fn trash_movie_request_with(
         .folder
         .as_deref()
         .ok_or(MOVIE_TRASH_FOLDER_UNAVAILABLE)?;
+    validate_current_movie_file(library, Path::new(&request.path))
+        .map_err(MoviePathValidationError::trash_error_code)?;
     let current_movie_paths = scan_movie_paths(folder).map_err(|error| {
         if error == MOVIES_FOLDER_UNAVAILABLE {
             MOVIE_TRASH_FOLDER_UNAVAILABLE
@@ -515,6 +1405,11 @@ fn trash_movie_request_with(
     library
         .movie_paths
         .retain(|movie_path| movie_path != &request.path);
+    if let Some(scan) = &mut library.completed_scan {
+        scan.files
+            .retain(|file| file.path != Path::new(&request.path));
+    }
+    invalidate_movie_metadata_context(library);
     Ok(())
 }
 
@@ -889,6 +1784,403 @@ fn fetch_yts_movie_releases_with(
     state.finish_release_lookup(generation, tmdb_movie_id, &details, &external_ids, &yts)
 }
 
+fn movie_metadata_optional_text(
+    object: &std::collections::BTreeMap<String, JsonValue>,
+    key: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, &'static str> {
+    match object.get(key) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(JsonValue::String(value)) if value.len() <= max_bytes => Ok(Some(value.clone())),
+        _ => Err(MOVIE_METADATA_MALFORMED),
+    }
+}
+
+fn movie_metadata_optional_date(
+    object: &std::collections::BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<String>, &'static str> {
+    match object.get(key) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) if value.is_empty() => Ok(None),
+        Some(JsonValue::String(value)) if valid_movie_metadata_date(value) => {
+            Ok(Some(value.clone()))
+        }
+        _ => Err(MOVIE_METADATA_MALFORMED),
+    }
+}
+
+fn movie_metadata_optional_poster(
+    object: &std::collections::BTreeMap<String, JsonValue>,
+) -> Result<Option<String>, &'static str> {
+    match object.get("poster_path") {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value))
+            if value.starts_with('/')
+                && value.len() <= 16 * 1024
+                && !value.chars().any(char::is_control) =>
+        {
+            Ok(Some(value.clone()))
+        }
+        _ => Err(MOVIE_METADATA_MALFORMED),
+    }
+}
+
+fn parse_movie_metadata_candidates(
+    document: &str,
+) -> Result<Vec<MovieMetadataCandidate>, &'static str> {
+    let document = JsonParser::new(document)
+        .parse()
+        .and_then(|value| json_object(&value).cloned())
+        .ok_or(MOVIE_METADATA_MALFORMED)?;
+    let results = document
+        .get("results")
+        .and_then(json_array)
+        .ok_or(MOVIE_METADATA_MALFORMED)?;
+    if results.len() > MOVIE_METADATA_MAX_CANDIDATES {
+        return Err(MOVIE_METADATA_MALFORMED);
+    }
+    let mut candidates = Vec::with_capacity(results.len());
+    let mut ids = HashSet::new();
+    for value in results {
+        let object = json_object(value).ok_or(MOVIE_METADATA_MALFORMED)?;
+        let tmdb_movie_id = json_u64(object, "id")
+            .filter(|id| *id > 0)
+            .ok_or(MOVIE_METADATA_MALFORMED)?;
+        let title = json_string(object, "title")
+            .filter(|title| !title.trim().is_empty() && title.len() <= 16 * 1024)
+            .map(str::to_owned)
+            .ok_or(MOVIE_METADATA_MALFORMED)?;
+        if !ids.insert(tmdb_movie_id) {
+            return Err(MOVIE_METADATA_MALFORMED);
+        }
+        candidates.push(MovieMetadataCandidate {
+            tmdb_movie_id,
+            title,
+            original_title: movie_metadata_optional_text(object, "original_title", 16 * 1024)?,
+            release_date: movie_metadata_optional_date(object, "release_date")?,
+            poster_path: movie_metadata_optional_poster(object)?,
+        });
+    }
+    Ok(candidates)
+}
+
+fn percent_encode_movie_metadata_query(query: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(query.len());
+    for byte in query.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(*byte));
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[usize::from(byte >> 4)] as char);
+            encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+    }
+    encoded
+}
+
+fn next_movie_metadata_operation(library: &mut MoviesLibraryContext) -> u64 {
+    library.metadata_operation_generation = library.metadata_operation_generation.wrapping_add(1);
+    if library.metadata_operation_generation == 0 {
+        library.metadata_operation_generation = 1;
+    }
+    library.metadata_operation_generation
+}
+
+fn begin_movie_metadata_search(
+    library: &mut MoviesLibraryContext,
+    file_id: &str,
+    query: &str,
+    token: &str,
+) -> Result<(u64, String), &'static str> {
+    if query.trim().is_empty()
+        || query.len() > MOVIE_METADATA_MAX_QUERY_BYTES
+        || query.chars().any(char::is_control)
+        || !is_valid_tmdb_token(token)
+    {
+        return Err(MOVIE_METADATA_CONTEXT_INVALID);
+    }
+    let authority = movie_metadata_authority(library, file_id)?;
+    let operation_generation = next_movie_metadata_operation(library);
+    let token_identity = hex_sha1(token.as_bytes());
+    let request_id = hex_sha1(
+        format!(
+            "search\0{operation_generation}\0{}\0{}\0{query}\0{token_identity}",
+            authority.file_id, authority.fingerprint
+        )
+        .as_bytes(),
+    );
+    library.metadata_verification = None;
+    library.metadata_search = Some(MovieMetadataSearch {
+        request_id: request_id.clone(),
+        operation_generation,
+        authority,
+        query: query.to_owned(),
+        token_identity,
+        candidates: Vec::new(),
+    });
+    Ok((operation_generation, request_id))
+}
+
+fn encode_movie_metadata_search(search: &MovieMetadataSearch) -> Vec<String> {
+    let mut response = Vec::with_capacity(2 + search.candidates.len() * 5);
+    response.push(search.request_id.clone());
+    response.push(search.candidates.len().to_string());
+    for candidate in &search.candidates {
+        response.push(candidate.tmdb_movie_id.to_string());
+        response.push(candidate.title.clone());
+        response.push(candidate.original_title.clone().unwrap_or_default());
+        response.push(candidate.release_date.clone().unwrap_or_default());
+        response.push(candidate.poster_path.clone().unwrap_or_default());
+    }
+    response
+}
+
+fn finish_movie_metadata_search(
+    library: &mut MoviesLibraryContext,
+    operation_generation: u64,
+    request_id: &str,
+    token: &str,
+    candidates: Vec<MovieMetadataCandidate>,
+) -> Result<Vec<String>, &'static str> {
+    let search = library
+        .metadata_search
+        .as_ref()
+        .filter(|search| {
+            search.operation_generation == operation_generation
+                && search.request_id == request_id
+                && search.token_identity == hex_sha1(token.as_bytes())
+        })
+        .cloned()
+        .ok_or(MOVIE_METADATA_CONTEXT_INVALID)?;
+    validate_movie_metadata_authority(library, &search.authority)?;
+    let current = library
+        .metadata_search
+        .as_mut()
+        .ok_or(MOVIE_METADATA_CONTEXT_INVALID)?;
+    current.candidates = candidates;
+    Ok(encode_movie_metadata_search(current))
+}
+
+fn parse_verified_movie_metadata(
+    authority: &MovieMetadataAuthority,
+    tmdb_movie_id: u64,
+    details_document: &str,
+    external_ids_document: &str,
+) -> Result<MovieMetadataAssociation, &'static str> {
+    let imdb_id = verified_movie_imdb_id(tmdb_movie_id, details_document, external_ids_document)
+        .map_err(|_| MOVIE_METADATA_MALFORMED)?;
+    let details = JsonParser::new(details_document)
+        .parse()
+        .and_then(|value| json_object(&value).cloned())
+        .ok_or(MOVIE_METADATA_MALFORMED)?;
+    if json_u64(&details, "id") != Some(tmdb_movie_id) {
+        return Err(MOVIE_METADATA_MALFORMED);
+    }
+    let title = json_string(&details, "title")
+        .filter(|title| !title.trim().is_empty() && title.len() <= 16 * 1024)
+        .map(str::to_owned)
+        .ok_or(MOVIE_METADATA_MALFORMED)?;
+    let association = MovieMetadataAssociation {
+        folder: authority.folder.clone(),
+        folder_identity: authority.folder_identity.clone(),
+        relative_path: authority.relative_path.clone(),
+        file_identity: authority.file_identity.clone(),
+        fingerprint: authority.fingerprint.clone(),
+        size: authority.size,
+        tmdb_movie_id,
+        imdb_id,
+        title,
+        original_title: movie_metadata_optional_text(&details, "original_title", 16 * 1024)?,
+        release_date: movie_metadata_optional_date(&details, "release_date")?,
+        poster_path: movie_metadata_optional_poster(&details)?,
+        overview: movie_metadata_optional_text(&details, "overview", 256 * 1024)?,
+        generation: 1,
+    };
+    validate_movie_metadata_association(&association).map_err(|_| MOVIE_METADATA_MALFORMED)?;
+    Ok(association)
+}
+
+fn begin_movie_metadata_verification(
+    library: &mut MoviesLibraryContext,
+    matching_request_id: &str,
+    tmdb_movie_id: u64,
+    token: &str,
+) -> Result<(u64, MovieMetadataSearch), &'static str> {
+    if tmdb_movie_id == 0 || !is_valid_tmdb_token(token) {
+        return Err(MOVIE_METADATA_CONTEXT_INVALID);
+    }
+    let search = library
+        .metadata_search
+        .as_ref()
+        .filter(|search| {
+            search.request_id == matching_request_id
+                && search.token_identity == hex_sha1(token.as_bytes())
+                && search
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.tmdb_movie_id == tmdb_movie_id)
+        })
+        .cloned()
+        .ok_or(MOVIE_METADATA_CONTEXT_INVALID)?;
+    validate_movie_metadata_authority(library, &search.authority)?;
+    let operation_generation = next_movie_metadata_operation(library);
+    library.metadata_verification = None;
+    Ok((operation_generation, search))
+}
+
+fn encode_movie_metadata_association(association: &MovieMetadataAssociation) -> Vec<String> {
+    vec![
+        association.tmdb_movie_id.to_string(),
+        association.imdb_id.clone(),
+        association.title.clone(),
+        association.original_title.clone().unwrap_or_default(),
+        association.release_date.clone().unwrap_or_default(),
+        association.poster_path.clone().unwrap_or_default(),
+        association.overview.clone().unwrap_or_default(),
+        association.generation.to_string(),
+    ]
+}
+
+fn finish_movie_metadata_verification(
+    library: &mut MoviesLibraryContext,
+    operation_generation: u64,
+    search: &MovieMetadataSearch,
+    tmdb_movie_id: u64,
+    token: &str,
+    association: MovieMetadataAssociation,
+) -> Result<Vec<String>, &'static str> {
+    if library.metadata_operation_generation != operation_generation
+        || library
+            .metadata_search
+            .as_ref()
+            .is_none_or(|current| current.request_id != search.request_id)
+        || search.token_identity != hex_sha1(token.as_bytes())
+        || association.tmdb_movie_id != tmdb_movie_id
+    {
+        return Err(MOVIE_METADATA_CONTEXT_INVALID);
+    }
+    validate_movie_metadata_authority(library, &search.authority)?;
+    let verification_id = hex_sha1(
+        format!(
+            "verify\0{operation_generation}\0{}\0{tmdb_movie_id}\0{}",
+            search.request_id, association.imdb_id
+        )
+        .as_bytes(),
+    );
+    library.metadata_verification = Some(MovieMetadataVerification {
+        verification_id: verification_id.clone(),
+        operation_generation,
+        matching_request_id: search.request_id.clone(),
+        authority: search.authority.clone(),
+        association: association.clone(),
+        token_identity: search.token_identity.clone(),
+    });
+    let mut response = vec![verification_id];
+    response.extend(encode_movie_metadata_association(&association));
+    Ok(response)
+}
+
+fn save_movie_metadata_match_with(
+    library: &mut MoviesLibraryContext,
+    persistence_path: &Path,
+    verification_id: &str,
+) -> Result<Vec<String>, &'static str> {
+    let verification = library
+        .metadata_verification
+        .as_ref()
+        .filter(|verification| {
+            verification.verification_id == verification_id
+                && verification.operation_generation == library.metadata_operation_generation
+        })
+        .cloned()
+        .ok_or(MOVIE_METADATA_CONTEXT_INVALID)?;
+    validate_movie_metadata_authority(library, &verification.authority)?;
+    let mut associations = read_movie_metadata_associations(persistence_path).map_err(|error| {
+        if error == MovieMetadataReadError::Unavailable {
+            MOVIE_METADATA_UNAVAILABLE
+        } else {
+            MOVIE_METADATA_PERSISTENCE_FAILED
+        }
+    })?;
+    associations.retain(|association| {
+        association.folder != verification.authority.folder
+            || association.folder_identity != verification.authority.folder_identity
+            || association.relative_path != verification.authority.relative_path
+    });
+    let generation = associations
+        .iter()
+        .map(|association| association.generation)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(MOVIE_METADATA_PERSISTENCE_FAILED)?;
+    let mut association = verification.association;
+    association.generation = generation;
+    associations.push(association.clone());
+    associations.sort_by(|left, right| {
+        left.folder
+            .cmp(&right.folder)
+            .then_with(|| left.folder_identity.cmp(&right.folder_identity))
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    write_movie_metadata_associations(persistence_path, &associations)?;
+    let scan = library
+        .completed_scan
+        .as_mut()
+        .ok_or(MOVIE_METADATA_STALE)?;
+    let file = scan
+        .files
+        .iter_mut()
+        .find(|file| file.file_id == verification.authority.file_id)
+        .ok_or(MOVIE_METADATA_STALE)?;
+    file.association = Some(association.clone());
+    invalidate_movie_metadata_context(library);
+    Ok(encode_movie_metadata_association(&association))
+}
+
+fn clear_movie_metadata_match_with(
+    library: &mut MoviesLibraryContext,
+    persistence_path: &Path,
+    file_id: &str,
+) -> Result<(), &'static str> {
+    let authority = movie_metadata_authority(library, file_id)?;
+    let mut associations = read_movie_metadata_associations(persistence_path).map_err(|error| {
+        if error == MovieMetadataReadError::Unavailable {
+            MOVIE_METADATA_UNAVAILABLE
+        } else {
+            MOVIE_METADATA_PERSISTENCE_FAILED
+        }
+    })?;
+    let original_count = associations.len();
+    associations.retain(|association| {
+        association.folder != authority.folder
+            || association.folder_identity != authority.folder_identity
+            || association.relative_path != authority.relative_path
+            || association.file_identity != authority.file_identity
+            || association.fingerprint != authority.fingerprint
+            || association.size != authority.size
+    });
+    if associations.len() == original_count {
+        return Err(MOVIE_METADATA_STALE);
+    }
+    write_movie_metadata_associations(persistence_path, &associations)?;
+    let scan = library
+        .completed_scan
+        .as_mut()
+        .ok_or(MOVIE_METADATA_STALE)?;
+    let file = scan
+        .files
+        .iter_mut()
+        .find(|file| file.file_id == file_id)
+        .ok_or(MOVIE_METADATA_STALE)?;
+    file.association = None;
+    invalidate_movie_metadata_context(library);
+    Ok(())
+}
+
 fn fetch_javdb_vr_catalog_with(
     code: &str,
     request: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
@@ -946,6 +2238,13 @@ fn movies_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map(|directory| directory.join(MOVIES_FOLDER_FILE_NAME))
         .map_err(|_| MOVIES_FOLDER_STORAGE_FAILED.to_owned())
+}
+
+fn movie_metadata_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(MOVIE_METADATA_FILE_NAME))
+        .map_err(|_| MOVIE_METADATA_PERSISTENCE_FAILED.to_owned())
 }
 
 fn adult_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -1014,6 +2313,8 @@ fn load_movies_folder(
         .map_err(|_| MOVIES_FOLDER_STORAGE_FAILED.to_owned())?;
     library.folder = folder;
     library.movie_paths.clear();
+    library.completed_scan = None;
+    invalidate_movie_metadata_context(&mut library);
     Ok(response)
 }
 
@@ -1059,6 +2360,8 @@ async fn choose_movies_folder(
         .map_err(|_| MOVIES_FOLDER_STORAGE_FAILED.to_owned())?;
     library.folder = Some(folder);
     library.movie_paths.clear();
+    library.completed_scan = None;
+    invalidate_movie_metadata_context(&mut library);
     Ok(Some(response))
 }
 
@@ -1076,15 +2379,21 @@ fn clear_movies_folder(
         .map_err(|_| MOVIES_FOLDER_STORAGE_FAILED.to_owned())?;
     library.folder = None;
     library.movie_paths.clear();
+    library.completed_scan = None;
+    invalidate_movie_metadata_context(&mut library);
     Ok(())
 }
 
 #[tauri::command]
-async fn scan_movies(state: tauri::State<'_, MoviesLibraryState>) -> Result<Vec<String>, String> {
+async fn scan_movies(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<Vec<String>, String> {
     let state = state.inner().clone();
+    let association_path = movie_metadata_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut library = state.0.lock().map_err(|_| MOVIES_SCAN_FAILED.to_owned())?;
-        scan_movies_library(&mut library).map_err(str::to_owned)
+        scan_movies_library(&mut library, &association_path).map_err(str::to_owned)
     })
     .await
     .map_err(|_| MOVIES_SCAN_FAILED.to_owned())?
@@ -1112,9 +2421,14 @@ async fn query_movies_storage(
 }
 
 #[tauri::command]
-async fn open_movie(path: String) -> Result<(), String> {
+async fn open_movie(
+    path: String,
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        open_movie_path_with(Path::new(&path), |movie_path| {
+        let library = state.0.lock().map_err(|_| MOVIE_OPEN_UNAVAILABLE)?;
+        open_movie_request_with(Path::new(&path), &library, |movie_path| {
             tauri_plugin_opener::open_path(movie_path, None::<&str>).map_err(|_| ())
         })
     })
@@ -1124,9 +2438,14 @@ async fn open_movie(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn reveal_movie(path: String) -> Result<(), String> {
+async fn reveal_movie(
+    path: String,
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        reveal_movie_path_with(Path::new(&path), |movie_path| {
+        let library = state.0.lock().map_err(|_| MOVIE_REVEAL_UNAVAILABLE)?;
+        reveal_movie_request_with(Path::new(&path), &library, |movie_path| {
             tauri_plugin_opener::reveal_item_in_dir(movie_path).map_err(|_| ())
         })
     })
@@ -1480,10 +2799,17 @@ fn load_tmdb_token(app: tauri::AppHandle) -> Result<Option<String>, String> {
 fn save_tmdb_token(
     app: tauri::AppHandle,
     token: String,
+    movie_library_state: tauri::State<'_, MoviesLibraryState>,
     tv_release_state: tauri::State<'_, TvReleaseState>,
     tv_torrent_state: tauri::State<'_, TvTorrentState>,
 ) -> Result<(), String> {
     save_tmdb_token_file(&tmdb_token_path(&app)?, &token).map_err(str::to_owned)?;
+    let mut movie_library = movie_library_state
+        .0
+        .lock()
+        .map_err(|_| MOVIE_METADATA_UNAVAILABLE.to_owned())?;
+    invalidate_movie_metadata_context(&mut movie_library);
+    drop(movie_library);
     tv_release_state.invalidate().map_err(str::to_owned)?;
     tv_torrent_state
         .invalidate_inspection()
@@ -1493,10 +2819,17 @@ fn save_tmdb_token(
 #[tauri::command]
 fn clear_tmdb_token(
     app: tauri::AppHandle,
+    movie_library_state: tauri::State<'_, MoviesLibraryState>,
     tv_release_state: tauri::State<'_, TvReleaseState>,
     tv_torrent_state: tauri::State<'_, TvTorrentState>,
 ) -> Result<(), String> {
     clear_tmdb_token_file(&tmdb_token_path(&app)?).map_err(str::to_owned)?;
+    let mut movie_library = movie_library_state
+        .0
+        .lock()
+        .map_err(|_| MOVIE_METADATA_UNAVAILABLE.to_owned())?;
+    invalidate_movie_metadata_context(&mut movie_library);
+    drop(movie_library);
     tv_release_state.invalidate().map_err(str::to_owned)?;
     tv_torrent_state
         .invalidate_inspection()
@@ -1937,6 +3270,148 @@ async fn fetch_sukebei_vr_releases(
 }
 
 #[tauri::command]
+async fn search_movie_metadata(
+    app: tauri::AppHandle,
+    file_id: String,
+    query: String,
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<Vec<String>, String> {
+    let token_path = tmdb_token_path(&app)?;
+    let token = load_tmdb_token_file(&token_path)
+        .map_err(str::to_owned)?
+        .ok_or_else(|| MOVIE_TMDB_UNAUTHORIZED.to_owned())?;
+    let state = state.inner().clone();
+    let (operation_generation, request_id) = {
+        let mut library = state
+            .0
+            .lock()
+            .map_err(|_| MOVIE_METADATA_UNAVAILABLE.to_owned())?;
+        begin_movie_metadata_search(&mut library, &file_id, &query, &token)
+            .map_err(str::to_owned)?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let url = format!(
+            "{TMDB_MOVIE_SEARCH_URL}{}",
+            percent_encode_movie_metadata_query(&query)
+        );
+        let document = fetch_movie_provider_document(&url, Some(&token))
+            .map_err(tmdb_movie_provider_error_code)?;
+        let candidates = parse_movie_metadata_candidates(&document)?;
+        if load_tmdb_token_file(&token_path).ok().flatten().as_deref() != Some(token.as_str()) {
+            return Err(MOVIE_METADATA_CONTEXT_INVALID);
+        }
+        let mut library = state.0.lock().map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
+        finish_movie_metadata_search(
+            &mut library,
+            operation_generation,
+            &request_id,
+            &token,
+            candidates,
+        )
+    })
+    .await
+    .map_err(|_| MOVIE_TMDB_PROVIDER_ERROR.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn verify_movie_metadata_candidate(
+    app: tauri::AppHandle,
+    matching_request_id: String,
+    tmdb_movie_id: u64,
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<Vec<String>, String> {
+    let token_path = tmdb_token_path(&app)?;
+    let token = load_tmdb_token_file(&token_path)
+        .map_err(str::to_owned)?
+        .ok_or_else(|| MOVIE_TMDB_UNAUTHORIZED.to_owned())?;
+    let state = state.inner().clone();
+    let (operation_generation, search) = {
+        let mut library = state
+            .0
+            .lock()
+            .map_err(|_| MOVIE_METADATA_UNAVAILABLE.to_owned())?;
+        begin_movie_metadata_verification(&mut library, &matching_request_id, tmdb_movie_id, &token)
+            .map_err(str::to_owned)?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let details_url = format!("{TMDB_MOVIE_URL}{tmdb_movie_id}");
+        let details = fetch_movie_provider_document(&details_url, Some(&token))
+            .map_err(tmdb_movie_provider_error_code)?;
+        let external_ids =
+            fetch_movie_provider_document(&format!("{details_url}/external_ids"), Some(&token))
+                .map_err(tmdb_movie_provider_error_code)?;
+        let association = parse_verified_movie_metadata(
+            &search.authority,
+            tmdb_movie_id,
+            &details,
+            &external_ids,
+        )?;
+        if load_tmdb_token_file(&token_path).ok().flatten().as_deref() != Some(token.as_str()) {
+            return Err(MOVIE_METADATA_CONTEXT_INVALID);
+        }
+        let mut library = state.0.lock().map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
+        finish_movie_metadata_verification(
+            &mut library,
+            operation_generation,
+            &search,
+            tmdb_movie_id,
+            &token,
+            association,
+        )
+    })
+    .await
+    .map_err(|_| MOVIE_TMDB_PROVIDER_ERROR.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn save_movie_metadata_match(
+    app: tauri::AppHandle,
+    verification_id: String,
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<Vec<String>, String> {
+    let persistence_path = movie_metadata_path(&app)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut library = state.0.lock().map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
+        save_movie_metadata_match_with(&mut library, &persistence_path, &verification_id)
+    })
+    .await
+    .map_err(|_| MOVIE_METADATA_PERSISTENCE_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn clear_movie_metadata_match(
+    app: tauri::AppHandle,
+    file_id: String,
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<(), String> {
+    let persistence_path = movie_metadata_path(&app)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut library = state.0.lock().map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
+        clear_movie_metadata_match_with(&mut library, &persistence_path, &file_id)
+    })
+    .await
+    .map_err(|_| MOVIE_METADATA_PERSISTENCE_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn invalidate_movie_metadata_match_context(
+    state: tauri::State<'_, MoviesLibraryState>,
+) -> Result<(), String> {
+    let mut library = state
+        .0
+        .lock()
+        .map_err(|_| MOVIE_METADATA_UNAVAILABLE.to_owned())?;
+    invalidate_movie_metadata_context(&mut library);
+    Ok(())
+}
+
+#[tauri::command]
 async fn fetch_yts_movie_releases(
     app: tauri::AppHandle,
     tmdb_movie_id: u64,
@@ -2363,6 +3838,11 @@ fn main() {
             open_movie,
             reveal_movie,
             trash_movie,
+            search_movie_metadata,
+            verify_movie_metadata_candidate,
+            save_movie_metadata_match,
+            clear_movie_metadata_match,
+            invalidate_movie_metadata_match_context,
             load_tv_folder,
             choose_tv_folder,
             clear_tv_folder,
@@ -2446,22 +3926,28 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::parse_windows_volume_storage;
     use super::{
-        clear_movies_folder_file, clear_tmdb_token_file, fetch_javdb_adult_catalog_with,
-        fetch_javdb_vr_catalog_with, fetch_sukebei_adult_releases_with,
-        fetch_sukebei_vr_releases_with, fetch_yts_movie_releases_with, load_movies_folder_file,
-        load_tmdb_token_file, movie_metadata_error, open_movie_path_with,
-        parse_movie_provider_response, parse_provider_response, query_movies_volume_storage_with,
-        reveal_movie_path_with, save_movies_folder_file, save_tmdb_token_file, scan_movie_paths,
+        begin_movie_metadata_search, begin_movie_metadata_verification,
+        clear_movie_metadata_match_with, clear_movies_folder_file, clear_tmdb_token_file,
+        fetch_javdb_adult_catalog_with, fetch_javdb_vr_catalog_with,
+        fetch_sukebei_adult_releases_with, fetch_sukebei_vr_releases_with,
+        fetch_yts_movie_releases_with, finish_movie_metadata_search,
+        finish_movie_metadata_verification, load_movies_folder_file, load_tmdb_token_file,
+        movie_metadata_error, open_movie_path_with, parse_movie_metadata_candidates,
+        parse_movie_provider_response, parse_provider_response, parse_verified_movie_metadata,
+        query_movies_volume_storage_with, reveal_movie_path_with, save_movie_metadata_match_with,
+        save_movies_folder_file, save_tmdb_token_file, scan_movie_paths, scan_movies_library,
         trash_movie_path_with, trash_movie_request_with, MoviePathValidationError,
         MovieProviderRequestError, MovieTorrentState, MoviesLibraryContext,
         MoviesVolumeStorageQueryError, ProviderRequestError, TrashMovieRequest,
         ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
-        MOVIES_STORAGE_UNAVAILABLE, MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND,
-        MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE,
-        MOVIE_REVEAL_NOT_FOUND, MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED,
-        MOVIE_TRASH_FAILED, MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE,
-        MOVIE_TRASH_NOT_FOUND, MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE,
-        MOVIE_TRASH_UNAVAILABLE, MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID, VR_PROVIDER_ERROR,
+        MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID, MOVIE_METADATA_MALFORMED,
+        MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE, MOVIE_OPEN_FAILED,
+        MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED,
+        MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
+        MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED,
+        MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND,
+        MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE, MOVIE_TRASH_UNAVAILABLE,
+        MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID, VR_PROVIDER_ERROR,
     };
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -2501,6 +3987,20 @@ mod tests {
         path.into_os_string()
             .into_string()
             .expect("fixture paths must be valid Unicode")
+    }
+
+    fn scan_trusted_movie_fixture(
+        fixture: &FilesystemFixture,
+        association_path: &Path,
+    ) -> MoviesLibraryContext {
+        let folder = fs::canonicalize(&fixture.path).expect("fixture folder must canonicalize");
+        let mut library = MoviesLibraryContext {
+            folder: Some(folder),
+            ..MoviesLibraryContext::default()
+        };
+        scan_movies_library(&mut library, association_path)
+            .expect("trusted Movie scan must succeed");
+        library
     }
 
     #[test]
@@ -2834,6 +4334,389 @@ mod tests {
     }
 
     #[test]
+    fn persists_reloads_and_clears_only_an_explicit_verified_movie_match() {
+        let fixture = FilesystemFixture::new();
+        let created_path = fixture.create_file("Nested/映画  —  Exact.Movie.MKV");
+        fs::write(&created_path, b"exact local movie bytes")
+            .expect("failed to write fixture Movie bytes");
+        let association_path = fixture.path.join("movie-metadata");
+        let mut library = scan_trusted_movie_fixture(&fixture, &association_path);
+        let scanned_file = library
+            .completed_scan
+            .as_ref()
+            .and_then(|scan| scan.files.first())
+            .cloned()
+            .expect("trusted scan must contain the Movie");
+
+        let candidates = parse_movie_metadata_candidates(
+            r#"{"results":[{"id":101,"title":"同じ題名","original_title":"Original One","release_date":"2001-01-01","poster_path":"/one.jpg"},{"id":202,"title":"同じ題名","original_title":"Original Two","release_date":"2002-02-02","poster_path":"/two.jpg"}]}"#,
+        )
+        .expect("valid same-title candidates must parse");
+        let (search_generation, matching_request_id) = begin_movie_metadata_search(
+            &mut library,
+            &scanned_file.file_id,
+            "同じ  題名",
+            "fixture-token",
+        )
+        .expect("explicit matching search must begin");
+        let search_response = finish_movie_metadata_search(
+            &mut library,
+            search_generation,
+            &matching_request_id,
+            "fixture-token",
+            candidates,
+        )
+        .expect("matching search must finish");
+        assert_eq!(search_response[1], "2");
+        assert!(library.metadata_verification.is_none());
+
+        let (verification_generation, search) = begin_movie_metadata_verification(
+            &mut library,
+            &matching_request_id,
+            202,
+            "fixture-token",
+        )
+        .expect("the manually chosen candidate must begin verification");
+        let association = parse_verified_movie_metadata(
+            &search.authority,
+            202,
+            r#"{"id":202,"title":"Accepted  Title — 特別版","original_title":"Original Two","release_date":"2002-02-02","poster_path":"/two.jpg","overview":"Exact verified overview."}"#,
+            r#"{"id":202,"imdb_id":"tt7654321"}"#,
+        )
+        .expect("exact TMDB and canonical IMDb details must verify");
+        let verification_response = finish_movie_metadata_verification(
+            &mut library,
+            verification_generation,
+            &search,
+            202,
+            "fixture-token",
+            association,
+        )
+        .expect("manual verification must finish");
+        assert_eq!(verification_response[3], "Accepted  Title — 特別版");
+        assert_eq!(verification_response[2], "tt7654321");
+
+        let saved = save_movie_metadata_match_with(
+            &mut library,
+            &association_path,
+            &verification_response[0],
+        )
+        .expect("verified association must persist");
+        assert_eq!(saved[0], "202");
+        assert_eq!(saved[1], "tt7654321");
+        assert_eq!(saved[2], "Accepted  Title — 特別版");
+        assert_eq!(
+            fs::read(&scanned_file.path).unwrap(),
+            b"exact local movie bytes"
+        );
+
+        let mut restarted = scan_trusted_movie_fixture(&fixture, &association_path);
+        let restarted_file = restarted
+            .completed_scan
+            .as_ref()
+            .and_then(|scan| scan.files.first())
+            .cloned()
+            .expect("restarted scan must contain the exact Movie");
+        let restarted_association = restarted_file
+            .association
+            .as_ref()
+            .expect("exact persisted metadata must load without a provider request");
+        assert_eq!(restarted_association.title, "Accepted  Title — 特別版");
+        assert_eq!(restarted_association.imdb_id, "tt7654321");
+
+        clear_movie_metadata_match_with(&mut restarted, &association_path, &restarted_file.file_id)
+            .expect("metadata-only clearing must persist");
+        assert_eq!(
+            fs::read(&scanned_file.path).unwrap(),
+            b"exact local movie bytes"
+        );
+        let cleared = scan_trusted_movie_fixture(&fixture, &association_path);
+        assert!(cleared.completed_scan.as_ref().unwrap().files[0]
+            .association
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_stale_searches_and_prevents_moved_or_replaced_files_from_inheriting_metadata() {
+        let fixture = FilesystemFixture::new();
+        let created_path = fixture.create_file("Exact.mp4");
+        fs::write(&created_path, b"original movie").expect("failed to write original Movie bytes");
+        let association_path = fixture.path.join("movie-metadata");
+        let mut library = scan_trusted_movie_fixture(&fixture, &association_path);
+        let original = library.completed_scan.as_ref().unwrap().files[0].clone();
+        let candidates = parse_movie_metadata_candidates(
+            r#"{"results":[{"id":419,"title":"Exact Movie","release_date":"1999-04-19","poster_path":null}]}"#,
+        )
+        .unwrap();
+        let (stale_generation, stale_request_id) = begin_movie_metadata_search(
+            &mut library,
+            &original.file_id,
+            "Exact Movie",
+            "fixture-token",
+        )
+        .unwrap();
+        fs::write(&original.path, b"changed movie bytes")
+            .expect("failed to change the fixture Movie");
+        assert_eq!(
+            finish_movie_metadata_search(
+                &mut library,
+                stale_generation,
+                &stale_request_id,
+                "fixture-token",
+                candidates.clone(),
+            ),
+            Err(MOVIE_METADATA_STALE)
+        );
+        assert!(!association_path.exists());
+
+        let mut current = scan_trusted_movie_fixture(&fixture, &association_path);
+        let current_file = current.completed_scan.as_ref().unwrap().files[0].clone();
+        let (token_generation, token_request_id) = begin_movie_metadata_search(
+            &mut current,
+            &current_file.file_id,
+            "Exact Movie",
+            "different-token",
+        )
+        .unwrap();
+        assert_eq!(
+            finish_movie_metadata_search(
+                &mut current,
+                token_generation,
+                &token_request_id,
+                "fixture-token",
+                candidates.clone(),
+            ),
+            Err(MOVIE_METADATA_CONTEXT_INVALID)
+        );
+
+        let (search_generation, request_id) = begin_movie_metadata_search(
+            &mut current,
+            &current_file.file_id,
+            "Exact Movie",
+            "fixture-token",
+        )
+        .unwrap();
+        finish_movie_metadata_search(
+            &mut current,
+            search_generation,
+            &request_id,
+            "fixture-token",
+            candidates,
+        )
+        .unwrap();
+        let (verification_generation, search) =
+            begin_movie_metadata_verification(&mut current, &request_id, 419, "fixture-token")
+                .unwrap();
+        let association = parse_verified_movie_metadata(
+            &search.authority,
+            419,
+            r#"{"id":419,"title":"Exact Movie","release_date":"1999-04-19"}"#,
+            r#"{"id":419,"imdb_id":"tt0123456"}"#,
+        )
+        .unwrap();
+        let verified = finish_movie_metadata_verification(
+            &mut current,
+            verification_generation,
+            &search,
+            419,
+            "fixture-token",
+            association,
+        )
+        .unwrap();
+        save_movie_metadata_match_with(&mut current, &association_path, &verified[0]).unwrap();
+
+        let other_fixture = FilesystemFixture::new();
+        let other_folder = fs::canonicalize(&other_fixture.path).unwrap();
+        let moved_path = other_folder.join("Moved.mp4");
+        fs::rename(&current_file.path, &moved_path).expect("failed to move associated Movie");
+        fs::write(&current_file.path, b"changed movie bytes")
+            .expect("failed to create replacement Movie");
+
+        let replacement_scan = scan_trusted_movie_fixture(&fixture, &association_path);
+        assert!(replacement_scan.completed_scan.as_ref().unwrap().files[0]
+            .association
+            .is_none());
+        let moved_scan = scan_trusted_movie_fixture(&other_fixture, &association_path);
+        assert!(moved_scan.completed_scan.as_ref().unwrap().files[0]
+            .association
+            .is_none());
+        assert_eq!(fs::read(moved_path).unwrap(), b"changed movie bytes");
+    }
+
+    #[test]
+    fn rejects_malformed_or_conflicting_tmdb_movie_identity_documents() {
+        assert_eq!(
+            parse_movie_metadata_candidates(
+                r#"{"results":[{"id":7,"title":"Duplicate"},{"id":7,"title":"Conflict"}]}"#,
+            ),
+            Err(MOVIE_METADATA_MALFORMED)
+        );
+        for document in [
+            r#"{"results":[{"id":0,"title":"Invalid"}]}"#,
+            r#"{"results":[{"id":1,"title":"   "}]}"#,
+            r#"{"results":[{"id":1,"title":"Invalid","release_date":"2024"}]}"#,
+            r#"{"results":[{"id":1,"title":"Invalid","poster_path":"https://example.invalid/poster.jpg"}]}"#,
+            r#"{"results":null}"#,
+        ] {
+            assert_eq!(
+                parse_movie_metadata_candidates(document),
+                Err(MOVIE_METADATA_MALFORMED)
+            );
+        }
+
+        let fixture = FilesystemFixture::new();
+        fixture.create_file("Exact.mp4");
+        let association_path = fixture.path.join("movie-metadata");
+        let library = scan_trusted_movie_fixture(&fixture, &association_path);
+        let file_id = &library.completed_scan.as_ref().unwrap().files[0].file_id;
+        let authority = super::movie_metadata_authority(&library, file_id).unwrap();
+        for (details, external_ids) in [
+            (
+                r#"{"id":420,"title":"Wrong Movie"}"#,
+                r#"{"id":419,"imdb_id":"tt0123456"}"#,
+            ),
+            (
+                r#"{"id":419,"title":"Exact Movie"}"#,
+                r#"{"id":420,"imdb_id":"tt0123456"}"#,
+            ),
+            (
+                r#"{"id":419,"title":"Exact Movie"}"#,
+                r#"{"id":419,"imdb_id":null}"#,
+            ),
+        ] {
+            assert_eq!(
+                parse_verified_movie_metadata(&authority, 419, details, external_ids),
+                Err(MOVIE_METADATA_MALFORMED)
+            );
+        }
+        assert_eq!(
+            parse_verified_movie_metadata(
+                &authority,
+                419,
+                r#"{"id":419,"title":"Exact Movie"}"#,
+                r#"{"id":419,"imdb_id":"TT0123456"}"#,
+            )
+            .unwrap()
+            .imdb_id,
+            "tt0123456"
+        );
+    }
+
+    #[test]
+    fn keeps_local_movies_available_when_metadata_storage_is_corrupt_or_oversized() {
+        let fixture = FilesystemFixture::new();
+        let movie_path = fixture.create_file("Available.mp4");
+        fs::write(&movie_path, b"available local bytes").unwrap();
+        let association_path = fixture.path.join("movie-metadata");
+        fs::write(&association_path, b"corrupt association data").unwrap();
+
+        let mut library = scan_trusted_movie_fixture(&fixture, &association_path);
+        let scan = library.completed_scan.as_ref().unwrap();
+        assert_eq!(scan.association_status, "attention");
+        assert_eq!(scan.files.len(), 1);
+        assert!(scan.files[0].association.is_none());
+        let file_id = scan.files[0].file_id.clone();
+        let candidates =
+            parse_movie_metadata_candidates(r#"{"results":[{"id":419,"title":"Exact Movie"}]}"#)
+                .unwrap();
+        let (search_generation, request_id) =
+            begin_movie_metadata_search(&mut library, &file_id, "Exact Movie", "fixture-token")
+                .unwrap();
+        finish_movie_metadata_search(
+            &mut library,
+            search_generation,
+            &request_id,
+            "fixture-token",
+            candidates,
+        )
+        .unwrap();
+        let (verification_generation, search) =
+            begin_movie_metadata_verification(&mut library, &request_id, 419, "fixture-token")
+                .unwrap();
+        let association = parse_verified_movie_metadata(
+            &search.authority,
+            419,
+            r#"{"id":419,"title":"Exact Movie"}"#,
+            r#"{"id":419,"imdb_id":"tt0123456"}"#,
+        )
+        .unwrap();
+        let verified = finish_movie_metadata_verification(
+            &mut library,
+            verification_generation,
+            &search,
+            419,
+            "fixture-token",
+            association,
+        )
+        .unwrap();
+        assert_eq!(
+            save_movie_metadata_match_with(&mut library, &association_path, &verified[0]),
+            Err(MOVIE_METADATA_PERSISTENCE_FAILED)
+        );
+        assert_eq!(fs::read(&movie_path).unwrap(), b"available local bytes");
+
+        fs::write(
+            &association_path,
+            vec![0; super::MOVIE_METADATA_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        let oversized = scan_trusted_movie_fixture(&fixture, &association_path);
+        assert_eq!(
+            oversized
+                .completed_scan
+                .as_ref()
+                .unwrap()
+                .association_status,
+            "attention"
+        );
+        assert_eq!(oversized.completed_scan.as_ref().unwrap().files.len(), 1);
+
+        let oversized_file = &oversized.completed_scan.as_ref().unwrap().files[0];
+        let authority = super::movie_metadata_authority(&oversized, &oversized_file.file_id)
+            .expect("the local Movie must remain trusted");
+        let association = super::MovieMetadataAssociation {
+            folder: authority.folder,
+            folder_identity: authority.folder_identity,
+            relative_path: authority.relative_path,
+            file_identity: authority.file_identity,
+            fingerprint: authority.fingerprint,
+            size: authority.size,
+            tmdb_movie_id: 419,
+            imdb_id: "tt0123456".to_owned(),
+            title: "Exact Movie".to_owned(),
+            original_title: None,
+            release_date: None,
+            poster_path: None,
+            overview: None,
+            generation: 1,
+        };
+        let conflicting = super::MovieMetadataAssociation {
+            tmdb_movie_id: 420,
+            imdb_id: "tt7654321".to_owned(),
+            title: "Conflicting Movie".to_owned(),
+            generation: 2,
+            ..association.clone()
+        };
+        fs::write(
+            &association_path,
+            super::encoded_movie_metadata_associations(&[association, conflicting]).unwrap(),
+        )
+        .unwrap();
+        let conflicting = scan_trusted_movie_fixture(&fixture, &association_path);
+        assert_eq!(
+            conflicting
+                .completed_scan
+                .as_ref()
+                .unwrap()
+                .association_status,
+            "attention"
+        );
+        assert!(conflicting.completed_scan.as_ref().unwrap().files[0]
+            .association
+            .is_none());
+    }
+
+    #[test]
     fn opens_the_exact_supported_movie_path_after_validation() {
         let fixture = FilesystemFixture::new();
         let movie_path = fixture.create_file("映画  —  Final.CUT!.MKV");
@@ -2867,12 +4750,10 @@ mod tests {
     fn trashes_the_exact_current_movie_path_after_root_validation() {
         let fixture = FilesystemFixture::new();
         fixture.create_file("nested/映画  —  Final.CUT!.MKV");
-        let movie_paths = scan_movie_paths(&fixture.path).expect("failed to scan fixture");
+        let association_path = fixture.path.join("metadata-associations");
+        let mut library = scan_trusted_movie_fixture(&fixture, &association_path);
+        let movie_paths = library.movie_paths.clone();
         let movie_path = PathBuf::from(&movie_paths[0]);
-        let mut library = MoviesLibraryContext {
-            folder: Some(fixture.path.clone()),
-            movie_paths: movie_paths.clone(),
-        };
         let dispatched_path = RefCell::new(None);
 
         let result = trash_movie_request_with(
@@ -2896,14 +4777,12 @@ mod tests {
     #[test]
     fn trash_rejects_fabricated_context_for_a_movie_outside_the_trusted_library() {
         let trusted_fixture = FilesystemFixture::new();
-        let trusted_movie = trusted_fixture.create_file("Trusted.mp4");
+        trusted_fixture.create_file("Trusted.mp4");
         let unrelated_fixture = FilesystemFixture::new();
         let unrelated_movie = unrelated_fixture.create_file("Unrelated.mkv");
         let unrelated_movie_path = path_string(unrelated_movie.clone());
-        let mut trusted_library = MoviesLibraryContext {
-            folder: Some(trusted_fixture.path.clone()),
-            movie_paths: vec![path_string(trusted_movie)],
-        };
+        let association_path = trusted_fixture.path.join("metadata-associations");
+        let mut trusted_library = scan_trusted_movie_fixture(&trusted_fixture, &association_path);
         let dispatched = RefCell::new(false);
 
         let result = trash_movie_request_with(

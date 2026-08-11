@@ -58,12 +58,21 @@ import {
   type AdultLibraryItem,
 } from "@/adult";
 import {
+  clearMovieMetadataMatch,
   fetchVerifiedYtsMovieReleases,
   inspectVerifiedYtsMovieTorrent,
+  invalidateMovieMetadataMatchContext,
   invalidateMovieReleaseContext,
   invalidateVerifiedMovieTorrent,
+  parseMovieLibraryScan,
   saveVerifiedMovieTorrent,
+  saveMovieMetadataMatch,
+  searchMovieMetadata,
   startVerifiedMovieDownload,
+  verifyMovieMetadataCandidate,
+  type MovieLibraryFile,
+  type MovieMetadataAssociation,
+  type MovieMetadataCandidate,
   type MovieReleaseContext,
   type MovieReleasesResult,
   type YtsMovieRelease,
@@ -251,7 +260,7 @@ const appIcons = {
 type AppearanceMode = (typeof appearanceModes)[number]["id"];
 type IconName = keyof typeof appIcons;
 type ResolvedTheme = Exclude<AppearanceMode, "system">;
-type Movie = { path: string; title: string };
+type Movie = MovieLibraryFile & { title: string };
 type LibraryTitleSortDirection = "ascending" | "descending";
 type MovieScanState =
   | { status: "unconfigured" }
@@ -259,7 +268,40 @@ type MovieScanState =
   | { status: "empty" }
   | { status: "unavailable" }
   | { status: "error" }
-  | { status: "ready"; movies: Movie[] };
+  | {
+      status: "ready";
+      movies: Movie[];
+      metadataStatus: "ready" | "attention" | "unavailable";
+    };
+type MovieMetadataSearchState =
+  | { status: "ready"; matchingRequestId: string; candidates: MovieMetadataCandidate[] }
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "empty" }
+  | { status: "unauthorized" }
+  | { status: "rate-limited" }
+  | { status: "network-error" }
+  | { status: "provider-error" }
+  | { status: "malformed-provider" }
+  | { status: "stale" };
+type MovieMetadataVerificationState =
+  | { status: "idle" }
+  | { status: "loading"; candidateId: number }
+  | {
+      status: "ready";
+      verificationId: string;
+      association: MovieMetadataAssociation;
+    }
+  | { status: "unauthorized" }
+  | { status: "rate-limited" }
+  | { status: "network-error" }
+  | { status: "provider-error" }
+  | { status: "malformed-provider" }
+  | { status: "stale" };
+type MovieMetadataFailureStatus = Exclude<
+  MovieMetadataSearchState["status"],
+  "idle" | "loading" | "ready" | "empty"
+>;
 type TvLibraryScanState =
   | { status: "loading" }
   | { status: "unconfigured" }
@@ -4017,15 +4059,319 @@ function DiscoverTvDetails({
   );
 }
 
+function MovieMetadataMatchDialog({
+  movie,
+  onClose,
+  onQueryChange,
+  onSave,
+  onSearch,
+  onSelectCandidate,
+  query,
+  saveState,
+  searchState,
+  triggerId,
+  verificationState,
+}: {
+  movie: Movie;
+  onClose: () => void;
+  onQueryChange: (query: string) => void;
+  onSave: () => void;
+  onSearch: () => void;
+  onSelectCandidate: (candidate: MovieMetadataCandidate) => void;
+  query: string;
+  saveState: "idle" | "saving" | "error";
+  searchState: MovieMetadataSearchState;
+  triggerId: string;
+  verificationState: MovieMetadataVerificationState;
+}) {
+  const queryInput = useRef<HTMLInputElement | null>(null);
+  const isBusy =
+    searchState.status === "loading" ||
+    verificationState.status === "loading" ||
+    saveState === "saving";
+  const searchFailure = [
+    "unauthorized",
+    "rate-limited",
+    "network-error",
+    "provider-error",
+    "malformed-provider",
+    "stale",
+  ].includes(searchState.status)
+    ? movieMetadataFailureMessages[searchState.status as MovieMetadataFailureStatus]
+    : null;
+  const verificationFailure = [
+    "unauthorized",
+    "rate-limited",
+    "network-error",
+    "provider-error",
+    "malformed-provider",
+    "stale",
+  ].includes(verificationState.status)
+    ? movieMetadataFailureMessages[
+        verificationState.status as MovieMetadataFailureStatus
+      ]
+    : null;
+  return (
+    <Dialog.Root
+      onOpenChange={(open) => {
+        if (!open) {
+          onClose();
+        }
+      }}
+      open
+    >
+      <Dialog.Portal>
+        <Dialog.Backdrop className="movie-metadata__backdrop" />
+        <Dialog.Viewport className="movie-metadata__viewport">
+          <Dialog.Popup
+            aria-busy={isBusy}
+            className="movie-metadata__popup"
+            finalFocus={() => document.getElementById(triggerId)}
+            initialFocus={() => queryInput.current}
+          >
+            <div className="movie-metadata__heading">
+              <div>
+                <p className="card-eyebrow">Explicit TMDB Movie match</p>
+                <Dialog.Title>Match metadata for {movie.title}</Dialog.Title>
+              </div>
+              <Dialog.Close
+                render={
+                  <Button aria-label="Close metadata matching" type="button" variant="ghost">
+                    <AppIcon name="close" />
+                    Close
+                  </Button>
+                }
+              />
+            </div>
+            <Dialog.Description className="movie-metadata__description">
+              Search does not select a result or change the local file. Choose one exact TMDB Movie manually, verify its canonical IMDb identity, then save.
+            </Dialog.Description>
+            <form
+              aria-label="Search TMDB Movie metadata"
+              className="movie-metadata__search"
+              onSubmit={(event) => {
+                event.preventDefault();
+                onSearch();
+              }}
+            >
+              <label htmlFor="movie-metadata-query">Movie title query</label>
+              <div>
+                <input
+                  disabled={isBusy}
+                  id="movie-metadata-query"
+                  onChange={(event) => onQueryChange(event.target.value)}
+                  ref={queryInput}
+                  type="text"
+                  value={query}
+                />
+                <Button disabled={isBusy || query.trim() === ""} type="submit">
+                  <AppIcon name="search" />
+                  {searchState.status === "loading" ? "Searching…" : "Search TMDB Movies"}
+                </Button>
+              </div>
+            </form>
+            {searchState.status === "empty" ? (
+              <p className="movie-metadata__notice" role="status">
+                No TMDB Movies matched this exact query. No metadata was selected.
+              </p>
+            ) : null}
+            {searchFailure === null ? null : (
+              <p className="movie-metadata__error" role="alert">
+                {searchFailure}
+              </p>
+            )}
+            {searchState.status === "ready" ? (
+              <section aria-labelledby="movie-metadata-results-heading">
+                <h3 id="movie-metadata-results-heading">TMDB Movie candidates</h3>
+                <p>No candidate is selected automatically.</p>
+                <ul aria-label="TMDB Movie metadata candidates" className="movie-metadata__candidates">
+                  {searchState.candidates.map((candidate) => (
+                    <li key={candidate.tmdbMovieId}>
+                      <button
+                        aria-label={`Select TMDB movie: ${candidate.title}${candidate.releaseDate === null ? "" : ` (${candidate.releaseDate.slice(0, 4)})`}`}
+                        disabled={isBusy}
+                        onClick={() => onSelectCandidate(candidate)}
+                        type="button"
+                      >
+                        <span>
+                          <strong>{candidate.title}</strong>
+                          {candidate.originalTitle === null || candidate.originalTitle === candidate.title ? null : (
+                            <span>Original title: {candidate.originalTitle}</span>
+                          )}
+                        </span>
+                        <span>
+                          {candidate.releaseDate ?? "Release date unavailable"} · TMDB {candidate.tmdbMovieId}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+            {verificationState.status === "loading" ? (
+              <p className="movie-metadata__notice" role="status">
+                Verifying the exact TMDB Movie and canonical IMDb identity…
+              </p>
+            ) : null}
+            {verificationFailure === null ? null : (
+              <p className="movie-metadata__error" role="alert">
+                {verificationFailure}
+              </p>
+            )}
+            {verificationState.status === "ready" ? (
+              <section aria-labelledby="movie-metadata-verified-heading" className="movie-metadata__verified">
+                <h3 id="movie-metadata-verified-heading">Verified metadata match</h3>
+                <dl>
+                  <div><dt>TMDB title</dt><dd>{verificationState.association.title}</dd></div>
+                  <div><dt>TMDB Movie</dt><dd>{verificationState.association.tmdbMovieId}</dd></div>
+                  <div><dt>Canonical IMDb ID</dt><dd>{verificationState.association.imdbId}</dd></div>
+                  {verificationState.association.releaseDate === null ? null : (
+                    <div><dt>Release date</dt><dd>{verificationState.association.releaseDate}</dd></div>
+                  )}
+                </dl>
+                {saveState === "error" ? (
+                  <p className="movie-metadata__error" role="alert">
+                    The exact metadata association could not be saved. The local Movie remains unchanged.
+                  </p>
+                ) : null}
+                <Button disabled={saveState === "saving"} onClick={onSave} type="button">
+                  <AppIcon name="details" />
+                  {saveState === "saving" ? "Saving metadata match…" : "Save metadata match"}
+                </Button>
+              </section>
+            ) : null}
+          </Dialog.Popup>
+        </Dialog.Viewport>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+function MovieMetadataDetailsDialog({
+  clearState,
+  movie,
+  onClear,
+  onClose,
+  triggerId,
+}: {
+  clearState: "idle" | "clearing" | "error";
+  movie: Movie;
+  onClear: () => void;
+  onClose: () => void;
+  triggerId: string;
+}) {
+  const [posterUnavailable, setPosterUnavailable] = useState(false);
+  const association = movie.association;
+  if (association === null) {
+    return null;
+  }
+  return (
+    <Dialog.Root
+      onOpenChange={(open) => {
+        if (!open && clearState !== "clearing") {
+          onClose();
+        }
+      }}
+      open
+    >
+      <Dialog.Portal>
+        <Dialog.Backdrop className="movie-metadata__backdrop" />
+        <Dialog.Viewport className="movie-metadata__viewport">
+          <Dialog.Popup
+            aria-busy={clearState === "clearing"}
+            className="movie-metadata__popup"
+            finalFocus={() => document.getElementById(triggerId)}
+          >
+            <div className="movie-metadata__heading">
+              <div>
+                <p className="card-eyebrow">Accepted TMDB metadata</p>
+                <Dialog.Title>{association.title}</Dialog.Title>
+              </div>
+              <Dialog.Close
+                render={
+                  <Button disabled={clearState === "clearing"} type="button" variant="ghost">
+                    <AppIcon name="close" />
+                    Close
+                  </Button>
+                }
+              />
+            </div>
+            <Dialog.Description className="movie-metadata__description">
+              Provider metadata is shown separately from the exact local file identity.
+            </Dialog.Description>
+            <div className="movie-metadata__details">
+              {association.posterPath === null || posterUnavailable ? (
+                <div className="movie-metadata__poster-unavailable">
+                  <AppIcon name="poster" />
+                  Poster unavailable
+                </div>
+              ) : (
+                <img
+                  alt={`TMDB poster for ${association.title}`}
+                  onError={() => setPosterUnavailable(true)}
+                  src={tmdbPosterUrl(association.posterPath)}
+                />
+              )}
+              <div>
+                <dl>
+                  <div><dt>Source</dt><dd>TMDB</dd></div>
+                  <div><dt>Accepted title</dt><dd>{association.title}</dd></div>
+                  {association.originalTitle === null ? null : (
+                    <div><dt>Original title</dt><dd>{association.originalTitle}</dd></div>
+                  )}
+                  {association.releaseDate === null ? null : (
+                    <div><dt>Release date</dt><dd>{association.releaseDate}</dd></div>
+                  )}
+                  <div><dt>Canonical IMDb ID</dt><dd>{association.imdbId}</dd></div>
+                  <div><dt>Local filename</dt><dd>{movie.relativePath.split(/[/\\]/).at(-1)}</dd></div>
+                  <div><dt>Local relative path</dt><dd>{movie.relativePath}</dd></div>
+                </dl>
+                {association.overview === null ? null : (
+                  <section className="movie-metadata__overview">
+                    <h3>Overview</h3>
+                    <p>{association.overview}</p>
+                  </section>
+                )}
+              </div>
+            </div>
+            {clearState === "error" ? (
+              <p className="movie-metadata__error" role="alert">
+                The metadata match could not be cleared. The local file and existing association remain unchanged.
+              </p>
+            ) : null}
+            <div className="movie-metadata__dialog-actions">
+              <Button
+                aria-label="Clear metadata match"
+                disabled={clearState === "clearing"}
+                onClick={onClear}
+                type="button"
+                variant="outline"
+              >
+                <AppIcon name="close" />
+                {clearState === "clearing" ? "Clearing metadata match…" : "Clear metadata match"}
+              </Button>
+            </div>
+          </Dialog.Popup>
+        </Dialog.Viewport>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
 function LibraryMovieCard({
   folder,
   movie,
+  onMatchMetadata,
   onMovieTrashed,
+  onViewMetadataDetails,
 }: {
   folder: string;
   movie: Movie;
+  onMatchMetadata: (movie: Movie, triggerId: string) => void;
   onMovieTrashed: (movie: Movie, folder: string) => void;
+  onViewMetadataDetails: (movie: Movie, triggerId: string) => void;
 }) {
+  const primaryTitle = moviePrimaryTitle(movie);
   const [isOpening, setIsOpening] = useState(false);
   const [isRevealing, setIsRevealing] = useState(false);
   const [isTrashing, setIsTrashing] = useState(false);
@@ -4039,6 +4385,12 @@ function LibraryMovieCard({
   const trashCancelButton = useRef<HTMLButtonElement | null>(null);
   const trashDialogPopup = useRef<HTMLDivElement | null>(null);
   const trashTriggerId = useId();
+  const metadataTriggerId = useId();
+  const [posterUnavailable, setPosterUnavailable] = useState(false);
+
+  useEffect(() => {
+    setPosterUnavailable(false);
+  }, [movie.association?.generation, movie.association?.posterPath]);
 
   const openMovie = async (event: ReactMouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -4155,11 +4507,21 @@ function LibraryMovieCard({
     >
       <div className="movie-card__header">
         <span className="movie-card__icon">
-          <AppIcon name="movie" />
+          {movie.association?.posterPath === undefined ||
+          movie.association.posterPath === null ||
+          posterUnavailable ? (
+            <AppIcon name="movie" />
+          ) : (
+            <img
+              alt=""
+              onError={() => setPosterUnavailable(true)}
+              src={tmdbPosterUrl(movie.association.posterPath)}
+            />
+          )}
         </span>
         <div className="movie-card__actions">
           <Button
-            aria-label={`${isOpening ? "Opening" : "Open"} movie: ${movie.title}`}
+            aria-label={`${isOpening ? "Opening" : "Open"} movie: ${primaryTitle}`}
             disabled={isOpening}
             onClick={openMovie}
             onKeyDown={(event) => event.stopPropagation()}
@@ -4172,7 +4534,7 @@ function LibraryMovieCard({
             {isOpening ? "Opening" : "Open"}
           </Button>
           <Button
-            aria-label={`${isRevealing ? "Revealing" : "Reveal"} movie: ${movie.title}`}
+            aria-label={`${isRevealing ? "Revealing" : "Reveal"} movie: ${primaryTitle}`}
             disabled={isRevealing}
             onClick={revealMovie}
             onKeyDown={(event) => event.stopPropagation()}
@@ -4187,8 +4549,46 @@ function LibraryMovieCard({
         </div>
       </div>
       <div className="media-title-row">
-        <h3>{movie.title}</h3>
+        <div>
+          <h3>{primaryTitle}</h3>
+          {movie.association === null ? null : (
+            <p className="movie-card__metadata-line">
+              TMDB
+              {movie.association.releaseDate === null
+                ? ""
+                : ` · ${movie.association.releaseDate.slice(0, 4)}`}
+            </p>
+          )}
+        </div>
         <div className="movie-card__title-actions">
+          <Button
+            aria-label={
+              movie.association === null
+                ? `Match metadata: ${movie.title}`
+                : `View metadata details: ${primaryTitle}`
+            }
+            id={metadataTriggerId}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (movie.association === null) {
+                onMatchMetadata(movie, metadataTriggerId);
+              } else {
+                onViewMetadataDetails(movie, metadataTriggerId);
+              }
+            }}
+            onKeyDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+            size="icon-xs"
+            title={
+              movie.association === null
+                ? "Match metadata"
+                : "View metadata details"
+            }
+            type="button"
+            variant="outline"
+          >
+            <AppIcon name="details" />
+          </Button>
           <AlertDialog.Root
             onOpenChange={updateTrashDialog}
             open={trashDialogOpen}
@@ -4198,7 +4598,7 @@ function LibraryMovieCard({
               id={trashTriggerId}
               render={
                 <Button
-                  aria-label={`Move movie to Trash or Recycle Bin: ${movie.title}`}
+                  aria-label={`Move movie to Trash or Recycle Bin: ${primaryTitle}`}
                   disabled={isTrashing}
                   onClick={(event) => event.stopPropagation()}
                   onKeyDown={(event) => event.stopPropagation()}
@@ -4232,7 +4632,7 @@ function LibraryMovieCard({
                 >
                   <div className="trash-dialog__heading">
                     <AlertDialog.Title>
-                      Move “{movie.title}” to Trash?
+                      Move “{primaryTitle}” to Trash?
                     </AlertDialog.Title>
                     <AlertDialog.Close
                       render={
@@ -4275,7 +4675,7 @@ function LibraryMovieCard({
                       }
                     />
                     <Button
-                      aria-label={`${isTrashing ? "Moving" : "Confirm moving"} movie to Trash or Recycle Bin: ${movie.title}`}
+                      aria-label={`${isTrashing ? "Moving" : "Confirm moving"} movie to Trash or Recycle Bin: ${primaryTitle}`}
                       disabled={isTrashing}
                       onClick={trashMovie}
                       onKeyDown={(event) => event.stopPropagation()}
@@ -4290,7 +4690,7 @@ function LibraryMovieCard({
               </AlertDialog.Viewport>
             </AlertDialog.Portal>
           </AlertDialog.Root>
-          <CopyTitleAction title={movie.title} />
+          <CopyTitleAction title={primaryTitle} />
         </div>
       </div>
       <div className="movie-card__file-action-errors">
@@ -5762,21 +6162,27 @@ function movieTitleFromPath(path: string) {
   return extensionStart > 0 ? filename.slice(0, extensionStart) : filename;
 }
 
+function moviePrimaryTitle(movie: Movie) {
+  return movie.association?.title ?? movie.title;
+}
+
 function compareLibraryMoviesByTitle(
   leftMovie: Movie,
   rightMovie: Movie,
   direction: LibraryTitleSortDirection,
 ) {
-  const leftTitle = leftMovie.title.toLowerCase();
-  const rightTitle = rightMovie.title.toLowerCase();
+  const leftPrimaryTitle = moviePrimaryTitle(leftMovie);
+  const rightPrimaryTitle = moviePrimaryTitle(rightMovie);
+  const leftTitle = leftPrimaryTitle.toLowerCase();
+  const rightTitle = rightPrimaryTitle.toLowerCase();
   const titleOrder =
     leftTitle < rightTitle ? -1 : leftTitle > rightTitle ? 1 : 0;
   if (titleOrder !== 0) {
     return direction === "ascending" ? titleOrder : -titleOrder;
   }
 
-  if (leftMovie.title !== rightMovie.title) {
-    return leftMovie.title < rightMovie.title ? -1 : 1;
+  if (leftPrimaryTitle !== rightPrimaryTitle) {
+    return leftPrimaryTitle < rightPrimaryTitle ? -1 : 1;
   }
   if (leftMovie.path === rightMovie.path) {
     return 0;
@@ -5926,6 +6332,33 @@ function nativeErrorCode(error: unknown) {
       : "";
 }
 
+function movieMetadataFailureStatus(error: unknown): MovieMetadataFailureStatus {
+  switch (nativeErrorCode(error)) {
+    case "movie_tmdb_unauthorized":
+      return "unauthorized";
+    case "movie_tmdb_rate_limited":
+      return "rate-limited";
+    case "movie_tmdb_network_error":
+      return "network-error";
+    case "movie_metadata_malformed_provider":
+      return "malformed-provider";
+    case "movie_metadata_context_invalid":
+    case "movie_metadata_stale":
+      return "stale";
+    default:
+      return "provider-error";
+  }
+}
+
+const movieMetadataFailureMessages: Record<MovieMetadataFailureStatus, string> = {
+  unauthorized: "The saved TMDB token is unavailable or was not accepted.",
+  "rate-limited": "TMDB is rate-limiting metadata requests. Retry later.",
+  "network-error": "TMDB could not be reached. The local Movie remains available.",
+  "provider-error": "TMDB could not complete this metadata request.",
+  "malformed-provider": "TMDB returned invalid or conflicting Movie identity data.",
+  stale: "This Movie, folder, token, or matching request is no longer current.",
+};
+
 function downloadStartError(
   error: unknown,
   category: "Adult" | "Movie" | "TV" | "VR",
@@ -5963,6 +6396,27 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [movieScanState, setMovieScanState] = useState<MovieScanState>({
     status: "unconfigured",
   });
+  const [movieMetadataContext, setMovieMetadataContext] = useState<{
+    fileId: string;
+    triggerId: string;
+  } | null>(null);
+  const [movieMetadataQuery, setMovieMetadataQuery] = useState("");
+  const [movieMetadataSearchState, setMovieMetadataSearchState] =
+    useState<MovieMetadataSearchState>({ status: "idle" });
+  const [movieMetadataVerificationState, setMovieMetadataVerificationState] =
+    useState<MovieMetadataVerificationState>({ status: "idle" });
+  const [movieMetadataSaveState, setMovieMetadataSaveState] = useState<
+    "idle" | "saving" | "error"
+  >("idle");
+  const [movieMetadataAnnouncement, setMovieMetadataAnnouncement] = useState<
+    string | null
+  >(null);
+  const [movieMetadataClearState, setMovieMetadataClearState] = useState<{
+    fileId: string;
+    status: "clearing" | "error";
+  } | null>(null);
+  const [movieMetadataDetailsContext, setMovieMetadataDetailsContext] =
+    useState<{ fileId: string; triggerId: string } | null>(null);
   const [movieRefreshVersion, setMovieRefreshVersion] = useState(0);
   const [movieStorageRefreshVersion, setMovieStorageRefreshVersion] =
     useState(0);
@@ -6276,6 +6730,12 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const navigationItems = useRef<Array<HTMLButtonElement | null>>([]);
   const workspace = useRef<HTMLElement | null>(null);
   const scanRequestId = useRef(0);
+  const movieMetadataRequestId = useRef(0);
+  const movieMetadataClearRequestId = useRef(0);
+  const movieMetadataSearchPending = useRef(false);
+  const movieMetadataVerificationPending = useRef(false);
+  const movieMetadataSavePending = useRef(false);
+  const movieMetadataClearPending = useRef(false);
   const storageRequestId = useRef(0);
   const discoverRequestId = useRef(0);
   const movieDetailsRequestId = useRef(0);
@@ -6994,23 +7454,24 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     setMovieScanState({ status: "scanning" });
     void window.__TAURI__.core
-      .invoke<string[]>("scan_movies")
-      .then((paths) => {
+      .invoke<unknown>("scan_movies")
+      .then((value) => {
         if (requestId !== scanRequestId.current) {
           return;
         }
-        if (!Array.isArray(paths) || paths.some((path) => typeof path !== "string")) {
+        const scan = parseMovieLibraryScan(value);
+        if (scan === null) {
           throw new Error("The native scanner returned invalid movie paths.");
         }
 
-        const movies = paths.map((path) => ({
-          path,
-          title: movieTitleFromPath(path),
+        const movies = scan.movies.map((movie) => ({
+          ...movie,
+          title: movieTitleFromPath(movie.relativePath),
         }));
         setMovieScanState(
           movies.length === 0
             ? { status: "empty" }
-            : { status: "ready", movies },
+            : { status: "ready", movies, metadataStatus: scan.metadataStatus },
         );
       })
       .catch((error: unknown) => {
@@ -8809,6 +9270,281 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
   };
 
+  const currentMovieByFileId = (fileId: string) => {
+    const current = currentMovieScanState.current;
+    return current.status === "ready"
+      ? (current.movies.find((movie) => movie.fileId === fileId) ?? null)
+      : null;
+  };
+
+  const closeMovieMetadataMatch = () => {
+    movieMetadataRequestId.current += 1;
+    movieMetadataSearchPending.current = false;
+    movieMetadataVerificationPending.current = false;
+    movieMetadataSavePending.current = false;
+    setMovieMetadataContext(null);
+    setMovieMetadataSearchState({ status: "idle" });
+    setMovieMetadataVerificationState({ status: "idle" });
+    setMovieMetadataSaveState("idle");
+    void invalidateMovieMetadataMatchContext().catch(() => undefined);
+  };
+
+  const openMovieMetadataMatch = (movie: Movie, triggerId: string) => {
+    movieMetadataRequestId.current += 1;
+    setMovieMetadataAnnouncement(null);
+    setMovieMetadataContext({ fileId: movie.fileId, triggerId });
+    setMovieMetadataQuery(movie.title);
+    setMovieMetadataSearchState({ status: "idle" });
+    setMovieMetadataVerificationState({ status: "idle" });
+    setMovieMetadataSaveState("idle");
+  };
+
+  const updateMovieMetadataQuery = (query: string) => {
+    setMovieMetadataQuery(query);
+    if (
+      movieMetadataSearchState.status !== "idle" ||
+      movieMetadataVerificationState.status !== "idle"
+    ) {
+      movieMetadataRequestId.current += 1;
+      setMovieMetadataSearchState({ status: "idle" });
+      setMovieMetadataVerificationState({ status: "idle" });
+      setMovieMetadataSaveState("idle");
+      void invalidateMovieMetadataMatchContext().catch(() => undefined);
+    }
+  };
+
+  const runMovieMetadataSearch = async () => {
+    if (
+      movieMetadataContext === null ||
+      movieMetadataQuery.trim() === "" ||
+      movieMetadataSearchPending.current
+    ) {
+      return;
+    }
+    const requestId = ++movieMetadataRequestId.current;
+    const fileId = movieMetadataContext.fileId;
+    movieMetadataSearchPending.current = true;
+    setMovieMetadataSearchState({ status: "loading" });
+    setMovieMetadataVerificationState({ status: "idle" });
+    setMovieMetadataSaveState("idle");
+    try {
+      const result = await searchMovieMetadata(fileId, movieMetadataQuery);
+      if (
+        requestId !== movieMetadataRequestId.current ||
+        movieMetadataContext.fileId !== fileId
+      ) {
+        return;
+      }
+      setMovieMetadataSearchState(
+        result.candidates.length === 0
+          ? { status: "empty" }
+          : { status: "ready", ...result },
+      );
+    } catch (error: unknown) {
+      if (requestId === movieMetadataRequestId.current) {
+        setMovieMetadataSearchState({
+          status: movieMetadataFailureStatus(error),
+        });
+      }
+    } finally {
+      if (requestId === movieMetadataRequestId.current) {
+        movieMetadataSearchPending.current = false;
+      }
+    }
+  };
+
+  const selectMovieMetadataCandidate = async (
+    candidate: MovieMetadataCandidate,
+  ) => {
+    if (
+      movieMetadataContext === null ||
+      movieMetadataSearchState.status !== "ready" ||
+      movieMetadataVerificationPending.current
+    ) {
+      return;
+    }
+    const requestId = ++movieMetadataRequestId.current;
+    const fileId = movieMetadataContext.fileId;
+    const matchingRequestId = movieMetadataSearchState.matchingRequestId;
+    movieMetadataVerificationPending.current = true;
+    setMovieMetadataVerificationState({
+      status: "loading",
+      candidateId: candidate.tmdbMovieId,
+    });
+    setMovieMetadataSaveState("idle");
+    try {
+      const verified = await verifyMovieMetadataCandidate(
+        matchingRequestId,
+        candidate.tmdbMovieId,
+      );
+      if (
+        requestId !== movieMetadataRequestId.current ||
+        movieMetadataContext.fileId !== fileId
+      ) {
+        return;
+      }
+      setMovieMetadataVerificationState({ status: "ready", ...verified });
+    } catch (error: unknown) {
+      if (requestId === movieMetadataRequestId.current) {
+        setMovieMetadataVerificationState({
+          status: movieMetadataFailureStatus(error),
+        });
+      }
+    } finally {
+      if (requestId === movieMetadataRequestId.current) {
+        movieMetadataVerificationPending.current = false;
+      }
+    }
+  };
+
+  const persistMovieMetadataMatch = async () => {
+    if (
+      movieMetadataContext === null ||
+      movieMetadataVerificationState.status !== "ready" ||
+      movieMetadataSavePending.current
+    ) {
+      return;
+    }
+    const requestId = ++movieMetadataRequestId.current;
+    const fileId = movieMetadataContext.fileId;
+    const verificationId = movieMetadataVerificationState.verificationId;
+    movieMetadataSavePending.current = true;
+    setMovieMetadataSaveState("saving");
+    try {
+      const association = await saveMovieMetadataMatch(verificationId);
+      if (requestId !== movieMetadataRequestId.current) {
+        return;
+      }
+      setMovieScanState((current) => {
+        if (current.status !== "ready") {
+          return current;
+        }
+        return {
+          ...current,
+          movies: current.movies.map((movie) =>
+            movie.fileId === fileId ? { ...movie, association } : movie,
+          ),
+        };
+      });
+      setMovieMetadataAnnouncement(
+        `${association.title} metadata was matched to the exact local Movie.`,
+      );
+      setMovieMetadataContext(null);
+      setMovieMetadataSearchState({ status: "idle" });
+      setMovieMetadataVerificationState({ status: "idle" });
+      setMovieMetadataSaveState("idle");
+    } catch {
+      if (requestId === movieMetadataRequestId.current) {
+        setMovieMetadataSaveState("error");
+      }
+    } finally {
+      if (requestId === movieMetadataRequestId.current) {
+        movieMetadataSavePending.current = false;
+      }
+    }
+  };
+
+  const openMovieMetadataDetails = (movie: Movie, triggerId: string) => {
+    setMovieMetadataClearState(null);
+    setMovieMetadataDetailsContext({ fileId: movie.fileId, triggerId });
+  };
+
+  const clearCurrentMovieMetadata = async () => {
+    if (
+      movieMetadataDetailsContext === null ||
+      movieMetadataClearPending.current
+    ) {
+      return;
+    }
+    const fileId = movieMetadataDetailsContext.fileId;
+    const current = currentMovieByFileId(fileId);
+    if (current?.association === null || current === null) {
+      return;
+    }
+    const requestId = ++movieMetadataClearRequestId.current;
+    const clearedTitle = current.association.title;
+    movieMetadataClearPending.current = true;
+    setMovieMetadataClearState({ fileId, status: "clearing" });
+    try {
+      await clearMovieMetadataMatch(fileId);
+      if (requestId !== movieMetadataClearRequestId.current) {
+        return;
+      }
+      setMovieScanState((scan) =>
+        scan.status === "ready"
+          ? {
+              ...scan,
+              movies: scan.movies.map((movie) =>
+                movie.fileId === fileId ? { ...movie, association: null } : movie,
+              ),
+            }
+          : scan,
+      );
+      setMovieMetadataAnnouncement(
+        `${clearedTitle} metadata was cleared. The local Movie file was not changed.`,
+      );
+      setMovieMetadataDetailsContext(null);
+      setMovieMetadataClearState(null);
+    } catch {
+      if (requestId === movieMetadataClearRequestId.current) {
+        setMovieMetadataClearState({ fileId, status: "error" });
+      }
+    } finally {
+      if (requestId === movieMetadataClearRequestId.current) {
+        movieMetadataClearPending.current = false;
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (
+      movieMetadataContext !== null &&
+      (activeDestination.id !== "library" || libraryCategory !== "movies")
+    ) {
+      movieMetadataRequestId.current += 1;
+      movieMetadataSearchPending.current = false;
+      movieMetadataVerificationPending.current = false;
+      movieMetadataSavePending.current = false;
+      setMovieMetadataContext(null);
+      setMovieMetadataSearchState({ status: "idle" });
+      setMovieMetadataVerificationState({ status: "idle" });
+      setMovieMetadataSaveState("idle");
+      void invalidateMovieMetadataMatchContext().catch(() => undefined);
+    }
+    if (
+      movieMetadataDetailsContext !== null &&
+      (activeDestination.id !== "library" || libraryCategory !== "movies")
+    ) {
+      movieMetadataClearRequestId.current += 1;
+      movieMetadataClearPending.current = false;
+      setMovieMetadataDetailsContext(null);
+      setMovieMetadataClearState(null);
+    }
+  }, [
+    activeDestination.id,
+    libraryCategory,
+    movieMetadataContext,
+    movieMetadataDetailsContext,
+  ]);
+
+  useEffect(() => {
+    if (movieMetadataContext !== null) {
+      movieMetadataRequestId.current += 1;
+      setMovieMetadataContext(null);
+      setMovieMetadataSearchState({ status: "idle" });
+      setMovieMetadataVerificationState({ status: "idle" });
+      setMovieMetadataSaveState("idle");
+      void invalidateMovieMetadataMatchContext().catch(() => undefined);
+    }
+    if (movieMetadataDetailsContext !== null) {
+      movieMetadataClearRequestId.current += 1;
+      setMovieMetadataDetailsContext(null);
+      setMovieMetadataClearState(null);
+    }
+    // Folder, token, and fresh-scan changes invalidate the native exact-file/provider context.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moviesFolder, tmdbToken, movieRefreshVersion]);
+
   const refreshMovies = () => {
     if (moviesFolder === null) {
       return;
@@ -8838,7 +9574,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
 
     setMovieTrashAnnouncement(
-      `${movie.title} was moved to Trash or the Recycle Bin.`,
+      `${moviePrimaryTitle(movie)} was moved to Trash or the Recycle Bin.`,
     );
     setMovieStorageRefreshVersion((version) => version + 1);
 
@@ -8862,7 +9598,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
       return remainingMovies.length === 0
         ? { status: "empty" }
-        : { status: "ready", movies: remainingMovies };
+        : {
+            status: "ready",
+            movies: remainingMovies,
+            metadataStatus: currentState.metadataStatus,
+          };
     });
   };
 
@@ -10123,9 +10863,26 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const isLibrarySearchActive = librarySearchQuery.trim() !== "";
   const completeLibraryMovies =
     movieScanState.status === "ready" ? movieScanState.movies : [];
+  const movieMetadataMovie =
+    movieMetadataContext === null
+      ? null
+      : (completeLibraryMovies.find(
+          (movie) => movie.fileId === movieMetadataContext.fileId,
+        ) ?? null);
+  const movieMetadataDetailsMovie =
+    movieMetadataDetailsContext === null
+      ? null
+      : (completeLibraryMovies.find(
+          (movie) => movie.fileId === movieMetadataDetailsContext.fileId,
+        ) ?? null);
+  const normalizedLibrarySearch = librarySearchQuery.toLowerCase();
   const matchingLibraryMovies = isLibrarySearchActive
-    ? completeLibraryMovies.filter((movie) =>
-        movie.title.toLowerCase().includes(librarySearchQuery.toLowerCase()),
+    ? completeLibraryMovies.filter(
+        (movie) =>
+          moviePrimaryTitle(movie)
+            .toLowerCase()
+            .includes(normalizedLibrarySearch) ||
+          movie.title.toLowerCase().includes(normalizedLibrarySearch),
       )
     : completeLibraryMovies;
   const orderedLibraryMovies = [...matchingLibraryMovies].sort(
@@ -10614,6 +11371,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           {movieTrashAnnouncement === null ? null : (
             <p aria-atomic="true" className="sr-only" role="status">
               {movieTrashAnnouncement}
+            </p>
+          )}
+          {movieMetadataAnnouncement === null ||
+          activeDestination.id !== "library" ||
+          libraryCategory !== "movies" ? null : (
+            <p aria-atomic="true" className="library-action-status" role="status">
+              {movieMetadataAnnouncement}
             </p>
           )}
 
@@ -12128,6 +12892,19 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
               {libraryCategory === "movies" ? (
                 movieScanState.status === "ready" && moviesFolder !== null ? (
                 <>
+                  {movieScanState.metadataStatus === "ready" ? null : (
+                    <div className="library-action-attention" role="alert">
+                      <p>
+                        {movieScanState.metadataStatus === "attention"
+                          ? "Movie metadata associations are invalid or conflicting. Local files remain available without enrichment."
+                          : "Movie metadata associations could not be read. Local files and exact file actions remain available."}
+                      </p>
+                      <Button onClick={refreshMovies} type="button" variant="outline">
+                        <AppIcon name="refresh" />
+                        Retry metadata
+                      </Button>
+                    </div>
+                  )}
                   <p
                     aria-atomic="true"
                     aria-live="polite"
@@ -12164,7 +12941,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         <LibraryMovieCard
                           folder={moviesFolder}
                           movie={movie}
+                          onMatchMetadata={openMovieMetadataMatch}
                           onMovieTrashed={recordTrashedMovie}
+                          onViewMetadataDetails={openMovieMetadataDetails}
                         />
                       )}
                       selectedPage={librarySelectedPage}
@@ -13097,6 +13876,43 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         </div>
       </main>
       </div>
+      {movieMetadataMovie === null || movieMetadataContext === null ? null : (
+        <MovieMetadataMatchDialog
+          movie={movieMetadataMovie}
+          onClose={closeMovieMetadataMatch}
+          onQueryChange={updateMovieMetadataQuery}
+          onSave={() => void persistMovieMetadataMatch()}
+          onSearch={() => void runMovieMetadataSearch()}
+          onSelectCandidate={(candidate) =>
+            void selectMovieMetadataCandidate(candidate)
+          }
+          query={movieMetadataQuery}
+          saveState={movieMetadataSaveState}
+          searchState={movieMetadataSearchState}
+          triggerId={movieMetadataContext.triggerId}
+          verificationState={movieMetadataVerificationState}
+        />
+      )}
+      {movieMetadataDetailsMovie === null ||
+      movieMetadataDetailsContext === null ||
+      movieMetadataDetailsMovie.association === null ? null : (
+        <MovieMetadataDetailsDialog
+          clearState={
+            movieMetadataClearState?.fileId === movieMetadataDetailsMovie.fileId
+              ? movieMetadataClearState.status
+              : "idle"
+          }
+          movie={movieMetadataDetailsMovie}
+          onClear={() => void clearCurrentMovieMetadata()}
+          onClose={() => {
+            movieMetadataClearRequestId.current += 1;
+            movieMetadataClearPending.current = false;
+            setMovieMetadataDetailsContext(null);
+            setMovieMetadataClearState(null);
+          }}
+          triggerId={movieMetadataDetailsContext.triggerId}
+        />
+      )}
       <Dialog.Root
         onOpenChange={(open) => {
           if (!open) {

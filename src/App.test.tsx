@@ -38,6 +38,19 @@ let invokeMock: Mock<
 let scanMoviesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
+let searchMovieMetadataMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let verifyMovieMetadataCandidateMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let saveMovieMetadataMatchMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let clearMovieMetadataMatchMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let invalidateMovieMetadataMatchContextMock: Mock<() => Promise<void>>;
 let queryMoviesStorageMock: Mock<() => Promise<[string, string]>>;
 let openMovieMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
@@ -185,6 +198,57 @@ let savedMoviesFolder: string | null;
 let savedTvFolder: string | null;
 let savedAdultFolder: string | null;
 let savedVrFolder: string | null;
+let movieMetadataStoreStatus: "ready" | "attention" | "unavailable";
+let movieMetadataAssociations: Map<
+  string,
+  {
+    tmdbMovieId: string;
+    imdbId: string;
+    title: string;
+    originalTitle?: string;
+    releaseDate?: string;
+    posterPath?: string;
+    overview?: string;
+    generation?: string;
+  }
+>;
+let movieFixtureFileIds: Map<string, string>;
+
+function fixtureMovieFileId(path: string) {
+  const existing = movieFixtureFileIds.get(path);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const fileId = (movieFixtureFileIds.size + 1).toString(16).padStart(40, "0");
+  movieFixtureFileIds.set(path, fileId);
+  return fileId;
+}
+
+function fixtureNativeMovieScan(paths: string[]) {
+  const rows = paths.flatMap((path) => {
+    const association = movieMetadataAssociations.get(path);
+    const relativePath =
+      savedMoviesFolder !== null && path.startsWith(`${savedMoviesFolder}/`)
+        ? path.slice(savedMoviesFolder.length + 1)
+        : (path.split(/[/\\]/).at(-1) ?? path);
+    return [
+      fixtureMovieFileId(path),
+      path,
+      relativePath,
+      "5",
+      association === undefined ? "0" : "1",
+      association?.tmdbMovieId ?? "",
+      association?.imdbId ?? "",
+      association?.title ?? "",
+      association?.originalTitle ?? "",
+      association?.releaseDate ?? "",
+      association?.posterPath ?? "",
+      association?.overview ?? "",
+      association?.generation ?? (association === undefined ? "" : "1"),
+    ];
+  });
+  return ["movie-library-v1", movieMetadataStoreStatus, paths.length.toString(), ...rows];
+}
 
 function createResizeEntry(
   target: Element,
@@ -675,7 +739,37 @@ beforeEach(() => {
   savedTvFolder = null;
   savedAdultFolder = null;
   savedVrFolder = null;
+  movieMetadataStoreStatus = "ready";
+  movieMetadataAssociations = new Map();
+  movieFixtureFileIds = new Map();
   scanMoviesMock = vi.fn().mockResolvedValue([]);
+  searchMovieMetadataMock = vi.fn().mockResolvedValue([
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "0",
+  ]);
+  verifyMovieMetadataCandidateMock = vi.fn().mockResolvedValue([
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "419",
+    "tt0123456",
+    "Matched Movie",
+    "Original Matched Movie",
+    "1999-04-19",
+    "/matched-poster.jpg",
+    "Verified overview.",
+    "1",
+  ]);
+  saveMovieMetadataMatchMock = vi.fn().mockResolvedValue([
+    "419",
+    "tt0123456",
+    "Matched Movie",
+    "Original Matched Movie",
+    "1999-04-19",
+    "/matched-poster.jpg",
+    "Verified overview.",
+    "1",
+  ]);
+  clearMovieMetadataMatchMock = vi.fn().mockResolvedValue(undefined);
+  invalidateMovieMetadataMatchContextMock = vi.fn().mockResolvedValue(undefined);
   queryMoviesStorageMock = vi
     .fn()
     .mockResolvedValue(["1099511627776", "274877906944"]);
@@ -861,7 +955,17 @@ beforeEach(() => {
             savedMoviesFolder = null;
           });
         case "scan_movies":
-          return scanMoviesMock(parameters);
+          return scanMoviesMock(parameters).then(fixtureNativeMovieScan);
+        case "search_movie_metadata":
+          return searchMovieMetadataMock(parameters);
+        case "verify_movie_metadata_candidate":
+          return verifyMovieMetadataCandidateMock(parameters);
+        case "save_movie_metadata_match":
+          return saveMovieMetadataMatchMock(parameters);
+        case "clear_movie_metadata_match":
+          return clearMovieMetadataMatchMock(parameters);
+        case "invalidate_movie_metadata_match_context":
+          return invalidateMovieMetadataMatchContextMock();
         case "query_movies_storage":
           return queryMoviesStorageMock();
         case "open_movie":
@@ -13583,5 +13687,331 @@ describe("resize-aware media galleries", () => {
     );
     expect(savedMoviesFolder).toBe("/Movies");
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("explicit Movie Library TMDB metadata matching", () => {
+  it("waits for an explicit search and manual result choice before saving exact metadata", async () => {
+    const path = "/Movies/映画  —  Local.File.MKV";
+    const matchingRequestId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([path]);
+    searchMovieMetadataMock.mockResolvedValue([
+      matchingRequestId,
+      "2",
+      "101",
+      "同じ題名",
+      "Original One",
+      "2001-01-01",
+      "/one.jpg",
+      "202",
+      "同じ題名",
+      "Original Two",
+      "2002-02-02",
+      "/two.jpg",
+    ]);
+    verifyMovieMetadataCandidateMock.mockResolvedValue([
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "202",
+      "tt7654321",
+      "Accepted  Title — 特別版",
+      "Original Two",
+      "2002-02-02",
+      "/two.jpg",
+      "Exact verified overview.",
+      "8",
+    ]);
+    saveMovieMetadataMatchMock.mockResolvedValue([
+      "202",
+      "tt7654321",
+      "Accepted  Title — 特別版",
+      "Original Two",
+      "2002-02-02",
+      "/two.jpg",
+      "Exact verified overview.",
+      "8",
+    ]);
+
+    render(<App />);
+    selectLibrary();
+    const match = await screen.findByRole("button", {
+      name: "Match metadata: 映画 — Local.File",
+    });
+    expect(searchMovieMetadataMock).not.toHaveBeenCalled();
+    expect(verifyMovieMetadataCandidateMock).not.toHaveBeenCalled();
+    expect(saveMovieMetadataMatchMock).not.toHaveBeenCalled();
+
+    fireEvent.click(match);
+    const query = screen.getByRole("textbox", { name: "Movie title query" });
+    await waitFor(() => expect(document.activeElement).toBe(query));
+    expect(query).toHaveProperty("value", "映画  —  Local.File");
+    fireEvent.change(query, { target: { value: "同じ  題名" } });
+    expect(searchMovieMetadataMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+
+    const candidates = await screen.findByRole("list", {
+      name: "TMDB Movie metadata candidates",
+    });
+    expect(within(candidates).getAllByRole("button")).toHaveLength(2);
+    expect(verifyMovieMetadataCandidateMock).not.toHaveBeenCalled();
+    fireEvent.click(
+      within(candidates).getByRole("button", {
+        name: "Select TMDB movie: 同じ題名 (2002)",
+      }),
+    );
+    expect(verifyMovieMetadataCandidateMock).toHaveBeenCalledWith({
+      matchingRequestId,
+      tmdbMovieId: 202,
+    });
+    expect(
+      await screen.findByRole("heading", { name: "Verified metadata match" }),
+    ).toBeTruthy();
+    expect(screen.getByText("tt7654321")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save metadata match" }));
+    const acceptedHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "Accepted Title — 特別版",
+    });
+    expect(acceptedHeading.textContent).toBe("Accepted  Title — 特別版");
+    expect(saveMovieMetadataMatchMock).toHaveBeenCalledWith({
+      verificationId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Copy title: Accepted Title — 特別版",
+      }),
+    );
+    expect(clipboardWriteMock).toHaveBeenCalledWith(
+      "Accepted  Title — 特別版",
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "View metadata details: Accepted Title — 特別版",
+      }),
+    );
+    expect(await screen.findByText("Exact verified overview.")).toBeTruthy();
+    expect(
+      screen
+        .getByText("Local filename")
+        .parentElement?.querySelector("dd")?.textContent,
+    ).toBe("映画  —  Local.File.MKV");
+    expect(
+      screen
+        .getByText("Local relative path")
+        .parentElement?.querySelector("dd")?.textContent,
+    ).toBe(path.replace("/Movies/", ""));
+    const poster = screen.getByRole("img", {
+      name: "TMDB poster for Accepted Title — 特別版",
+    });
+    fireEvent.error(poster);
+    expect(screen.getByText("Poster unavailable")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear metadata match" }));
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "映画 — Local.File",
+      }),
+    ).toBeTruthy();
+    expect(clearMovieMetadataMatchMock).toHaveBeenCalledWith({
+      fileId: fixtureMovieFileId(path),
+    });
+    expect(openMovieMock).not.toHaveBeenCalled();
+    expect(revealMovieMock).not.toHaveBeenCalled();
+    expect(trashMovieMock).not.toHaveBeenCalled();
+  });
+
+  it("loads durable metadata offline and keeps canonical and filename search and sorting available", async () => {
+    const associatedPath = "/Movies/z-local-name.mp4";
+    savedMoviesFolder = "/Movies";
+    movieMetadataAssociations.set(associatedPath, {
+      generation: "12",
+      imdbId: "tt1234567",
+      originalTitle: "元の題名",
+      overview: "Persisted offline overview.",
+      releaseDate: "1998-03-04",
+      title: "A Canonical Movie",
+      tmdbMovieId: "55",
+    });
+    scanMoviesMock.mockResolvedValue([
+      associatedPath,
+      "/Movies/B Plain Local.mp4",
+    ]);
+
+    render(<App />);
+    selectLibrary();
+    expect(
+      await screen.findByRole("heading", { name: "A Canonical Movie" }),
+    ).toBeTruthy();
+    expect(searchMovieMetadataMock).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open movie: A Canonical Movie" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Reveal movie: A Canonical Movie" }),
+    );
+    expect(openMovieMock).toHaveBeenCalledWith({ path: associatedPath });
+    expect(revealMovieMock).toHaveBeenCalledWith({ path: associatedPath });
+    expect(
+      screen.getByRole("button", {
+        name: "Move movie to Trash or Recycle Bin: A Canonical Movie",
+      }),
+    ).toBeTruthy();
+
+    sortMovies("ascending");
+    expect(visibleMovieTitles()).toEqual(["A Canonical Movie", "B Plain Local"]);
+    searchMovies("z-local-name");
+    expect(visibleMovieTitles()).toEqual(["A Canonical Movie"]);
+    searchMovies("canonical movie");
+    expect(visibleMovieTitles()).toEqual(["A Canonical Movie"]);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "View metadata details: A Canonical Movie",
+      }),
+    );
+    expect(await screen.findByText("Persisted offline overview.")).toBeTruthy();
+    expect(searchMovieMetadataMock).not.toHaveBeenCalled();
+
+    cleanup();
+    movieMetadataAssociations.clear();
+    movieMetadataStoreStatus = "attention";
+    render(<App />);
+    selectLibrary();
+    expect(
+      await screen.findByText(
+        "Movie metadata associations are invalid or conflicting. Local files remain available without enrichment.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "z-local-name" }),
+    ).toBeTruthy();
+    expect(searchMovieMetadataMock).not.toHaveBeenCalled();
+  });
+
+  it("isolates provider failures and ignores a late Save result after navigation", async () => {
+    const path = "/Movies/Stale response.mp4";
+    const pendingSave = createDeferred<string[]>();
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([path]);
+    searchMovieMetadataMock
+      .mockRejectedValueOnce("movie_tmdb_network_error")
+      .mockResolvedValueOnce([
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0",
+      ])
+      .mockResolvedValueOnce([
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "1",
+        "419",
+        "Matched Movie",
+        "",
+        "1999-04-19",
+        "",
+      ]);
+    saveMovieMetadataMatchMock.mockReturnValue(pendingSave.promise);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match metadata: Stale response",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+    expect(
+      await screen.findByText(
+        "TMDB could not be reached. The local Movie remains available.",
+      ),
+    ).toBeTruthy();
+    expect(
+      document.querySelector(".movie-card h3")?.textContent,
+    ).toBe("Stale response");
+
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+    expect(
+      await screen.findByText(
+        "No TMDB Movies matched this exact query. No metadata was selected.",
+      ),
+    ).toBeTruthy();
+    expect(verifyMovieMetadataCandidateMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select TMDB movie: Matched Movie (1999)",
+      }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Save metadata match" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Close metadata matching" }),
+    );
+    selectDashboard();
+    await act(async () => {
+      pendingSave.resolve([
+        "419",
+        "tt0123456",
+        "Late Matched Movie",
+        "",
+        "1999-04-19",
+        "",
+        "",
+        "2",
+      ]);
+      await pendingSave.promise;
+    });
+    expect(screen.queryByText(/metadata was matched to/)).toBeNull();
+    expect(screen.queryByText(/could not be saved/)).toBeNull();
+    expect(saveMovieMetadataMatchMock).toHaveBeenCalledOnce();
+    expect(invalidateMovieMetadataMatchContextMock).toHaveBeenCalled();
+  });
+
+  it("keeps explicit matching usable at 720 by 520 in light, dark, and system modes", async () => {
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 720,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 520,
+    });
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([
+      "/Movies/非常に長い exact local Movie filename — part 01.MKV",
+    ]);
+
+    for (const [appearance, resolvedTheme] of [
+      ["light", "light"],
+      ["dark", "dark"],
+      ["system", "dark"],
+    ] as const) {
+      cleanup();
+      window.localStorage.clear();
+      setSystemPreference(appearance === "system");
+      render(<App />);
+      selectSettings();
+      fireEvent.click(
+        screen.getByRole("radio", { name: new RegExp(appearance, "i") }),
+      );
+      selectLibrary();
+      fireEvent.click(
+        await screen.findByRole("button", { name: /Match metadata:/ }),
+      );
+      const dialog = await screen.findByRole("dialog");
+      const query = within(dialog).getByRole("textbox", {
+        name: "Movie title query",
+      });
+      await waitFor(() => expect(document.activeElement).toBe(query));
+      expect(document.documentElement.dataset.theme).toBe(resolvedTheme);
+      expect(dialog.closest(".movie-metadata__viewport")).not.toBeNull();
+      expect(
+        within(dialog).getByRole("button", { name: "Search TMDB Movies" }),
+      ).toBeTruthy();
+      expect(
+        within(dialog).getByRole("button", { name: "Close metadata matching" }),
+      ).toBeTruthy();
+    }
   });
 });

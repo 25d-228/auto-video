@@ -1,12 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  clearMovieMetadataMatch,
   fetchVerifiedYtsMovieReleases,
   inspectVerifiedYtsMovieTorrent,
+  invalidateMovieMetadataMatchContext,
   invalidateMovieReleaseContext,
   invalidateVerifiedMovieTorrent,
+  parseMovieLibraryScan,
+  saveMovieMetadataMatch,
   saveVerifiedMovieTorrent,
+  searchMovieMetadata,
   startVerifiedMovieDownload,
+  verifyMovieMetadataCandidate,
   type MovieReleaseContext,
   type YtsMovieRelease,
 } from "./movie";
@@ -20,6 +26,154 @@ beforeEach(() => {
 
 const infohash = "0123456789abcdef0123456789abcdef01234567";
 const torrentUrl = `https://yts.mx/torrent/download/${infohash.toUpperCase()}`;
+
+describe("trusted Movie Library metadata boundary", () => {
+  const fileId = "1111111111111111111111111111111111111111";
+  const requestId = "2222222222222222222222222222222222222222";
+  const verificationId = "3333333333333333333333333333333333333333";
+
+  it("parses exact trusted scan identity and accepted metadata without normalizing text", () => {
+    expect(
+      parseMovieLibraryScan([
+        "movie-library-v1",
+        "ready",
+        "1",
+        fileId,
+        "/Movies/映画  —  Local.File.MKV",
+        "映画  —  Local.File.MKV",
+        "987654321",
+        "1",
+        "419",
+        "tt0123456",
+        "Accepted  Title — 特別版",
+        "Original  Title",
+        "1999-04-19",
+        "/poster.jpg",
+        "Exact  overview.",
+        "7",
+      ]),
+    ).toEqual({
+      metadataStatus: "ready",
+      movies: [
+        {
+          association: {
+            generation: "7",
+            imdbId: "tt0123456",
+            originalTitle: "Original  Title",
+            overview: "Exact  overview.",
+            posterPath: "/poster.jpg",
+            releaseDate: "1999-04-19",
+            title: "Accepted  Title — 特別版",
+            tmdbMovieId: 419,
+          },
+          fileId,
+          path: "/Movies/映画  —  Local.File.MKV",
+          relativePath: "映画  —  Local.File.MKV",
+          sizeBytes: "987654321",
+        },
+      ],
+    });
+  });
+
+  it("rejects malformed, duplicate, and conflicting trusted scan rows", () => {
+    const validRow = [
+      fileId,
+      "/Movies/Exact.mp4",
+      "Exact.mp4",
+      "5",
+      "0",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+    ];
+    for (const response of [
+      ["movie-library-v2", "ready", "0"],
+      ["movie-library-v1", "invalid", "0"],
+      ["movie-library-v1", "ready", "1", ...validRow.slice(0, -1)],
+      ["movie-library-v1", "ready", "2", ...validRow, ...validRow],
+      [
+        "movie-library-v1",
+        "ready",
+        "1",
+        ...validRow.slice(0, 4),
+        "1",
+        "419",
+        "tt0123456",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "1",
+      ],
+    ]) {
+      expect(parseMovieLibraryScan(response)).toBeNull();
+    }
+  });
+
+  it("submits only explicit exact matching identities through search, verification, Save, clear, and invalidation", async () => {
+    invokeMock
+      .mockResolvedValueOnce([
+        requestId,
+        "1",
+        "419",
+        "Candidate  Title",
+        "Original Title",
+        "1999-04-19",
+        "/poster.jpg",
+      ])
+      .mockResolvedValueOnce([
+        verificationId,
+        "419",
+        "tt0123456",
+        "Accepted  Title",
+        "Original Title",
+        "1999-04-19",
+        "/poster.jpg",
+        "Overview.",
+        "1",
+      ])
+      .mockResolvedValueOnce([
+        "419",
+        "tt0123456",
+        "Accepted  Title",
+        "Original Title",
+        "1999-04-19",
+        "/poster.jpg",
+        "Overview.",
+        "4",
+      ])
+      .mockResolvedValue(undefined);
+
+    await expect(searchMovieMetadata(fileId, "Exact  Query — 特別版")).resolves.toMatchObject({
+      matchingRequestId: requestId,
+      candidates: [{ tmdbMovieId: 419, title: "Candidate  Title" }],
+    });
+    await expect(verifyMovieMetadataCandidate(requestId, 419)).resolves.toMatchObject({
+      verificationId,
+      association: { imdbId: "tt0123456", tmdbMovieId: 419 },
+    });
+    await expect(saveMovieMetadataMatch(verificationId)).resolves.toMatchObject({
+      generation: "4",
+      imdbId: "tt0123456",
+      tmdbMovieId: 419,
+    });
+    await clearMovieMetadataMatch(fileId);
+    await invalidateMovieMetadataMatchContext();
+    expect(invokeMock.mock.calls).toEqual([
+      ["search_movie_metadata", { fileId, query: "Exact  Query — 特別版" }],
+      ["verify_movie_metadata_candidate", { matchingRequestId: requestId, tmdbMovieId: 419 }],
+      ["save_movie_metadata_match", { verificationId }],
+      ["clear_movie_metadata_match", { fileId }],
+      ["invalidate_movie_metadata_match_context"],
+    ]);
+  });
+});
 
 function movieReleaseResponse() {
   return [
