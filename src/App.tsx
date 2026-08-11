@@ -5421,7 +5421,6 @@ function TvLibraryFileRow({
   onTrashPendingChange,
   scanGeneration,
   showTitle,
-  trashActionsDisabled,
   trashPendingPath,
 }: {
   file: TvLibraryFile;
@@ -5430,7 +5429,6 @@ function TvLibraryFileRow({
   onTrashPendingChange: (path: string | null) => void;
   scanGeneration: string;
   showTitle: string | null;
-  trashActionsDisabled: boolean;
   trashPendingPath: string | null;
 }) {
   const [pendingAction, setPendingAction] = useState<"open" | "reveal" | null>(
@@ -5486,11 +5484,7 @@ function TvLibraryFileRow({
 
   const trashFile = async (event: ReactMouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
-    if (
-      trashRequestPending.current ||
-      trashPendingPath !== null ||
-      trashActionsDisabled
-    ) {
+    if (trashRequestPending.current || trashPendingPath !== null) {
       return;
     }
 
@@ -5573,7 +5567,7 @@ function TvLibraryFileRow({
             render={
               <Button
                 aria-label={`Move TV file to Trash or Recycle Bin: ${file.filename}`}
-                disabled={trashPendingPath !== null || trashActionsDisabled}
+                disabled={trashPendingPath !== null}
                 onClick={(event) => event.stopPropagation()}
                 onKeyDown={(event) => event.stopPropagation()}
                 onPointerDown={(event) => event.stopPropagation()}
@@ -5688,7 +5682,6 @@ function TvLibraryCard({
   onTrashPendingChange,
   onViewMetadataDetails,
   scanGeneration,
-  trashActionsDisabled,
   trashPendingPath,
 }: {
   item: TvLibraryItem;
@@ -5698,7 +5691,6 @@ function TvLibraryCard({
   onTrashPendingChange: (path: string | null) => void;
   onViewMetadataDetails: (item: TvLibraryItem, triggerId: string) => void;
   scanGeneration: string;
-  trashActionsDisabled: boolean;
   trashPendingPath: string | null;
 }) {
   const metadataTriggerId = useId();
@@ -5793,7 +5785,6 @@ function TvLibraryCard({
             onTrashPendingChange={onTrashPendingChange}
             scanGeneration={scanGeneration}
             showTitle={item.showTitle}
-            trashActionsDisabled={trashActionsDisabled}
             trashPendingPath={trashPendingPath}
           />
         ))}
@@ -6691,7 +6682,20 @@ function compareTvLibraryItemsByTitle(
 function removeTvLibraryFile(items: TvLibraryItem[], path: string) {
   return items.flatMap((item) => {
     const files = item.files.filter((file) => file.path !== path);
-    return files.length === 0 ? [] : [{ ...item, files }];
+    if (files.length === 0) {
+      return [];
+    }
+    return item.association == null
+      ? [{ ...item, files }]
+      : [
+          {
+            ...item,
+            association: null,
+            files,
+            metadataState: "attention" as const,
+            title: item.showTitle ?? item.title,
+          },
+        ];
   });
 }
 
@@ -8923,10 +8927,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
         let needsAttention = false;
         if (scanResult.status === "fulfilled") {
-          const reconciledItems = removeTvLibraryFile(
-            scanResult.value.items,
-            file.path,
-          );
+          const reconciledItems = scanResult.value.items;
           const reconciledState: TvLibraryScanState =
             reconciledItems.length === 0
               ? {
@@ -14127,9 +14128,6 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                             onTrashPendingChange={setTvTrashPendingPath}
                             onViewMetadataDetails={openTvMetadataDetails}
                             scanGeneration={tvLibraryScanState.generation}
-                            trashActionsDisabled={
-                              tvTrashReconciliationState !== null
-                            }
                             trashPendingPath={tvTrashPendingPath}
                           />
                         )}

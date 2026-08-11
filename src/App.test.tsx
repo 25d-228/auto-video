@@ -1906,6 +1906,229 @@ describe("parsed TV Library and Dashboard", () => {
     expect(queryTvStorageMock).toHaveBeenCalledTimes(3);
   });
 
+  it("suppresses final-anchor metadata while accepted Trash reconciliation needs retry", async () => {
+    savedTvFolder = "/TV";
+    const groupId = "6".repeat(40);
+    const anchorPath = "/TV/Exact Local Show.S01E01.mp4";
+    const laterMemberPath = "/TV/Exact Local Show.S01E02.mkv";
+    const providerName = "Canonical Provider Show";
+    const members = [
+      {
+        path: anchorPath,
+        relativePath: "Exact Local Show.S01E01.mp4",
+      },
+      {
+        path: laterMemberPath,
+        relativePath: "Exact Local Show.S01E02.mkv",
+      },
+    ];
+    scanTvLibraryMock
+      .mockResolvedValueOnce(
+        fixtureTvMetadataScan({
+          association: {
+            tmdbTvId: "701",
+            imdbId: "tt1234567",
+            name: providerName,
+          },
+          groupId,
+          members,
+          metadataState: "ready",
+          showTitle: "Exact Local Show",
+        }),
+      )
+      .mockRejectedValueOnce("tv_library_scan_failed")
+      .mockResolvedValueOnce(
+        fixtureTvMetadataScan({
+          generation: "8",
+          groupId,
+          members: [members[1]],
+          metadataState: "attention",
+          showTitle: "Exact Local Show",
+        }),
+      );
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    expect(
+      await screen.findByRole("heading", { name: providerName }),
+    ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
+      }),
+    );
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Confirm moving TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Exact Local Show" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: providerName })).toBeNull();
+    expect(
+      screen.queryByRole("button", {
+        name: `View show metadata details: ${providerName}`,
+      }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: `Copy title: ${providerName}` }),
+    ).toBeNull();
+    const localCopy = screen.getByRole("button", {
+      name: "Copy title: Exact Local Show",
+    });
+    fireEvent.click(localCopy);
+    expect(clipboardWriteMock).toHaveBeenCalledWith("Exact Local Show");
+    expect(
+      screen.getByRole("button", {
+        name: "Match show metadata: Exact Local Show",
+      }),
+    ).toHaveProperty("disabled", true);
+
+    const open = screen.getByRole("button", {
+      name: "Open TV file: Exact Local Show.S01E02.mkv",
+    });
+    const reveal = screen.getByRole("button", {
+      name: "Reveal TV file: Exact Local Show.S01E02.mkv",
+    });
+    const remainingTrash = screen.getByRole("button", {
+      name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E02.mkv",
+    });
+    expect(open).toHaveProperty("disabled", false);
+    expect(reveal).toHaveProperty("disabled", false);
+    expect(remainingTrash).toHaveProperty("disabled", false);
+    fireEvent.click(open);
+    await waitFor(() => {
+      expect(openTvFileMock).toHaveBeenCalledWith({ path: laterMemberPath });
+      expect(reveal).toHaveProperty("disabled", false);
+    });
+    fireEvent.click(reveal);
+    await waitFor(() => {
+      expect(revealTvFileMock).toHaveBeenCalledWith({ path: laterMemberPath });
+    });
+
+    const reconciliationAlert = screen
+      .getByText(/file move succeeded, but the TV Library or storage/)
+      .closest('[role="alert"]');
+    if (!(reconciliationAlert instanceof HTMLElement)) {
+      throw new Error("The TV reconciliation alert was not rendered.");
+    }
+    fireEvent.click(
+      within(reconciliationAlert).getByRole("button", {
+        name: "Retry reconciliation",
+      }),
+    );
+    expect(
+      await screen.findByText("Exact Local Show.S01E02.mkv"),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", {
+        name: "Match show metadata: Exact Local Show",
+      }),
+    ).toHaveProperty("disabled", true);
+    expect(trashTvFileMock).toHaveBeenCalledTimes(1);
+    expect(trashTvFileMock).toHaveBeenCalledWith({
+      path: anchorPath,
+      scanGeneration: "7",
+    });
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(3);
+    expect(searchTvShowMetadataMock).not.toHaveBeenCalled();
+  });
+
+  it("restores a valid association only after native Trash reconciliation succeeds", async () => {
+    savedTvFolder = "/TV";
+    const groupId = "7".repeat(40);
+    const removedPath = "/TV/Exact Local Show.S01E01.mp4";
+    const remainingPath = "/TV/Exact Local Show.S01E02.mkv";
+    const providerName = "Canonical Provider Show";
+    const members = [
+      {
+        path: removedPath,
+        relativePath: "Exact Local Show.S01E01.mp4",
+      },
+      {
+        path: remainingPath,
+        relativePath: "Exact Local Show.S01E02.mkv",
+      },
+    ];
+    const association = {
+      tmdbTvId: "701",
+      imdbId: "tt1234567",
+      name: providerName,
+    };
+    const reconciliation = createDeferred<string[]>();
+    scanTvLibraryMock
+      .mockResolvedValueOnce(
+        fixtureTvMetadataScan({
+          association,
+          groupId,
+          members,
+          metadataState: "ready",
+          showTitle: "Exact Local Show",
+        }),
+      )
+      .mockReturnValueOnce(reconciliation.promise);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    await screen.findByRole("heading", { name: providerName });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
+      }),
+    );
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Confirm moving TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
+      }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Exact Local Show" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: providerName })).toBeNull();
+    expect(
+      screen.getByRole("button", {
+        name: "Match show metadata: Exact Local Show",
+      }),
+    ).toHaveProperty("disabled", true);
+    expect(
+      screen.getByRole("button", {
+        name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E02.mkv",
+      }),
+    ).toHaveProperty("disabled", false);
+
+    await act(async () => {
+      reconciliation.resolve(
+        fixtureTvMetadataScan({
+          association,
+          generation: "8",
+          groupId,
+          members: [members[1]],
+          metadataState: "ready",
+          showTitle: "Exact Local Show",
+        }),
+      );
+      await reconciliation.promise;
+    });
+    expect(
+      await screen.findByRole("heading", { name: providerName }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", {
+        name: `View show metadata details: ${providerName}`,
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: `Copy title: ${providerName}` }),
+    ).toBeTruthy();
+    expect(trashTvFileMock).toHaveBeenCalledTimes(1);
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     ["tv_file_trash_not_found", "This file is no longer available."],
     [
