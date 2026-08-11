@@ -258,6 +258,7 @@ struct CleanupRecovery {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CleanupDeletionOutcome {
     TargetAbsent,
+    #[cfg(any(target_os = "macos", test))]
     ReplacementPreserved,
 }
 
@@ -271,7 +272,24 @@ impl From<()> for CleanupDeletionOutcome {
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 enum CleanupReconciliation {
     Continue,
+    #[cfg(any(target_os = "macos", test))]
     DeletionCompleted,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+impl CleanupReconciliation {
+    fn deletion_completed(self) -> bool {
+        #[cfg(any(target_os = "macos", test))]
+        {
+            matches!(self, Self::DeletionCompleted)
+        }
+        #[cfg(all(target_os = "windows", not(test)))]
+        {
+            match self {
+                Self::Continue => false,
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -6523,7 +6541,7 @@ where
             )?;
             match recovery.files[selected_index] {
                 CleanupFileState::Deleted | CleanupFileState::AbsentBeforeCleanup => {
-                    if matches!(reconciliation, CleanupReconciliation::DeletionCompleted) {
+                    if reconciliation.deletion_completed() {
                         continue;
                     }
                     match fs::symlink_metadata(&target) {
@@ -6531,9 +6549,7 @@ where
                         _ => return Err(VR_DOWNLOAD_STALE),
                     }
                 }
-                CleanupFileState::Present
-                    if matches!(reconciliation, CleanupReconciliation::DeletionCompleted) =>
-                {
+                CleanupFileState::Present if reconciliation.deletion_completed() => {
                     recovery.files[selected_index] = CleanupFileState::Deleted;
                     (persistence.0)(persistence_path, &recovery)?;
                 }
@@ -6552,6 +6568,7 @@ where
                         match (deletion, fs::symlink_metadata(&target)) {
                             (CleanupDeletionOutcome::TargetAbsent, Err(error))
                                 if error.kind() == io::ErrorKind::NotFound => {}
+                            #[cfg(any(target_os = "macos", test))]
                             (CleanupDeletionOutcome::ReplacementPreserved, Ok(metadata))
                                 if !metadata.file_type().is_symlink() && metadata.is_file() => {}
                             _ => return Err(VR_DOWNLOAD_STALE),
