@@ -2474,6 +2474,52 @@ fn parse_macos_cleanup_mutation(
 }
 
 #[cfg(target_os = "macos")]
+fn read_macos_cleanup_mutations(
+    persistence_path: &Path,
+) -> Result<Vec<MacosCleanupMutation>, &'static str> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = cleanup_recovery_directory(persistence_path)?;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(VR_DOWNLOAD_PERSISTENCE_FAILED),
+    };
+    let metadata = fs::symlink_metadata(&directory).map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+    }
+    let mut mutations = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+        let name = entry.file_name();
+        if !name
+            .as_bytes()
+            .starts_with(MACOS_CLEANUP_MUTATION_PREFIX.as_bytes())
+        {
+            continue;
+        }
+        let name = name.to_str().ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+        let transfer_id = name
+            .strip_prefix(MACOS_CLEANUP_MUTATION_PREFIX)
+            .and_then(|name| name.strip_suffix(TERMINAL_RECOVERY_SUFFIX))
+            .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?;
+        if transfer_id.len() != 40
+            || !transfer_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || mutations.len() >= MAX_PERSISTED_TRANSFERS
+        {
+            return Err(VR_DOWNLOAD_PERSISTENCE_FAILED);
+        }
+        mutations.push(
+            parse_macos_cleanup_mutation(persistence_path, &entry.path())
+                .ok_or(VR_DOWNLOAD_PERSISTENCE_FAILED)?,
+        );
+    }
+    mutations.sort_by(|left, right| left.record.transfer_id.cmp(&right.record.transfer_id));
+    Ok(mutations)
+}
+
+#[cfg(target_os = "macos")]
 fn write_macos_cleanup_mutation(
     persistence_path: &Path,
     mutation: &MacosCleanupMutation,
@@ -3555,36 +3601,136 @@ fn macos_cleanup_path_state(
 }
 
 #[cfg(target_os = "macos")]
+fn macos_cleanup_metadata_matches(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.file_type().is_symlink() == right.file_type().is_symlink()
+        && left.is_file() == right.is_file()
+}
+
+#[cfg(target_os = "macos")]
+fn open_exact_macos_cleanup_file(
+    path: &Path,
+    expected_fingerprint: &str,
+) -> Result<File, &'static str> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    const O_EVTONLY: i32 = 0x0000_8000;
+    const O_NOFOLLOW: i32 = 0x0000_0100;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_EVTONLY | O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| VR_DOWNLOAD_STALE)?;
+    let pinned = file.metadata().map_err(|_| VR_DOWNLOAD_STALE)?;
+    let current = fs::symlink_metadata(path).map_err(|_| VR_DOWNLOAD_STALE)?;
+    if !pinned.is_file()
+        || pinned.file_type().is_symlink()
+        || pinned.nlink() != 1
+        || !macos_cleanup_metadata_matches(&pinned, &current)
+        || format!("{}:{}", pinned.dev(), pinned.ino()) != expected_fingerprint
+    {
+        return Err(VR_DOWNLOAD_STALE);
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "macos")]
+fn open_exact_macos_cleanup_staging_token(
+    path: &Path,
+    staging_token: &str,
+) -> Result<Option<File>, &'static str> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    const O_EVTONLY: i32 = 0x0000_8000;
+    const O_SYMLINK: i32 = 0x0020_0000;
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(O_EVTONLY | O_SYMLINK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(VR_DOWNLOAD_STALE),
+    };
+    let pinned = file.metadata().map_err(|_| VR_DOWNLOAD_STALE)?;
+    let before = fs::symlink_metadata(path).map_err(|_| VR_DOWNLOAD_STALE)?;
+    let token = fs::read_link(path).map_err(|_| VR_DOWNLOAD_STALE)?;
+    let after = fs::symlink_metadata(path).map_err(|_| VR_DOWNLOAD_STALE)?;
+    if !pinned.file_type().is_symlink()
+        || pinned.nlink() != 1
+        || token != Path::new(staging_token)
+        || !macos_cleanup_metadata_matches(&pinned, &before)
+        || !macos_cleanup_metadata_matches(&pinned, &after)
+    {
+        return Err(VR_DOWNLOAD_STALE);
+    }
+    Ok(Some(file))
+}
+
+#[cfg(target_os = "macos")]
+fn remove_pinned_macos_cleanup_object(
+    file: &File,
+    path: &Path,
+) -> Result<CleanupDeletionOutcome, &'static str> {
+    use std::os::unix::fs::MetadataExt;
+
+    let pinned = file.metadata().map_err(|_| VR_DOWNLOAD_STALE)?;
+    if pinned.nlink() != 1 {
+        return Err(VR_DOWNLOAD_STALE);
+    }
+    // The open vnode prevents file-ID reuse while /.vol avoids unlinking a raced pathname.
+    let volume_path = PathBuf::from("/.vol")
+        .join(pinned.dev().to_string())
+        .join(pinned.ino().to_string());
+    let volume_metadata = fs::symlink_metadata(&volume_path).map_err(|_| VR_DOWNLOAD_STALE)?;
+    if !macos_cleanup_metadata_matches(&pinned, &volume_metadata) {
+        return Err(VR_DOWNLOAD_STALE);
+    }
+    fs::remove_file(&volume_path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+    if file.metadata().map_err(|_| VR_DOWNLOAD_STALE)?.nlink() != 0 {
+        return Err(VR_DOWNLOAD_STALE);
+    }
+    sync_parent_directory(&volume_path);
+    sync_parent_directory(path);
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(CleanupDeletionOutcome::TargetAbsent)
+        }
+        Ok(_) => Ok(CleanupDeletionOutcome::ReplacementPreserved),
+        Err(_) => Err(VR_DOWNLOAD_STALE),
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn remove_macos_cleanup_staging_token(
     path: &Path,
     staging_token: &str,
-) -> Result<(), &'static str> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Ok(metadata)
-            if metadata.file_type().is_symlink()
-                && fs::read_link(path).ok().as_deref() == Some(Path::new(staging_token)) =>
-        {
-            fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
-            sync_parent_directory(path);
-            Ok(())
-        }
-        Ok(_) | Err(_) => Err(VR_DOWNLOAD_STALE),
-    }
+    before_removal: &mut impl FnMut(&Path) -> Result<(), &'static str>,
+) -> Result<CleanupDeletionOutcome, &'static str> {
+    let Some(file) = open_exact_macos_cleanup_staging_token(path, staging_token)? else {
+        return Ok(CleanupDeletionOutcome::TargetAbsent);
+    };
+    before_removal(path)?;
+    remove_pinned_macos_cleanup_object(&file, path)
 }
 
 #[cfg(target_os = "macos")]
 fn remove_exact_macos_cleanup_file(
     path: &Path,
     expected_fingerprint: &str,
-) -> Result<(), &'static str> {
-    if macos_cleanup_path_state(path, expected_fingerprint, "")? != MacosCleanupPathState::ExactFile
-    {
-        return Err(VR_DOWNLOAD_STALE);
+    before_removal: &mut impl FnMut(&Path) -> Result<(), &'static str>,
+) -> Result<Option<CleanupDeletionOutcome>, &'static str> {
+    let file = open_exact_macos_cleanup_file(path, expected_fingerprint)?;
+    before_removal(path)?;
+    let current = fs::symlink_metadata(path).map_err(|_| VR_DOWNLOAD_STALE)?;
+    let pinned = file.metadata().map_err(|_| VR_DOWNLOAD_STALE)?;
+    if !macos_cleanup_metadata_matches(&pinned, &current) {
+        return Ok(None);
     }
-    fs::remove_file(path).map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
-    sync_parent_directory(path);
-    Ok(())
+    remove_pinned_macos_cleanup_object(&file, path).map(Some)
 }
 
 #[cfg(target_os = "macos")]
@@ -3602,6 +3748,7 @@ enum MacosCleanupMutationBoundary {
 enum MacosCleanupPreparationBoundary {
     Exchange,
     ExactDeletion,
+    StagingTokenRemoval,
 }
 
 #[cfg(target_os = "macos")]
@@ -3833,6 +3980,12 @@ fn run_macos_cleanup_mutation_with(
                     remove_macos_cleanup_staging_token(
                         &mutation.target_path,
                         &mutation.staging_token,
+                        &mut |path| {
+                            before_mutation(
+                                MacosCleanupPreparationBoundary::StagingTokenRemoval,
+                                path,
+                            )
+                        },
                     )?;
                     after_mutation(MacosCleanupMutationBoundary::StagingRemoved)?;
                 }
@@ -3840,6 +3993,12 @@ fn run_macos_cleanup_mutation_with(
                     remove_macos_cleanup_staging_token(
                         &mutation.staging_path,
                         &mutation.staging_token,
+                        &mut |path| {
+                            before_mutation(
+                                MacosCleanupPreparationBoundary::StagingTokenRemoval,
+                                path,
+                            )
+                        },
                     )?;
                     after_mutation(MacosCleanupMutationBoundary::StagingRemoved)?;
                 }
@@ -3864,14 +4023,16 @@ fn run_macos_cleanup_mutation_with(
             },
             Phase::ExactDeletionPrepared => match staging_state {
                 PathState::ExactFile => {
-                    before_mutation(
-                        MacosCleanupPreparationBoundary::ExactDeletion,
-                        &mutation.staging_path,
-                    )?;
-                    remove_exact_macos_cleanup_file(
+                    let Some(outcome) = remove_exact_macos_cleanup_file(
                         &mutation.staging_path,
                         &mutation.expected_fingerprint,
-                    )?;
+                        &mut |path| {
+                            before_mutation(MacosCleanupPreparationBoundary::ExactDeletion, path)
+                        },
+                    )?
+                    else {
+                        return Err(VR_DOWNLOAD_STALE);
+                    };
                     after_mutation(MacosCleanupMutationBoundary::ExactDeleted)?;
                     advance_macos_cleanup_mutation(
                         persistence_path,
@@ -3879,6 +4040,9 @@ fn run_macos_cleanup_mutation_with(
                         Phase::ExactDeleted,
                         &mut persist_mutation,
                     )?;
+                    if outcome == CleanupDeletionOutcome::ReplacementPreserved {
+                        return Err(VR_DOWNLOAD_STALE);
+                    }
                 }
                 PathState::Absent => advance_macos_cleanup_mutation(
                     persistence_path,
@@ -3903,19 +4067,35 @@ fn run_macos_cleanup_mutation_with(
                 if staging_state == PathState::ExactFile {
                     return Err(VR_DOWNLOAD_STALE);
                 }
+                let mut replacement_detected = false;
                 if target_state == PathState::StagingToken {
-                    remove_macos_cleanup_staging_token(
+                    replacement_detected |= remove_macos_cleanup_staging_token(
                         &mutation.target_path,
                         &mutation.staging_token,
-                    )?;
+                        &mut |path| {
+                            before_mutation(
+                                MacosCleanupPreparationBoundary::StagingTokenRemoval,
+                                path,
+                            )
+                        },
+                    )? == CleanupDeletionOutcome::ReplacementPreserved;
                     after_mutation(MacosCleanupMutationBoundary::StagingRemoved)?;
                 }
                 if staging_state == PathState::StagingToken {
-                    remove_macos_cleanup_staging_token(
+                    replacement_detected |= remove_macos_cleanup_staging_token(
                         &mutation.staging_path,
                         &mutation.staging_token,
-                    )?;
+                        &mut |path| {
+                            before_mutation(
+                                MacosCleanupPreparationBoundary::StagingTokenRemoval,
+                                path,
+                            )
+                        },
+                    )? == CleanupDeletionOutcome::ReplacementPreserved;
                     after_mutation(MacosCleanupMutationBoundary::StagingRemoved)?;
+                }
+                if replacement_detected {
+                    return Err(VR_DOWNLOAD_STALE);
                 }
                 persist_macos_cleanup_file_deleted(
                     persistence_path,
@@ -4195,6 +4375,9 @@ fn validate_cleanup_start_reservations(
     proposed: &TransferRecord,
 ) -> Result<(), &'static str> {
     let recoveries = read_cleanup_recoveries(persistence_path).map_err(|_| VR_DOWNLOAD_STALE)?;
+    #[cfg(target_os = "macos")]
+    let macos_mutations =
+        read_macos_cleanup_mutations(persistence_path).map_err(|_| VR_DOWNLOAD_STALE)?;
     let proposed_targets = proposed
         .selected_files
         .iter()
@@ -4229,6 +4412,18 @@ fn validate_cleanup_start_reservations(
             cleanup_record_start_conflict(&recovery.record, proposed, &proposed_targets)?
         {
             return Err(error);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for mutation in macos_mutations {
+        if mutation.record.transfer_id == proposed.transfer_id {
+            return Err(VR_DOWNLOAD_DUPLICATE);
+        }
+        if proposed_targets
+            .iter()
+            .any(|target| target == &mutation.target_path || target == &mutation.staging_path)
+        {
+            return Err(VR_DOWNLOAD_DESTINATION_CONFLICT);
         }
     }
     Ok(())
@@ -14817,6 +15012,8 @@ mod tests {
             prepared_macos_cleanup_mutation(&fixture, "final-deletion-race");
         let staging_path = mutation.staging_path.clone();
         let displaced = record.destination.join("displaced-selected.mp4");
+        let unrelated = record.destination.join("unrelated.bin");
+        fs::write(&unrelated, b"unrelated").expect("unrelated fixture must exist");
         write_macos_cleanup_mutation(&persistence_path, &mutation)
             .expect("prepared mutation authority must persist");
 
@@ -14857,6 +15054,343 @@ mod tests {
                 .expect("mutation path must resolve")
                 .is_file()
         );
+        let restarted = restarted_macos_cleanup_state(&fixture, &persistence_path, &record);
+        assert_eq!(transfer_rows(&restarted)[8], "cleanup");
+        assert_eq!(
+            fs::read(&staging_path).expect("replacement must survive restart"),
+            b"replacement"
+        );
+        assert_eq!(
+            file_fingerprint(&displaced).expect("selected object must survive restart"),
+            record.fingerprints[0]
+        );
+        assert_eq!(
+            fs::read(&unrelated).expect("unrelated bytes must survive restart"),
+            b"unrelated"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_final_staging_token_race_preserves_replacement_and_restarts_safely() {
+        let fixture = FilesystemFixture::new();
+        let (persistence_path, record, mut mutation, target) =
+            prepared_macos_cleanup_mutation(&fixture, "staging-token-race");
+        let staging_path = mutation.staging_path.clone();
+        let displaced_token = record.destination.join("displaced-staging-token");
+        let unrelated = record.destination.join("unrelated.bin");
+        let raced = Cell::new(false);
+        fs::write(&unrelated, b"unrelated").expect("unrelated fixture must exist");
+        write_macos_cleanup_mutation(&persistence_path, &mutation)
+            .expect("prepared mutation authority must persist");
+
+        assert_eq!(
+            run_macos_cleanup_mutation_with(
+                &persistence_path,
+                &mut mutation,
+                write_macos_cleanup_mutation,
+                write_cleanup_recovery,
+                remove_macos_cleanup_mutation,
+                |boundary, path| {
+                    if boundary == MacosCleanupPreparationBoundary::StagingTokenRemoval
+                        && !raced.get()
+                    {
+                        fs::rename(path, &displaced_token)
+                            .map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+                        fs::write(path, b"replacement").map_err(|_| VR_DOWNLOAD_CLEANUP_FAILED)?;
+                        raced.set(true);
+                    }
+                    Ok(())
+                },
+                |_| Ok(()),
+            ),
+            Err(VR_DOWNLOAD_STALE)
+        );
+        assert!(raced.get());
+        assert_eq!(
+            fs::read(&target).expect("staging-path replacement must survive"),
+            b"replacement"
+        );
+        assert!(!staging_path.exists());
+        assert!(!displaced_token.exists());
+        assert_eq!(
+            fs::read(&unrelated).expect("unrelated bytes must survive"),
+            b"unrelated"
+        );
+        assert_eq!(
+            read_persisted_transfers(&persistence_path)
+                .expect("cleanup row must remain durable")
+                .len(),
+            1
+        );
+        assert_eq!(
+            read_cleanup_recoveries(&persistence_path).expect("cleanup recovery must remain")[0]
+                .files,
+            vec![CleanupFileState::Present]
+        );
+        assert_eq!(
+            read_macos_cleanup_mutations(&persistence_path)
+                .expect("mutation authority must remain")[0]
+                .phase,
+            MacosCleanupMutationPhase::StagingCleanupPrepared
+        );
+
+        let restarted = restarted_macos_cleanup_state(&fixture, &persistence_path, &record);
+        assert_eq!(transfer_rows(&restarted)[8], "cleanup");
+        cleanup_cancelled_download(&restarted, &persistence_path, &record.transfer_id)
+            .expect("explicit retry must finish exact durable cleanup");
+        assert_eq!(
+            fs::read(&target).expect("replacement must survive retry"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(&unrelated).expect("unrelated bytes must survive retry"),
+            b"unrelated"
+        );
+        assert!(transfer_rows(&restarted).is_empty());
+        assert!(read_macos_cleanup_mutations(&persistence_path)
+            .expect("mutation directory must remain readable")
+            .is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn durable_macos_mutations_reserve_every_category_start_until_cleanup_finishes() {
+        for after_exact_deletion in [false, true] {
+            let fixture = FilesystemFixture::new();
+            let label = if after_exact_deletion {
+                "exact-deleted-start-reservation"
+            } else {
+                "prepared-start-reservation"
+            };
+            let (persistence_path, record, mut mutation, target) =
+                prepared_macos_cleanup_mutation(&fixture, label);
+            let destination = record.destination.clone();
+            let staging_path = mutation.staging_path.clone();
+            let staging_relative = staging_path
+                .strip_prefix(&destination)
+                .expect("staging path must remain inside the shared folder")
+                .to_str()
+                .expect("fixture staging path must be UTF-8")
+                .to_owned();
+            write_macos_cleanup_mutation(&persistence_path, &mutation)
+                .expect("prepared mutation authority must persist");
+            if after_exact_deletion {
+                assert_eq!(
+                    run_macos_cleanup_mutation_with(
+                        &persistence_path,
+                        &mut mutation,
+                        |path, next| {
+                            if next.phase == MacosCleanupMutationPhase::StagingCleanupPrepared {
+                                Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+                            } else {
+                                write_macos_cleanup_mutation(path, next)
+                            }
+                        },
+                        write_cleanup_recovery,
+                        remove_macos_cleanup_mutation,
+                        |_, _| Ok(()),
+                        |_| Ok(()),
+                    ),
+                    Err(VR_DOWNLOAD_PERSISTENCE_FAILED)
+                );
+                assert_eq!(
+                    read_macos_cleanup_mutations(&persistence_path)
+                        .expect("exact-deleted mutation must remain durable")[0]
+                        .phase,
+                    MacosCleanupMutationPhase::ExactDeleted
+                );
+            }
+            assert!(!staging_path.exists());
+
+            let state = restarted_macos_cleanup_state(&fixture, &persistence_path, &record);
+            {
+                let mut context = state.0.lock().expect("state must lock");
+                context.future_folder = Some(destination.clone());
+                context.adult_future_folder = Some(destination.clone());
+                context.movie_future_folder = Some(destination.clone());
+                context.tv_future_folder = Some(destination.clone());
+            }
+            let session_folder = fixture.path.join("blocked-session");
+            let product_source = |code: &str, release_name: &str| {
+                let metainfo = movie_organization_metainfo(&[(&staging_relative, 5)]);
+                let infohash = hex_sha1(&metainfo[b"d4:info".len()..metainfo.len() - 1]);
+                revalidate_persisted_download_source(&metainfo, code, release_name, &infohash, &[0])
+                    .expect("cross-category source must revalidate")
+            };
+            let adult_source =
+                product_source("ADLT-124", "【Adult】 ADLT-124  Exact — Start reservation");
+            let proposals = [
+                (
+                    TransferCategory::Vr,
+                    persistable_fixture_source(),
+                    VR_DOWNLOAD_DUPLICATE,
+                ),
+                (
+                    TransferCategory::Vr,
+                    product_source("MDVR-420", "【VR】 MDVR-420  Exact — Start reservation"),
+                    VR_DOWNLOAD_DESTINATION_CONFLICT,
+                ),
+                (
+                    TransferCategory::Adult,
+                    adult_source.clone(),
+                    VR_DOWNLOAD_DESTINATION_CONFLICT,
+                ),
+                (
+                    TransferCategory::Movie,
+                    movie_organization_source(
+                        "Exact Movie",
+                        Some("1999-04-19"),
+                        "Exact Provider Movie",
+                        &[(&staging_relative, 5)],
+                        &[0],
+                    ),
+                    VR_DOWNLOAD_DESTINATION_CONFLICT,
+                ),
+                (
+                    TransferCategory::Tv,
+                    tv_download_source(&[(&staging_relative, 5)], &[0]),
+                    VR_DOWNLOAD_DESTINATION_CONFLICT,
+                ),
+            ];
+            let primary_before =
+                fs::read(&persistence_path).expect("primary authority must remain readable");
+            let recovery_path = cleanup_recovery_path(&persistence_path, &record)
+                .expect("cleanup recovery path must resolve");
+            let recovery_before =
+                fs::read(&recovery_path).expect("cleanup recovery must remain readable");
+            let mutation_path = macos_cleanup_mutation_path(&persistence_path, &record.transfer_id)
+                .expect("mutation path must resolve");
+            let mutation_before =
+                fs::read(&mutation_path).expect("mutation authority must remain readable");
+            let transfers_before = transfer_snapshots(&state);
+
+            tauri::async_runtime::block_on(async {
+                for (category, source, expected_error) in proposals {
+                    assert_eq!(
+                        start_download_source(
+                            &state,
+                            &persistence_path,
+                            &session_folder,
+                            category,
+                            source,
+                        )
+                        .await,
+                        Err(expected_error),
+                        "{} Start ignored durable macOS mutation authority",
+                        category.as_str()
+                    );
+                    assert!(!staging_path.exists());
+                    assert_eq!(transfer_snapshots(&state), transfers_before);
+                    assert_eq!(
+                        fs::read(&persistence_path)
+                            .expect("blocked Start must not rewrite primary authority"),
+                        primary_before
+                    );
+                    assert_eq!(
+                        fs::read(&recovery_path)
+                            .expect("blocked Start must not rewrite cleanup recovery"),
+                        recovery_before
+                    );
+                    assert_eq!(
+                        fs::read(&mutation_path)
+                            .expect("blocked Start must not rewrite mutation authority"),
+                        mutation_before
+                    );
+                    let context = state.0.lock().expect("state must lock");
+                    assert!(context.session.is_none());
+                    assert!(!context.session_starting);
+                    assert_eq!(context.transfers.len(), 1);
+                    assert!(context.transfers.iter().all(|transfer| {
+                        matches!(transfer, StoredTransfer::Valid(record) if record.handle.is_none())
+                    }));
+                    drop(context);
+                    assert!(!session_folder.exists());
+                }
+
+                cleanup_cancelled_download(&state, &persistence_path, &record.transfer_id)
+                    .expect("cleanup retry must remove every durable authority");
+                assert!(!target.exists());
+                assert!(!staging_path.exists());
+                assert!(transfer_rows(&state).is_empty());
+                assert!(read_cleanup_recoveries(&persistence_path)
+                    .expect("cleanup recovery directory must remain readable")
+                    .is_empty());
+                assert!(read_macos_cleanup_mutations(&persistence_path)
+                    .expect("mutation directory must remain readable")
+                    .is_empty());
+
+                let started_transfer_id = start_download_source(
+                    &state,
+                    &persistence_path,
+                    &session_folder,
+                    TransferCategory::Adult,
+                    adult_source,
+                )
+                .await
+                .expect("Start must become available after durable authority removal");
+                assert!(staging_path.is_file());
+                assert!(state.0.lock().expect("state must lock").session.is_some());
+                cancel_download(&state, &persistence_path, &started_transfer_id)
+                    .await
+                    .expect("started fixture must cancel without deleting files");
+                dismiss_download(&state, &persistence_path, &started_transfer_id)
+                    .expect("cancelled fixture metadata must dismiss");
+                assert!(staging_path.is_file());
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn corrupt_or_unavailable_macos_mutation_authority_blocks_start_without_side_effects() {
+        for unavailable in [false, true] {
+            let fixture = FilesystemFixture::new();
+            let destination = fixture.path.join("destination");
+            fs::create_dir(&destination).expect("destination must exist");
+            let destination = fs::canonicalize(destination).expect("destination must canonicalize");
+            let persistence_path = fixture.path.join("downloads");
+            let session_folder = fixture.path.join("session");
+            let mutation_path = macos_cleanup_mutation_path(&persistence_path, &"0".repeat(40))
+                .expect("mutation path must resolve");
+            fs::create_dir(mutation_path.parent().expect("mutation must have a parent"))
+                .expect("mutation directory must exist");
+            if unavailable {
+                std::os::unix::fs::symlink("missing-mutation-authority", &mutation_path)
+                    .expect("unavailable mutation fixture must exist");
+            } else {
+                fs::write(&mutation_path, b"corrupt macOS cleanup mutation")
+                    .expect("corrupt mutation fixture must exist");
+            }
+            let state = VrDownloadState::default();
+            {
+                let mut context = state.0.lock().expect("state must lock");
+                context.future_folder = Some(destination.clone());
+                context.download_limit = DownloadLimitState::Loaded(None);
+                context.transfers_loaded = true;
+                context.persistence_path = Some(persistence_path.clone());
+            }
+
+            assert_eq!(
+                tauri::async_runtime::block_on(start_download_source(
+                    &state,
+                    &persistence_path,
+                    &session_folder,
+                    TransferCategory::Vr,
+                    persistable_fixture_source(),
+                )),
+                Err(VR_DOWNLOAD_STALE)
+            );
+            assert!(transfer_rows(&state).is_empty());
+            let context = state.0.lock().expect("state must lock");
+            assert!(context.session.is_none());
+            assert!(!context.session_starting);
+            drop(context);
+            assert!(!session_folder.exists());
+            assert!(!destination.join("Movie  A.mp4").exists());
+            assert!(!persistence_path.exists());
+            assert!(fs::symlink_metadata(&mutation_path).is_ok());
+        }
     }
 
     #[cfg(target_os = "macos")]
