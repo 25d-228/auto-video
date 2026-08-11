@@ -1360,11 +1360,11 @@ describe("parsed TV Library and Dashboard", () => {
   it("shows independent folder, scan, aggregate, storage, and routing states", async () => {
     savedTvFolder = "/TV/番組  Library";
     scanTvLibraryMock.mockResolvedValue([
-      "/TV/番組  Library/星  Show.S01E02.mp4",
-      "星  Show.S01E02.mp4",
+      "/TV/番組  Library/星  Show.S01E02.AVI",
+      "星  Show.S01E02.AVI",
       "1073741824",
-      "/TV/番組  Library/星  Show.S01E03.MKV",
-      "星  Show.S01E03.MKV",
+      "/TV/番組  Library/星  Show.S01E03.MOV",
+      "星  Show.S01E03.MOV",
       "2147483648",
       "/TV/番組  Library/Unknown release.mp4",
       "Unknown release.mp4",
@@ -2983,11 +2983,11 @@ describe("parsed Adult Library and Dashboard", () => {
   it("shows exact grouped membership, multipart labels, complete totals, storage, and routing", async () => {
     savedAdultFolder = "/Adult/作品  Library";
     scanAdultLibraryMock.mockResolvedValue([
-      "/Adult/作品  Library/ADLT-123 Part 01 — 前編.mp4",
-      "ADLT-123 Part 01 — 前編.mp4",
+      "/Adult/作品  Library/ADLT-123 Part 01 — 前編.AVI",
+      "ADLT-123 Part 01 — 前編.AVI",
       "1073741824",
-      "/Adult/作品  Library/adlt_00123_CD2  特別版.MKV",
-      "adlt_00123_CD2  特別版.MKV",
+      "/Adult/作品  Library/adlt_00123_CD2  特別版.MOV",
+      "adlt_00123_CD2  特別版.MOV",
       "2147483648",
       "/Adult/作品  Library/ADLT-123 Part 01 Disc 02.mp4",
       "ADLT-123 Part 01 Disc 02.mp4",
@@ -3936,9 +3936,9 @@ describe("parsed VR Library and Dashboard", () => {
   });
 
   it("shows grouped counts while preserving exact member copy, open, and reveal actions", async () => {
-    const firstPath = "/VR/作品/MDVR-419  Disc 01 — 前編.mp4";
-    const secondPath = "/VR/mdvr_00419_CD2  特別版.MKV";
-    const unassociatedPath = "/VR/MDVR-419 + ABC-123  pack.mp4";
+    const firstPath = "/VR/作品/MDVR-419  Disc 01 — 前編.AVI";
+    const secondPath = "/VR/mdvr_00419_CD2  特別版.MOV";
+    const unassociatedPath = "/VR/MDVR-419 + ABC-123  pack.FLV";
     savedVrFolder = "/VR";
     scanVrLibraryMock.mockResolvedValue([
       firstPath,
@@ -5095,11 +5095,25 @@ describe("Movies Library Dashboard", () => {
   it("shows the exact configured path and complete scan count without rescanning on navigation or resize", async () => {
     const folder =
       "C:\\映像ライブラリ\\Family — Archive & Restored Editions\\A very long configured Movies folder name";
-    const paths = Array.from(
-      { length: 25 },
-      (_, index) =>
-        `${folder}\\Movie ${String(index + 1).padStart(2, "0")}.mkv`,
-    );
+    const extensions = [
+      "mkv",
+      "mp4",
+      "avi",
+      "wmv",
+      "m4v",
+      "ts",
+      "mov",
+      "flv",
+      "iso",
+      "rmvb",
+      "webm",
+      "mpg",
+      "mpeg",
+    ];
+    const paths = Array.from({ length: 25 }, (_, index) => {
+      const extension = extensions[index % extensions.length];
+      return `${folder}\\Movie ${String(index + 1).padStart(2, "0")}.${extension}`;
+    });
     savedMoviesFolder = folder;
     scanMoviesMock.mockResolvedValue(paths);
 

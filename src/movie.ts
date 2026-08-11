@@ -3,6 +3,7 @@ import {
   torrentInspectionErrorStatus,
   type TorrentInspectionResult,
 } from "@/vr";
+import { hasSupportedLibraryExtension } from "@/library-media";
 
 export type MovieMetadataAssociation = {
   tmdbMovieId: number;
@@ -141,6 +142,7 @@ export function parseMovieLibraryScan(value: unknown): MovieLibraryScan | null {
       path === "" ||
       paths.has(path) ||
       relativePath === "" ||
+      !hasSupportedLibraryExtension(relativePath) ||
       !nonnegativeIntegerPattern.test(sizeBytes) ||
       !["0", "1"].includes(associated)
     ) {

@@ -1,3 +1,4 @@
+import { hasSupportedLibraryExtension } from "@/library-media";
 import { productCodeCandidates } from "@/vr";
 
 export type AdultFolderState =
@@ -113,13 +114,12 @@ function parseAdultLibrary(value: unknown): AdultLibraryScan {
     const relativePath = value[index + 1] as string;
     const sizeBytes = value[index + 2] as string;
     const filename = exactFilename(relativePath);
-    const extension = filename?.slice(filename.lastIndexOf(".") + 1) ?? "";
     if (
       path === "" ||
       filename === null ||
       paths.has(path) ||
       relativePaths.has(relativePath) ||
-      !/^(?:mp4|mkv)$/i.test(extension) ||
+      !hasSupportedLibraryExtension(filename) ||
       !unsignedU64Pattern.test(sizeBytes) ||
       BigInt(sizeBytes) > maximumU64
     ) {
