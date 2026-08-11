@@ -153,6 +153,8 @@ const JAVDB_API_USER_AGENT: &str = "Dart/3.5 (dart:io)";
 const JAVDB_SIGNATURE_MIDDLE: &str = "lpw6vgqzsp";
 const JAVDB_SIGNATURE_SECRET: &str = "71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa";
 const JAVDB_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "windows")]
+const JAVDB_USER_AGENT_ENV: &str = "AUTO_VIDEO_JAVDB_USER_AGENT";
 const SUKEBEI_RELEASES_URL: &str = "https://sukebei.nyaa.si/?page=rss&q=%22";
 const TMDB_MOVIE_URL: &str = "https://api.themoviedb.org/3/movie/";
 const TMDB_MOVIE_SEARCH_URL: &str = "https://api.themoviedb.org/3/search/movie?query=";
@@ -1760,7 +1762,7 @@ fn fetch_javdb_api_document(url: &str) -> Result<String, ProviderRequestError> {
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 try {
-  $headers = @{ Accept = 'application/json'; 'accept-language' = 'en'; jdsignature = $env:AUTO_VIDEO_JAVDB_SIGNATURE; 'User-Agent' = 'Dart/3.5 (dart:io)' }
+  $headers = @{ Accept = 'application/json'; 'accept-language' = 'en'; jdsignature = $env:AUTO_VIDEO_JAVDB_SIGNATURE; 'User-Agent' = $env:AUTO_VIDEO_JAVDB_USER_AGENT }
   $response = Invoke-WebRequest -UseBasicParsing -Uri $env:AUTO_VIDEO_JAVDB_URL -Headers $headers -MaximumRedirection 0 -TimeoutSec 20
   [Console]::Out.Write($response.Content)
   [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + [int]$response.StatusCode)
@@ -1774,6 +1776,7 @@ try {
         .arg(JAVDB_SCRIPT)
         .env(JAVDB_URL_ENV, url)
         .env(JAVDB_SIGNATURE_ENV, signature)
+        .env(JAVDB_USER_AGENT_ENV, JAVDB_API_USER_AGENT)
         .output()
         .map_err(|_| ProviderRequestError::Network)?;
     if !output.status.success() {
@@ -1815,6 +1818,7 @@ fn provider_binary_marker(output: &[u8]) -> Option<usize> {
         .rposition(|window| window == PROVIDER_HTTP_STATUS_MARKER.as_bytes())
 }
 
+#[cfg(target_os = "macos")]
 fn parse_provider_binary_response(output: &[u8]) -> Result<Vec<u8>, ProviderRequestError> {
     let marker = provider_binary_marker(output).ok_or(ProviderRequestError::Provider)?;
     let status = std::str::from_utf8(&output[marker + PROVIDER_HTTP_STATUS_MARKER.len()..])
@@ -1864,7 +1868,7 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    if value.len() % 4 != 0 {
+    if !value.len().is_multiple_of(4) {
         return None;
     }
     let mut output = Vec::with_capacity(value.len() / 4 * 3);
@@ -1937,7 +1941,7 @@ fn fetch_javdb_image_bytes(url: &str) -> Result<Vec<u8>, ProviderRequestError> {
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 try {
-  $headers = @{ Accept = 'image/*'; Referer = 'https://javdb.com/'; 'User-Agent' = 'Dart/3.5 (dart:io)' }
+  $headers = @{ Accept = 'image/*'; Referer = 'https://javdb.com/'; 'User-Agent' = $env:AUTO_VIDEO_JAVDB_USER_AGENT }
   $response = Invoke-WebRequest -UseBasicParsing -Uri $env:AUTO_VIDEO_JAVDB_IMAGE_URL -Headers $headers -MaximumRedirection 0 -TimeoutSec 20
   $memory = New-Object System.IO.MemoryStream
   $response.RawContentStream.CopyTo($memory)
@@ -1951,6 +1955,7 @@ try {
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
         .arg(JAVDB_IMAGE_SCRIPT)
         .env(JAVDB_IMAGE_URL_ENV, url)
+        .env(JAVDB_USER_AGENT_ENV, JAVDB_API_USER_AGENT)
         .output()
         .map_err(|_| ProviderRequestError::Network)?;
     if !output.status.success() {
