@@ -9,11 +9,14 @@ mod vr_torrent;
 
 use std::{
     collections::HashSet,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
+#[cfg(unix)]
+use std::fs::File;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::{Command, Stdio};
@@ -452,39 +455,8 @@ fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'stat
 }
 
 #[cfg(target_os = "windows")]
-#[repr(C)]
-struct MovieWindowsFileInformation {
-    file_attributes: u32,
-    creation_time_low: u32,
-    creation_time_high: u32,
-    last_access_time_low: u32,
-    last_access_time_high: u32,
-    last_write_time_low: u32,
-    last_write_time_high: u32,
-    volume_serial_number: u32,
-    file_size_high: u32,
-    file_size_low: u32,
-    number_of_links: u32,
-    file_index_high: u32,
-    file_index_low: u32,
-}
-
-#[cfg(target_os = "windows")]
-#[link(name = "Kernel32")]
-extern "system" {
-    #[link_name = "GetFileInformationByHandle"]
-    fn get_movie_file_information_by_handle(
-        file: *mut std::ffi::c_void,
-        information: *mut MovieWindowsFileInformation,
-    ) -> i32;
-}
-
-#[cfg(target_os = "windows")]
 fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'static str> {
-    use std::{
-        mem::MaybeUninit,
-        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
-    };
+    use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
     const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -505,17 +477,7 @@ fn movie_path_identity(path: &Path, regular_file: bool) -> Result<String, &'stat
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|_| MOVIE_METADATA_UNAVAILABLE)?;
-    let mut information = MaybeUninit::<MovieWindowsFileInformation>::uninit();
-    let succeeded = unsafe {
-        get_movie_file_information_by_handle(file.as_raw_handle().cast(), information.as_mut_ptr())
-    };
-    if succeeded == 0 {
-        return Err(MOVIE_METADATA_UNAVAILABLE);
-    }
-    let information = unsafe { information.assume_init() };
-    let file_index =
-        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
-    Ok(format!("{}:{file_index}", information.volume_serial_number))
+    vr_download::open_file_fingerprint(&file).map_err(|_| MOVIE_METADATA_UNAVAILABLE)
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
