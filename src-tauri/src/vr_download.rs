@@ -4152,7 +4152,7 @@ extern "system" {
 }
 
 #[cfg(target_os = "windows")]
-fn open_file_fingerprint(file: &File) -> io::Result<String> {
+pub(crate) fn open_file_fingerprint(file: &File) -> io::Result<String> {
     use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
 
     let mut information = MaybeUninit::<WindowsFileInformation>::uninit();

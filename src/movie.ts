@@ -4,6 +4,320 @@ import {
   type TorrentInspectionResult,
 } from "@/vr";
 
+export type MovieMetadataAssociation = {
+  tmdbMovieId: number;
+  imdbId: string;
+  title: string;
+  originalTitle: string | null;
+  releaseDate: string | null;
+  posterPath: string | null;
+  overview: string | null;
+  generation: string;
+};
+
+export type MovieLibraryFile = {
+  fileId: string;
+  path: string;
+  relativePath: string;
+  sizeBytes: string;
+  association: MovieMetadataAssociation | null;
+};
+
+export type MovieLibraryScan = {
+  metadataStatus: "ready" | "attention" | "unavailable";
+  movies: MovieLibraryFile[];
+};
+
+export type MovieMetadataCandidate = {
+  tmdbMovieId: number;
+  title: string;
+  originalTitle: string | null;
+  releaseDate: string | null;
+  posterPath: string | null;
+};
+
+export type MovieMetadataSearchResult = {
+  matchingRequestId: string;
+  candidates: MovieMetadataCandidate[];
+};
+
+export type VerifiedMovieMetadata = {
+  verificationId: string;
+  association: MovieMetadataAssociation;
+};
+
+const movieLibraryHeaderLength = 3;
+const movieLibraryRowLength = 13;
+const movieMetadataAssociationLength = 8;
+const movieMetadataCandidateLength = 5;
+const positiveIntegerPattern = /^[1-9]\d{0,19}$/;
+const nonnegativeIntegerPattern = /^\d{1,20}$/;
+const movieFileIdPattern = /^[a-f0-9]{40}$/;
+const movieImdbIdPattern = /^tt\d{7,10}$/;
+const movieReleaseDatePattern = /^\d{4}-\d{2}-\d{2}$/;
+
+function optionalMovieMetadataText(value: string) {
+  return value === "" ? null : value;
+}
+
+function parseMovieMetadataAssociation(
+  values: string[],
+): MovieMetadataAssociation | null {
+  if (values.length !== movieMetadataAssociationLength) {
+    return null;
+  }
+  const [
+    tmdbMovieIdValue,
+    imdbId,
+    title,
+    originalTitle,
+    releaseDate,
+    posterPath,
+    overview,
+    generation,
+  ] = values;
+  if (
+    !positiveIntegerPattern.test(tmdbMovieIdValue) ||
+    !movieImdbIdPattern.test(imdbId) ||
+    title.trim() === "" ||
+    (originalTitle !== "" && originalTitle.trim() === "") ||
+    (releaseDate !== "" && !movieReleaseDatePattern.test(releaseDate)) ||
+    (posterPath !== "" && !posterPath.startsWith("/")) ||
+    (overview !== "" && overview.trim() === "") ||
+    !positiveIntegerPattern.test(generation)
+  ) {
+    return null;
+  }
+  const tmdbMovieId = Number(tmdbMovieIdValue);
+  if (!Number.isSafeInteger(tmdbMovieId)) {
+    return null;
+  }
+  return {
+    tmdbMovieId,
+    imdbId,
+    title,
+    originalTitle: optionalMovieMetadataText(originalTitle),
+    releaseDate: optionalMovieMetadataText(releaseDate),
+    posterPath: optionalMovieMetadataText(posterPath),
+    overview: optionalMovieMetadataText(overview),
+    generation,
+  };
+}
+
+export function parseMovieLibraryScan(value: unknown): MovieLibraryScan | null {
+  if (
+    !Array.isArray(value) ||
+    value.length < movieLibraryHeaderLength ||
+    !value.every((entry) => typeof entry === "string")
+  ) {
+    return null;
+  }
+  const values = value as string[];
+  const [version, metadataStatus, countValue] = values;
+  if (
+    version !== "movie-library-v1" ||
+    !["ready", "attention", "unavailable"].includes(metadataStatus) ||
+    !/^\d{1,6}$/.test(countValue)
+  ) {
+    return null;
+  }
+  const count = Number(countValue);
+  if (values.length !== movieLibraryHeaderLength + count * movieLibraryRowLength) {
+    return null;
+  }
+  const movies: MovieLibraryFile[] = [];
+  const fileIds = new Set<string>();
+  const paths = new Set<string>();
+  for (
+    let index = movieLibraryHeaderLength;
+    index < values.length;
+    index += movieLibraryRowLength
+  ) {
+    const [fileId, path, relativePath, sizeBytes, associated, ...associationValues] =
+      values.slice(index, index + movieLibraryRowLength);
+    if (
+      !movieFileIdPattern.test(fileId) ||
+      fileIds.has(fileId) ||
+      path === "" ||
+      paths.has(path) ||
+      relativePath === "" ||
+      !nonnegativeIntegerPattern.test(sizeBytes) ||
+      !["0", "1"].includes(associated)
+    ) {
+      return null;
+    }
+    const association =
+      associated === "1"
+        ? parseMovieMetadataAssociation(associationValues)
+        : associationValues.every((entry) => entry === "")
+          ? null
+          : undefined;
+    if (association === undefined || (associated === "1" && association === null)) {
+      return null;
+    }
+    fileIds.add(fileId);
+    paths.add(path);
+    movies.push({ fileId, path, relativePath, sizeBytes, association });
+  }
+  return {
+    metadataStatus: metadataStatus as MovieLibraryScan["metadataStatus"],
+    movies,
+  };
+}
+
+function parseMovieMetadataSearch(value: unknown): MovieMetadataSearchResult | null {
+  if (
+    !Array.isArray(value) ||
+    value.length < 2 ||
+    !value.every((entry) => typeof entry === "string")
+  ) {
+    return null;
+  }
+  const values = value as string[];
+  const [matchingRequestId, countValue] = values;
+  if (!movieFileIdPattern.test(matchingRequestId) || !/^\d{1,3}$/.test(countValue)) {
+    return null;
+  }
+  const count = Number(countValue);
+  if (values.length !== 2 + count * movieMetadataCandidateLength) {
+    return null;
+  }
+  const candidates: MovieMetadataCandidate[] = [];
+  const ids = new Set<number>();
+  for (let index = 2; index < values.length; index += movieMetadataCandidateLength) {
+    const [idValue, title, originalTitle, releaseDate, posterPath] = values.slice(
+      index,
+      index + movieMetadataCandidateLength,
+    );
+    if (
+      !positiveIntegerPattern.test(idValue) ||
+      title.trim() === "" ||
+      (originalTitle !== "" && originalTitle.trim() === "") ||
+      (releaseDate !== "" && !movieReleaseDatePattern.test(releaseDate)) ||
+      (posterPath !== "" && !posterPath.startsWith("/"))
+    ) {
+      return null;
+    }
+    const tmdbMovieId = Number(idValue);
+    if (!Number.isSafeInteger(tmdbMovieId) || ids.has(tmdbMovieId)) {
+      return null;
+    }
+    ids.add(tmdbMovieId);
+    candidates.push({
+      tmdbMovieId,
+      title,
+      originalTitle: optionalMovieMetadataText(originalTitle),
+      releaseDate: optionalMovieMetadataText(releaseDate),
+      posterPath: optionalMovieMetadataText(posterPath),
+    });
+  }
+  return { matchingRequestId, candidates };
+}
+
+function parseVerifiedMovieMetadata(value: unknown): VerifiedMovieMetadata | null {
+  if (
+    !Array.isArray(value) ||
+    value.length !== 1 + movieMetadataAssociationLength ||
+    !value.every((entry) => typeof entry === "string")
+  ) {
+    return null;
+  }
+  const values = value as string[];
+  const association = parseMovieMetadataAssociation(values.slice(1));
+  return movieFileIdPattern.test(values[0]) && association !== null
+    ? { verificationId: values[0], association }
+    : null;
+}
+
+export async function searchMovieMetadata(
+  fileId: string,
+  query: string,
+  contextGeneration: number,
+) {
+  if (
+    !movieFileIdPattern.test(fileId) ||
+    query.trim() === "" ||
+    !Number.isSafeInteger(contextGeneration) ||
+    contextGeneration <= 0
+  ) {
+    throw new Error("A current Movie file and metadata query are required.");
+  }
+  const result = parseMovieMetadataSearch(
+    await window.__TAURI__.core.invoke<unknown>("search_movie_metadata", {
+      fileId,
+      query,
+      contextGeneration,
+    }),
+  );
+  if (result === null) {
+    throw new Error("movie_metadata_malformed_provider");
+  }
+  return result;
+}
+
+export async function verifyMovieMetadataCandidate(
+  matchingRequestId: string,
+  tmdbMovieId: number,
+  contextGeneration: number,
+) {
+  if (
+    !movieFileIdPattern.test(matchingRequestId) ||
+    !Number.isSafeInteger(tmdbMovieId) ||
+    tmdbMovieId <= 0 ||
+    !Number.isSafeInteger(contextGeneration) ||
+    contextGeneration <= 0
+  ) {
+    throw new Error("A current metadata request and TMDB Movie are required.");
+  }
+  const result = parseVerifiedMovieMetadata(
+    await window.__TAURI__.core.invoke<unknown>(
+      "verify_movie_metadata_candidate",
+      { matchingRequestId, tmdbMovieId, contextGeneration },
+    ),
+  );
+  if (result === null) {
+    throw new Error("movie_metadata_malformed_provider");
+  }
+  return result;
+}
+
+export async function saveMovieMetadataMatch(verificationId: string) {
+  if (!movieFileIdPattern.test(verificationId)) {
+    throw new Error("A verified Movie metadata match is required.");
+  }
+  const value = await window.__TAURI__.core.invoke<unknown>(
+    "save_movie_metadata_match",
+    { verificationId },
+  );
+  const association =
+    Array.isArray(value) && value.every((entry) => typeof entry === "string")
+      ? parseMovieMetadataAssociation(value as string[])
+      : null;
+  if (association === null) {
+    throw new Error("movie_metadata_persistence_failed");
+  }
+  return association;
+}
+
+export function clearMovieMetadataMatch(fileId: string) {
+  if (!movieFileIdPattern.test(fileId)) {
+    throw new Error("A current Movie file is required.");
+  }
+  return window.__TAURI__.core.invoke<void>("clear_movie_metadata_match", {
+    fileId,
+  });
+}
+
+export function invalidateMovieMetadataMatchContext(contextGeneration: number) {
+  if (!Number.isSafeInteger(contextGeneration) || contextGeneration <= 0) {
+    throw new Error("A current metadata context generation is required.");
+  }
+  return window.__TAURI__.core.invoke<void>(
+    "invalidate_movie_metadata_match_context",
+    { contextGeneration },
+  );
+}
+
 export type MovieReleaseContext = {
   tmdbMovieId: number;
   tmdbTitle: string;
