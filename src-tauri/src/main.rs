@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adult_library;
+mod library_scan;
 mod tv_library;
 mod tv_release;
 mod vr_download;
@@ -28,6 +29,7 @@ use adult_library::{
     ADULT_FILE_REVEAL_FAILED, ADULT_FILE_TRASH_FAILED, ADULT_FOLDER_STORAGE_FAILED,
     ADULT_FOLDER_UNAVAILABLE, ADULT_LIBRARY_SCAN_FAILED,
 };
+use library_scan::{is_supported_library_media, scan_library_files};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tv_library::{
@@ -409,48 +411,14 @@ fn query_movies_volume_storage(_folder: &Path) -> Result<[u64; 2], MoviesVolumeS
     Err(MoviesVolumeStorageQueryError::Failed)
 }
 
-fn collect_movie_paths(directory: &Path, movie_paths: &mut Vec<PathBuf>) -> io::Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-
-        if file_type.is_dir() {
-            collect_movie_paths(&path, movie_paths)?;
-        } else if file_type.is_file() && is_supported_movie(&path) {
-            movie_paths.push(path);
-        }
-    }
-
-    Ok(())
-}
-
-fn is_supported_movie(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("mp4") || extension.eq_ignore_ascii_case("mkv")
-        })
-}
-
 fn scan_movie_paths(folder: &Path) -> Result<Vec<String>, &'static str> {
     let metadata = fs::metadata(folder).map_err(|_| MOVIES_FOLDER_UNAVAILABLE)?;
     if !metadata.is_dir() {
         return Err(MOVIES_FOLDER_UNAVAILABLE);
     }
 
-    let mut movie_paths = Vec::new();
-    collect_movie_paths(folder, &mut movie_paths).map_err(|_| MOVIES_SCAN_FAILED)?;
-    movie_paths.sort();
-
-    movie_paths
-        .into_iter()
-        .map(|path| {
-            path.into_os_string()
-                .into_string()
-                .map_err(|_| MOVIES_SCAN_FAILED)
-        })
-        .collect()
+    scan_library_files(folder, |path, _| path.into_os_string().into_string().ok())
+        .map_err(|_| MOVIES_SCAN_FAILED)
 }
 
 #[cfg(unix)]
@@ -576,7 +544,7 @@ fn capture_trusted_movie_file(
 ) -> Result<TrustedMovieFile, &'static str> {
     validate_movie_components(folder, &path)?;
     let metadata = fs::metadata(&path).map_err(|_| MOVIES_SCAN_FAILED)?;
-    if !metadata.is_file() || !is_supported_movie(&path) {
+    if !metadata.is_file() || !is_supported_library_media(&path) {
         return Err(MOVIES_SCAN_FAILED);
     }
     let canonical_path = fs::canonicalize(&path).map_err(|_| MOVIES_SCAN_FAILED)?;
@@ -623,13 +591,10 @@ fn scan_trusted_movie_files(
         return Err(MOVIES_FOLDER_UNAVAILABLE);
     }
     let folder_identity = movie_path_identity(folder, false).map_err(|_| MOVIES_SCAN_FAILED)?;
-    let paths = scan_movie_paths(folder)?;
-    let mut files = paths
-        .into_iter()
-        .map(PathBuf::from)
-        .map(|path| capture_trusted_movie_file(folder, &folder_identity, generation, path))
-        .collect::<Result<Vec<_>, _>>()?;
-    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let files = scan_library_files(folder, |path, _| {
+        capture_trusted_movie_file(folder, &folder_identity, generation, path).ok()
+    })
+    .map_err(|_| MOVIES_SCAN_FAILED)?;
     Ok((folder_identity, files))
 }
 
@@ -1189,7 +1154,7 @@ fn validate_current_movie_file(
     if !metadata.is_file() {
         return Err(MoviePathValidationError::NotFile);
     }
-    if !is_supported_movie(requested_path) {
+    if !is_supported_library_media(requested_path) {
         return Err(MoviePathValidationError::Unsupported);
     }
     let canonical =
@@ -1282,7 +1247,7 @@ fn validate_movie_path(path: &Path) -> Result<(), MoviePathValidationError> {
     if !metadata.is_file() {
         return Err(MoviePathValidationError::NotFile);
     }
-    if !is_supported_movie(path) {
+    if !is_supported_library_media(path) {
         return Err(MoviePathValidationError::Unsupported);
     }
 
@@ -1346,7 +1311,7 @@ fn trash_movie_path_with(
     if !path_metadata.is_file() {
         return Err(MOVIE_TRASH_NOT_FILE);
     }
-    if !is_supported_movie(path) {
+    if !is_supported_library_media(path) {
         return Err(MOVIE_TRASH_UNSUPPORTED);
     }
 
@@ -4097,18 +4062,18 @@ mod tests {
         fetch_sukebei_vr_releases_with, fetch_yts_movie_releases_with,
         finish_movie_metadata_search, finish_movie_metadata_verification,
         invalidate_movie_metadata_client_context, load_movies_folder_file, load_tmdb_token_file,
-        movie_metadata_error, open_movie_path_with, parse_movie_metadata_candidates,
-        parse_movie_provider_response, parse_provider_response, parse_verified_movie_metadata,
-        query_movies_volume_storage_with, reveal_movie_path_with, save_movie_metadata_match_with,
-        save_movies_folder_file, save_tmdb_token_file, scan_movie_paths, scan_movies_library,
-        trash_movie_path_with, trash_movie_request_with, MoviePathValidationError,
-        MovieProviderRequestError, MovieTorrentState, MoviesLibraryContext,
-        MoviesVolumeStorageQueryError, ProviderRequestError, TrashMovieRequest,
-        ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
-        MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID, MOVIE_METADATA_MALFORMED,
-        MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE, MOVIE_OPEN_FAILED,
-        MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED,
-        MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
+        movie_metadata_error, open_movie_path_with, open_movie_request_with,
+        parse_movie_metadata_candidates, parse_movie_provider_response, parse_provider_response,
+        parse_verified_movie_metadata, query_movies_volume_storage_with, reveal_movie_path_with,
+        reveal_movie_request_with, save_movie_metadata_match_with, save_movies_folder_file,
+        save_tmdb_token_file, scan_movie_paths, scan_movies_library, trash_movie_path_with,
+        trash_movie_request_with, MoviePathValidationError, MovieProviderRequestError,
+        MovieTorrentState, MoviesLibraryContext, MoviesVolumeStorageQueryError,
+        ProviderRequestError, TrashMovieRequest, ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE,
+        MOVIES_STORAGE_FAILED, MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID,
+        MOVIE_METADATA_MALFORMED, MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE,
+        MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE,
+        MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
         MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED,
         MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND,
         MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE, MOVIE_TRASH_UNAVAILABLE,
@@ -4375,7 +4340,7 @@ mod tests {
         let third_movie =
             fixture.create_file(Path::new("nested").join("deeper").join("映画 — Final.mP4"));
         fixture.create_file(Path::new("nested").join("notes.txt"));
-        fixture.create_file("clip.mov");
+        let fourth_movie = fixture.create_file("clip.mov");
         fs::create_dir(fixture.path.join("directory.mkv"))
             .expect("failed to create fixture directory");
 
@@ -4383,6 +4348,7 @@ mod tests {
             path_string(first_movie),
             path_string(second_movie),
             path_string(third_movie),
+            path_string(fourth_movie),
         ];
         expected_paths.sort();
 
@@ -4949,10 +4915,13 @@ mod tests {
     #[test]
     fn opens_the_exact_supported_movie_path_after_validation() {
         let fixture = FilesystemFixture::new();
-        let movie_path = fixture.create_file("映画  —  Final.CUT!.MKV");
+        fixture.create_file("映画  —  Final.CUT!.AVI");
+        let association_path = fixture.path.join("metadata-associations");
+        let library = scan_trusted_movie_fixture(&fixture, &association_path);
+        let movie_path = PathBuf::from(&library.movie_paths[0]);
         let dispatched_path = RefCell::new(None);
 
-        let result = open_movie_path_with(&movie_path, |path| {
+        let result = open_movie_request_with(&movie_path, &library, |path| {
             dispatched_path.replace(Some(path.to_path_buf()));
             Ok(())
         });
@@ -4964,10 +4933,13 @@ mod tests {
     #[test]
     fn reveals_the_exact_supported_movie_path_after_validation() {
         let fixture = FilesystemFixture::new();
-        let movie_path = fixture.create_file("映画  —  Final.CUT!.MKV");
+        fixture.create_file("映画  —  Final.CUT!.MOV");
+        let association_path = fixture.path.join("metadata-associations");
+        let library = scan_trusted_movie_fixture(&fixture, &association_path);
+        let movie_path = PathBuf::from(&library.movie_paths[0]);
         let dispatched_path = RefCell::new(None);
 
-        let result = reveal_movie_path_with(&movie_path, |path| {
+        let result = reveal_movie_request_with(&movie_path, &library, |path| {
             dispatched_path.replace(Some(path.to_path_buf()));
             Ok(())
         });
@@ -4979,7 +4951,7 @@ mod tests {
     #[test]
     fn trashes_the_exact_current_movie_path_after_root_validation() {
         let fixture = FilesystemFixture::new();
-        fixture.create_file("nested/映画  —  Final.CUT!.MKV");
+        fixture.create_file("nested/映画  —  Final.CUT!.WMV");
         let association_path = fixture.path.join("metadata-associations");
         let mut library = scan_trusted_movie_fixture(&fixture, &association_path);
         let movie_paths = library.movie_paths.clone();

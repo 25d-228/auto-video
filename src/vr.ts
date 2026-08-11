@@ -1,3 +1,5 @@
+import { hasSupportedLibraryExtension } from "@/library-media";
+
 export type JavdbCatalogItem = {
   code: string;
   title: string | null;
@@ -767,7 +769,7 @@ function parseVrLibrary(value: unknown): VrLibraryScan {
     }
     paths.add(path);
     const filename = vrFilename(path);
-    if (filename === "") {
+    if (filename === "" || !hasSupportedLibraryExtension(filename)) {
       throw new Error("The native VR Library scanner returned invalid data.");
     }
     const title = vrTitle(filename);

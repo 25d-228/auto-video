@@ -19,7 +19,6 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::tv_library::parse_tv_relative_identity;
 use crate::tv_release::{TvDownloadIdentity, TvReleaseState};
-use crate::vr_library::is_supported_media;
 use crate::vr_torrent::{
     adult_media_name_matches_product_code, hex_sha1, media_name_matches_product_code,
     revalidate_persisted_download_source, revalidate_persisted_movie_download_source,
@@ -79,6 +78,14 @@ const TV_METADATA_TRACKERS: [&str; 3] = [
 ];
 // A bounded request prevents an unavailable metadata swarm from holding the inspection open.
 const TV_METADATA_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn is_supported_transfer_media(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("mp4") || extension.eq_ignore_ascii_case("mkv")
+        })
+}
 
 type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
@@ -1556,7 +1563,7 @@ fn parse_transfer_line(line: &[u8], allow_legacy_vr: bool) -> Option<TransferRec
         let eligible_media = record
             .selected_files
             .iter()
-            .filter(|file| is_supported_media(Path::new(&file.path)))
+            .filter(|file| is_supported_transfer_media(Path::new(&file.path)))
             .count();
         if eligible_media == 0 {
             return None;
@@ -2711,7 +2718,7 @@ fn reconcile_interrupted_organization(mut record: TransferRecord) -> Option<Tran
     let eligible_media = record
         .selected_files
         .iter()
-        .filter(|file| is_supported_media(Path::new(&file.path)))
+        .filter(|file| is_supported_transfer_media(Path::new(&file.path)))
         .count();
     if eligible_media == 0 {
         return None;
@@ -5197,7 +5204,7 @@ fn organization_directory_name(record: &TransferRecord) -> Result<String, &'stat
             let media_count = record
                 .selected_files
                 .iter()
-                .filter(|file| is_supported_media(Path::new(&file.path)))
+                .filter(|file| is_supported_transfer_media(Path::new(&file.path)))
                 .count();
             tv_organization_directory(
                 record
@@ -5283,7 +5290,7 @@ fn organization_destination_relative(
         .get(selected_index)
         .map(|file| file.path.as_str())
         .ok_or(VR_ORGANIZATION_STALE)?;
-    if !is_supported_media(Path::new(original_relative)) {
+    if !is_supported_transfer_media(Path::new(original_relative)) {
         return Ok(None);
     }
     let source_name = Path::new(original_relative)
@@ -5390,7 +5397,7 @@ fn organization_entries(
     let eligible_media = record
         .selected_files
         .iter()
-        .filter(|file| is_supported_media(Path::new(&file.path)))
+        .filter(|file| is_supported_transfer_media(Path::new(&file.path)))
         .count();
     if eligible_media == 0 {
         return Err(VR_ORGANIZATION_INELIGIBLE);

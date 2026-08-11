@@ -170,7 +170,7 @@ describe("conservative parsed Adult Library identity", () => {
         "1",
       ],
       ["1", "/Adult/ADLT-123.mp4", "../ADLT-123.mp4", "1"],
-      ["1", "/Adult/ADLT-123.avi", "ADLT-123.avi", "1"],
+      ["1", "/Adult/ADLT-123.txt", "ADLT-123.txt", "1"],
       [
         "1",
         "/Adult/ADLT-123.mp4",

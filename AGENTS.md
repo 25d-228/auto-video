@@ -33,4 +33,6 @@
 ## Delivery
 
 - Keep one issue on one branch and one pull request. Include exactly one `Fixes #N` reference when required, and do not begin downstream work.
-- An executor completion handoff must state the repository, issue and PR, branch, latest commit, CI state, unresolved feedback, uncovered requirements, human-verification need, queue state, and any blocker.
+- Keep requested corrections on that issue's existing branch and pull request.
+- Begin completion handoffs with `EXECUTOR → HUMAN` or `EXECUTOR → ORCHESTRATOR`, as requested.
+- A completion handoff must state the repository, issue and PR, branch, latest commit, CI state, unresolved feedback, uncovered requirements, human-verification need, queue state, and any blocker.

@@ -5,6 +5,7 @@ use std::{
     time::SystemTime,
 };
 
+use crate::library_scan::{is_supported_library_media, scan_library_files};
 use crate::vr_download::{
     configured_vr_folder, with_configured_vr_folder, with_unowned_vr_library_path, VrDownloadState,
     VrLibraryTrashOwnershipError,
@@ -77,35 +78,6 @@ pub fn invalidate_vr_library(state: &VrLibraryState) -> Result<(), &'static str>
     Ok(())
 }
 
-pub fn is_supported_media(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("mp4") || extension.eq_ignore_ascii_case("mkv")
-        })
-}
-
-fn collect_media_files(directory: &Path, files: &mut Vec<TrustedVrFile>) -> io::Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-
-        if file_type.is_dir() {
-            collect_media_files(&path, files)?;
-        } else if file_type.is_file() && is_supported_media(&path) {
-            let metadata = entry.metadata()?;
-            files.push(TrustedVrFile {
-                path,
-                size: metadata.len(),
-                modified: metadata.modified()?,
-            });
-        }
-    }
-
-    Ok(())
-}
-
 fn scan_media_files(folder: &Path) -> Result<Vec<TrustedVrFile>, &'static str> {
     let canonical_folder = fs::canonicalize(folder).map_err(|_| VR_LIBRARY_FOLDER_UNAVAILABLE)?;
     if canonical_folder != folder
@@ -116,10 +88,14 @@ fn scan_media_files(folder: &Path) -> Result<Vec<TrustedVrFile>, &'static str> {
         return Err(VR_LIBRARY_FOLDER_UNAVAILABLE);
     }
 
-    let mut files = Vec::new();
-    collect_media_files(folder, &mut files).map_err(|_| VR_LIBRARY_SCAN_FAILED)?;
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(files)
+    scan_library_files(folder, |path, metadata| {
+        Some(TrustedVrFile {
+            path,
+            size: metadata.len(),
+            modified: metadata.modified().ok()?,
+        })
+    })
+    .map_err(|_| VR_LIBRARY_SCAN_FAILED)
 }
 
 pub fn scan_vr_library_with(
@@ -202,7 +178,7 @@ fn validate_vr_file(
     if !metadata.is_file() {
         return Err(VrFileValidationError::NotFile);
     }
-    if !is_supported_media(requested_path) {
+    if !is_supported_library_media(requested_path) {
         return Err(VrFileValidationError::Unsupported);
     }
     let canonical_path =
@@ -480,13 +456,13 @@ mod tests {
             (fixture.path.join("missing.mp4"), VR_FILE_OPEN_NOT_FOUND),
             (fixture.path.join("folder"), VR_FILE_OPEN_NOT_FILE),
             (
-                fixture.path.join("unsupported.avi"),
+                fixture.path.join("unsupported.txt"),
                 VR_FILE_OPEN_UNSUPPORTED,
             ),
         ] {
             if path.file_name().is_some_and(|name| name == "folder") {
                 fs::create_dir(&path).expect("directory must be created");
-            } else if path.extension().is_some_and(|extension| extension == "avi") {
+            } else if path.extension().is_some_and(|extension| extension == "txt") {
                 fs::write(&path, b"unsupported").expect("unsupported file must be written");
             }
             assert_eq!(
@@ -503,7 +479,7 @@ mod tests {
     #[test]
     fn file_action_reports_dispatch_failure_for_an_exact_trusted_file() {
         let fixture = Fixture::new("dispatch-failure");
-        let movie = fixture.path.join("MDVR-419.mp4");
+        let movie = fixture.path.join("MDVR-419.AVI");
         fs::write(&movie, b"movie").expect("movie must be written");
         let download_state = configured_state(&fixture.path, &fixture.path.join("config"));
         let library_state = VrLibraryState::default();
@@ -548,7 +524,7 @@ mod tests {
     fn trash_dispatches_one_exact_mdvr_419_member_without_mutating_siblings_or_neighbors() {
         let fixture = Fixture::new("trash-exact");
         let configuration = Fixture::new("trash-config");
-        let removed = fixture.path.join("MDVR-419 Part 01.mp4");
+        let removed = fixture.path.join("MDVR-419 Part 01.WMV");
         let sibling = fixture.path.join("MDVR-419 PT 02.mkv");
         let ambiguous = fixture.path.join("MDVR-419 Part 01 Disc 02.mp4");
         let unassociated = fixture.path.join("MDVR-419 + ABC-123 pack.mkv");
@@ -674,7 +650,7 @@ mod tests {
         fs::write(&mixed_code, b"mixed").expect("mixed-code file must be written");
         let directory = trusted.path.join("directory.mkv");
         fs::create_dir(&directory).expect("directory must be created");
-        let unsupported = trusted.path.join("unsupported.avi");
+        let unsupported = trusted.path.join("unsupported.txt");
         fs::write(&unsupported, b"unsupported").expect("unsupported file must be written");
         fs::write(&changed, b"different content").expect("member must change");
         fs::remove_file(&missing).expect("member must be removed");

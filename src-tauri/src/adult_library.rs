@@ -6,6 +6,8 @@ use std::{
     time::SystemTime,
 };
 
+use crate::library_scan::{is_supported_library_media, scan_library_files};
+
 pub const ADULT_FOLDER_STORAGE_FAILED: &str = "adult_folder_storage_failed";
 pub const ADULT_FOLDER_UNAVAILABLE: &str = "adult_folder_unavailable";
 pub const ADULT_LIBRARY_SCAN_FAILED: &str = "adult_library_scan_failed";
@@ -169,34 +171,6 @@ pub fn configured_adult_folder(state: &AdultLibraryState) -> Result<Option<PathB
         .map_err(|_| ADULT_FOLDER_STORAGE_FAILED)
 }
 
-fn is_supported_media(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("mp4") || extension.eq_ignore_ascii_case("mkv")
-        })
-}
-
-fn collect_media_files(directory: &Path, files: &mut Vec<TrustedAdultFile>) -> io::Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-
-        if file_type.is_dir() {
-            collect_media_files(&path, files)?;
-        } else if file_type.is_file() && is_supported_media(&path) {
-            let metadata = entry.metadata()?;
-            files.push(TrustedAdultFile {
-                path,
-                size: metadata.len(),
-                modified: metadata.modified()?,
-            });
-        }
-    }
-    Ok(())
-}
-
 fn scan_media_files(folder: &Path) -> Result<Vec<TrustedAdultFile>, &'static str> {
     let canonical_folder = fs::canonicalize(folder).map_err(|_| ADULT_FOLDER_UNAVAILABLE)?;
     if canonical_folder != folder
@@ -206,10 +180,14 @@ fn scan_media_files(folder: &Path) -> Result<Vec<TrustedAdultFile>, &'static str
     {
         return Err(ADULT_FOLDER_UNAVAILABLE);
     }
-    let mut files = Vec::new();
-    collect_media_files(folder, &mut files).map_err(|_| ADULT_LIBRARY_SCAN_FAILED)?;
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(files)
+    scan_library_files(folder, |path, metadata| {
+        Some(TrustedAdultFile {
+            path,
+            size: metadata.len(),
+            modified: metadata.modified().ok()?,
+        })
+    })
+    .map_err(|_| ADULT_LIBRARY_SCAN_FAILED)
 }
 
 pub fn scan_adult_library_with(state: &AdultLibraryState) -> Result<Vec<String>, &'static str> {
@@ -293,7 +271,7 @@ fn validate_adult_file(
     if !metadata.is_file() {
         return Err(AdultFileValidationError::NotFile);
     }
-    if !is_supported_media(requested_path) {
+    if !is_supported_library_media(requested_path) {
         return Err(AdultFileValidationError::Unsupported);
     }
     let canonical_path =
@@ -584,7 +562,7 @@ mod tests {
             .expect("Adult folder must be configured");
         scan_adult_library_with(&state).expect("scan must complete");
         let directory = fixture.path.join("directory.mkv");
-        let unsupported = fixture.path.join("unsupported.avi");
+        let unsupported = fixture.path.join("unsupported.txt");
         fs::create_dir(&directory).expect("directory must be created");
         fs::write(&unsupported, b"unsupported").expect("unsupported file must be written");
         let dispatched = Cell::new(false);
@@ -620,7 +598,7 @@ mod tests {
     #[test]
     fn file_actions_dispatch_only_the_exact_trusted_file_and_report_failures() {
         let fixture = Fixture::new("dispatch");
-        let movie = fixture.path.join("ADLT-123.mp4");
+        let movie = fixture.path.join("ADLT-123.AVI");
         fs::write(&movie, b"movie").expect("movie must be written");
         let state = AdultLibraryState::default();
         set_adult_folder(&state, &fixture.path.join("config"), fixture.path.clone())
@@ -660,7 +638,7 @@ mod tests {
     #[test]
     fn trash_dispatches_one_exact_scanned_adult_member_and_updates_state_only_after_success() {
         let fixture = Fixture::new("trash-exact");
-        let first = fixture.path.join("ADLT-123 Part 01.mp4");
+        let first = fixture.path.join("ADLT-123 Part 01.WMV");
         let sibling = fixture.path.join("ADLT-123 CD2.mkv");
         let ambiguous = fixture.path.join("ADLT-123 Part 1-2.mp4");
         let unassociated = fixture.path.join("作品 without code.mp4");
@@ -734,7 +712,7 @@ mod tests {
         fs::write(&mixed_code, b"mixed").expect("mixed-code file must be written");
         let directory = trusted.path.join("directory.mkv");
         fs::create_dir(&directory).expect("directory must be created");
-        let unsupported = trusted.path.join("unsupported.avi");
+        let unsupported = trusted.path.join("unsupported.txt");
         fs::write(&unsupported, b"unsupported").expect("unsupported file must be written");
         fs::write(&changed, b"different content").expect("member must change");
         fs::remove_file(&missing).expect("member must be removed");
