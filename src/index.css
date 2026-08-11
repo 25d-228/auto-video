@@ -864,6 +864,83 @@ button {
   gap: 0.5rem;
 }
 
+.javdb-control-group {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.javdb-control-group legend,
+.javdb-select-label {
+  color: var(--foreground);
+  font-size: 0.6875rem;
+  font-weight: 650;
+}
+
+.javdb-control-group > div {
+  display: flex;
+  margin-top: 0.25rem;
+}
+
+.javdb-control-group label {
+  cursor: pointer;
+}
+
+.javdb-control-group input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.javdb-control-group label span {
+  display: grid;
+  min-height: 1.75rem;
+  padding: 0.25rem 0.625rem;
+  border: 1px solid var(--border);
+  background: var(--background);
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  font-weight: 600;
+  place-items: center;
+}
+
+.javdb-control-group label + label span {
+  border-left: 0;
+}
+
+.javdb-control-group input:checked + span {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.javdb-control-group input:focus-visible + span {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.javdb-select-label {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.javdb-select-label select {
+  min-height: 2rem;
+  padding: 0.25rem 1.75rem 0.25rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+}
+
+.javdb-provider-label {
+  align-self: center;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+}
+
 .discover-category {
   min-width: 7.5rem;
   margin: 0;
@@ -1117,6 +1194,244 @@ button {
 
 .media-gallery--discover .media-gallery__viewport {
   min-height: 31rem;
+}
+
+.media-gallery--javdb .media-gallery__viewport {
+  min-height: 31rem;
+}
+
+.javdb-browse-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 1rem 0.875rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.javdb-browse-grid > li {
+  flex: 0 0 auto;
+}
+
+.javdb-browse-card {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+  background: var(--card);
+  color: var(--card-foreground);
+  cursor: pointer;
+}
+
+.javdb-browse-card:focus-within {
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 45%, transparent);
+}
+
+.javdb-browse-card__details {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.javdb-browse-card__cover {
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 180px;
+  overflow: hidden;
+  background: var(--muted);
+  place-items: center;
+}
+
+.javdb-browse-card__cover > img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.javdb-cover__placeholder {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  padding: 0.75rem;
+  place-items: center;
+  gap: 0.5rem;
+  color: var(--muted-foreground);
+  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
+.javdb-browse-card__badges {
+  position: absolute;
+  top: 0.375rem;
+  left: 0.375rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.javdb-browse-card__badges span {
+  padding: 0.125rem 0.375rem;
+  border-radius: var(--radius);
+  background: rgb(15 23 42 / 0.75);
+  color: white;
+  font-size: 0.625rem;
+  text-transform: capitalize;
+}
+
+.javdb-browse-card__actions {
+  position: absolute;
+  top: 8.25rem;
+  right: 0.375rem;
+  left: 0.375rem;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.25rem;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.javdb-browse-card__actions > [data-slot="button"] {
+  padding-inline: 0.25rem;
+}
+
+.javdb-browse-card:hover .javdb-browse-card__actions,
+.javdb-browse-card:focus-within .javdb-browse-card__actions {
+  opacity: 1;
+}
+
+.javdb-browse-card__body {
+  min-height: 5rem;
+  padding: 0.625rem;
+}
+
+.javdb-browse-card__body h3,
+.javdb-browse-card__body p {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.javdb-browse-card__body h3 {
+  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-size: 0.8125rem;
+}
+
+.javdb-browse-card__body p {
+  margin-top: 0.25rem;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+}
+
+.javdb-browse-card__body > span {
+  display: inline-block;
+  margin-top: 0.375rem;
+  padding: 0.0625rem 0.25rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--muted-foreground);
+  font-size: 0.625rem;
+}
+
+.javdb-details__content {
+  display: grid;
+  grid-template-columns: minmax(10rem, 40%) minmax(0, 1fr);
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.javdb-details__cover {
+  display: block;
+  width: 100%;
+  max-height: 18rem;
+  object-fit: contain;
+}
+
+.javdb-details__content dl {
+  display: grid;
+  margin: 0;
+  gap: 0.375rem;
+}
+
+.javdb-details__content dl > div {
+  display: grid;
+  grid-template-columns: 5rem minmax(0, 1fr);
+  gap: 0.5rem;
+  font-size: 0.75rem;
+}
+
+.javdb-details__content dt {
+  color: var(--muted-foreground);
+}
+
+.javdb-details__content dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.javdb-details__content p {
+  font-size: 0.75rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.javdb-details__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.javdb-details__actions > a {
+  min-height: 2rem;
+  padding: 0.375rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--foreground);
+  font-size: 0.75rem;
+  text-decoration: none;
+}
+
+.javdb-preview__image {
+  display: grid;
+  margin-top: 1rem;
+  place-items: center;
+  gap: 0.75rem;
+}
+
+.javdb-preview__image img {
+  display: block;
+  max-width: 100%;
+  max-height: calc(100vh - 10rem);
+  object-fit: contain;
+}
+
+.javdb-preview__image > div {
+  display: flex;
+  gap: 0.5rem;
+}
+
+@media (max-width: 720px) {
+  .javdb-details__content {
+    grid-template-columns: 1fr;
+  }
+
+  .javdb-details__cover {
+    max-height: 12rem;
+  }
 }
 
 .media-gallery--library .media-gallery__viewport {

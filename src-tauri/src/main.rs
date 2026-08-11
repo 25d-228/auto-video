@@ -13,6 +13,7 @@ use std::{
     io::{self, Write},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -147,6 +148,11 @@ const PROVIDER_HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
 #[cfg(target_os = "macos")]
 const PROVIDER_HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_code}";
 const JAVDB_CATALOG_URL: &str = "https://javdb.com/search?q=";
+const JAVDB_API_URL: &str = "https://apidd.spthgb.com";
+const JAVDB_API_USER_AGENT: &str = "Dart/3.5 (dart:io)";
+const JAVDB_SIGNATURE_MIDDLE: &str = "lpw6vgqzsp";
+const JAVDB_SIGNATURE_SECRET: &str = "71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa";
+const JAVDB_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SUKEBEI_RELEASES_URL: &str = "https://sukebei.nyaa.si/?page=rss&q=%22";
 const TMDB_MOVIE_URL: &str = "https://api.themoviedb.org/3/movie/";
 const TMDB_MOVIE_SEARCH_URL: &str = "https://api.themoviedb.org/3/search/movie?query=";
@@ -1633,6 +1639,332 @@ fn fetch_provider_document(_url: &str) -> Result<String, ProviderRequestError> {
     Err(ProviderRequestError::Network)
 }
 
+fn md5_hex(input: &[u8]) -> String {
+    const SHIFTS: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const CONSTANTS: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+
+    let bit_length = (input.len() as u64).wrapping_mul(8);
+    let mut padded = input.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_length.to_le_bytes());
+
+    let mut state = [0x67452301_u32, 0xefcdab89, 0x98badcfe, 0x10325476];
+    for block in padded.chunks_exact(64) {
+        let mut words = [0_u32; 16];
+        for (word, bytes) in words.iter_mut().zip(block.chunks_exact(4)) {
+            *word = u32::from_le_bytes(bytes.try_into().expect("four-byte MD5 word"));
+        }
+        let [mut a, mut b, mut c, mut d] = state;
+        for index in 0..64 {
+            let (value, word_index) = if index < 16 {
+                ((b & c) | (!b & d), index)
+            } else if index < 32 {
+                ((d & b) | (!d & c), (5 * index + 1) % 16)
+            } else if index < 48 {
+                (b ^ c ^ d, (3 * index + 5) % 16)
+            } else {
+                (c ^ (b | !d), (7 * index) % 16)
+            };
+            let next_d = c;
+            let next_c = b;
+            let next_b = b.wrapping_add(
+                a.wrapping_add(value)
+                    .wrapping_add(CONSTANTS[index])
+                    .wrapping_add(words[word_index])
+                    .rotate_left(SHIFTS[index]),
+            );
+            a = d;
+            b = next_b;
+            c = next_c;
+            d = next_d;
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+    }
+
+    state
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn javdb_signature(timestamp: u64) -> String {
+    let digest = md5_hex(format!("{timestamp}{JAVDB_SIGNATURE_SECRET}").as_bytes());
+    format!("{timestamp}.{JAVDB_SIGNATURE_MIDDLE}.{digest}")
+}
+
+fn current_unix_timestamp() -> Result<u64, ProviderRequestError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| ProviderRequestError::Provider)
+}
+
+#[cfg(target_os = "macos")]
+fn fetch_javdb_api_document(url: &str) -> Result<String, ProviderRequestError> {
+    let signature = javdb_signature(current_unix_timestamp()?);
+    let output = Command::new("/usr/bin/curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "20",
+            "--user-agent",
+            JAVDB_API_USER_AGENT,
+            "--header",
+            "Accept: application/json",
+            "--header",
+            "accept-language: en",
+            "--header",
+            &format!("jdsignature: {signature}"),
+            "--write-out",
+            PROVIDER_HTTP_STATUS_WRITE_OUT,
+            url,
+        ])
+        .output()
+        .map_err(|_| ProviderRequestError::Network)?;
+    if !output.status.success() {
+        return Err(ProviderRequestError::Network);
+    }
+    parse_provider_response(&output.stdout)
+}
+
+#[cfg(target_os = "windows")]
+fn fetch_javdb_api_document(url: &str) -> Result<String, ProviderRequestError> {
+    const JAVDB_URL_ENV: &str = "AUTO_VIDEO_JAVDB_URL";
+    const JAVDB_SIGNATURE_ENV: &str = "AUTO_VIDEO_JAVDB_SIGNATURE";
+    const JAVDB_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  $headers = @{ Accept = 'application/json'; 'accept-language' = 'en'; jdsignature = $env:AUTO_VIDEO_JAVDB_SIGNATURE; 'User-Agent' = 'Dart/3.5 (dart:io)' }
+  $response = Invoke-WebRequest -UseBasicParsing -Uri $env:AUTO_VIDEO_JAVDB_URL -Headers $headers -MaximumRedirection 0 -TimeoutSec 20
+  [Console]::Out.Write($response.Content)
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + [int]$response.StatusCode)
+} catch {
+  $status = if ($null -eq $_.Exception.Response) { 0 } else { [int]$_.Exception.Response.StatusCode }
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + $status)
+}"#;
+    let signature = javdb_signature(current_unix_timestamp()?);
+    let output = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(JAVDB_SCRIPT)
+        .env(JAVDB_URL_ENV, url)
+        .env(JAVDB_SIGNATURE_ENV, signature)
+        .output()
+        .map_err(|_| ProviderRequestError::Network)?;
+    if !output.status.success() {
+        return Err(ProviderRequestError::Network);
+    }
+    if output.stdout.ends_with(b"AUTO_VIDEO_HTTP_STATUS:0") {
+        return Err(ProviderRequestError::Network);
+    }
+    parse_provider_response(&output.stdout)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn fetch_javdb_api_document(_url: &str) -> Result<String, ProviderRequestError> {
+    Err(ProviderRequestError::Network)
+}
+
+fn valid_javdb_image_url(url: &str) -> bool {
+    let Some(remainder) = url.strip_prefix("https://tp.") else {
+        return false;
+    };
+    let Some((host_suffix, path)) = remainder.split_once('/') else {
+        return false;
+    };
+    !host_suffix.is_empty()
+        && host_suffix.ends_with(".com")
+        && !host_suffix.contains("..")
+        && host_suffix
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, b'-' | b'.'))
+        && !path.is_empty()
+        && !path
+            .bytes()
+            .any(|character| character.is_ascii_control() || character == b'\\')
+}
+
+fn provider_binary_marker(output: &[u8]) -> Option<usize> {
+    output
+        .windows(PROVIDER_HTTP_STATUS_MARKER.len())
+        .rposition(|window| window == PROVIDER_HTTP_STATUS_MARKER.as_bytes())
+}
+
+fn parse_provider_binary_response(output: &[u8]) -> Result<Vec<u8>, ProviderRequestError> {
+    let marker = provider_binary_marker(output).ok_or(ProviderRequestError::Provider)?;
+    let status = std::str::from_utf8(&output[marker + PROVIDER_HTTP_STATUS_MARKER.len()..])
+        .map_err(|_| ProviderRequestError::Provider)?
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| ProviderRequestError::Provider)?;
+    match status {
+        200..=299 if marker <= JAVDB_IMAGE_MAX_BYTES => Ok(output[..marker].to_vec()),
+        404 | 410 | 451 => Err(ProviderRequestError::SourceUnavailable),
+        _ => Err(ProviderRequestError::Provider),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_provider_encoded_response(output: &[u8]) -> Result<Vec<u8>, ProviderRequestError> {
+    let marker = provider_binary_marker(output).ok_or(ProviderRequestError::Provider)?;
+    let status = std::str::from_utf8(&output[marker + PROVIDER_HTTP_STATUS_MARKER.len()..])
+        .map_err(|_| ProviderRequestError::Provider)?
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| ProviderRequestError::Provider)?;
+    match status {
+        200..=299 => {
+            let encoded = std::str::from_utf8(&output[..marker])
+                .map_err(|_| ProviderRequestError::Provider)?
+                .trim();
+            let payload = decode_base64(encoded).ok_or(ProviderRequestError::Provider)?;
+            (payload.len() <= JAVDB_IMAGE_MAX_BYTES + 1)
+                .then_some(payload)
+                .ok_or(ProviderRequestError::Provider)
+        }
+        404 | 410 | 451 => Err(ProviderRequestError::SourceUnavailable),
+        _ => Err(ProviderRequestError::Provider),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    fn digit(character: u8) -> Option<u8> {
+        match character {
+            b'A'..=b'Z' => Some(character - b'A'),
+            b'a'..=b'z' => Some(character - b'a' + 26),
+            b'0'..=b'9' => Some(character - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    if value.len() % 4 != 0 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(value.len() / 4 * 3);
+    for chunk in value.as_bytes().chunks_exact(4) {
+        let first = digit(chunk[0])?;
+        let second = digit(chunk[1])?;
+        let third = (chunk[2] != b'=').then(|| digit(chunk[2])).flatten();
+        let fourth = (chunk[3] != b'=').then(|| digit(chunk[3])).flatten();
+        if chunk[2] == b'=' && chunk[3] != b'=' {
+            return None;
+        }
+        output.push((first << 2) | (second >> 4));
+        if let Some(third) = third {
+            output.push((second << 4) | (third >> 2));
+            if let Some(fourth) = fourth {
+                output.push((third << 6) | fourth);
+            }
+        }
+    }
+    Some(output)
+}
+
+fn decode_javdb_image_payload(payload: &[u8]) -> Result<Vec<u8>, ProviderRequestError> {
+    if payload.len() < 2 || payload.len() > JAVDB_IMAGE_MAX_BYTES + 1 {
+        return Err(ProviderRequestError::Provider);
+    }
+    let key = payload[0];
+    let decoded: Vec<u8> = payload[1..].iter().map(|byte| byte ^ key).collect();
+    let is_image = decoded.starts_with(&[0xff, 0xd8, 0xff])
+        || decoded.starts_with(&[0x89, b'P', b'N', b'G'])
+        || decoded.starts_with(b"GIF8")
+        || (decoded.starts_with(b"RIFF") && decoded.get(8..12) == Some(b"WEBP"));
+    is_image
+        .then_some(decoded)
+        .ok_or(ProviderRequestError::Provider)
+}
+
+#[cfg(target_os = "macos")]
+fn fetch_javdb_image_bytes(url: &str) -> Result<Vec<u8>, ProviderRequestError> {
+    let output = Command::new("/usr/bin/curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "20",
+            "--user-agent",
+            JAVDB_API_USER_AGENT,
+            "--header",
+            "Accept: image/*",
+            "--header",
+            "Referer: https://javdb.com/",
+            "--write-out",
+            PROVIDER_HTTP_STATUS_WRITE_OUT,
+            url,
+        ])
+        .output()
+        .map_err(|_| ProviderRequestError::Network)?;
+    if !output.status.success() {
+        return Err(ProviderRequestError::Network);
+    }
+    decode_javdb_image_payload(&parse_provider_binary_response(&output.stdout)?)
+}
+
+#[cfg(target_os = "windows")]
+fn fetch_javdb_image_bytes(url: &str) -> Result<Vec<u8>, ProviderRequestError> {
+    const JAVDB_IMAGE_URL_ENV: &str = "AUTO_VIDEO_JAVDB_IMAGE_URL";
+    const JAVDB_IMAGE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  $headers = @{ Accept = 'image/*'; Referer = 'https://javdb.com/'; 'User-Agent' = 'Dart/3.5 (dart:io)' }
+  $response = Invoke-WebRequest -UseBasicParsing -Uri $env:AUTO_VIDEO_JAVDB_IMAGE_URL -Headers $headers -MaximumRedirection 0 -TimeoutSec 20
+  $memory = New-Object System.IO.MemoryStream
+  $response.RawContentStream.CopyTo($memory)
+  [Console]::Out.Write([Convert]::ToBase64String($memory.ToArray()))
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + [int]$response.StatusCode)
+} catch {
+  $status = if ($null -eq $_.Exception.Response) { 0 } else { [int]$_.Exception.Response.StatusCode }
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + $status)
+}"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(JAVDB_IMAGE_SCRIPT)
+        .env(JAVDB_IMAGE_URL_ENV, url)
+        .output()
+        .map_err(|_| ProviderRequestError::Network)?;
+    if !output.status.success() {
+        return Err(ProviderRequestError::Network);
+    }
+    let payload = parse_provider_encoded_response(&output.stdout)?;
+    decode_javdb_image_payload(&payload)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn fetch_javdb_image_bytes(_url: &str) -> Result<Vec<u8>, ProviderRequestError> {
+    Err(ProviderRequestError::Network)
+}
+
 fn parse_movie_provider_response(output: &[u8]) -> Result<String, MovieProviderRequestError> {
     let output = std::str::from_utf8(output).map_err(|_| MovieProviderRequestError::Provider)?;
     let (document, status) = output
@@ -2220,6 +2552,210 @@ fn fetch_javdb_adult_catalog_with(
     }
 
     request(&format!("{JAVDB_CATALOG_URL}{code}&f=all")).map_err(adult_provider_error_code)
+}
+
+fn javdb_provider_error(category: &str, error: ProviderRequestError) -> &'static str {
+    if category == "adult" {
+        adult_provider_error_code(error)
+    } else {
+        provider_error_code(error)
+    }
+}
+
+fn valid_javdb_provider_item_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric())
+}
+
+fn javdb_listing_item_ids(document: &str) -> Option<Vec<String>> {
+    let JsonValue::Object(envelope) = JsonParser::new(document).parse()? else {
+        return None;
+    };
+    if envelope.get("success") != Some(&JsonValue::Number("1".to_owned())) {
+        return None;
+    }
+    let JsonValue::Object(data) = envelope.get("data")? else {
+        return None;
+    };
+    let JsonValue::Array(movies) = data.get("movies")? else {
+        return None;
+    };
+    let mut item_ids = Vec::with_capacity(movies.len());
+    for movie in movies {
+        let JsonValue::Object(movie) = movie else {
+            return None;
+        };
+        let JsonValue::String(item_id) = movie.get("id")? else {
+            return None;
+        };
+        if !valid_javdb_provider_item_id(item_id) {
+            return None;
+        }
+        item_ids.push(item_id.clone());
+    }
+    Some(item_ids)
+}
+
+fn accept_javdb_api_document(category: &str, document: String) -> Result<String, &'static str> {
+    let success = match JsonParser::new(&document).parse() {
+        Some(JsonValue::Object(envelope)) => match envelope.get("success") {
+            Some(JsonValue::Number(value)) => Some(value == "1"),
+            _ => None,
+        },
+        _ => None,
+    };
+    if success == Some(false) {
+        Err(if category == "adult" {
+            ADULT_PROVIDER_ERROR
+        } else {
+            VR_PROVIDER_ERROR
+        })
+    } else {
+        Ok(document)
+    }
+}
+
+fn javdb_sort(sort: &str) -> Option<(&'static str, &'static str)> {
+    match sort {
+        "newest" => Some(("release", "desc")),
+        "oldest" => Some(("release", "asc")),
+        "recently-updated" => Some(("update", "desc")),
+        "top-rated" => Some(("score", "desc")),
+        "most-viewed" => Some(("hit", "desc")),
+        "most-wanted" => Some(("want_watch_count", "desc")),
+        "most-watched" => Some(("watched_count", "desc")),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_javdb_browse_with(
+    category: &str,
+    mode: &str,
+    period: &str,
+    year: Option<&str>,
+    month: Option<u8>,
+    sort: &str,
+    count: u16,
+    mut request: impl FnMut(&str) -> Result<String, ProviderRequestError>,
+) -> Result<Vec<String>, &'static str> {
+    if !matches!(category, "adult" | "vr")
+        || !matches!(mode, "category" | "ranking")
+        || !matches!(period, "daily" | "weekly" | "monthly")
+        || category == "vr" && mode != "category"
+        || !matches!(count, 10 | 25 | 50 | 100)
+        || year.is_some_and(|value| {
+            value.len() != 4
+                || !value.bytes().all(|character| character.is_ascii_digit())
+                || !matches!(value.parse::<u16>(), Ok(2001..=2100))
+        })
+        || month.is_some_and(|value| !(1..=12).contains(&value))
+        || mode == "ranking" && (year.is_some() || month.is_some() || sort != "newest")
+    {
+        return Err(if category == "adult" {
+            ADULT_PROVIDER_ERROR
+        } else {
+            VR_PROVIDER_ERROR
+        });
+    }
+    let (sort_by, order_by) = javdb_sort(sort).ok_or(if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    })?;
+    let mut documents = Vec::new();
+    if mode == "ranking" {
+        documents.push(accept_javdb_api_document(
+            category,
+            request(&format!(
+                "{JAVDB_API_URL}/api/v1/rankings?type=0&period={period}"
+            ))
+            .map_err(|error| javdb_provider_error(category, error))?,
+        )?);
+    } else {
+        let genre = if category == "vr" { "212" } else { "" };
+        let year = year.unwrap_or("");
+        let month = month.map(|value| value.to_string()).unwrap_or_default();
+        let page_count = if count == 100 { 2 } else { 1 };
+        let limit = count.min(50);
+        for page in 1..=page_count {
+            let url = format!(
+                "{JAVDB_API_URL}/api/v1/movies/tags?filter_by=0%3At%3Am%3A{genre}%3A{year}%3A%3A{month}&filter_by_tags=&sort_by={sort_by}&order_by={order_by}&page={page}&limit={limit}"
+            );
+            let document = accept_javdb_api_document(
+                category,
+                request(&url).map_err(|error| javdb_provider_error(category, error))?,
+            )?;
+            let is_empty = javdb_listing_item_ids(&document).is_some_and(|ids| ids.is_empty());
+            documents.push(document);
+            if is_empty {
+                break;
+            }
+        }
+    }
+
+    if category == "adult" {
+        let mut item_ids = Vec::new();
+        for document in &documents {
+            let Some(document_item_ids) = javdb_listing_item_ids(document) else {
+                return Ok(documents);
+            };
+            for item_id in document_item_ids {
+                if !item_ids.contains(&item_id) {
+                    item_ids.push(item_id);
+                }
+            }
+        }
+        for item_id in item_ids {
+            documents.push(accept_javdb_api_document(
+                category,
+                request(&format!(
+                    "{JAVDB_API_URL}/api/v4/movies/{item_id}?from_rankings=false"
+                ))
+                .map_err(|error| javdb_provider_error(category, error))?,
+            )?);
+        }
+    }
+    Ok(documents)
+}
+
+fn fetch_javdb_item_details_with(
+    category: &str,
+    provider_item_id: &str,
+    request: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+) -> Result<String, &'static str> {
+    if !matches!(category, "adult" | "vr") || !valid_javdb_provider_item_id(provider_item_id) {
+        return Err(if category == "adult" {
+            ADULT_PROVIDER_ERROR
+        } else {
+            VR_PROVIDER_ERROR
+        });
+    }
+    accept_javdb_api_document(
+        category,
+        request(&format!(
+            "{JAVDB_API_URL}/api/v4/movies/{provider_item_id}?from_rankings=false"
+        ))
+        .map_err(|error| javdb_provider_error(category, error))?,
+    )
+}
+
+fn fetch_javdb_image_with(
+    category: &str,
+    source_url: &str,
+    request: impl FnOnce(&str) -> Result<Vec<u8>, ProviderRequestError>,
+) -> Result<Vec<u8>, &'static str> {
+    if !matches!(category, "adult" | "vr") || !valid_javdb_image_url(source_url) {
+        return Err(if category == "adult" {
+            ADULT_PROVIDER_ERROR
+        } else {
+            VR_PROVIDER_ERROR
+        });
+    }
+    request(source_url).map_err(|error| javdb_provider_error(category, error))
 }
 
 fn fetch_sukebei_adult_releases_with(
@@ -3240,6 +3776,71 @@ fn dismiss_vr_organization(state: tauri::State<'_, VrDownloadState>) -> Result<(
 }
 
 #[tauri::command]
+async fn fetch_javdb_browse(
+    category: String,
+    mode: String,
+    period: String,
+    year: Option<String>,
+    month: Option<u8>,
+    sort: String,
+    count: u16,
+) -> Result<Vec<String>, String> {
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_javdb_browse_with(
+            &category,
+            &mode,
+            &period,
+            year.as_deref(),
+            month,
+            &sort,
+            count,
+            fetch_javdb_api_document,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
+async fn fetch_javdb_item_details(
+    category: String,
+    provider_item_id: String,
+) -> Result<String, String> {
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_javdb_item_details_with(&category, &provider_item_id, fetch_javdb_api_document)
+            .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
+async fn fetch_javdb_image(category: String, source_url: String) -> Result<Vec<u8>, String> {
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_javdb_image_with(&category, &source_url, fetch_javdb_image_bytes)
+            .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
 async fn fetch_javdb_vr_catalog(code: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         fetch_javdb_vr_catalog_with(&code, fetch_provider_document).map_err(str::to_owned)
@@ -4050,6 +4651,9 @@ fn main() {
             preview_vr_organization,
             apply_vr_organization,
             dismiss_vr_organization,
+            fetch_javdb_browse,
+            fetch_javdb_item_details,
+            fetch_javdb_image,
             fetch_javdb_vr_catalog,
             fetch_javdb_adult_catalog,
             fetch_sukebei_adult_releases,
@@ -4092,11 +4696,13 @@ mod tests {
     use super::{
         begin_movie_metadata_client_operation, begin_movie_metadata_search,
         begin_movie_metadata_verification, clear_movie_metadata_match_with,
-        clear_movies_folder_file, clear_tmdb_token_file, fetch_javdb_adult_catalog_with,
-        fetch_javdb_vr_catalog_with, fetch_sukebei_adult_releases_with,
-        fetch_sukebei_vr_releases_with, fetch_yts_movie_releases_with,
-        finish_movie_metadata_search, finish_movie_metadata_verification,
-        invalidate_movie_metadata_client_context, load_movies_folder_file, load_tmdb_token_file,
+        clear_movies_folder_file, clear_tmdb_token_file, decode_javdb_image_payload,
+        fetch_javdb_adult_catalog_with, fetch_javdb_browse_with, fetch_javdb_image_with,
+        fetch_javdb_item_details_with, fetch_javdb_vr_catalog_with,
+        fetch_sukebei_adult_releases_with, fetch_sukebei_vr_releases_with,
+        fetch_yts_movie_releases_with, finish_movie_metadata_search,
+        finish_movie_metadata_verification, invalidate_movie_metadata_client_context,
+        javdb_signature, load_movies_folder_file, load_tmdb_token_file, md5_hex,
         movie_metadata_error, open_movie_path_with, parse_movie_metadata_candidates,
         parse_movie_provider_response, parse_provider_response, parse_verified_movie_metadata,
         query_movies_volume_storage_with, reveal_movie_path_with, save_movie_metadata_match_with,
@@ -4223,6 +4829,155 @@ mod tests {
         assert_eq!(
             sukebei_url.into_inner().as_deref(),
             Some("https://sukebei.nyaa.si/?page=rss&q=%22ADLT-123%22&c=0_0&f=0")
+        );
+    }
+
+    #[test]
+    fn signs_javdb_requests_with_the_captured_deterministic_identity() {
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(
+            javdb_signature(1_712_345_678),
+            "1712345678.lpw6vgqzsp.091fb26889e107ccb852b17532498a5b"
+        );
+    }
+
+    #[test]
+    fn builds_exact_adult_ranking_and_category_requests_with_detail_authority() {
+        let ranking_urls = RefCell::new(Vec::new());
+        let ranking = fetch_javdb_browse_with(
+            "adult",
+            "ranking",
+            "weekly",
+            None,
+            None,
+            "newest",
+            25,
+            |url| {
+                ranking_urls.borrow_mut().push(url.to_owned());
+                if url.contains("/rankings?") {
+                    Ok(r#"{"success":1,"data":{"movies":[{"id":"Adult1"}]}}"#.to_owned())
+                } else {
+                    Ok(r#"{"success":1,"data":{"movie":{"id":"Adult1","tags":[{"id":"28","name":"Solo"}]}}}"#.to_owned())
+                }
+            },
+        )
+        .expect("valid Adult ranking request must succeed");
+        assert_eq!(ranking.len(), 2);
+        assert_eq!(
+            ranking_urls.borrow().as_slice(),
+            [
+                "https://apidd.spthgb.com/api/v1/rankings?type=0&period=weekly",
+                "https://apidd.spthgb.com/api/v4/movies/Adult1?from_rankings=false",
+            ]
+        );
+
+        for (sort, sort_by, order_by) in [
+            ("newest", "release", "desc"),
+            ("oldest", "release", "asc"),
+            ("recently-updated", "update", "desc"),
+            ("top-rated", "score", "desc"),
+            ("most-viewed", "hit", "desc"),
+            ("most-wanted", "want_watch_count", "desc"),
+            ("most-watched", "watched_count", "desc"),
+        ] {
+            let category_url = RefCell::new(None);
+            fetch_javdb_browse_with(
+                "adult",
+                "category",
+                "daily",
+                Some("2026"),
+                Some(6),
+                sort,
+                10,
+                |url| {
+                    category_url.replace(Some(url.to_owned()));
+                    Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
+                },
+            )
+            .expect("valid Adult category request must succeed");
+            assert_eq!(
+                category_url.into_inner(),
+                Some(format!(
+                    "https://apidd.spthgb.com/api/v1/movies/tags?filter_by=0%3At%3Am%3A%3A2026%3A%3A6&filter_by_tags=&sort_by={sort_by}&order_by={order_by}&page=1&limit=10"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn builds_exact_vr_tag_requests_and_stops_a_hundred_result_request_at_empty_page() {
+        let urls = RefCell::new(Vec::new());
+        let documents = fetch_javdb_browse_with(
+            "vr",
+            "category",
+            "daily",
+            None,
+            None,
+            "oldest",
+            100,
+            |url| {
+                urls.borrow_mut().push(url.to_owned());
+                Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
+            },
+        )
+        .expect("valid VR browse request must succeed");
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            urls.borrow().as_slice(),
+            ["https://apidd.spthgb.com/api/v1/movies/tags?filter_by=0%3At%3Am%3A212%3A%3A%3A&filter_by_tags=&sort_by=release&order_by=asc&page=1&limit=50"]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_javdb_browse_and_detail_input_before_dispatch() {
+        let calls = RefCell::new(0);
+        assert_eq!(
+            fetch_javdb_browse_with("vr", "ranking", "daily", None, None, "newest", 25, |_| {
+                calls.replace_with(|count| *count + 1);
+                Ok(String::new())
+            },),
+            Err(VR_PROVIDER_ERROR)
+        );
+        assert_eq!(
+            fetch_javdb_item_details_with("adult", "../Adult1", |_| {
+                calls.replace_with(|count| *count + 1);
+                Ok(String::new())
+            }),
+            Err(ADULT_PROVIDER_ERROR)
+        );
+        assert_eq!(*calls.borrow(), 0);
+    }
+
+    #[test]
+    fn validates_and_decodes_only_exact_javdb_image_payloads() {
+        let key = 0x5a;
+        let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10];
+        let mut encoded = vec![key];
+        encoded.extend(jpeg.iter().map(|byte| byte ^ key));
+        assert_eq!(decode_javdb_image_payload(&encoded), Ok(jpeg.to_vec()));
+
+        let dispatched = RefCell::new(false);
+        assert_eq!(
+            fetch_javdb_image_with("vr", "https://tp.cmastd.com/covers/a.jpg", |url| {
+                dispatched.replace(true);
+                assert_eq!(url, "https://tp.cmastd.com/covers/a.jpg");
+                Ok(jpeg.to_vec())
+            }),
+            Ok(jpeg.to_vec())
+        );
+        assert!(*dispatched.borrow());
+        dispatched.replace(false);
+        assert_eq!(
+            fetch_javdb_image_with("vr", "https://tp.cmastd.com.evil.test/a.jpg", |_| {
+                dispatched.replace(true);
+                Ok(Vec::new())
+            }),
+            Err(VR_PROVIDER_ERROR)
+        );
+        assert!(!*dispatched.borrow());
+        assert_eq!(
+            decode_javdb_image_payload(&[1, b'n' ^ 1, b'o' ^ 1]),
+            Err(ProviderRequestError::Provider)
         );
     }
 

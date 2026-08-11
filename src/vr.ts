@@ -13,6 +13,65 @@ export type JavdbCatalogResult =
   | { status: "malformed-provider" }
   | { status: "provider-error" };
 
+export type JavdbBrowseCategory = "adult" | "vr";
+export type JavdbBrowseMode = "category" | "ranking";
+export type JavdbBrowsePeriod = "daily" | "monthly" | "weekly";
+export type JavdbBrowseSort =
+  | "newest"
+  | "oldest"
+  | "recently-updated"
+  | "top-rated"
+  | "most-viewed"
+  | "most-wanted"
+  | "most-watched";
+
+export type JavdbBrowseRequest = {
+  category: JavdbBrowseCategory;
+  mode: JavdbBrowseMode;
+  period: JavdbBrowsePeriod;
+  year: string | null;
+  month: number | null;
+  sort: JavdbBrowseSort;
+  count: 10 | 25 | 50 | 100;
+};
+
+export type JavdbBrowseItem = JavdbCatalogItem & {
+  category: JavdbBrowseCategory;
+  providerItemId: string;
+  requestIdentity: string;
+  releaseDate: string | null;
+  sourceAspectRatio: number;
+};
+
+export type JavdbBrowseResult =
+  | { status: "ready"; items: JavdbBrowseItem[] }
+  | { status: "empty" }
+  | { status: "source-unavailable" }
+  | { status: "network-error" }
+  | { status: "malformed-provider" }
+  | { status: "conflicting-provider" }
+  | { status: "provider-error" };
+
+export type JavdbItemDetails = {
+  item: JavdbBrowseItem;
+  title: string | null;
+  releaseDate: string | null;
+  runtimeMinutes: number | null;
+  cast: string[];
+  tags: string[];
+  summary: string | null;
+  sourceLink: string;
+  previewUrls: string[];
+};
+
+export type JavdbItemDetailsResult =
+  | { status: "ready"; details: JavdbItemDetails }
+  | { status: "source-unavailable" }
+  | { status: "network-error" }
+  | { status: "malformed-provider" }
+  | { status: "conflicting-provider" }
+  | { status: "provider-error" };
+
 export type VrCatalogItem = JavdbCatalogItem;
 export type VrCatalogResult = JavdbCatalogResult;
 
@@ -151,6 +210,393 @@ const vrLibraryPartPattern =
   /(^|[^A-Za-z0-9])((?:part|pt|cd|disc|disk)[ _-]*0*([0-9]{1,4}))(?=$|[^A-Za-z0-9])/gi;
 const vrLibraryPartPrefixes = new Set(["PART", "PT", "CD", "DISC", "DISK"]);
 const javdbBaseUrl = "https://javdb.com";
+const javdbVrTagId = "212";
+const javdbSourceAspectRatio = 1.48;
+const javdbProviderItemPattern = /^[A-Za-z0-9]{1,64}$/;
+const maximumJavdbPreviewImages = 24;
+
+type JsonRecord = Record<string, unknown>;
+
+function jsonRecord(value: unknown): JsonRecord | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as JsonRecord)
+    : null;
+}
+
+function optionalProviderText(value: unknown) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+function javdbApiData(documentText: string) {
+  try {
+    const envelope = jsonRecord(JSON.parse(documentText));
+    const data = jsonRecord(envelope?.data);
+    return envelope?.success === 1 && data !== null ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+function javdbImageUrl(value: unknown) {
+  if (typeof value !== "string" || value.trim() === "") {
+    return value === null || value === undefined || value === ""
+      ? null
+      : undefined;
+  }
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" ||
+      !url.hostname.startsWith("tp.") ||
+      !url.hostname.endsWith(".com") ||
+      url.port !== "" ||
+      url.username !== "" ||
+      url.password !== ""
+    ) {
+      return undefined;
+    }
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function javdbBrowseRequestIdentity(request: JavdbBrowseRequest) {
+  return [
+    request.category,
+    request.mode,
+    request.period,
+    request.year ?? "all-years",
+    request.month ?? "all-months",
+    request.sort,
+    request.count,
+  ].join("|");
+}
+
+function parseJavdbBrowseMovie(
+  value: unknown,
+  request: JavdbBrowseRequest,
+): JavdbBrowseItem | null {
+  const movie = jsonRecord(value);
+  if (movie === null || typeof movie.id !== "string") {
+    return null;
+  }
+  const providerItemId = movie.id.trim();
+  const code =
+    typeof movie.number === "string"
+      ? canonicalizeProductCode(movie.number)
+      : null;
+  const title = optionalProviderText(movie.title);
+  const coverUrl = javdbImageUrl(movie.cover_url ?? movie.thumb_url);
+  const releaseDate = optionalProviderText(movie.release_date);
+  if (
+    !javdbProviderItemPattern.test(providerItemId) ||
+    code === null ||
+    title === undefined ||
+    coverUrl === undefined ||
+    releaseDate === undefined
+  ) {
+    return null;
+  }
+  return {
+    category: request.category,
+    providerItemId,
+    requestIdentity: javdbBrowseRequestIdentity(request),
+    code,
+    title,
+    coverUrl,
+    releaseDate,
+    source: "JavDB",
+    sourceAspectRatio: javdbSourceAspectRatio,
+  };
+}
+
+function javdbDetailCategory(value: unknown) {
+  const movie = jsonRecord(value);
+  if (movie === null || !Array.isArray(movie.tags)) {
+    return null;
+  }
+  for (const tagValue of movie.tags) {
+    const tag = jsonRecord(tagValue);
+    if (tag === null || typeof tag.id !== "string") {
+      return null;
+    }
+  }
+  return movie.tags.some(
+    (tagValue) => jsonRecord(tagValue)?.id === javdbVrTagId,
+  )
+    ? "vr"
+    : "adult";
+}
+
+function sameJavdbBrowseItem(
+  left: JavdbBrowseItem,
+  right: JavdbBrowseItem,
+) {
+  return (
+    left.category === right.category &&
+    left.providerItemId === right.providerItemId &&
+    left.requestIdentity === right.requestIdentity &&
+    left.code === right.code &&
+    left.title === right.title &&
+    left.coverUrl === right.coverUrl &&
+    left.releaseDate === right.releaseDate
+  );
+}
+
+export function parseJavdbBrowseDocuments(
+  documents: unknown,
+  request: JavdbBrowseRequest,
+): JavdbBrowseResult {
+  if (!Array.isArray(documents) || !documents.every((value) => typeof value === "string")) {
+    return { status: "malformed-provider" };
+  }
+  const listingMovies: unknown[] = [];
+  const detailCategories = new Map<string, JavdbBrowseCategory>();
+  for (const documentText of documents) {
+    const data = javdbApiData(documentText);
+    if (data === null) {
+      return { status: "malformed-provider" };
+    }
+    if (Array.isArray(data.movies)) {
+      listingMovies.push(...data.movies);
+      continue;
+    }
+    const movie = jsonRecord(data.movie);
+    const category = javdbDetailCategory(movie);
+    if (
+      movie === null ||
+      typeof movie.id !== "string" ||
+      !javdbProviderItemPattern.test(movie.id) ||
+      category === null
+    ) {
+      return { status: "malformed-provider" };
+    }
+    const previousCategory = detailCategories.get(movie.id);
+    if (previousCategory !== undefined && previousCategory !== category) {
+      return { status: "conflicting-provider" };
+    }
+    detailCategories.set(movie.id, category);
+  }
+
+  const items: JavdbBrowseItem[] = [];
+  const providerItems = new Map<string, JavdbBrowseItem>();
+  for (const movie of listingMovies) {
+    const item = parseJavdbBrowseMovie(movie, request);
+    if (item === null) {
+      return { status: "malformed-provider" };
+    }
+    if (
+      request.category === "adult" &&
+      detailCategories.get(item.providerItemId) === undefined
+    ) {
+      return { status: "malformed-provider" };
+    }
+    const actualCategory =
+      request.category === "adult"
+        ? detailCategories.get(item.providerItemId)
+        : "vr";
+    if (actualCategory !== request.category) {
+      continue;
+    }
+    const previousItem = providerItems.get(item.providerItemId);
+    if (previousItem !== undefined) {
+      if (!sameJavdbBrowseItem(previousItem, item)) {
+        return { status: "conflicting-provider" };
+      }
+      continue;
+    }
+    providerItems.set(item.providerItemId, item);
+    items.push(item);
+  }
+  const acceptedItems = items.slice(0, request.count);
+  return acceptedItems.length === 0
+    ? { status: "empty" }
+    : { status: "ready", items: acceptedItems };
+}
+
+function javdbBrowseInvokeStatus(error: unknown): Exclude<
+  JavdbBrowseResult["status"],
+  "ready" | "empty" | "malformed-provider" | "conflicting-provider"
+> {
+  return invokeErrorStatus(error);
+}
+
+export async function fetchJavdbBrowse(
+  request: JavdbBrowseRequest,
+): Promise<JavdbBrowseResult> {
+  try {
+    const documents = await window.__TAURI__.core.invoke<unknown>(
+      "fetch_javdb_browse",
+      request,
+    );
+    return parseJavdbBrowseDocuments(documents, request);
+  } catch (error: unknown) {
+    return { status: javdbBrowseInvokeStatus(error) };
+  }
+}
+
+function stringList(value: unknown) {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const values: string[] = [];
+  for (const entry of value) {
+    const record = jsonRecord(entry);
+    const name = optionalProviderText(record?.name);
+    if (record === null || name === undefined) {
+      return null;
+    }
+    if (name !== null) {
+      values.push(name);
+    }
+  }
+  return values;
+}
+
+export function parseJavdbItemDetails(
+  documentText: unknown,
+  item: JavdbBrowseItem,
+): JavdbItemDetailsResult {
+  if (typeof documentText !== "string") {
+    return { status: "malformed-provider" };
+  }
+  const data = javdbApiData(documentText);
+  const movie = jsonRecord(data?.movie);
+  const category = javdbDetailCategory(movie);
+  const code =
+    typeof movie?.number === "string"
+      ? canonicalizeProductCode(movie.number)
+      : null;
+  const title = optionalProviderText(movie?.title);
+  const releaseDate = optionalProviderText(movie?.release_date);
+  const summary = optionalProviderText(movie?.summary);
+  const coverUrl = javdbImageUrl(movie?.cover_url ?? movie?.thumb_url);
+  const cast = stringList(movie?.actors);
+  const tags = stringList(movie?.tags);
+  if (
+    movie === null ||
+    movie.id !== item.providerItemId ||
+    code !== item.code ||
+    category === null ||
+    title === undefined ||
+    releaseDate === undefined ||
+    summary === undefined ||
+    coverUrl === undefined ||
+    cast === null ||
+    tags === null
+  ) {
+    return { status: "malformed-provider" };
+  }
+  if (category !== item.category) {
+    return { status: "conflicting-provider" };
+  }
+  const previewImages = movie.preview_images;
+  if (previewImages !== null && previewImages !== undefined && !Array.isArray(previewImages)) {
+    return { status: "malformed-provider" };
+  }
+  const previewUrls: string[] = [];
+  for (const previewValue of previewImages ?? []) {
+    const preview = jsonRecord(previewValue);
+    const url = javdbImageUrl(preview?.large_url ?? preview?.thumb_url);
+    if (preview === null || url === undefined) {
+      return { status: "malformed-provider" };
+    }
+    if (url !== null && !previewUrls.includes(url)) {
+      previewUrls.push(url);
+    }
+    if (previewUrls.length === maximumJavdbPreviewImages) {
+      break;
+    }
+  }
+  const runtimeMinutes = movie.duration;
+  if (
+    runtimeMinutes !== null &&
+    runtimeMinutes !== undefined &&
+    (!Number.isSafeInteger(runtimeMinutes) || Number(runtimeMinutes) <= 0)
+  ) {
+    return { status: "malformed-provider" };
+  }
+  return {
+    status: "ready",
+    details: {
+      item: { ...item, title, coverUrl, releaseDate },
+      title,
+      releaseDate,
+      runtimeMinutes:
+        runtimeMinutes === null || runtimeMinutes === undefined
+          ? null
+          : Number(runtimeMinutes),
+      cast,
+      tags,
+      summary,
+      sourceLink: `${javdbBaseUrl}/v/${item.providerItemId}`,
+      previewUrls,
+    },
+  };
+}
+
+export async function fetchJavdbItemDetails(
+  item: JavdbBrowseItem,
+): Promise<JavdbItemDetailsResult> {
+  try {
+    const documentText = await window.__TAURI__.core.invoke<unknown>(
+      "fetch_javdb_item_details",
+      { category: item.category, providerItemId: item.providerItemId },
+    );
+    return parseJavdbItemDetails(documentText, item);
+  } catch (error: unknown) {
+    return { status: javdbBrowseInvokeStatus(error) };
+  }
+}
+
+function javdbImageMimeType(bytes: Uint8Array) {
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return "image/png";
+  }
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) {
+    return "image/gif";
+  }
+  if (
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46
+  ) {
+    return "image/webp";
+  }
+  return "image/jpeg";
+}
+
+export async function fetchJavdbImageObjectUrl(
+  category: JavdbBrowseCategory,
+  sourceUrl: string,
+) {
+  const value = await window.__TAURI__.core.invoke<unknown>(
+    "fetch_javdb_image",
+    { category, sourceUrl },
+  );
+  if (
+    !Array.isArray(value) ||
+    value.length < 3 ||
+    !value.every(
+      (byte) => Number.isInteger(byte) && Number(byte) >= 0 && Number(byte) <= 255,
+    )
+  ) {
+    throw new Error("JavDB returned an invalid image payload.");
+  }
+  const bytes = new Uint8Array(value as number[]);
+  return URL.createObjectURL(
+    new Blob([bytes], { type: javdbImageMimeType(bytes) }),
+  );
+}
 
 function invokeErrorStatus(error: unknown): Exclude<
   JavdbCatalogResult["status"],
