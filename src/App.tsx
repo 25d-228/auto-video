@@ -2162,15 +2162,13 @@ function JavdbBrowseControls({
 }
 
 function JavdbImage({
-  category,
   className,
-  code,
+  item,
   sourceUrl,
   onRatio,
 }: {
-  category: JavdbBrowseCategory;
   className?: string;
-  code: string;
+  item: JavdbBrowseItem;
   sourceUrl: string | null;
   onRatio?: (ratio: number) => void;
 }) {
@@ -2186,7 +2184,7 @@ function JavdbImage({
         current = false;
       };
     }
-    void fetchJavdbImageObjectUrl(category, sourceUrl)
+    void fetchJavdbImageObjectUrl(item, sourceUrl)
       .then((nextObjectUrl) => {
         if (!current) {
           URL.revokeObjectURL(nextObjectUrl);
@@ -2202,7 +2200,7 @@ function JavdbImage({
     return () => {
       current = false;
     };
-  }, [category, sourceUrl]);
+  }, [item, sourceUrl]);
 
   useEffect(
     () => () => {
@@ -2217,7 +2215,7 @@ function JavdbImage({
     return (
       <div className={`javdb-cover__placeholder ${className ?? ""}`}>
         <AppIcon name="poster" />
-        <span>{code}</span>
+        <span>{item.code}</span>
       </div>
     );
   }
@@ -2273,8 +2271,7 @@ function DiscoverJavdbBrowseCard({
       >
         <div className="javdb-browse-card__cover">
           <JavdbImage
-            category={item.category}
-            code={item.code}
+            item={item}
             onRatio={setCoverRatio}
             sourceUrl={item.coverUrl}
           />
@@ -2505,9 +2502,8 @@ function JavdbDetailsDialog({
           ) : (
             <div className="javdb-details__content">
               <JavdbImage
-                category={item.category}
                 className="javdb-details__cover"
-                code={item.code}
+                item={state.details.item}
                 sourceUrl={state.details.item.coverUrl}
               />
               <div>
@@ -2549,9 +2545,7 @@ function JavdbDetailsDialog({
                     <dd>JavDB</dd>
                   </div>
                 </dl>
-                {state.details.summary === null ? null : (
-                  <p>{state.details.summary}</p>
-                )}
+                <p>{state.details.summary ?? "Summary unavailable"}</p>
                 <div className="javdb-details__actions">
                   <a
                     href={state.details.sourceLink}
@@ -9597,7 +9591,7 @@ export default function App() {
       }
       const imageResults = await Promise.allSettled(
         result.details.previewUrls.map((sourceUrl) =>
-          fetchJavdbImageObjectUrl(javdbPreviewContext.item.category, sourceUrl),
+          fetchJavdbImageObjectUrl(javdbPreviewContext.item, sourceUrl),
         ),
       );
       const objectUrls = imageResults.flatMap((imageResult) =>

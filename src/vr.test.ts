@@ -96,6 +96,8 @@ const adultBrowseRequest: JavdbBrowseRequest = {
   sort: "newest",
   count: 25,
 };
+const adultImageAuthorityId = "javdb-adult-1-00000000";
+const vrImageAuthorityId = "javdb-vr-1-00000000";
 
 function javdbApiDocument(data: unknown) {
   return JSON.stringify({ success: 1, action: null, message: null, data });
@@ -355,6 +357,7 @@ describe("JavDB Adult and VR browse provider boundary", () => {
         javdbApiDocument({ movie: javdbDetailMovie("Adult2", "ADLT-125", false) }),
       ],
       adultBrowseRequest,
+      adultImageAuthorityId,
     );
     expect(result).toMatchObject({
       status: "ready",
@@ -369,9 +372,13 @@ describe("JavDB Adult and VR browse provider boundary", () => {
     const listing = javdbApiDocument({
       movies: [javdbBrowseMovie("Adult1", "ADLT-123")],
     });
-    expect(parseJavdbBrowseDocuments([listing], adultBrowseRequest)).toEqual({
-      status: "malformed-provider",
-    });
+    expect(
+      parseJavdbBrowseDocuments(
+        [listing],
+        adultBrowseRequest,
+        adultImageAuthorityId,
+      ),
+    ).toEqual({ status: "empty" });
     expect(
       parseJavdbBrowseDocuments(
         [
@@ -380,6 +387,7 @@ describe("JavDB Adult and VR browse provider boundary", () => {
           javdbApiDocument({ movie: javdbDetailMovie("Adult1", "ADLT-123", true) }),
         ],
         adultBrowseRequest,
+        adultImageAuthorityId,
       ),
     ).toEqual({ status: "conflicting-provider" });
   });
@@ -394,8 +402,9 @@ describe("JavDB Adult and VR browse provider boundary", () => {
           javdbApiDocument({ movies: [javdbBrowseMovie("bad/id", "ADLT-123")] }),
         ],
         { ...adultBrowseRequest, category: "vr", mode: "category" },
+        vrImageAuthorityId,
       ),
-    ).toEqual({ status: "malformed-provider" });
+    ).toEqual({ status: "empty" });
     expect(
       parseJavdbBrowseDocuments(
         [
@@ -408,12 +417,130 @@ describe("JavDB Adult and VR browse provider boundary", () => {
           detail,
         ],
         adultBrowseRequest,
+        adultImageAuthorityId,
       ),
     ).toEqual({ status: "conflicting-provider" });
   });
 
+  it("keeps valid rotating-host rows in provider order while rejecting unusable rows locally", () => {
+    const listing = javdbApiDocument({
+      movies: [
+        {
+          ...javdbBrowseMovie("Adult1", "ADLT-123"),
+          cover_url: "https://tp.spfcas.com/covers/Adult1.jpg",
+        },
+        { id: "MissingCode", title: "No exact identity" },
+        javdbBrowseMovie("bad/id", "ADLT-124"),
+        javdbBrowseMovie(" Adult3 ", "ADLT-124"),
+        {
+          id: "Adult2",
+          number: "adlt_00125",
+          title: null,
+          cover_url: null,
+          release_date: null,
+        },
+        javdbBrowseMovie("NoCategory", "ADLT-126"),
+      ],
+    });
+    const result = parseJavdbBrowseDocuments(
+      [
+        listing,
+        javdbApiDocument({ movie: javdbDetailMovie("Adult1", "ADLT-123", false) }),
+        javdbApiDocument({ movie: javdbDetailMovie("Adult2", "ADLT-125", false) }),
+        javdbApiDocument({ movie: { id: "NoCategory", tags: null } }),
+      ],
+      adultBrowseRequest,
+      adultImageAuthorityId,
+    );
+    expect(result).toEqual({
+      status: "ready",
+      items: [
+        expect.objectContaining({
+          providerItemId: "Adult1",
+          code: "ADLT-123",
+          coverUrl: "https://tp.spfcas.com/covers/Adult1.jpg",
+        }),
+        expect.objectContaining({
+          providerItemId: "Adult2",
+          code: "ADLT-125",
+          title: null,
+          coverUrl: null,
+          releaseDate: null,
+        }),
+      ],
+    });
+
+    expect(
+      parseJavdbBrowseDocuments(
+        [
+          javdbApiDocument({
+            movies: [
+              {
+                ...javdbBrowseMovie("Vr1", "MDVR-419"),
+                cover_url: "https://tp.spfcas.com/covers/Vr1.jpg",
+              },
+            ],
+          }),
+        ],
+        { ...adultBrowseRequest, category: "vr", mode: "category" },
+        vrImageAuthorityId,
+      ),
+    ).toMatchObject({
+      status: "ready",
+      items: [
+        {
+          providerItemId: "Vr1",
+          coverUrl: "https://tp.spfcas.com/covers/Vr1.jpg",
+        },
+      ],
+    });
+  });
+
+  it("renders absent and null optional details as unavailable without inventing previews", () => {
+    const item = {
+      category: "adult",
+      imageAuthorityId: adultImageAuthorityId,
+      providerItemId: "Adult1",
+      requestIdentity: "adult|ranking|daily|all-years|all-months|newest|25",
+      code: "ADLT-123",
+      title: null,
+      coverUrl: null,
+      releaseDate: null,
+      source: "JavDB",
+      sourceAspectRatio: 1.48,
+    } satisfies JavdbBrowseItem;
+    expect(
+      parseJavdbItemDetails(
+        javdbApiDocument({
+          movie: {
+            id: "Adult1",
+            number: "ADLT-123",
+            title: null,
+            cover_url: null,
+            duration: null,
+            preview_images: null,
+          },
+        }),
+        item,
+      ),
+    ).toEqual({
+      status: "ready",
+      details: {
+        item,
+        title: null,
+        releaseDate: null,
+        runtimeMinutes: null,
+        cast: [],
+        tags: [],
+        summary: null,
+        sourceLink: "https://javdb.com/v/Adult1",
+        previewUrls: [],
+      },
+    });
+  });
+
   it("dispatches every exact browse identity and distinguishes native failures", async () => {
-    invokeMock.mockResolvedValue([
+    invokeMock.mockResolvedValue([adultImageAuthorityId,
       javdbApiDocument({ movies: [] }),
     ]);
     for (const sort of [
@@ -463,6 +590,7 @@ describe("JavDB Adult and VR browse provider boundary", () => {
     const item = {
       ...javdbBrowseMovie("Vr1", "MDVR-419"),
       category: "vr",
+      imageAuthorityId: vrImageAuthorityId,
       providerItemId: "Vr1",
       requestIdentity: "vr|category|daily|all-years|all-months|newest|25",
       code: "MDVR-419",
@@ -507,6 +635,7 @@ describe("JavDB Adult and VR browse provider boundary", () => {
     await fetchJavdbItemDetails(item);
     expect(invokeMock).toHaveBeenCalledWith("fetch_javdb_item_details", {
       category: "vr",
+      imageAuthorityId: vrImageAuthorityId,
       providerItemId: "Vr1",
     });
   });
@@ -515,17 +644,60 @@ describe("JavDB Adult and VR browse provider boundary", () => {
     const createObjectUrl = vi.fn(() => "blob:javdb-cover");
     vi.stubGlobal("URL", Object.assign(URL, { createObjectURL: createObjectUrl }));
     invokeMock.mockResolvedValue([0xff, 0xd8, 0xff, 0xe0]);
+    const item = {
+      category: "adult",
+      imageAuthorityId: adultImageAuthorityId,
+      providerItemId: "Adult1",
+      requestIdentity: "adult|ranking|daily|all-years|all-months|newest|25",
+      code: "ADLT-123",
+      title: null,
+      coverUrl: "https://tp.cmastd.com/covers/Adult1.jpg",
+      releaseDate: null,
+      source: "JavDB",
+      sourceAspectRatio: 1.48,
+    } satisfies JavdbBrowseItem;
     await expect(
-      fetchJavdbImageObjectUrl("adult", "https://tp.cmastd.com/covers/Adult1.jpg"),
+      fetchJavdbImageObjectUrl(item, "https://tp.cmastd.com/covers/Adult1.jpg"),
     ).resolves.toBe("blob:javdb-cover");
     expect(invokeMock).toHaveBeenCalledWith("fetch_javdb_image", {
       category: "adult",
+      imageAuthorityId: adultImageAuthorityId,
+      providerItemId: "Adult1",
       sourceUrl: "https://tp.cmastd.com/covers/Adult1.jpg",
     });
     invokeMock.mockResolvedValueOnce([999]);
     await expect(
-      fetchJavdbImageObjectUrl("adult", "https://tp.cmastd.com/covers/Adult1.jpg"),
+      fetchJavdbImageObjectUrl(item, "https://tp.cmastd.com/covers/Adult1.jpg"),
     ).rejects.toThrow("invalid image payload");
+  });
+
+  it("dispatches a retained rotating-host image with the exact provider authority", async () => {
+    const item = {
+      category: "vr",
+      imageAuthorityId: vrImageAuthorityId,
+      providerItemId: "Vr1",
+      requestIdentity: "vr|category|daily|all-years|all-months|newest|25",
+      code: "MDVR-419",
+      title: null,
+      coverUrl: "https://tp.spfcas.com/covers/Vr1.jpg",
+      releaseDate: null,
+      source: "JavDB",
+      sourceAspectRatio: 1.48,
+    } satisfies JavdbBrowseItem;
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, { createObjectURL: vi.fn(() => "blob:rotating-host") }),
+    );
+    invokeMock.mockResolvedValue([0xff, 0xd8, 0xff]);
+    await expect(
+      fetchJavdbImageObjectUrl(item, item.coverUrl),
+    ).resolves.toBe("blob:rotating-host");
+    expect(invokeMock).toHaveBeenCalledWith("fetch_javdb_image", {
+      category: "vr",
+      imageAuthorityId: vrImageAuthorityId,
+      providerItemId: "Vr1",
+      sourceUrl: "https://tp.spfcas.com/covers/Vr1.jpg",
+    });
   });
 
   it.each([
@@ -536,7 +708,19 @@ describe("JavDB Adult and VR browse provider boundary", () => {
     "https://tp.cmastd.com\\@evil.example/covers/Adult1.jpg",
     "not a URL",
   ])("rejects unsupported JavDB image URL %s before native dispatch", async (sourceUrl) => {
-    await expect(fetchJavdbImageObjectUrl("vr", sourceUrl)).rejects.toThrow(
+    const item = {
+      category: "vr",
+      imageAuthorityId: vrImageAuthorityId,
+      providerItemId: "Vr1",
+      requestIdentity: "vr|category|daily|all-years|all-months|newest|25",
+      code: "MDVR-419",
+      title: null,
+      coverUrl: null,
+      releaseDate: null,
+      source: "JavDB",
+      sourceAspectRatio: 1.48,
+    } satisfies JavdbBrowseItem;
+    await expect(fetchJavdbImageObjectUrl(item, sourceUrl)).rejects.toThrow(
       "invalid image URL",
     );
     expect(invokeMock).not.toHaveBeenCalled();

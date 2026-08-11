@@ -485,6 +485,7 @@ function javdbBrowseFixture(
   items: JavdbBrowseFixtureItem[],
   category: "adult" | "vr",
 ) {
+  const imageAuthorityId = `javdb-${category}-1-00000000`;
   const listing = JSON.stringify({
     success: 1,
     data: {
@@ -501,9 +502,10 @@ function javdbBrowseFixture(
     },
   });
   if (category === "vr") {
-    return [listing];
+    return [imageAuthorityId, listing];
   }
   return [
+    imageAuthorityId,
     listing,
     ...items.map((item) =>
       JSON.stringify({
@@ -1035,6 +1037,7 @@ beforeEach(() => {
     .fn()
     .mockResolvedValue('<div class="movie-list"></div>');
   fetchJavdbBrowseMock = vi.fn().mockResolvedValue([
+    "javdb-adult-1-00000000",
     JSON.stringify({ success: 1, data: { movies: [] } }),
   ]);
   fetchJavdbDetailsMock = vi.fn().mockResolvedValue(
@@ -9341,6 +9344,146 @@ describe("JavDB Adult and VR catalog browsing", () => {
     expect(await screen.findByRole("heading", { name: "MDVR-430" })).toBeTruthy();
   });
 
+  it("keeps valid Adult rows around unusable neighbors and renders missing provider fields locally", async () => {
+    fetchJavdbBrowseMock.mockResolvedValue([
+      "javdb-adult-7-00000000",
+      JSON.stringify({
+        success: 1,
+        data: {
+          movies: [
+            {
+              id: "Adult1",
+              number: "ADLT-123",
+              title: "First exact row",
+              cover_url: "https://tp.spfcas.com/covers/Adult1.jpg",
+            },
+            { id: "MissingCode", title: "Rejected row" },
+            { id: "bad/id", number: "ADLT-124" },
+            {
+              id: "Adult2",
+              number: "ADLT-125",
+              title: null,
+              cover_url: null,
+              release_date: null,
+            },
+            {
+              id: "ForgedCover",
+              number: "ADLT-126",
+              cover_url: "https://tp.evil.com/covers/ForgedCover.jpg",
+            },
+            { id: "NoCategory", number: "ADLT-127" },
+          ],
+        },
+      }),
+      ...["Adult1", "Adult2", "ForgedCover"].map((id) =>
+        JSON.stringify({
+          success: 1,
+          data: { movie: { id, tags: [{ id: "28", name: "Solo" }] } },
+        }),
+      ),
+      JSON.stringify({
+        success: 1,
+        data: { movie: { id: "NoCategory", tags: null } },
+      }),
+    ]);
+    fetchJavdbDetailsMock.mockResolvedValue(
+      JSON.stringify({
+        success: 1,
+        data: {
+          movie: {
+            id: "Adult2",
+            number: "ADLT-125",
+            title: null,
+            cover_url: null,
+            duration: null,
+            preview_images: null,
+          },
+        },
+      }),
+    );
+    render(<App />);
+    selectDiscover();
+    selectAdultBrowse();
+
+    const headings = await screen.findAllByRole("heading", { level: 3 });
+    expect(headings.map((heading) => heading.textContent)).toEqual([
+      "ADLT-123",
+      "ADLT-125",
+      "ADLT-126",
+    ]);
+    expect(screen.queryByText("Rejected row")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "ADLT-127" })).toBeNull();
+    for (const code of ["ADLT-125", "ADLT-126"]) {
+      const card = screen.getByRole("heading", { name: code }).closest("article") as HTMLElement;
+      expect(within(card).getByText(code, { selector: ".javdb-cover__placeholder span" })).toBeTruthy();
+    }
+    expect(fetchJavdbImageMock).toHaveBeenCalledWith({
+      category: "adult",
+      imageAuthorityId: "javdb-adult-7-00000000",
+      providerItemId: "Adult1",
+      sourceUrl: "https://tp.spfcas.com/covers/Adult1.jpg",
+    });
+    expect(
+      fetchJavdbImageMock.mock.calls.some(
+        ([parameters]) => parameters?.providerItemId === "ForgedCover",
+      ),
+    ).toBe(false);
+
+    const secondCard = screen
+      .getByRole("heading", { name: "ADLT-125" })
+      .closest("article") as HTMLElement;
+    fireEvent.click(
+      within(secondCard).getByRole("button", { name: "View details: ADLT-125" }),
+    );
+    expect(await screen.findByText("Summary unavailable")).toBeTruthy();
+    expect(screen.getAllByText("Unavailable").length).toBeGreaterThanOrEqual(5);
+    expect(fetchJavdbDetailsMock).toHaveBeenCalledWith({
+      category: "adult",
+      imageAuthorityId: "javdb-adult-7-00000000",
+      providerItemId: "Adult2",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect(
+      await screen.findByText("No preview images are available for this exact title."),
+    ).toBeTruthy();
+  });
+
+  it("accepts rotating JavDB covers independently for Adult and VR retained items", async () => {
+    fetchJavdbBrowseMock.mockImplementation(async (parameters) =>
+      javdbBrowseFixture(
+        [
+          {
+            code: parameters?.category === "vr" ? "MDVR-419" : "ADLT-123",
+            id: parameters?.category === "vr" ? "Vr1" : "Adult1",
+            vr: parameters?.category === "vr",
+            coverUrl: `https://tp.spfcas.com/covers/${parameters?.category}.jpg`,
+          },
+        ],
+        parameters?.category === "vr" ? "vr" : "adult",
+      ),
+    );
+    render(<App />);
+    selectDiscover();
+    selectAdultBrowse();
+    expect(await screen.findByRole("heading", { name: "ADLT-123" })).toBeTruthy();
+    selectVrBrowse();
+    expect(await screen.findByRole("heading", { name: "MDVR-419" })).toBeTruthy();
+    expect(fetchJavdbImageMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        category: "adult",
+        providerItemId: "Adult1",
+        sourceUrl: "https://tp.spfcas.com/covers/adult.jpg",
+      }),
+    );
+    expect(fetchJavdbImageMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        category: "vr",
+        providerItemId: "Vr1",
+        sourceUrl: "https://tp.spfcas.com/covers/vr.jpg",
+      }),
+    );
+  });
+
   it("keeps source order, controls, results, and a valid natural-width page across ordinary context changes", async () => {
     let fittingCards = 7;
     const originalBounds = HTMLElement.prototype.getBoundingClientRect;
@@ -9493,6 +9636,8 @@ describe("JavDB Adult and VR catalog browsing", () => {
     ).toBeTruthy();
     expect(fetchJavdbImageMock).toHaveBeenCalledWith({
       category: "adult",
+      imageAuthorityId: "javdb-adult-1-00000000",
+      providerItemId: "Failed",
       sourceUrl: "https://tp.cmastd.com/covers/Failed.jpg",
     });
 
@@ -9515,6 +9660,7 @@ describe("JavDB Adult and VR catalog browsing", () => {
     expect(await screen.findByText("Exact provider summary.")).toBeTruthy();
     expect(fetchJavdbDetailsMock).toHaveBeenLastCalledWith({
       category: "adult",
+      imageAuthorityId: "javdb-adult-1-00000000",
       providerItemId: "Wide",
     });
     expect(
@@ -9672,6 +9818,7 @@ describe("JavDB Adult and VR catalog browsing", () => {
     for (const [parameters] of fetchJavdbDetailsMock.mock.calls) {
       expect(parameters).toEqual({
         category: "adult",
+        imageAuthorityId: "javdb-adult-1-00000000",
         providerItemId: "Adult1",
       });
     }

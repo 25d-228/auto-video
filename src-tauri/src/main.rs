@@ -154,7 +154,7 @@ const JAVDB_API_URL: &str = "https://apidd.spthgb.com";
 const JAVDB_API_USER_AGENT: &str = "Dart/3.5 (dart:io)";
 const JAVDB_SIGNATURE_MIDDLE: &str = "lpw6vgqzsp";
 const JAVDB_SIGNATURE_SECRET: &str = "71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa";
-const JAVDB_IMAGE_ORIGIN: &str = "https://tp.cmastd.com/";
+const JAVDB_IMAGE_HOSTS: [&str; 2] = ["tp.cmastd.com", "tp.spfcas.com"];
 const JAVDB_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "windows")]
 const JAVDB_USER_AGENT_ENV: &str = "AUTO_VIDEO_JAVDB_USER_AGENT";
@@ -277,6 +277,31 @@ enum ProviderRequestError {
     Network,
     Provider,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+struct JavdbAuthorizedItem {
+    provider_item_id: String,
+    code: String,
+    image_urls: HashSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct JavdbProviderAuthority {
+    authority_id: String,
+    items: Vec<JavdbAuthorizedItem>,
+}
+
+#[derive(Default)]
+struct JavdbProviderContext {
+    generation: u64,
+    adult_pending_authority_id: Option<String>,
+    adult_authority: Option<JavdbProviderAuthority>,
+    vr_pending_authority_id: Option<String>,
+    vr_authority: Option<JavdbProviderAuthority>,
+}
+
+#[derive(Clone, Default)]
+struct JavdbProviderState(Arc<Mutex<JavdbProviderContext>>);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum MovieProviderRequestError {
@@ -1760,10 +1785,14 @@ fn fetch_javdb_api_document(_url: &str) -> Result<String, ProviderRequestError> 
 }
 
 fn valid_javdb_image_url(url: &str) -> bool {
-    let Some(path) = url.strip_prefix(JAVDB_IMAGE_ORIGIN) else {
+    let Some(remainder) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let Some((host, path)) = remainder.split_once('/') else {
         return false;
     };
     !path.is_empty()
+        && JAVDB_IMAGE_HOSTS.contains(&host)
         && !path.bytes().any(|character| {
             character.is_ascii_control() || character.is_ascii_whitespace() || character == b'\\'
         })
@@ -2548,17 +2577,266 @@ fn javdb_listing_item_ids(document: &str) -> Option<Vec<String>> {
     let mut item_ids = Vec::with_capacity(movies.len());
     for movie in movies {
         let JsonValue::Object(movie) = movie else {
-            return None;
+            continue;
         };
-        let JsonValue::String(item_id) = movie.get("id")? else {
-            return None;
+        let Some(JsonValue::String(item_id)) = movie.get("id") else {
+            continue;
         };
         if !valid_javdb_provider_item_id(item_id) {
-            return None;
+            continue;
         }
         item_ids.push(item_id.clone());
     }
     Some(item_ids)
+}
+
+fn canonical_javdb_product_code(value: &str) -> Option<String> {
+    let value = value.trim();
+    let prefix_end = value
+        .bytes()
+        .position(|character| !character.is_ascii_alphabetic())?;
+    let prefix = &value[..prefix_end];
+    if !(2..=16).contains(&prefix.len()) {
+        return None;
+    }
+    let remainder = value[prefix_end..].trim_start_matches([' ', '_', '-']);
+    if remainder.is_empty()
+        || remainder.len() > 10
+        || !remainder
+            .bytes()
+            .all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    let number = remainder.parse::<u64>().ok()?;
+    (number > 0).then(|| format!("{}-{number}", prefix.to_ascii_uppercase()))
+}
+
+fn javdb_movie_category(
+    movie: &std::collections::BTreeMap<String, JsonValue>,
+) -> Option<&'static str> {
+    let JsonValue::Array(tags) = movie.get("tags")? else {
+        return None;
+    };
+    let mut vr = false;
+    for tag in tags {
+        let JsonValue::Object(tag) = tag else {
+            return None;
+        };
+        let Some(JsonValue::String(id)) = tag.get("id") else {
+            return None;
+        };
+        vr |= id == "212";
+    }
+    Some(if vr { "vr" } else { "adult" })
+}
+
+fn javdb_movie_image_url(
+    movie: &std::collections::BTreeMap<String, JsonValue>,
+    primary: &str,
+    fallback: &str,
+) -> Option<String> {
+    let value = match movie.get(primary) {
+        Some(JsonValue::String(value)) => Some(value),
+        Some(JsonValue::Null) | None => match movie.get(fallback) {
+            Some(JsonValue::String(value)) => Some(value),
+            _ => None,
+        },
+        _ => None,
+    }?;
+    valid_javdb_image_url(value).then(|| value.clone())
+}
+
+fn javdb_browse_authorized_items(
+    category: &str,
+    documents: &[String],
+    count: u16,
+) -> Vec<JavdbAuthorizedItem> {
+    let mut listing_items: Vec<JavdbAuthorizedItem> = Vec::new();
+    let mut detail_categories: Vec<(String, &'static str)> = Vec::new();
+    let mut conflicting = false;
+
+    for document in documents {
+        let Some(JsonValue::Object(envelope)) = JsonParser::new(document).parse() else {
+            return Vec::new();
+        };
+        if envelope.get("success") != Some(&JsonValue::Number("1".to_owned())) {
+            return Vec::new();
+        }
+        let Some(JsonValue::Object(data)) = envelope.get("data") else {
+            return Vec::new();
+        };
+        if let Some(movies) = data.get("movies") {
+            let JsonValue::Array(movies) = movies else {
+                return Vec::new();
+            };
+            for movie in movies {
+                let JsonValue::Object(movie) = movie else {
+                    continue;
+                };
+                let Some(JsonValue::String(provider_item_id)) = movie.get("id") else {
+                    continue;
+                };
+                let Some(JsonValue::String(number)) = movie.get("number") else {
+                    continue;
+                };
+                if !valid_javdb_provider_item_id(provider_item_id) {
+                    continue;
+                }
+                let Some(code) = canonical_javdb_product_code(number) else {
+                    continue;
+                };
+                let image_url = javdb_movie_image_url(movie, "cover_url", "thumb_url");
+                if let Some(previous) = listing_items
+                    .iter()
+                    .find(|item| item.provider_item_id == *provider_item_id)
+                {
+                    conflicting |= previous.code != code
+                        || previous.image_urls.iter().next() != image_url.as_ref();
+                    continue;
+                }
+                listing_items.push(JavdbAuthorizedItem {
+                    provider_item_id: provider_item_id.clone(),
+                    code,
+                    image_urls: image_url.into_iter().collect(),
+                });
+            }
+            continue;
+        }
+        let Some(movie_value) = data.get("movie") else {
+            return Vec::new();
+        };
+        let JsonValue::Object(movie) = movie_value else {
+            continue;
+        };
+        let Some(JsonValue::String(provider_item_id)) = movie.get("id") else {
+            continue;
+        };
+        if !valid_javdb_provider_item_id(provider_item_id) {
+            continue;
+        }
+        let Some(detail_category) = javdb_movie_category(movie) else {
+            continue;
+        };
+        if let Some((_, previous_category)) = detail_categories
+            .iter()
+            .find(|(item_id, _)| item_id == provider_item_id)
+        {
+            conflicting |= *previous_category != detail_category;
+        } else {
+            detail_categories.push((provider_item_id.clone(), detail_category));
+        }
+    }
+
+    if conflicting {
+        return Vec::new();
+    }
+    listing_items
+        .into_iter()
+        .filter(|item| {
+            category == "vr"
+                || detail_categories
+                    .iter()
+                    .any(|(provider_item_id, item_category)| {
+                        provider_item_id == &item.provider_item_id && *item_category == category
+                    })
+        })
+        .take(usize::from(count))
+        .collect()
+}
+
+fn javdb_browse_request_identity(
+    category: &str,
+    mode: &str,
+    period: &str,
+    year: Option<&str>,
+    month: Option<u8>,
+    sort: &str,
+    count: u16,
+) -> String {
+    format!(
+        "{category}|{mode}|{period}|{}|{}|{sort}|{count}",
+        year.unwrap_or("all-years"),
+        month
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "all-months".to_owned())
+    )
+}
+
+fn begin_javdb_browse(
+    state: &JavdbProviderState,
+    category: &str,
+    request_identity: &str,
+) -> Result<String, &'static str> {
+    let mut context = state
+        .0
+        .lock()
+        .map_err(|_| javdb_provider_error(category, ProviderRequestError::Provider))?;
+    context.generation = context.generation.saturating_add(1);
+    let authority_id = format!(
+        "javdb-{category}-{}-{}",
+        context.generation,
+        &md5_hex(request_identity.as_bytes())[..8]
+    );
+    if category == "adult" {
+        context.adult_pending_authority_id = Some(authority_id.clone());
+        context.adult_authority = None;
+    } else {
+        context.vr_pending_authority_id = Some(authority_id.clone());
+        context.vr_authority = None;
+    }
+    Ok(authority_id)
+}
+
+fn finish_javdb_browse(
+    state: &JavdbProviderState,
+    category: &str,
+    authority_id: &str,
+    items: Vec<JavdbAuthorizedItem>,
+) -> Result<(), &'static str> {
+    let mut context = state
+        .0
+        .lock()
+        .map_err(|_| javdb_provider_error(category, ProviderRequestError::Provider))?;
+    let authority = JavdbProviderAuthority {
+        authority_id: authority_id.to_owned(),
+        items,
+    };
+    if category == "adult" {
+        if context.adult_pending_authority_id.as_deref() != Some(authority_id) {
+            return Err(javdb_provider_error(
+                category,
+                ProviderRequestError::Provider,
+            ));
+        }
+        context.adult_pending_authority_id = None;
+        context.adult_authority = Some(authority);
+    } else {
+        if context.vr_pending_authority_id.as_deref() != Some(authority_id) {
+            return Err(javdb_provider_error(
+                category,
+                ProviderRequestError::Provider,
+            ));
+        }
+        context.vr_pending_authority_id = None;
+        context.vr_authority = Some(authority);
+    }
+    Ok(())
+}
+
+fn current_javdb_authority<'a>(
+    context: &'a JavdbProviderContext,
+    category: &str,
+    authority_id: &str,
+) -> Option<&'a JavdbProviderAuthority> {
+    let authority = if category == "adult" {
+        context.adult_authority.as_ref()
+    } else if category == "vr" {
+        context.vr_authority.as_ref()
+    } else {
+        None
+    }?;
+    (authority.authority_id == authority_id).then_some(authority)
 }
 
 fn accept_javdb_api_document(category: &str, document: String) -> Result<String, &'static str> {
@@ -2594,6 +2872,31 @@ fn javdb_sort(sort: &str) -> Option<(&'static str, &'static str)> {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn valid_javdb_browse_request(
+    category: &str,
+    mode: &str,
+    period: &str,
+    year: Option<&str>,
+    month: Option<u8>,
+    sort: &str,
+    count: u16,
+) -> bool {
+    matches!(category, "adult" | "vr")
+        && matches!(mode, "category" | "ranking")
+        && matches!(period, "daily" | "weekly" | "monthly")
+        && (category != "vr" || mode == "category")
+        && matches!(count, 10 | 25 | 50 | 100)
+        && year.is_none_or(|value| {
+            value.len() == 4
+                && value.bytes().all(|character| character.is_ascii_digit())
+                && matches!(value.parse::<u16>(), Ok(2001..=2100))
+        })
+        && month.is_none_or(|value| (1..=12).contains(&value))
+        && (mode != "ranking" || year.is_none() && month.is_none() && sort == "newest")
+        && javdb_sort(sort).is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn fetch_javdb_browse_with(
     category: &str,
     mode: &str,
@@ -2604,19 +2907,7 @@ fn fetch_javdb_browse_with(
     count: u16,
     mut request: impl FnMut(&str) -> Result<String, ProviderRequestError>,
 ) -> Result<Vec<String>, &'static str> {
-    if !matches!(category, "adult" | "vr")
-        || !matches!(mode, "category" | "ranking")
-        || !matches!(period, "daily" | "weekly" | "monthly")
-        || category == "vr" && mode != "category"
-        || !matches!(count, 10 | 25 | 50 | 100)
-        || year.is_some_and(|value| {
-            value.len() != 4
-                || !value.bytes().all(|character| character.is_ascii_digit())
-                || !matches!(value.parse::<u16>(), Ok(2001..=2100))
-        })
-        || month.is_some_and(|value| !(1..=12).contains(&value))
-        || mode == "ranking" && (year.is_some() || month.is_some() || sort != "newest")
-    {
+    if !valid_javdb_browse_request(category, mode, period, year, month, sort, count) {
         return Err(if category == "adult" {
             ADULT_PROVIDER_ERROR
         } else {
@@ -2684,6 +2975,38 @@ fn fetch_javdb_browse_with(
     Ok(documents)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fetch_javdb_browse_for_state_with(
+    state: &JavdbProviderState,
+    category: &str,
+    mode: &str,
+    period: &str,
+    year: Option<&str>,
+    month: Option<u8>,
+    sort: &str,
+    count: u16,
+    request: impl FnMut(&str) -> Result<String, ProviderRequestError>,
+) -> Result<Vec<String>, &'static str> {
+    if !valid_javdb_browse_request(category, mode, period, year, month, sort, count) {
+        return Err(if category == "adult" {
+            ADULT_PROVIDER_ERROR
+        } else {
+            VR_PROVIDER_ERROR
+        });
+    }
+    let request_identity =
+        javdb_browse_request_identity(category, mode, period, year, month, sort, count);
+    let authority_id = begin_javdb_browse(state, category, &request_identity)?;
+    let documents =
+        fetch_javdb_browse_with(category, mode, period, year, month, sort, count, request)?;
+    let items = javdb_browse_authorized_items(category, &documents, count);
+    finish_javdb_browse(state, category, &authority_id, items)?;
+    let mut response = Vec::with_capacity(documents.len() + 1);
+    response.push(authority_id);
+    response.extend(documents);
+    Ok(response)
+}
+
 fn fetch_javdb_item_details_with(
     category: &str,
     provider_item_id: &str,
@@ -2705,8 +3028,114 @@ fn fetch_javdb_item_details_with(
     )
 }
 
-fn fetch_javdb_image_with(
+fn authorize_javdb_item_details(
+    state: &JavdbProviderState,
     category: &str,
+    authority_id: &str,
+    provider_item_id: &str,
+) -> Result<(), &'static str> {
+    let context = state
+        .0
+        .lock()
+        .map_err(|_| javdb_provider_error(category, ProviderRequestError::Provider))?;
+    let authorized =
+        current_javdb_authority(&context, category, authority_id).is_some_and(|authority| {
+            authority
+                .items
+                .iter()
+                .any(|item| item.provider_item_id == provider_item_id)
+        });
+    authorized
+        .then_some(())
+        .ok_or_else(|| javdb_provider_error(category, ProviderRequestError::Provider))
+}
+
+fn retain_javdb_detail_images(
+    state: &JavdbProviderState,
+    category: &str,
+    authority_id: &str,
+    provider_item_id: &str,
+    document: &str,
+) -> Result<(), &'static str> {
+    let mut context = state
+        .0
+        .lock()
+        .map_err(|_| javdb_provider_error(category, ProviderRequestError::Provider))?;
+    let authority = if category == "adult" {
+        context.adult_authority.as_mut()
+    } else if category == "vr" {
+        context.vr_authority.as_mut()
+    } else {
+        None
+    }
+    .filter(|authority| authority.authority_id == authority_id)
+    .ok_or_else(|| javdb_provider_error(category, ProviderRequestError::Provider))?;
+    let item = authority
+        .items
+        .iter_mut()
+        .find(|item| item.provider_item_id == provider_item_id)
+        .ok_or_else(|| javdb_provider_error(category, ProviderRequestError::Provider))?;
+
+    let Some(JsonValue::Object(envelope)) = JsonParser::new(document).parse() else {
+        return Ok(());
+    };
+    if envelope.get("success") != Some(&JsonValue::Number("1".to_owned())) {
+        return Ok(());
+    }
+    let Some(JsonValue::Object(data)) = envelope.get("data") else {
+        return Ok(());
+    };
+    let Some(JsonValue::Object(movie)) = data.get("movie") else {
+        return Ok(());
+    };
+    if movie.get("id") != Some(&JsonValue::String(provider_item_id.to_owned()))
+        || movie
+            .get("number")
+            .and_then(|value| match value {
+                JsonValue::String(number) => canonical_javdb_product_code(number),
+                _ => None,
+            })
+            .as_deref()
+            != Some(item.code.as_str())
+        || javdb_movie_category(movie).is_some_and(|item_category| item_category != category)
+    {
+        return Ok(());
+    }
+
+    if let Some(url) = javdb_movie_image_url(movie, "cover_url", "thumb_url") {
+        item.image_urls.insert(url);
+    }
+    if let Some(JsonValue::Array(previews)) = movie.get("preview_images") {
+        for preview in previews {
+            let JsonValue::Object(preview) = preview else {
+                continue;
+            };
+            if let Some(url) = javdb_movie_image_url(preview, "large_url", "thumb_url") {
+                item.image_urls.insert(url);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fetch_javdb_item_details_for_state_with(
+    state: &JavdbProviderState,
+    category: &str,
+    authority_id: &str,
+    provider_item_id: &str,
+    request: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+) -> Result<String, &'static str> {
+    authorize_javdb_item_details(state, category, authority_id, provider_item_id)?;
+    let document = fetch_javdb_item_details_with(category, provider_item_id, request)?;
+    retain_javdb_detail_images(state, category, authority_id, provider_item_id, &document)?;
+    Ok(document)
+}
+
+fn fetch_javdb_image_with(
+    state: &JavdbProviderState,
+    category: &str,
+    authority_id: &str,
+    provider_item_id: &str,
     source_url: &str,
     request: impl FnOnce(&str) -> Result<Vec<u8>, ProviderRequestError>,
 ) -> Result<Vec<u8>, &'static str> {
@@ -2717,6 +3146,25 @@ fn fetch_javdb_image_with(
             VR_PROVIDER_ERROR
         });
     }
+    let context = state
+        .0
+        .lock()
+        .map_err(|_| javdb_provider_error(category, ProviderRequestError::Provider))?;
+    let authorized = current_javdb_authority(&context, category, authority_id)
+        .and_then(|authority| {
+            authority
+                .items
+                .iter()
+                .find(|item| item.provider_item_id == provider_item_id)
+        })
+        .is_some_and(|item| item.image_urls.contains(source_url));
+    if !authorized {
+        return Err(javdb_provider_error(
+            category,
+            ProviderRequestError::Provider,
+        ));
+    }
+    drop(context);
     request(source_url).map_err(|error| javdb_provider_error(category, error))
 }
 
@@ -3738,6 +4186,7 @@ fn dismiss_vr_organization(state: tauri::State<'_, VrDownloadState>) -> Result<(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn fetch_javdb_browse(
     category: String,
     mode: String,
@@ -3746,14 +4195,17 @@ async fn fetch_javdb_browse(
     month: Option<u8>,
     sort: String,
     count: u16,
+    state: tauri::State<'_, JavdbProviderState>,
 ) -> Result<Vec<String>, String> {
     let join_error = if category == "adult" {
         ADULT_PROVIDER_ERROR
     } else {
         VR_PROVIDER_ERROR
     };
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        fetch_javdb_browse_with(
+        fetch_javdb_browse_for_state_with(
+            &state,
             &category,
             &mode,
             &period,
@@ -3772,31 +4224,54 @@ async fn fetch_javdb_browse(
 #[tauri::command]
 async fn fetch_javdb_item_details(
     category: String,
+    image_authority_id: String,
     provider_item_id: String,
+    state: tauri::State<'_, JavdbProviderState>,
 ) -> Result<String, String> {
     let join_error = if category == "adult" {
         ADULT_PROVIDER_ERROR
     } else {
         VR_PROVIDER_ERROR
     };
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        fetch_javdb_item_details_with(&category, &provider_item_id, fetch_javdb_api_document)
-            .map_err(str::to_owned)
+        fetch_javdb_item_details_for_state_with(
+            &state,
+            &category,
+            &image_authority_id,
+            &provider_item_id,
+            fetch_javdb_api_document,
+        )
+        .map_err(str::to_owned)
     })
     .await
     .map_err(|_| join_error.to_owned())?
 }
 
 #[tauri::command]
-async fn fetch_javdb_image(category: String, source_url: String) -> Result<Vec<u8>, String> {
+async fn fetch_javdb_image(
+    category: String,
+    image_authority_id: String,
+    provider_item_id: String,
+    source_url: String,
+    state: tauri::State<'_, JavdbProviderState>,
+) -> Result<Vec<u8>, String> {
     let join_error = if category == "adult" {
         ADULT_PROVIDER_ERROR
     } else {
         VR_PROVIDER_ERROR
     };
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        fetch_javdb_image_with(&category, &source_url, fetch_javdb_image_bytes)
-            .map_err(str::to_owned)
+        fetch_javdb_image_with(
+            &state,
+            &category,
+            &image_authority_id,
+            &provider_item_id,
+            &source_url,
+            fetch_javdb_image_bytes,
+        )
+        .map_err(str::to_owned)
     })
     .await
     .map_err(|_| join_error.to_owned())?
@@ -4551,6 +5026,7 @@ fn main() {
         .manage(VrTorrentState::default())
         .manage(VrDownloadState::default())
         .manage(VrLibraryState::default())
+        .manage(JavdbProviderState::default())
         .invoke_handler(tauri::generate_handler![
             load_movies_folder,
             choose_movies_folder,
@@ -4659,7 +5135,8 @@ mod tests {
         begin_movie_metadata_client_operation, begin_movie_metadata_search,
         begin_movie_metadata_verification, clear_movie_metadata_match_with,
         clear_movies_folder_file, clear_tmdb_token_file, decode_javdb_image_payload,
-        fetch_javdb_adult_catalog_with, fetch_javdb_browse_with, fetch_javdb_image_with,
+        fetch_javdb_adult_catalog_with, fetch_javdb_browse_for_state_with, fetch_javdb_browse_with,
+        fetch_javdb_image_with, fetch_javdb_item_details_for_state_with,
         fetch_javdb_item_details_with, fetch_javdb_vr_catalog_with,
         fetch_sukebei_adult_releases_with, fetch_sukebei_vr_releases_with,
         fetch_yts_movie_releases_with, finish_movie_metadata_search,
@@ -4670,13 +5147,14 @@ mod tests {
         parse_verified_movie_metadata, query_movies_volume_storage_with, reveal_movie_path_with,
         reveal_movie_request_with, save_movie_metadata_match_with, save_movies_folder_file,
         save_tmdb_token_file, scan_movie_paths, scan_movies_library, trash_movie_path_with,
-        trash_movie_request_with, MoviePathValidationError, MovieProviderRequestError,
-        MovieTorrentState, MoviesLibraryContext, MoviesVolumeStorageQueryError,
-        ProviderRequestError, TrashMovieRequest, ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE,
-        MOVIES_STORAGE_FAILED, MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID,
-        MOVIE_METADATA_MALFORMED, MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE,
-        MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE,
-        MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
+        trash_movie_request_with, JavdbProviderState, MoviePathValidationError,
+        MovieProviderRequestError, MovieTorrentState, MoviesLibraryContext,
+        MoviesVolumeStorageQueryError, ProviderRequestError, TrashMovieRequest,
+        ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
+        MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID, MOVIE_METADATA_MALFORMED,
+        MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE, MOVIE_OPEN_FAILED,
+        MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED,
+        MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
         MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED,
         MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND,
         MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE, MOVIE_TRASH_UNAVAILABLE,
@@ -4911,20 +5389,43 @@ mod tests {
     }
 
     #[test]
-    fn validates_and_decodes_only_exact_javdb_image_payloads() {
+    fn retains_rotating_javdb_images_for_only_the_exact_provider_item() {
         let key = 0x5a;
         let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10];
         let mut encoded = vec![key];
         encoded.extend(jpeg.iter().map(|byte| byte ^ key));
         assert_eq!(decode_javdb_image_payload(&encoded), Ok(jpeg.to_vec()));
 
+        let state = JavdbProviderState::default();
+        let response = fetch_javdb_browse_for_state_with(
+            &state,
+            "vr",
+            "category",
+            "daily",
+            None,
+            None,
+            "newest",
+            25,
+            |_| {
+                Ok(r#"{"success":1,"data":{"movies":[{"id":"Vr1","number":"MDVR-419","cover_url":"https://tp.spfcas.com/covers/Vr1.jpg"},{"id":"Vr2","number":"MDVR-420","cover_url":"https://tp.cmastd.com/covers/Vr2.jpg"}]}}"#.to_owned())
+            },
+        )
+        .expect("the exact signed VR response must establish image authority");
+        let authority_id = &response[0];
         let dispatched = RefCell::new(false);
         assert_eq!(
-            fetch_javdb_image_with("vr", "https://tp.cmastd.com/covers/a.jpg", |url| {
-                dispatched.replace(true);
-                assert_eq!(url, "https://tp.cmastd.com/covers/a.jpg");
-                Ok(jpeg.to_vec())
-            }),
+            fetch_javdb_image_with(
+                &state,
+                "vr",
+                authority_id,
+                "Vr1",
+                "https://tp.spfcas.com/covers/Vr1.jpg",
+                |url| {
+                    dispatched.replace(true);
+                    assert_eq!(url, "https://tp.spfcas.com/covers/Vr1.jpg");
+                    Ok(jpeg.to_vec())
+                },
+            ),
             Ok(jpeg.to_vec())
         );
         assert!(*dispatched.borrow());
@@ -4936,23 +5437,159 @@ mod tests {
             "https://tp.cmastd.com:443/covers/a.jpg",
             "https://tp.cmastd.com:8443/covers/a.jpg",
             "https://tp.cmastd.com\\@evil.example/covers/a.jpg",
+            "https://tp.spfcas.com/covers/not-retained.jpg",
             "not a URL",
         ] {
             dispatched.replace(false);
             assert_eq!(
-                fetch_javdb_image_with("vr", rejected_url, |_| {
+                fetch_javdb_image_with(&state, "vr", authority_id, "Vr1", rejected_url, |_| {
                     dispatched.replace(true);
                     Ok(Vec::new())
-                }),
+                },),
                 Err(VR_PROVIDER_ERROR),
                 "{rejected_url} must be rejected"
             );
             assert!(!*dispatched.borrow());
         }
+        dispatched.replace(false);
+        assert_eq!(
+            fetch_javdb_image_with(
+                &state,
+                "vr",
+                authority_id,
+                "Vr1",
+                "https://tp.cmastd.com/covers/Vr2.jpg",
+                |_| {
+                    dispatched.replace(true);
+                    Ok(Vec::new())
+                },
+            ),
+            Err(VR_PROVIDER_ERROR)
+        );
+        assert!(!*dispatched.borrow());
         assert_eq!(
             decode_javdb_image_payload(&[1, b'n' ^ 1, b'o' ^ 1]),
             Err(ProviderRequestError::Provider)
         );
+    }
+
+    #[test]
+    fn invalidates_adult_cover_and_preview_authority_with_the_browse_generation() {
+        let state = JavdbProviderState::default();
+        let response = fetch_javdb_browse_for_state_with(
+            &state,
+            "adult",
+            "ranking",
+            "daily",
+            None,
+            None,
+            "newest",
+            25,
+            |url| {
+                if url.contains("/rankings?") {
+                    Ok(r#"{"success":1,"data":{"movies":[{"id":"Adult1","number":"ADLT-123","cover_url":"https://tp.spfcas.com/covers/Adult1.jpg"},{"id":"MissingCode","cover_url":"https://tp.spfcas.com/covers/MissingCode.jpg"}]}}"#.to_owned())
+                } else {
+                    Ok(format!(
+                        r#"{{"success":1,"data":{{"movie":{{"id":"{}","tags":[{{"id":"28","name":"Solo"}}]}}}}}}"#,
+                        if url.contains("Adult1") { "Adult1" } else { "MissingCode" }
+                    ))
+                }
+            },
+        )
+        .expect("the exact signed Adult response must establish category authority");
+        let authority_id = response[0].clone();
+        let detail = fetch_javdb_item_details_for_state_with(
+            &state,
+            "adult",
+            &authority_id,
+            "Adult1",
+            |_| {
+                Ok(r#"{"success":1,"data":{"movie":{"id":"Adult1","number":"ADLT-123","cover_url":"https://tp.spfcas.com/details/Adult1.jpg","preview_images":[{"large_url":"https://tp.cmastd.com/previews/Adult1.jpg"}]}}}"#.to_owned())
+            },
+        )
+        .expect("the retained provider item must authorize exact details");
+        assert!(detail.contains("ADLT-123"));
+
+        for retained_url in [
+            "https://tp.spfcas.com/covers/Adult1.jpg",
+            "https://tp.spfcas.com/details/Adult1.jpg",
+            "https://tp.cmastd.com/previews/Adult1.jpg",
+        ] {
+            let calls = RefCell::new(0);
+            assert_eq!(
+                fetch_javdb_image_with(
+                    &state,
+                    "adult",
+                    &authority_id,
+                    "Adult1",
+                    retained_url,
+                    |_| {
+                        calls.replace_with(|count| *count + 1);
+                        Ok(vec![0xff, 0xd8, 0xff])
+                    },
+                ),
+                Ok(vec![0xff, 0xd8, 0xff])
+            );
+            assert_eq!(*calls.borrow(), 1);
+        }
+
+        let rejected_calls = RefCell::new(0);
+        assert_eq!(
+            fetch_javdb_image_with(
+                &state,
+                "adult",
+                &authority_id,
+                "MissingCode",
+                "https://tp.spfcas.com/covers/MissingCode.jpg",
+                |_| {
+                    rejected_calls.replace_with(|count| *count + 1);
+                    Ok(Vec::new())
+                },
+            ),
+            Err(ADULT_PROVIDER_ERROR)
+        );
+        assert_eq!(*rejected_calls.borrow(), 0);
+
+        fetch_javdb_browse_for_state_with(
+            &state,
+            "adult",
+            "ranking",
+            "weekly",
+            None,
+            None,
+            "newest",
+            25,
+            |_| Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned()),
+        )
+        .expect("a newer signed browse must replace Adult authority");
+        assert_eq!(
+            fetch_javdb_image_with(
+                &state,
+                "adult",
+                &authority_id,
+                "Adult1",
+                "https://tp.spfcas.com/covers/Adult1.jpg",
+                |_| {
+                    rejected_calls.replace_with(|count| *count + 1);
+                    Ok(Vec::new())
+                },
+            ),
+            Err(ADULT_PROVIDER_ERROR)
+        );
+        assert_eq!(
+            fetch_javdb_item_details_for_state_with(
+                &state,
+                "adult",
+                &authority_id,
+                "Adult1",
+                |_| {
+                    rejected_calls.replace_with(|count| *count + 1);
+                    Ok(String::new())
+                },
+            ),
+            Err(ADULT_PROVIDER_ERROR)
+        );
+        assert_eq!(*rejected_calls.borrow(), 0);
     }
 
     #[test]

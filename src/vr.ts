@@ -39,6 +39,7 @@ export type JavdbBrowseRequest = {
 
 export type JavdbBrowseItem = JavdbCatalogItem & {
   category: JavdbBrowseCategory;
+  imageAuthorityId: string;
   providerItemId: string;
   requestIdentity: string;
   releaseDate: string | null;
@@ -212,11 +213,12 @@ const vrLibraryPartPattern =
   /(^|[^A-Za-z0-9])((?:part|pt|cd|disc|disk)[ _-]*0*([0-9]{1,4}))(?=$|[^A-Za-z0-9])/gi;
 const vrLibraryPartPrefixes = new Set(["PART", "PT", "CD", "DISC", "DISK"]);
 const javdbBaseUrl = "https://javdb.com";
-const javdbImageHost = "tp.cmastd.com";
-const javdbImageOrigin = `https://${javdbImageHost}`;
+const javdbImageHosts = new Set(["tp.cmastd.com", "tp.spfcas.com"]);
 const javdbVrTagId = "212";
 const javdbSourceAspectRatio = 1.48;
 const javdbProviderItemPattern = /^[A-Za-z0-9]{1,64}$/;
+const javdbImageAuthorityPattern =
+  /^javdb-(?:adult|vr)-[1-9][0-9]*-[a-f0-9]{8}$/;
 const maximumJavdbPreviewImages = 24;
 
 type JsonRecord = Record<string, unknown>;
@@ -232,7 +234,7 @@ function optionalProviderText(value: unknown) {
     return null;
   }
   if (typeof value !== "string") {
-    return undefined;
+    return null;
   }
   const trimmed = value.trim();
   return trimmed === "" ? null : trimmed;
@@ -256,22 +258,24 @@ function javdbImageUrl(value: unknown) {
   }
   if (
     /[\s\\]/u.test(value) ||
-    !value.startsWith(`${javdbImageOrigin}/`)
+    !value.startsWith("https://")
   ) {
     return undefined;
   }
   try {
     const url = new URL(value);
+    const authority = value.slice("https://".length).split("/", 1)[0];
     if (
       url.protocol !== "https:" ||
-      url.hostname !== javdbImageHost ||
+      !javdbImageHosts.has(url.hostname) ||
+      authority !== url.hostname ||
       url.port !== "" ||
       url.username !== "" ||
       url.password !== ""
     ) {
       return undefined;
     }
-    return url.toString();
+    return value;
   } catch {
     return undefined;
   }
@@ -292,6 +296,7 @@ function javdbBrowseRequestIdentity(request: JavdbBrowseRequest) {
 function parseJavdbBrowseMovie(
   value: unknown,
   request: JavdbBrowseRequest,
+  imageAuthorityId: string,
 ): JavdbBrowseItem | null {
   const movie = jsonRecord(value);
   if (movie === null || typeof movie.id !== "string") {
@@ -303,19 +308,18 @@ function parseJavdbBrowseMovie(
       ? canonicalizeProductCode(movie.number)
       : null;
   const title = optionalProviderText(movie.title);
-  const coverUrl = javdbImageUrl(movie.cover_url ?? movie.thumb_url);
+  const coverUrl = javdbImageUrl(movie.cover_url ?? movie.thumb_url) ?? null;
   const releaseDate = optionalProviderText(movie.release_date);
   if (
     !javdbProviderItemPattern.test(providerItemId) ||
-    code === null ||
-    title === undefined ||
-    coverUrl === undefined ||
-    releaseDate === undefined
+    providerItemId !== movie.id ||
+    code === null
   ) {
     return null;
   }
   return {
     category: request.category,
+    imageAuthorityId,
     providerItemId,
     requestIdentity: javdbBrowseRequestIdentity(request),
     code,
@@ -329,13 +333,16 @@ function parseJavdbBrowseMovie(
 
 function javdbDetailCategory(value: unknown) {
   const movie = jsonRecord(value);
-  if (movie === null || !Array.isArray(movie.tags)) {
+  if (movie === null || movie.tags === null || movie.tags === undefined) {
     return null;
+  }
+  if (!Array.isArray(movie.tags)) {
+    return undefined;
   }
   for (const tagValue of movie.tags) {
     const tag = jsonRecord(tagValue);
     if (tag === null || typeof tag.id !== "string") {
-      return null;
+      return undefined;
     }
   }
   return movie.tags.some(
@@ -351,6 +358,7 @@ function sameJavdbBrowseItem(
 ) {
   return (
     left.category === right.category &&
+    left.imageAuthorityId === right.imageAuthorityId &&
     left.providerItemId === right.providerItemId &&
     left.requestIdentity === right.requestIdentity &&
     left.code === right.code &&
@@ -363,20 +371,34 @@ function sameJavdbBrowseItem(
 export function parseJavdbBrowseDocuments(
   documents: unknown,
   request: JavdbBrowseRequest,
+  imageAuthorityId: string,
 ): JavdbBrowseResult {
-  if (!Array.isArray(documents) || !documents.every((value) => typeof value === "string")) {
+  if (
+    !javdbImageAuthorityPattern.test(imageAuthorityId) ||
+    !imageAuthorityId.startsWith(`javdb-${request.category}-`) ||
+    !Array.isArray(documents) ||
+    !documents.every((value) => typeof value === "string")
+  ) {
     return { status: "malformed-provider" };
   }
   const listingMovies: unknown[] = [];
   const detailCategories = new Map<string, JavdbBrowseCategory>();
+  let foundListing = false;
   for (const documentText of documents) {
     const data = javdbApiData(documentText);
     if (data === null) {
       return { status: "malformed-provider" };
     }
-    if (Array.isArray(data.movies)) {
+    if (Object.hasOwn(data, "movies")) {
+      if (!Array.isArray(data.movies)) {
+        return { status: "malformed-provider" };
+      }
+      foundListing = true;
       listingMovies.push(...data.movies);
       continue;
+    }
+    if (!Object.hasOwn(data, "movie")) {
+      return { status: "malformed-provider" };
     }
     const movie = jsonRecord(data.movie);
     const category = javdbDetailCategory(movie);
@@ -384,9 +406,10 @@ export function parseJavdbBrowseDocuments(
       movie === null ||
       typeof movie.id !== "string" ||
       !javdbProviderItemPattern.test(movie.id) ||
-      category === null
+      category === null ||
+      category === undefined
     ) {
-      return { status: "malformed-provider" };
+      continue;
     }
     const previousCategory = detailCategories.get(movie.id);
     if (previousCategory !== undefined && previousCategory !== category) {
@@ -394,19 +417,22 @@ export function parseJavdbBrowseDocuments(
     }
     detailCategories.set(movie.id, category);
   }
+  if (!foundListing) {
+    return { status: "malformed-provider" };
+  }
 
   const items: JavdbBrowseItem[] = [];
   const providerItems = new Map<string, JavdbBrowseItem>();
   for (const movie of listingMovies) {
-    const item = parseJavdbBrowseMovie(movie, request);
+    const item = parseJavdbBrowseMovie(movie, request, imageAuthorityId);
     if (item === null) {
-      return { status: "malformed-provider" };
+      continue;
     }
     if (
       request.category === "adult" &&
       detailCategories.get(item.providerItemId) === undefined
     ) {
-      return { status: "malformed-provider" };
+      continue;
     }
     const actualCategory =
       request.category === "adult"
@@ -442,11 +468,17 @@ export async function fetchJavdbBrowse(
   request: JavdbBrowseRequest,
 ): Promise<JavdbBrowseResult> {
   try {
-    const documents = await window.__TAURI__.core.invoke<unknown>(
+    const response = await window.__TAURI__.core.invoke<unknown>(
       "fetch_javdb_browse",
       request,
     );
-    return parseJavdbBrowseDocuments(documents, request);
+    if (
+      !Array.isArray(response) ||
+      typeof response[0] !== "string"
+    ) {
+      return { status: "malformed-provider" };
+    }
+    return parseJavdbBrowseDocuments(response.slice(1), request, response[0]);
   } catch (error: unknown) {
     return { status: javdbBrowseInvokeStatus(error) };
   }
@@ -454,15 +486,13 @@ export async function fetchJavdbBrowse(
 
 function stringList(value: unknown) {
   if (!Array.isArray(value)) {
-    return null;
+    return [];
   }
   const values: string[] = [];
   for (const entry of value) {
     const record = jsonRecord(entry);
     const name = optionalProviderText(record?.name);
-    if (record === null || name === undefined) {
-      return null;
-    }
+    if (record === null) continue;
     if (name !== null) {
       values.push(name);
     }
@@ -487,24 +517,17 @@ export function parseJavdbItemDetails(
   const title = optionalProviderText(movie?.title);
   const releaseDate = optionalProviderText(movie?.release_date);
   const summary = optionalProviderText(movie?.summary);
-  const coverUrl = javdbImageUrl(movie?.cover_url ?? movie?.thumb_url);
+  const coverUrl = javdbImageUrl(movie?.cover_url ?? movie?.thumb_url) ?? null;
   const cast = stringList(movie?.actors);
   const tags = stringList(movie?.tags);
   if (
     movie === null ||
     movie.id !== item.providerItemId ||
-    code !== item.code ||
-    category === null ||
-    title === undefined ||
-    releaseDate === undefined ||
-    summary === undefined ||
-    coverUrl === undefined ||
-    cast === null ||
-    tags === null
+    code !== item.code
   ) {
     return { status: "malformed-provider" };
   }
-  if (category !== item.category) {
+  if (category !== null && category !== undefined && category !== item.category) {
     return { status: "conflicting-provider" };
   }
   const previewImages = movie.preview_images;
@@ -515,10 +538,8 @@ export function parseJavdbItemDetails(
   for (const previewValue of previewImages ?? []) {
     const preview = jsonRecord(previewValue);
     const url = javdbImageUrl(preview?.large_url ?? preview?.thumb_url);
-    if (preview === null || url === undefined) {
-      return { status: "malformed-provider" };
-    }
-    if (url !== null && !previewUrls.includes(url)) {
+    if (preview === null) continue;
+    if (typeof url === "string" && !previewUrls.includes(url)) {
       previewUrls.push(url);
     }
     if (previewUrls.length === maximumJavdbPreviewImages) {
@@ -526,23 +547,17 @@ export function parseJavdbItemDetails(
     }
   }
   const runtimeMinutes = movie.duration;
-  if (
-    runtimeMinutes !== null &&
-    runtimeMinutes !== undefined &&
-    (!Number.isSafeInteger(runtimeMinutes) || Number(runtimeMinutes) <= 0)
-  ) {
-    return { status: "malformed-provider" };
-  }
+  const validRuntimeMinutes =
+    Number.isSafeInteger(runtimeMinutes) && Number(runtimeMinutes) > 0
+      ? Number(runtimeMinutes)
+      : null;
   return {
     status: "ready",
     details: {
       item: { ...item, title, coverUrl, releaseDate },
       title,
       releaseDate,
-      runtimeMinutes:
-        runtimeMinutes === null || runtimeMinutes === undefined
-          ? null
-          : Number(runtimeMinutes),
+      runtimeMinutes: validRuntimeMinutes,
       cast,
       tags,
       summary,
@@ -558,7 +573,11 @@ export async function fetchJavdbItemDetails(
   try {
     const documentText = await window.__TAURI__.core.invoke<unknown>(
       "fetch_javdb_item_details",
-      { category: item.category, providerItemId: item.providerItemId },
+      {
+        category: item.category,
+        imageAuthorityId: item.imageAuthorityId,
+        providerItemId: item.providerItemId,
+      },
     );
     return parseJavdbItemDetails(documentText, item);
   } catch (error: unknown) {
@@ -585,7 +604,7 @@ function javdbImageMimeType(bytes: Uint8Array) {
 }
 
 export async function fetchJavdbImageObjectUrl(
-  category: JavdbBrowseCategory,
+  item: JavdbBrowseItem,
   sourceUrl: string,
 ) {
   const acceptedSourceUrl = javdbImageUrl(sourceUrl);
@@ -594,7 +613,12 @@ export async function fetchJavdbImageObjectUrl(
   }
   const value = await window.__TAURI__.core.invoke<unknown>(
     "fetch_javdb_image",
-    { category, sourceUrl: acceptedSourceUrl },
+    {
+      category: item.category,
+      imageAuthorityId: item.imageAuthorityId,
+      providerItemId: item.providerItemId,
+      sourceUrl: acceptedSourceUrl,
+    },
   );
   if (
     !Array.isArray(value) ||
