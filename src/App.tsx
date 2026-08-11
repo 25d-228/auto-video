@@ -340,7 +340,8 @@ type TvMetadataFailureStatus = Exclude<
   TvMetadataSearchState["status"],
   "idle" | "loading" | "ready" | "empty"
 >;
-type TvMetadataSaveState = "idle" | "saving" | MovieMetadataMutationFailure;
+type TvMetadataMutationFailure = "stale" | "unavailable" | "persistence-failed";
+type TvMetadataSaveState = "idle" | "saving" | TvMetadataMutationFailure;
 type TvLibraryScanState =
   | { status: "loading" }
   | { status: "unconfigured" }
@@ -4639,7 +4640,7 @@ function TvMetadataDetailsDialog({
   onClose,
   triggerId,
 }: {
-  clearState: "idle" | "clearing" | MovieMetadataMutationFailure;
+  clearState: "idle" | "clearing" | TvMetadataMutationFailure;
   item: TvLibraryItem;
   onClear: () => void;
   onClose: () => void;
@@ -6900,7 +6901,7 @@ const tvMetadataFailureMessages: Record<TvMetadataFailureStatus, string> = {
 };
 
 const tvMetadataSaveFailureMessages: Record<
-  MovieMetadataMutationFailure,
+  TvMetadataMutationFailure,
   string
 > = {
   stale:
@@ -6912,7 +6913,7 @@ const tvMetadataSaveFailureMessages: Record<
 };
 
 const tvMetadataClearFailureMessages: Record<
-  MovieMetadataMutationFailure,
+  TvMetadataMutationFailure,
   string
 > = {
   stale:
@@ -6934,6 +6935,19 @@ function tvMetadataFocusTarget(triggerId: string) {
   }
   const refresh = document.getElementById("tv-library-refresh");
   return refresh instanceof HTMLElement && refresh.isConnected ? refresh : null;
+}
+
+function tvMetadataMutationFailure(error: unknown): TvMetadataMutationFailure {
+  switch (nativeErrorCode(error)) {
+    case "tv_metadata_context_invalid":
+    case "tv_metadata_stale":
+      return "stale";
+    case "tv_metadata_unavailable":
+      return "unavailable";
+    case "tv_metadata_persistence_failed":
+    default:
+      return "persistence-failed";
+  }
 }
 
 function downloadStartError(
@@ -7029,7 +7043,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   >(null);
   const [tvMetadataClearState, setTvMetadataClearState] = useState<{
     groupId: string;
-    status: "clearing" | MovieMetadataMutationFailure;
+    status: "clearing" | TvMetadataMutationFailure;
   } | null>(null);
   const [tvMetadataDetailsContext, setTvMetadataDetailsContext] = useState<{
     groupId: string;
@@ -10460,7 +10474,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       });
     } catch (error: unknown) {
       if (requestId === tvMetadataRequestId.current) {
-        setTvMetadataSaveState(movieMetadataMutationFailure(error));
+        setTvMetadataSaveState(tvMetadataMutationFailure(error));
       }
     } finally {
       if (requestId === tvMetadataRequestId.current) {
@@ -10542,7 +10556,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       if (requestId === tvMetadataRequestId.current) {
         setTvMetadataClearState({
           groupId,
-          status: movieMetadataMutationFailure(error),
+          status: tvMetadataMutationFailure(error),
         });
       }
     } finally {

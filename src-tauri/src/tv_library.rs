@@ -1133,9 +1133,10 @@ fn encode_tv_scan(scan: &CompletedTvScan) -> Result<Vec<String>, &'static str> {
     Ok(response)
 }
 
-fn scan_tv_library_with_path(
+fn scan_tv_library_with_path_before_persistence(
     state: &TvLibraryState,
     association_path: Option<&Path>,
+    before_persistence: impl FnOnce(),
 ) -> Result<Vec<String>, &'static str> {
     let (folder, generation) = {
         let mut context = state.0.lock().map_err(|_| TV_LIBRARY_SCAN_FAILED)?;
@@ -1155,23 +1156,25 @@ fn scan_tv_library_with_path(
         },
         None => (Vec::new(), "ready"),
     };
-    if metadata_status == "ready"
+    let associations_changed = metadata_status == "ready"
         && reconcile_tv_metadata_associations(
             &folder,
             &folder_identity,
             &files,
             &mut groups,
             &mut associations,
-        )
-        && association_path
-            .is_some_and(|path| write_tv_metadata_associations(path, &associations).is_err())
-    {
-        metadata_status = "unavailable";
-    }
+        );
+    before_persistence();
 
     let mut context = state.0.lock().map_err(|_| TV_LIBRARY_SCAN_FAILED)?;
     if context.generation != generation || context.folder.as_ref() != Some(&folder) {
         return Err(TV_LIBRARY_STALE);
+    }
+    if associations_changed
+        && association_path
+            .is_some_and(|path| write_tv_metadata_associations(path, &associations).is_err())
+    {
+        metadata_status = "unavailable";
     }
     let scan = CompletedTvScan {
         folder,
@@ -1184,6 +1187,22 @@ fn scan_tv_library_with_path(
     let response = encode_tv_scan(&scan)?;
     context.completed_scan = Some(scan);
     Ok(response)
+}
+
+fn scan_tv_library_with_path(
+    state: &TvLibraryState,
+    association_path: Option<&Path>,
+) -> Result<Vec<String>, &'static str> {
+    scan_tv_library_with_path_before_persistence(state, association_path, || {})
+}
+
+#[cfg(test)]
+fn scan_tv_library_with_metadata_before_persistence(
+    state: &TvLibraryState,
+    association_path: &Path,
+    before_persistence: impl FnOnce(),
+) -> Result<Vec<String>, &'static str> {
+    scan_tv_library_with_path_before_persistence(state, Some(association_path), before_persistence)
 }
 
 pub fn scan_tv_library_with_metadata(
@@ -1921,7 +1940,11 @@ mod tests {
     use super::*;
     use std::{
         cell::Cell,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Barrier,
+        },
+        thread,
     };
 
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
@@ -2835,5 +2858,163 @@ mod tests {
         assert_eq!(&restored[14], "Canonical Show");
         assert!(first_member.is_file());
         assert!(second_member.is_file());
+    }
+
+    #[test]
+    fn late_scan_cannot_resurrect_association_cleared_by_newer_scan() {
+        let fixture = Fixture::new("metadata-late-scan-clear");
+        let configuration = Fixture::new("metadata-late-scan-clear-config");
+        let folder_path = configuration.path.join("folder-store");
+        let association_path = configuration.path.join("association-store");
+        let first = fixture.path.join("Exact Local Show.S01E01.mp4");
+        let second = fixture.path.join("Exact Local Show.S01E02.mkv");
+        fs::write(&first, b"first exact episode").expect("first member must be written");
+        fs::write(&second, b"second exact episode").expect("second member must be written");
+        let state = TvLibraryState::default();
+        set_tv_folder(&state, &folder_path, fixture.path.clone())
+            .expect("TV folder must be configured");
+        let initial = scan_tv_library_with_metadata(&state, &association_path)
+            .expect("initial scan must complete");
+        verified_tv_association(&state, &association_path, &initial[10], 1);
+        fs::remove_file(&first).expect("one persisted anchor must be removed");
+
+        let reconciliation_ready = Arc::new(Barrier::new(2));
+        let resume_late_scan = Arc::new(Barrier::new(2));
+        let late_state = state.clone();
+        let late_association_path = association_path.clone();
+        let late_reconciliation_ready = Arc::clone(&reconciliation_ready);
+        let late_resume = Arc::clone(&resume_late_scan);
+        let late_scan = thread::spawn(move || {
+            scan_tv_library_with_metadata_before_persistence(
+                &late_state,
+                &late_association_path,
+                || {
+                    late_reconciliation_ready.wait();
+                    late_resume.wait();
+                },
+            )
+        });
+        reconciliation_ready.wait();
+
+        let current = scan_tv_library_with_metadata(&state, &association_path)
+            .expect("newer scan must become current");
+        clear_tv_metadata_match_with(&state, &association_path, &current[10])
+            .expect("newer scan must clear the exact association");
+        assert!(read_tv_metadata_associations(&association_path)
+            .expect("cleared store must load")
+            .is_empty());
+
+        resume_late_scan.wait();
+        assert_eq!(
+            late_scan.join().expect("late scan thread must finish"),
+            Err(TV_LIBRARY_STALE)
+        );
+        assert!(read_tv_metadata_associations(&association_path)
+            .expect("late scan must leave the cleared store readable")
+            .is_empty());
+        assert!(state
+            .0
+            .lock()
+            .expect("TV state must remain available")
+            .completed_scan
+            .as_ref()
+            .and_then(|scan| scan.groups.first())
+            .is_some_and(|group| group.association.is_none()));
+
+        let restarted = TvLibraryState::default();
+        load_tv_folder_with(&restarted, &folder_path).expect("folder must reload");
+        let restarted_scan = scan_tv_library_with_metadata(&restarted, &association_path)
+            .expect("restart scan must complete");
+        assert_eq!(&restarted_scan[11], "");
+        assert!(restarted_scan[12..20].iter().all(String::is_empty));
+        assert!(second.is_file());
+    }
+
+    #[test]
+    fn late_old_folder_scan_cannot_overwrite_association_saved_by_current_folder() {
+        let configuration = Fixture::new("metadata-late-old-folder-config");
+        let old_folder = Fixture::new("metadata-late-old-folder-a");
+        let current_folder = Fixture::new("metadata-late-old-folder-b");
+        let folder_path = configuration.path.join("folder-store");
+        let association_path = configuration.path.join("association-store");
+        let old_first = old_folder.path.join("Exact Local Show.S01E01.mp4");
+        let old_second = old_folder.path.join("Exact Local Show.S01E02.mkv");
+        let current_member = current_folder.path.join("Exact Local Show.S01E01.mp4");
+        fs::write(&old_first, b"old first episode").expect("old first member must be written");
+        fs::write(&old_second, b"old second episode").expect("old second member must be written");
+        fs::write(&current_member, b"current exact episode")
+            .expect("current member must be written");
+        let state = TvLibraryState::default();
+        set_tv_folder(&state, &folder_path, old_folder.path.clone())
+            .expect("old TV folder must be configured");
+        let initial = scan_tv_library_with_metadata(&state, &association_path)
+            .expect("old-folder scan must complete");
+        verified_tv_association(&state, &association_path, &initial[10], 1);
+        fs::remove_file(&old_first).expect("old association must require reconciliation");
+
+        let reconciliation_ready = Arc::new(Barrier::new(2));
+        let resume_late_scan = Arc::new(Barrier::new(2));
+        let late_state = state.clone();
+        let late_association_path = association_path.clone();
+        let late_reconciliation_ready = Arc::clone(&reconciliation_ready);
+        let late_resume = Arc::clone(&resume_late_scan);
+        let late_scan = thread::spawn(move || {
+            scan_tv_library_with_metadata_before_persistence(
+                &late_state,
+                &late_association_path,
+                || {
+                    late_reconciliation_ready.wait();
+                    late_resume.wait();
+                },
+            )
+        });
+        reconciliation_ready.wait();
+
+        set_tv_folder(&state, &folder_path, current_folder.path.clone())
+            .expect("new TV folder must become current");
+        let current = scan_tv_library_with_metadata(&state, &association_path)
+            .expect("current-folder scan must complete");
+        verified_tv_association(&state, &association_path, &current[10], 10);
+        let current_store = read_tv_metadata_associations(&association_path)
+            .expect("newer association store must load");
+        assert_eq!(current_store.len(), 2);
+        let saved = current_store
+            .iter()
+            .find(|association| association.folder == current_folder.path)
+            .cloned()
+            .expect("current-folder association must persist");
+        assert_eq!(saved.folder, current_folder.path);
+        assert_eq!(saved.generation, 2);
+
+        resume_late_scan.wait();
+        assert_eq!(
+            late_scan.join().expect("late old-folder scan must finish"),
+            Err(TV_LIBRARY_STALE)
+        );
+        assert_eq!(
+            read_tv_metadata_associations(&association_path)
+                .expect("late scan must not replace the newer store"),
+            current_store
+        );
+        let current_group_association = state
+            .0
+            .lock()
+            .expect("TV state must remain available")
+            .completed_scan
+            .as_ref()
+            .and_then(|scan| scan.groups.first())
+            .and_then(|group| group.association.as_ref())
+            .cloned();
+        assert_eq!(current_group_association, Some(saved.clone()));
+
+        let restarted = TvLibraryState::default();
+        load_tv_folder_with(&restarted, &folder_path).expect("current folder must reload");
+        let restarted_scan = scan_tv_library_with_metadata(&restarted, &association_path)
+            .expect("restart scan must retain the current association");
+        assert_eq!(&restarted_scan[11], "ready");
+        assert_eq!(&restarted_scan[14], "Canonical Show");
+        assert_eq!(&restarted_scan[19], &saved.generation.to_string());
+        assert!(old_second.is_file());
+        assert!(current_member.is_file());
     }
 }

@@ -2213,6 +2213,127 @@ describe("explicit TV Library TMDB show metadata matching", () => {
     expect(saveTmdbTokenMock).not.toHaveBeenCalled();
   });
 
+  it("distinguishes stale, unavailable, and persistence failures while saving TV show metadata", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        groupId,
+        members,
+        showTitle: "Exact  Local — 番組",
+      }),
+    );
+    searchTvShowMetadataMock.mockResolvedValue([
+      matchingRequestId,
+      "1",
+      "702",
+      "Current Show",
+      "",
+      "2021-02-03",
+      "",
+    ]);
+    verifyTvShowMetadataCandidateMock.mockResolvedValue([
+      verificationId,
+      "702",
+      "tt7654321",
+      "Current Show",
+      "",
+      "2021-02-03",
+      "",
+      "",
+      "1",
+    ]);
+    saveTvShowMetadataMatchMock
+      .mockRejectedValueOnce("tv_metadata_context_invalid")
+      .mockRejectedValueOnce("tv_metadata_unavailable")
+      .mockRejectedValueOnce("tv_metadata_persistence_failed");
+
+    render(<App />);
+    selectTvLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match show metadata: Exact Local — 番組",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB TV shows" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select TMDB TV show: Current Show (2021)",
+      }),
+    );
+    const save = await screen.findByRole("button", {
+      name: "Save show metadata match",
+    });
+    for (const message of [
+      "This TV show or verified metadata context is no longer current. The local show remains unchanged.",
+      "TV show metadata storage is unavailable. The association was not saved and the local show remains unchanged.",
+      "The exact show metadata association could not be persisted. The local show remains unchanged.",
+    ]) {
+      fireEvent.click(save);
+      expect((await screen.findByRole("alert")).textContent).toBe(message);
+      expect(
+        screen.getByRole("heading", {
+          hidden: true,
+          name: "Exact Local — 番組",
+        }),
+      ).toBeTruthy();
+      expect(
+        screen.getAllByRole("button", { hidden: true, name: /^Open TV file:/ }),
+      ).toHaveLength(2);
+    }
+    expect(saveTvShowMetadataMatchMock).toHaveBeenCalledTimes(3);
+    expect(openTvFileMock).not.toHaveBeenCalled();
+    expect(revealTvFileMock).not.toHaveBeenCalled();
+    expect(trashTvFileMock).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes stale, unavailable, and persistence failures while clearing TV show metadata", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        association: {
+          tmdbTvId: "702",
+          imdbId: "tt7654321",
+          name: "Current Show",
+        },
+        groupId,
+        members,
+        metadataState: "ready",
+        showTitle: "Exact  Local — 番組",
+      }),
+    );
+    clearTvShowMetadataMatchMock
+      .mockRejectedValueOnce("tv_metadata_stale")
+      .mockRejectedValueOnce("tv_metadata_unavailable")
+      .mockRejectedValueOnce("tv_metadata_persistence_failed");
+
+    render(<App />);
+    selectTvLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View show metadata details: Current Show",
+      }),
+    );
+    const clear = screen.getByRole("button", {
+      name: "Clear show metadata match",
+    });
+    for (const message of [
+      "This TV show or metadata association is no longer current. The local files and existing association remain unchanged.",
+      "TV show metadata storage is unavailable. The existing association and local files remain unchanged.",
+      "The show metadata removal could not be persisted. The existing association and local files remain unchanged.",
+    ]) {
+      fireEvent.click(clear);
+      expect((await screen.findByRole("alert")).textContent).toBe(message);
+      expect(screen.getByRole("heading", { name: "Current Show" })).toBeTruthy();
+      expect(
+        screen.getAllByRole("button", { hidden: true, name: /^Open TV file:/ }),
+      ).toHaveLength(2);
+    }
+    expect(clearTvShowMetadataMatchMock).toHaveBeenCalledTimes(3);
+    expect(openTvFileMock).not.toHaveBeenCalled();
+    expect(revealTvFileMock).not.toHaveBeenCalled();
+    expect(trashTvFileMock).not.toHaveBeenCalled();
+  });
+
   it("drops late Search and verification results after their exact surface is stale", async () => {
     savedTvFolder = "/TV";
     scanTvLibraryMock.mockResolvedValue(
