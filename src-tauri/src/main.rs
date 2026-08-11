@@ -233,6 +233,7 @@ struct MoviesLibraryContext {
     movie_paths: Vec<String>,
     generation: u64,
     completed_scan: Option<CompletedMovieScan>,
+    metadata_client_generation: u64,
     metadata_operation_generation: u64,
     metadata_search: Option<MovieMetadataSearch>,
     metadata_verification: Option<MovieMetadataVerification>,
@@ -973,6 +974,28 @@ fn invalidate_movie_metadata_context(library: &mut MoviesLibraryContext) {
     library.metadata_operation_generation = library.metadata_operation_generation.wrapping_add(1);
     library.metadata_search = None;
     library.metadata_verification = None;
+}
+
+fn begin_movie_metadata_client_operation(
+    library: &mut MoviesLibraryContext,
+    client_generation: u64,
+) -> Result<(), &'static str> {
+    if client_generation == 0 || client_generation <= library.metadata_client_generation {
+        return Err(MOVIE_METADATA_CONTEXT_INVALID);
+    }
+    library.metadata_client_generation = client_generation;
+    Ok(())
+}
+
+fn invalidate_movie_metadata_client_context(
+    library: &mut MoviesLibraryContext,
+    client_generation: u64,
+) {
+    if client_generation < library.metadata_client_generation {
+        return;
+    }
+    library.metadata_client_generation = client_generation;
+    invalidate_movie_metadata_context(library);
 }
 
 fn association_matches_file(
@@ -3236,6 +3259,7 @@ async fn search_movie_metadata(
     app: tauri::AppHandle,
     file_id: String,
     query: String,
+    context_generation: u64,
     state: tauri::State<'_, MoviesLibraryState>,
 ) -> Result<Vec<String>, String> {
     let token_path = tmdb_token_path(&app)?;
@@ -3248,6 +3272,8 @@ async fn search_movie_metadata(
             .0
             .lock()
             .map_err(|_| MOVIE_METADATA_UNAVAILABLE.to_owned())?;
+        begin_movie_metadata_client_operation(&mut library, context_generation)
+            .map_err(str::to_owned)?;
         begin_movie_metadata_search(&mut library, &file_id, &query, &token)
             .map_err(str::to_owned)?
     };
@@ -3281,6 +3307,7 @@ async fn verify_movie_metadata_candidate(
     app: tauri::AppHandle,
     matching_request_id: String,
     tmdb_movie_id: u64,
+    context_generation: u64,
     state: tauri::State<'_, MoviesLibraryState>,
 ) -> Result<Vec<String>, String> {
     let token_path = tmdb_token_path(&app)?;
@@ -3293,6 +3320,8 @@ async fn verify_movie_metadata_candidate(
             .0
             .lock()
             .map_err(|_| MOVIE_METADATA_UNAVAILABLE.to_owned())?;
+        begin_movie_metadata_client_operation(&mut library, context_generation)
+            .map_err(str::to_owned)?;
         begin_movie_metadata_verification(&mut library, &matching_request_id, tmdb_movie_id, &token)
             .map_err(str::to_owned)?
     };
@@ -3363,13 +3392,14 @@ async fn clear_movie_metadata_match(
 
 #[tauri::command]
 fn invalidate_movie_metadata_match_context(
+    context_generation: u64,
     state: tauri::State<'_, MoviesLibraryState>,
 ) -> Result<(), String> {
     let mut library = state
         .0
         .lock()
         .map_err(|_| MOVIE_METADATA_UNAVAILABLE.to_owned())?;
-    invalidate_movie_metadata_context(&mut library);
+    invalidate_movie_metadata_client_context(&mut library, context_generation);
     Ok(())
 }
 
@@ -3888,12 +3918,13 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::parse_windows_volume_storage;
     use super::{
-        begin_movie_metadata_search, begin_movie_metadata_verification,
-        clear_movie_metadata_match_with, clear_movies_folder_file, clear_tmdb_token_file,
-        fetch_javdb_adult_catalog_with, fetch_javdb_vr_catalog_with,
-        fetch_sukebei_adult_releases_with, fetch_sukebei_vr_releases_with,
-        fetch_yts_movie_releases_with, finish_movie_metadata_search,
-        finish_movie_metadata_verification, load_movies_folder_file, load_tmdb_token_file,
+        begin_movie_metadata_client_operation, begin_movie_metadata_search,
+        begin_movie_metadata_verification, clear_movie_metadata_match_with,
+        clear_movies_folder_file, clear_tmdb_token_file, fetch_javdb_adult_catalog_with,
+        fetch_javdb_vr_catalog_with, fetch_sukebei_adult_releases_with,
+        fetch_sukebei_vr_releases_with, fetch_yts_movie_releases_with,
+        finish_movie_metadata_search, finish_movie_metadata_verification,
+        invalidate_movie_metadata_client_context, load_movies_folder_file, load_tmdb_token_file,
         movie_metadata_error, open_movie_path_with, parse_movie_metadata_candidates,
         parse_movie_provider_response, parse_provider_response, parse_verified_movie_metadata,
         query_movies_volume_storage_with, reveal_movie_path_with, save_movie_metadata_match_with,
@@ -4396,6 +4427,71 @@ mod tests {
         assert!(cleared.completed_scan.as_ref().unwrap().files[0]
             .association
             .is_none());
+    }
+
+    #[test]
+    fn delayed_client_invalidation_cannot_erase_a_newer_search_or_verification() {
+        let fixture = FilesystemFixture::new();
+        fixture.create_file("Exact.mp4");
+        let association_path = fixture.path.join("movie-metadata");
+        let mut library = scan_trusted_movie_fixture(&fixture, &association_path);
+        let file_id = library.completed_scan.as_ref().unwrap().files[0]
+            .file_id
+            .clone();
+        let candidates = parse_movie_metadata_candidates(
+            r#"{"results":[{"id":419,"title":"Exact Movie","release_date":"1999-04-19"}]}"#,
+        )
+        .unwrap();
+
+        begin_movie_metadata_client_operation(&mut library, 2).unwrap();
+        let (search_generation, request_id) =
+            begin_movie_metadata_search(&mut library, &file_id, "Exact Movie", "fixture-token")
+                .unwrap();
+        finish_movie_metadata_search(
+            &mut library,
+            search_generation,
+            &request_id,
+            "fixture-token",
+            candidates,
+        )
+        .unwrap();
+        invalidate_movie_metadata_client_context(&mut library, 1);
+        assert_eq!(
+            library.metadata_search.as_ref().unwrap().request_id,
+            request_id
+        );
+
+        begin_movie_metadata_client_operation(&mut library, 3).unwrap();
+        let (verification_generation, search) =
+            begin_movie_metadata_verification(&mut library, &request_id, 419, "fixture-token")
+                .unwrap();
+        let association = parse_verified_movie_metadata(
+            &search.authority,
+            419,
+            r#"{"id":419,"title":"Exact Movie","release_date":"1999-04-19"}"#,
+            r#"{"id":419,"imdb_id":"tt0123456"}"#,
+        )
+        .unwrap();
+        invalidate_movie_metadata_client_context(&mut library, 2);
+        let verified = finish_movie_metadata_verification(
+            &mut library,
+            verification_generation,
+            &search,
+            419,
+            "fixture-token",
+            association,
+        )
+        .unwrap();
+        assert_eq!(verified[2], "tt0123456");
+        assert!(library.metadata_verification.is_some());
+        assert_eq!(
+            begin_movie_metadata_client_operation(&mut library, 3),
+            Err(MOVIE_METADATA_CONTEXT_INVALID)
+        );
+
+        invalidate_movie_metadata_client_context(&mut library, 4);
+        assert!(library.metadata_search.is_none());
+        assert!(library.metadata_verification.is_none());
     }
 
     #[test]

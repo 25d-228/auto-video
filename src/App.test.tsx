@@ -50,7 +50,9 @@ let saveMovieMetadataMatchMock: Mock<
 let clearMovieMetadataMatchMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
-let invalidateMovieMetadataMatchContextMock: Mock<() => Promise<void>>;
+let invalidateMovieMetadataMatchContextMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
 let queryMoviesStorageMock: Mock<() => Promise<[string, string]>>;
 let openMovieMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
@@ -965,7 +967,7 @@ beforeEach(() => {
         case "clear_movie_metadata_match":
           return clearMovieMetadataMatchMock(parameters);
         case "invalidate_movie_metadata_match_context":
-          return invalidateMovieMetadataMatchContextMock();
+          return invalidateMovieMetadataMatchContextMock(parameters);
         case "query_movies_storage":
           return queryMoviesStorageMock();
         case "open_movie":
@@ -13753,6 +13755,11 @@ describe("explicit Movie Library TMDB metadata matching", () => {
       name: "TMDB Movie metadata candidates",
     });
     expect(within(candidates).getAllByRole("button")).toHaveLength(2);
+    expect(
+      screen.getByText(
+        "2 TMDB Movie candidates were found. No candidate was selected automatically.",
+      ).getAttribute("role"),
+    ).toBe("status");
     expect(verifyMovieMetadataCandidateMock).not.toHaveBeenCalled();
     fireEvent.click(
       within(candidates).getByRole("button", {
@@ -13760,6 +13767,7 @@ describe("explicit Movie Library TMDB metadata matching", () => {
       }),
     );
     expect(verifyMovieMetadataCandidateMock).toHaveBeenCalledWith({
+      contextGeneration: expect.any(Number),
       matchingRequestId,
       tmdbMovieId: 202,
     });
@@ -13777,6 +13785,13 @@ describe("explicit Movie Library TMDB metadata matching", () => {
     expect(saveMovieMetadataMatchMock).toHaveBeenCalledWith({
       verificationId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     });
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", {
+          name: "View metadata details: Accepted Title — 特別版",
+        }),
+      ),
+    );
 
     fireEvent.click(
       screen.getByRole("button", {
@@ -13815,6 +13830,13 @@ describe("explicit Movie Library TMDB metadata matching", () => {
         name: "映画 — Local.File",
       }),
     ).toBeTruthy();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", {
+          name: "Match metadata: 映画 — Local.File",
+        }),
+      ),
+    );
     expect(clearMovieMetadataMatchMock).toHaveBeenCalledWith({
       fileId: fixtureMovieFileId(path),
     });
@@ -13966,6 +13988,520 @@ describe("explicit Movie Library TMDB metadata matching", () => {
     expect(screen.queryByText(/could not be saved/)).toBeNull();
     expect(saveMovieMetadataMatchMock).toHaveBeenCalledOnce();
     expect(invalidateMovieMetadataMatchContextMock).toHaveBeenCalled();
+  });
+
+  it("clears a deferred Search latch on refresh and permits an exact retry", async () => {
+    const path = "/Movies/Deferred Search.mp4";
+    const pendingSearch = createDeferred<string[]>();
+    const searchResponse = [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "1",
+      "419",
+      "Matched Movie",
+      "",
+      "1999-04-19",
+      "",
+    ];
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([path]);
+    searchMovieMetadataMock
+      .mockReturnValueOnce(pendingSearch.promise)
+      .mockResolvedValue(searchResponse);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match metadata: Deferred Search",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+    fireEvent.click(document.getElementById("movies-refresh")!);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("textbox", { name: "Search titles" }),
+      ),
+    );
+    await act(async () => {
+      pendingSearch.resolve(searchResponse);
+      await pendingSearch.promise;
+    });
+    expect(screen.queryByText("Matched Movie")).toBeNull();
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match metadata: Deferred Search",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+    expect(
+      await screen.findByRole("button", {
+        name: "Select TMDB movie: Matched Movie (1999)",
+      }),
+    ).toBeTruthy();
+    expect(searchMovieMetadataMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears a deferred verification latch on refresh and permits an exact retry", async () => {
+    const path = "/Movies/Deferred Verification.mp4";
+    const pendingVerification = createDeferred<string[]>();
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([path]);
+    searchMovieMetadataMock.mockResolvedValue([
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "1",
+      "419",
+      "Matched Movie",
+      "",
+      "1999-04-19",
+      "",
+    ]);
+    verifyMovieMetadataCandidateMock
+      .mockReturnValueOnce(pendingVerification.promise)
+      .mockResolvedValue([
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "419",
+        "tt0123456",
+        "Matched Movie",
+        "",
+        "1999-04-19",
+        "",
+        "Verified overview.",
+        "1",
+      ]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match metadata: Deferred Verification",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select TMDB movie: Matched Movie (1999)",
+      }),
+    );
+    fireEvent.click(document.getElementById("movies-refresh")!);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await act(async () => {
+      pendingVerification.resolve([
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "419",
+        "tt0123456",
+        "Late Movie",
+        "",
+        "1999-04-19",
+        "",
+        "",
+        "1",
+      ]);
+      await pendingVerification.promise;
+    });
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match metadata: Deferred Verification",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select TMDB movie: Matched Movie (1999)",
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Verified metadata match" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("Late Movie")).toBeNull();
+    expect(verifyMovieMetadataCandidateMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears a deferred Save latch on token change and permits an exact retry", async () => {
+    const path = "/Movies/Deferred Save.mp4";
+    const pendingSave = createDeferred<string[]>();
+    const savedAssociation = [
+      "419",
+      "tt0123456",
+      "Matched Movie",
+      "",
+      "1999-04-19",
+      "",
+      "Verified overview.",
+      "2",
+    ];
+    savedMoviesFolder = "/Movies";
+    loadTmdbTokenMock.mockResolvedValue("old-token");
+    scanMoviesMock.mockResolvedValue([path]);
+    searchMovieMetadataMock.mockResolvedValue([
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "1",
+      "419",
+      "Matched Movie",
+      "",
+      "1999-04-19",
+      "",
+    ]);
+    saveMovieMetadataMatchMock
+      .mockReturnValueOnce(pendingSave.promise)
+      .mockResolvedValue(savedAssociation);
+
+    render(<App />);
+    selectLibrary();
+    const openAndVerify = async () => {
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Match metadata: Deferred Save",
+        }),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Search TMDB Movies" }),
+      );
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Select TMDB movie: Matched Movie (1999)",
+        }),
+      );
+      await screen.findByRole("button", { name: "Save metadata match" });
+    };
+    await openAndVerify();
+    fireEvent.click(screen.getByRole("button", { name: "Save metadata match" }));
+    fireEvent.click(screen.getByText("Settings").closest("button")!);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.change(screen.getByLabelText("New token"), {
+      target: { value: "replacement-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Replace token" }));
+    expect(await screen.findByText("TMDB token replaced.")).toBeTruthy();
+    await act(async () => {
+      pendingSave.resolve(savedAssociation);
+      await pendingSave.promise;
+    });
+    expect(screen.queryByText(/metadata was matched to/)).toBeNull();
+
+    selectLibrary();
+    await openAndVerify();
+    fireEvent.click(screen.getByRole("button", { name: "Save metadata match" }));
+    expect(
+      await screen.findByRole("heading", { name: "Matched Movie" }),
+    ).toBeTruthy();
+    expect(saveMovieMetadataMatchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears a deferred clear latch on folder change and permits an exact retry", async () => {
+    const path = "/Movies/Deferred Clear.mp4";
+    const replacementPath = "/NewMovies/Deferred Clear.mp4";
+    const pendingClear = createDeferred<void>();
+    savedMoviesFolder = "/Movies";
+    movieMetadataAssociations.set(path, {
+      generation: "3",
+      imdbId: "tt0123456",
+      title: "Matched Movie",
+      tmdbMovieId: "419",
+    });
+    movieMetadataAssociations.set(replacementPath, {
+      generation: "4",
+      imdbId: "tt0123456",
+      title: "Matched Movie",
+      tmdbMovieId: "419",
+    });
+    scanMoviesMock.mockImplementation(() =>
+      Promise.resolve([
+        savedMoviesFolder === "/NewMovies" ? replacementPath : path,
+      ]),
+    );
+    openFolderMock.mockResolvedValue("/NewMovies");
+    clearMovieMetadataMatchMock
+      .mockReturnValueOnce(pendingClear.promise)
+      .mockResolvedValue(undefined);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View metadata details: Matched Movie",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Clear metadata match" }));
+    fireEvent.click(screen.getByText("Settings").closest("button")!);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Change folder" })[0],
+    );
+    expect(await screen.findByText("/NewMovies")).toBeTruthy();
+    await act(async () => {
+      pendingClear.resolve();
+      await pendingClear.promise;
+    });
+    expect(screen.queryByText(/metadata was cleared/)).toBeNull();
+
+    selectLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View metadata details: Matched Movie",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Clear metadata match" }));
+    expect(
+      await screen.findByRole("heading", { name: "Deferred Clear" }),
+    ).toBeTruthy();
+    expect(clearMovieMetadataMatchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("orders delayed query and close invalidations behind newer native contexts", async () => {
+    const path = "/Movies/Sequenced invalidation.mp4";
+    const delayedQueryInvalidation = createDeferred<void>();
+    const delayedCloseInvalidation = createDeferred<void>();
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([path]);
+    searchMovieMetadataMock.mockResolvedValue([
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "1",
+      "419",
+      "Matched Movie",
+      "",
+      "1999-04-19",
+      "",
+    ]);
+    invalidateMovieMetadataMatchContextMock
+      .mockReturnValueOnce(delayedQueryInvalidation.promise)
+      .mockReturnValueOnce(delayedCloseInvalidation.promise)
+      .mockResolvedValue(undefined);
+
+    render(<App />);
+    selectLibrary();
+    const openAndSearch = async () => {
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: "Match metadata: Sequenced invalidation",
+        }),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Search TMDB Movies" }),
+      );
+      await screen.findByRole("button", {
+        name: "Select TMDB movie: Matched Movie (1999)",
+      });
+    };
+
+    await openAndSearch();
+    fireEvent.change(screen.getByRole("textbox", { name: "Movie title query" }), {
+      target: { value: "New exact query" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select TMDB movie: Matched Movie (1999)",
+      }),
+    );
+    await screen.findByRole("heading", { name: "Verified metadata match" });
+    const queryInvalidationGeneration = invalidateMovieMetadataMatchContextMock
+      .mock.calls[0]?.[0]?.contextGeneration as number;
+    const newerSearchGeneration = searchMovieMetadataMock.mock.calls[1]?.[0]
+      ?.contextGeneration as number;
+    expect(queryInvalidationGeneration).toBeLessThan(newerSearchGeneration);
+    await act(async () => {
+      delayedQueryInvalidation.resolve();
+      await delayedQueryInvalidation.promise;
+    });
+    expect(
+      screen.getByRole("heading", { name: "Verified metadata match" }),
+    ).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Close metadata matching" }),
+    );
+    await openAndSearch();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Select TMDB movie: Matched Movie (1999)",
+      }),
+    );
+    await screen.findByRole("heading", { name: "Verified metadata match" });
+    const closeInvalidationGeneration = invalidateMovieMetadataMatchContextMock
+      .mock.calls[1]?.[0]?.contextGeneration as number;
+    const newerVerificationGeneration =
+      verifyMovieMetadataCandidateMock.mock.calls.at(-1)?.[0]
+        ?.contextGeneration as number;
+    expect(closeInvalidationGeneration).toBeLessThan(
+      newerVerificationGeneration,
+    );
+    await act(async () => {
+      delayedCloseInvalidation.resolve();
+      await delayedCloseInvalidation.promise;
+    });
+    expect(
+      screen.getByRole("heading", { name: "Verified metadata match" }),
+    ).toBeTruthy();
+  });
+
+  it("focuses Movies search when Save moves the card off the sorted page", async () => {
+    const paths = Array.from(
+      { length: 8 },
+      (_, index) => `/Movies/${String.fromCharCode(66 + index)} Local.mp4`,
+    );
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(paths);
+    searchMovieMetadataMock.mockResolvedValue([
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "1",
+      "419",
+      "Z Canonical",
+      "",
+      "1999-04-19",
+      "",
+    ]);
+    saveMovieMetadataMatchMock.mockResolvedValue([
+      "419",
+      "tt0123456",
+      "Z Canonical",
+      "",
+      "1999-04-19",
+      "",
+      "",
+      "2",
+    ]);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByRole("heading", { name: "B Local" });
+    resizeGallery("library", 1528, 136);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Match metadata: B Local" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select TMDB movie: Z Canonical (1999)",
+      }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Save metadata match" }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.queryByRole("heading", { name: "Z Canonical" })).toBeNull();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("textbox", { name: "Search titles" }),
+      ),
+    );
+  });
+
+  it("focuses Movies search when clear removes a canonical-title-only result", async () => {
+    const path = "/Movies/Unrelated local filename.mp4";
+    savedMoviesFolder = "/Movies";
+    movieMetadataAssociations.set(path, {
+      generation: "4",
+      imdbId: "tt0123456",
+      title: "Canonical Only Match",
+      tmdbMovieId: "419",
+    });
+    scanMoviesMock.mockResolvedValue([path]);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByRole("heading", { name: "Canonical Only Match" });
+    searchMovies("Canonical Only Match");
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "View metadata details: Canonical Only Match",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Clear metadata match" }));
+    expect(
+      await screen.findByRole("heading", {
+        name: "No Movies match this search",
+      }),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("textbox", { name: "Search titles" }),
+      ),
+    );
+  });
+
+  it("distinguishes stale, unavailable, and persistence failures for Save and clear", async () => {
+    const path = "/Movies/Mutation failures.mp4";
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([path]);
+    searchMovieMetadataMock.mockResolvedValue([
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "1",
+      "419",
+      "Matched Movie",
+      "",
+      "1999-04-19",
+      "",
+    ]);
+    saveMovieMetadataMatchMock
+      .mockRejectedValueOnce("movie_metadata_stale")
+      .mockRejectedValueOnce("movie_metadata_unavailable")
+      .mockRejectedValueOnce("movie_metadata_persistence_failed")
+      .mockResolvedValue([
+        "419",
+        "tt0123456",
+        "Matched Movie",
+        "",
+        "1999-04-19",
+        "",
+        "",
+        "2",
+      ]);
+    clearMovieMetadataMatchMock
+      .mockRejectedValueOnce("movie_metadata_stale")
+      .mockRejectedValueOnce("movie_metadata_unavailable")
+      .mockRejectedValueOnce("movie_metadata_persistence_failed")
+      .mockResolvedValue(undefined);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Match metadata: Mutation failures",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Search TMDB Movies" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Select TMDB movie: Matched Movie (1999)",
+      }),
+    );
+    const save = await screen.findByRole("button", {
+      name: "Save metadata match",
+    });
+    for (const message of [
+      "This Movie or verified metadata context is no longer current. The local Movie remains unchanged.",
+      "Movie metadata storage is unavailable. The association was not saved and the local Movie remains unchanged.",
+      "The exact metadata association could not be persisted. The local Movie remains unchanged.",
+    ]) {
+      fireEvent.click(save);
+      expect((await screen.findByRole("alert")).textContent).toBe(message);
+      expect(document.querySelector(".movie-card h3")?.textContent).toBe(
+        "Mutation failures",
+      );
+    }
+    fireEvent.click(save);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View metadata details: Matched Movie",
+      }),
+    );
+    const clear = screen.getByRole("button", { name: "Clear metadata match" });
+    for (const message of [
+      "This Movie or metadata association is no longer current. The local file and existing association remain unchanged.",
+      "Movie metadata storage is unavailable. The existing association and local file remain unchanged.",
+      "The metadata removal could not be persisted. The existing association and local file remain unchanged.",
+    ]) {
+      fireEvent.click(clear);
+      expect((await screen.findByRole("alert")).textContent).toBe(message);
+      expect(screen.getByRole("heading", { name: "Matched Movie" })).toBeTruthy();
+    }
+    fireEvent.click(clear);
+    expect(
+      await screen.findByRole("heading", { name: "Mutation failures" }),
+    ).toBeTruthy();
   });
 
   it("keeps explicit matching usable at 720 by 520 in light, dark, and system modes", async () => {

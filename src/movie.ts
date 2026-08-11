@@ -229,14 +229,24 @@ function parseVerifiedMovieMetadata(value: unknown): VerifiedMovieMetadata | nul
     : null;
 }
 
-export async function searchMovieMetadata(fileId: string, query: string) {
-  if (!movieFileIdPattern.test(fileId) || query.trim() === "") {
+export async function searchMovieMetadata(
+  fileId: string,
+  query: string,
+  contextGeneration: number,
+) {
+  if (
+    !movieFileIdPattern.test(fileId) ||
+    query.trim() === "" ||
+    !Number.isSafeInteger(contextGeneration) ||
+    contextGeneration <= 0
+  ) {
     throw new Error("A current Movie file and metadata query are required.");
   }
   const result = parseMovieMetadataSearch(
     await window.__TAURI__.core.invoke<unknown>("search_movie_metadata", {
       fileId,
       query,
+      contextGeneration,
     }),
   );
   if (result === null) {
@@ -248,18 +258,21 @@ export async function searchMovieMetadata(fileId: string, query: string) {
 export async function verifyMovieMetadataCandidate(
   matchingRequestId: string,
   tmdbMovieId: number,
+  contextGeneration: number,
 ) {
   if (
     !movieFileIdPattern.test(matchingRequestId) ||
     !Number.isSafeInteger(tmdbMovieId) ||
-    tmdbMovieId <= 0
+    tmdbMovieId <= 0 ||
+    !Number.isSafeInteger(contextGeneration) ||
+    contextGeneration <= 0
   ) {
     throw new Error("A current metadata request and TMDB Movie are required.");
   }
   const result = parseVerifiedMovieMetadata(
     await window.__TAURI__.core.invoke<unknown>(
       "verify_movie_metadata_candidate",
-      { matchingRequestId, tmdbMovieId },
+      { matchingRequestId, tmdbMovieId, contextGeneration },
     ),
   );
   if (result === null) {
@@ -295,9 +308,13 @@ export function clearMovieMetadataMatch(fileId: string) {
   });
 }
 
-export function invalidateMovieMetadataMatchContext() {
+export function invalidateMovieMetadataMatchContext(contextGeneration: number) {
+  if (!Number.isSafeInteger(contextGeneration) || contextGeneration <= 0) {
+    throw new Error("A current metadata context generation is required.");
+  }
   return window.__TAURI__.core.invoke<void>(
     "invalidate_movie_metadata_match_context",
+    { contextGeneration },
   );
 }
 

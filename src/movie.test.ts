@@ -150,11 +150,11 @@ describe("trusted Movie Library metadata boundary", () => {
       ])
       .mockResolvedValue(undefined);
 
-    await expect(searchMovieMetadata(fileId, "Exact  Query — 特別版")).resolves.toMatchObject({
+    await expect(searchMovieMetadata(fileId, "Exact  Query — 特別版", 1)).resolves.toMatchObject({
       matchingRequestId: requestId,
       candidates: [{ tmdbMovieId: 419, title: "Candidate  Title" }],
     });
-    await expect(verifyMovieMetadataCandidate(requestId, 419)).resolves.toMatchObject({
+    await expect(verifyMovieMetadataCandidate(requestId, 419, 2)).resolves.toMatchObject({
       verificationId,
       association: { imdbId: "tt0123456", tmdbMovieId: 419 },
     });
@@ -164,13 +164,13 @@ describe("trusted Movie Library metadata boundary", () => {
       tmdbMovieId: 419,
     });
     await clearMovieMetadataMatch(fileId);
-    await invalidateMovieMetadataMatchContext();
+    await invalidateMovieMetadataMatchContext(3);
     expect(invokeMock.mock.calls).toEqual([
-      ["search_movie_metadata", { fileId, query: "Exact  Query — 特別版" }],
-      ["verify_movie_metadata_candidate", { matchingRequestId: requestId, tmdbMovieId: 419 }],
+      ["search_movie_metadata", { contextGeneration: 1, fileId, query: "Exact  Query — 特別版" }],
+      ["verify_movie_metadata_candidate", { contextGeneration: 2, matchingRequestId: requestId, tmdbMovieId: 419 }],
       ["save_movie_metadata_match", { verificationId }],
       ["clear_movie_metadata_match", { fileId }],
-      ["invalidate_movie_metadata_match_context"],
+      ["invalidate_movie_metadata_match_context", { contextGeneration: 3 }],
     ]);
   });
 });
