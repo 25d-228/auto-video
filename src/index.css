@@ -1311,6 +1311,12 @@ button {
   opacity: 1;
 }
 
+.javdb-browse-card:hover .title-copy-button,
+.javdb-browse-card:focus-within .title-copy-button {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 .javdb-browse-card__body {
   min-height: 5rem;
   padding: 0.625rem;

@@ -527,6 +527,20 @@ describe("JavDB Adult and VR browse provider boundary", () => {
       fetchJavdbImageObjectUrl("adult", "https://tp.cmastd.com/covers/Adult1.jpg"),
     ).rejects.toThrow("invalid image payload");
   });
+
+  it.each([
+    "https://tp.evil.com/covers/Adult1.jpg",
+    "https://tp.cmastd.com.evil.example/covers/Adult1.jpg",
+    "https://user:secret@tp.cmastd.com/covers/Adult1.jpg",
+    "https://tp.cmastd.com:443/covers/Adult1.jpg",
+    "https://tp.cmastd.com\\@evil.example/covers/Adult1.jpg",
+    "not a URL",
+  ])("rejects unsupported JavDB image URL %s before native dispatch", async (sourceUrl) => {
+    await expect(fetchJavdbImageObjectUrl("vr", sourceUrl)).rejects.toThrow(
+      "invalid image URL",
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("Sukebei identity-verified release request", () => {

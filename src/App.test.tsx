@@ -1486,11 +1486,11 @@ describe("parsed TV Library and Dashboard", () => {
   it("shows independent folder, scan, aggregate, storage, and routing states", async () => {
     savedTvFolder = "/TV/番組  Library";
     scanTvLibraryMock.mockResolvedValue([
-      "/TV/番組  Library/星  Show.S01E02.mp4",
-      "星  Show.S01E02.mp4",
+      "/TV/番組  Library/星  Show.S01E02.AVI",
+      "星  Show.S01E02.AVI",
       "1073741824",
-      "/TV/番組  Library/星  Show.S01E03.MKV",
-      "星  Show.S01E03.MKV",
+      "/TV/番組  Library/星  Show.S01E03.MOV",
+      "星  Show.S01E03.MOV",
       "2147483648",
       "/TV/番組  Library/Unknown release.mp4",
       "Unknown release.mp4",
@@ -3109,11 +3109,11 @@ describe("parsed Adult Library and Dashboard", () => {
   it("shows exact grouped membership, multipart labels, complete totals, storage, and routing", async () => {
     savedAdultFolder = "/Adult/作品  Library";
     scanAdultLibraryMock.mockResolvedValue([
-      "/Adult/作品  Library/ADLT-123 Part 01 — 前編.mp4",
-      "ADLT-123 Part 01 — 前編.mp4",
+      "/Adult/作品  Library/ADLT-123 Part 01 — 前編.AVI",
+      "ADLT-123 Part 01 — 前編.AVI",
       "1073741824",
-      "/Adult/作品  Library/adlt_00123_CD2  特別版.MKV",
-      "adlt_00123_CD2  特別版.MKV",
+      "/Adult/作品  Library/adlt_00123_CD2  特別版.MOV",
+      "adlt_00123_CD2  特別版.MOV",
       "2147483648",
       "/Adult/作品  Library/ADLT-123 Part 01 Disc 02.mp4",
       "ADLT-123 Part 01 Disc 02.mp4",
@@ -4062,9 +4062,9 @@ describe("parsed VR Library and Dashboard", () => {
   });
 
   it("shows grouped counts while preserving exact member copy, open, and reveal actions", async () => {
-    const firstPath = "/VR/作品/MDVR-419  Disc 01 — 前編.mp4";
-    const secondPath = "/VR/mdvr_00419_CD2  特別版.MKV";
-    const unassociatedPath = "/VR/MDVR-419 + ABC-123  pack.mp4";
+    const firstPath = "/VR/作品/MDVR-419  Disc 01 — 前編.AVI";
+    const secondPath = "/VR/mdvr_00419_CD2  特別版.MOV";
+    const unassociatedPath = "/VR/MDVR-419 + ABC-123  pack.FLV";
     savedVrFolder = "/VR";
     scanVrLibraryMock.mockResolvedValue([
       firstPath,
@@ -5221,11 +5221,25 @@ describe("Movies Library Dashboard", () => {
   it("shows the exact configured path and complete scan count without rescanning on navigation or resize", async () => {
     const folder =
       "C:\\映像ライブラリ\\Family — Archive & Restored Editions\\A very long configured Movies folder name";
-    const paths = Array.from(
-      { length: 25 },
-      (_, index) =>
-        `${folder}\\Movie ${String(index + 1).padStart(2, "0")}.mkv`,
-    );
+    const extensions = [
+      "mkv",
+      "mp4",
+      "avi",
+      "wmv",
+      "m4v",
+      "ts",
+      "mov",
+      "flv",
+      "iso",
+      "rmvb",
+      "webm",
+      "mpg",
+      "mpeg",
+    ];
+    const paths = Array.from({ length: 25 }, (_, index) => {
+      const extension = extensions[index % extensions.length];
+      return `${folder}\\Movie ${String(index + 1).padStart(2, "0")}.${extension}`;
+    });
     savedMoviesFolder = folder;
     scanMoviesMock.mockResolvedValue(paths);
 
@@ -9508,6 +9522,82 @@ describe("JavDB Adult and VR catalog browsing", () => {
     ).toBe("https://javdb.com/v/Wide");
   });
 
+  it("copies complete Adult and VR browse codes with isolated local feedback and stable cards", async () => {
+    fetchJavdbBrowseMock.mockImplementation(async (parameters) =>
+      parameters?.category === "vr"
+        ? javdbBrowseFixture(
+            [{ code: "MDVR-419", id: "Vr1", vr: true }],
+            "vr",
+          )
+        : javdbBrowseFixture([{ code: "ADLT-123", id: "Adult1" }], "adult"),
+    );
+    const outsideActivation = vi.fn();
+    render(
+      <div onClick={outsideActivation} onPointerDown={outsideActivation}>
+        <App />
+      </div>,
+    );
+    selectDiscover();
+    selectAdultBrowse();
+    const adultCard = (
+      await screen.findByRole("heading", { name: "ADLT-123" })
+    ).closest("article") as HTMLElement;
+    const adultWidth = adultCard.style.width;
+    const adultCapacity = adultCard
+      .closest(".media-gallery--javdb")
+      ?.getAttribute("data-page-capacity");
+    const adultCopy = within(adultCard).getByRole("button", {
+      name: "Copy title: ADLT-123",
+    });
+    expect(adultCopy.closest(".javdb-browse-card__actions")).not.toBeNull();
+    adultCopy.focus();
+    expect(document.activeElement).toBe(adultCopy);
+    outsideActivation.mockClear();
+    fireEvent.pointerDown(adultCopy);
+    fireEvent.click(adultCopy);
+    await waitFor(() =>
+      expect(clipboardWriteMock).toHaveBeenCalledWith("ADLT-123"),
+    );
+    expect(within(adultCard).getByRole("status").textContent).toBe(
+      "Copied title: ADLT-123",
+    );
+    expect(outsideActivation).not.toHaveBeenCalled();
+    expect(fetchJavdbDetailsMock).not.toHaveBeenCalled();
+    expect(fetchSukebeiAdultReleasesMock).not.toHaveBeenCalled();
+    expect(adultCard.style.width).toBe(adultWidth);
+    expect(
+      adultCard
+        .closest(".media-gallery--javdb")
+        ?.getAttribute("data-page-capacity"),
+    ).toBe(adultCapacity);
+
+    clipboardWriteMock.mockRejectedValueOnce(new Error("permission denied"));
+    selectVrBrowse();
+    const vrCard = (
+      await screen.findByRole("heading", { name: "MDVR-419" })
+    ).closest("article") as HTMLElement;
+    const vrWidth = vrCard.style.width;
+    const vrCopy = within(vrCard).getByRole("button", {
+      name: "Copy title: MDVR-419",
+    });
+    vrCopy.focus();
+    expect(document.activeElement).toBe(vrCopy);
+    outsideActivation.mockClear();
+    fireEvent.click(vrCopy);
+    expect(
+      await within(vrCard).findByRole("button", {
+        name: "Copy failed for title: MDVR-419",
+      }),
+    ).toHaveProperty("textContent", "Failed");
+    expect(within(vrCard).getByRole("alert").textContent).toBe(
+      "Copy failed for title: MDVR-419",
+    );
+    expect(outsideActivation).not.toHaveBeenCalled();
+    expect(fetchJavdbDetailsMock).not.toHaveBeenCalled();
+    expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
+    expect(vrCard.style.width).toBe(vrWidth);
+  });
+
   it("loads only exact previews explicitly, drops one failed image, caps at 24, and wraps keyboard paging", async () => {
     const item = { code: "MDVR-419", id: "Vr1", vr: true };
     fetchJavdbBrowseMock.mockResolvedValue(javdbBrowseFixture([item], "vr"));
@@ -9543,6 +9633,109 @@ describe("JavDB Adult and VR catalog browsing", () => {
     expect(screen.getByText("Exact provider item Vr1 · 1 of 23")).toBeTruthy();
     fireEvent.keyDown(document, { key: "Escape" });
     await waitFor(() => expect(document.activeElement).toBe(preview));
+  });
+
+  it("retries every exact preview failure locally until the retained item succeeds", async () => {
+    const item = { code: "ADLT-123", id: "Adult1" };
+    fetchJavdbBrowseMock.mockResolvedValue(javdbBrowseFixture([item], "adult"));
+    fetchJavdbDetailsMock
+      .mockRejectedValueOnce("adult_source_unavailable")
+      .mockRejectedValueOnce("adult_network_error")
+      .mockRejectedValueOnce("adult_provider_error")
+      .mockResolvedValueOnce("not-json")
+      .mockResolvedValueOnce(javdbDetailsFixture({ ...item, vr: true }, 1))
+      .mockResolvedValueOnce(javdbDetailsFixture(item, 1));
+    render(<App />);
+    selectDiscover();
+    selectAdultBrowse();
+    const card = (
+      await screen.findByRole("heading", { name: "ADLT-123" })
+    ).closest("article") as HTMLElement;
+    const preview = within(card).getByRole("button", { name: "Preview" });
+    preview.focus();
+    fireEvent.click(preview);
+
+    for (const heading of [
+      "JavDB is unavailable",
+      "JavDB could not be reached",
+      "JavDB could not complete the search",
+      "JavDB returned malformed details",
+      "JavDB returned conflicting details",
+    ]) {
+      expect(await screen.findByRole("heading", { name: heading })).toBeTruthy();
+      expect(screen.getByRole("alert").textContent).toContain(heading);
+      fireEvent.click(screen.getByRole("button", { name: "Retry preview" }));
+    }
+
+    expect(await screen.findByText("Exact provider item Adult1 · 1 of 1")).toBeTruthy();
+    expect(fetchJavdbDetailsMock).toHaveBeenCalledTimes(6);
+    for (const [parameters] of fetchJavdbDetailsMock.mock.calls) {
+      expect(parameters).toEqual({
+        category: "adult",
+        providerItemId: "Adult1",
+      });
+    }
+    expect(
+      fetchJavdbImageMock.mock.calls.filter(([parameters]) =>
+        String(parameters?.sourceUrl).includes("/previews/"),
+      ),
+    ).toHaveLength(1);
+    expect(fetchSukebeiAdultReleasesMock).not.toHaveBeenCalled();
+    expect(screen.queryByText("Exact provider summary.")).toBeNull();
+
+    vi.mocked(URL.revokeObjectURL).mockClear();
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(preview));
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:javdb-image");
+  });
+
+  it("rejects a late retried preview and revokes its obsolete object URL after closure", async () => {
+    const item = { code: "MDVR-419", id: "Vr1", vr: true };
+    const latePreviewImage = createDeferred<number[]>();
+    fetchJavdbBrowseMock.mockResolvedValue(javdbBrowseFixture([item], "vr"));
+    fetchJavdbDetailsMock
+      .mockRejectedValueOnce("vr_network_error")
+      .mockResolvedValueOnce(javdbDetailsFixture(item, 1));
+    fetchJavdbImageMock.mockImplementation((parameters) =>
+      String(parameters?.sourceUrl).includes("/previews/")
+        ? latePreviewImage.promise
+        : Promise.resolve([0xff, 0xd8, 0xff, 0xe0]),
+    );
+    render(<App />);
+    selectDiscover();
+    selectVrBrowse();
+    const card = (
+      await screen.findByRole("heading", { name: "MDVR-419" })
+    ).closest("article") as HTMLElement;
+    await waitFor(() => expect(card.querySelector("img")).not.toBeNull());
+    const preview = within(card).getByRole("button", { name: "Preview" });
+    fireEvent.click(preview);
+    expect(
+      await screen.findByRole("heading", { name: "JavDB could not be reached" }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry preview" }));
+    await waitFor(() =>
+      expect(
+        fetchJavdbImageMock.mock.calls.filter(([parameters]) =>
+          String(parameters?.sourceUrl).includes("/previews/"),
+        ),
+      ).toHaveLength(1),
+    );
+    vi.mocked(URL.createObjectURL).mockReturnValueOnce("blob:late-preview");
+    vi.mocked(URL.revokeObjectURL).mockClear();
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    await act(async () => {
+      latePreviewImage.resolve([0xff, 0xd8, 0xff, 0xe0]);
+      await latePreviewImage.promise;
+    });
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:late-preview");
+    expect(screen.queryByText(/Exact provider item Vr1/)).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("heading", { name: "MDVR-419" })).toBeTruthy();
+    expect(fetchJavdbDetailsMock).toHaveBeenCalledTimes(2);
+    expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
   });
 
   it("isolates late catalog, details, cover, preview, and release work after exact context changes", async () => {

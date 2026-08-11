@@ -405,8 +405,8 @@ describe("conservative parsed TV Library identity", () => {
       [
         "1",
         ...tvScanFile(
-          "/TV/Show.S01E02.avi",
-          "Show.S01E02.avi",
+          "/TV/Show.S01E02.txt",
+          "Show.S01E02.txt",
           "1",
           { showTitle: "Show", season: 1, episode: 2 },
         ),

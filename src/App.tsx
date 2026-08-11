@@ -2290,6 +2290,7 @@ function DiscoverJavdbBrowseCard({
         </div>
       </button>
       <div className="javdb-browse-card__actions">
+        <CopyTitleAction title={item.code} />
         <Button
           id={previewTriggerId}
           onClick={() => onOpenPreview(item, previewTriggerId)}
@@ -2586,10 +2587,12 @@ function JavdbDetailsDialog({
 
 function JavdbPreviewDialog({
   item,
+  onRetry,
   state,
   triggerId,
 }: {
   item: JavdbBrowseItem;
+  onRetry: () => void;
   state: JavdbPreviewState;
   triggerId: string;
 }) {
@@ -2604,7 +2607,7 @@ function JavdbPreviewDialog({
   };
   useEffect(() => {
     setSelectedImage(0);
-  }, [item.providerItemId]);
+  }, [item.providerItemId, state.status]);
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === "ArrowLeft") {
@@ -2665,6 +2668,10 @@ function JavdbPreviewDialog({
               <div>
                 <h3>{message?.heading}</h3>
                 <p>{message?.message}</p>
+                <Button onClick={onRetry} type="button" variant="outline">
+                  <AppIcon name="refresh" />
+                  Retry preview
+                </Button>
               </div>
             </div>
           ) : (
@@ -12318,6 +12325,21 @@ export default function App() {
     setJavdbPreviewRequestVersion((version) => version + 1);
   };
 
+  const retryJavdbPreview = () => {
+    if (
+      javdbPreviewContext === null ||
+      javdbPreviewState === null ||
+      javdbPreviewState.status === "loading" ||
+      javdbPreviewState.status === "ready" ||
+      javdbPreviewState.status === "no-preview"
+    ) {
+      return;
+    }
+    javdbPreviewRequestId.current += 1;
+    setJavdbPreviewState({ status: "loading" });
+    setJavdbPreviewRequestVersion((version) => version + 1);
+  };
+
   const invalidateAdultBrowseSurface = () => {
     closeJavdbDialogs();
     resetAdultReleaseComparison();
@@ -16434,6 +16456,7 @@ export default function App() {
         {javdbPreviewContext === null || javdbPreviewState === null ? null : (
           <JavdbPreviewDialog
             item={javdbPreviewContext.item}
+            onRetry={retryJavdbPreview}
             state={javdbPreviewState}
             triggerId={javdbPreviewContext.triggerId}
           />

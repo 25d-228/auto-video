@@ -10,6 +10,7 @@ use std::{
 #[cfg(unix)]
 use std::fs::File;
 
+use crate::library_scan::{is_supported_library_media, scan_library_files};
 use crate::vr_download::{
     with_unowned_tv_library_path, VrDownloadState, VrLibraryTrashOwnershipError,
 };
@@ -327,14 +328,6 @@ pub fn configured_tv_folder(state: &TvLibraryState) -> Result<Option<PathBuf>, &
         .lock()
         .map(|context| context.folder.clone())
         .map_err(|_| TV_FOLDER_STORAGE_FAILED)
-}
-
-fn is_supported_media(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("mp4") || extension.eq_ignore_ascii_case("mkv")
-        })
 }
 
 fn episode_component_end(bytes: &[u8], start: usize) -> Option<usize> {
@@ -889,47 +882,6 @@ fn write_tv_metadata_associations(
     result
 }
 
-fn collect_media_files(
-    folder: &Path,
-    directory: &Path,
-    files: &mut Vec<TrustedTvFile>,
-) -> io::Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-
-        if file_type.is_dir() {
-            collect_media_files(folder, &path, files)?;
-        } else if file_type.is_file() && is_supported_media(&path) {
-            let metadata = entry.metadata()?;
-            let canonical_path = fs::canonicalize(&path)?;
-            if canonical_path != path || !canonical_path.starts_with(folder) {
-                return Err(io::Error::other("TV file escaped its configured folder"));
-            }
-            let relative_path = path
-                .strip_prefix(folder)
-                .ok()
-                .and_then(Path::to_str)
-                .filter(|relative| !relative.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| io::Error::other("TV relative path is unavailable"))?;
-            let file_identity = movie_path_identity(&path, true)
-                .map_err(|_| io::Error::other("TV file identity is unavailable"))?;
-            files.push(TrustedTvFile {
-                path,
-                identity: parse_tv_relative_identity(&relative_path),
-                relative_path,
-                file_identity,
-                fingerprint: movie_file_fingerprint(&metadata),
-                size: metadata.len(),
-                modified: metadata.modified()?,
-            });
-        }
-    }
-    Ok(())
-}
-
 fn scan_media_files(folder: &Path) -> Result<(String, Vec<TrustedTvFile>), &'static str> {
     let canonical_folder = fs::canonicalize(folder).map_err(|_| TV_FOLDER_UNAVAILABLE)?;
     if canonical_folder != folder
@@ -940,9 +892,29 @@ fn scan_media_files(folder: &Path) -> Result<(String, Vec<TrustedTvFile>), &'sta
         return Err(TV_FOLDER_UNAVAILABLE);
     }
     let folder_identity = movie_path_identity(folder, false).map_err(|_| TV_LIBRARY_SCAN_FAILED)?;
-    let mut files = Vec::new();
-    collect_media_files(folder, folder, &mut files).map_err(|_| TV_LIBRARY_SCAN_FAILED)?;
-    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let files = scan_library_files(folder, |path, metadata| {
+        let canonical_path = fs::canonicalize(&path).ok()?;
+        if canonical_path != path || !canonical_path.starts_with(folder) {
+            return None;
+        }
+        let relative_path = path
+            .strip_prefix(folder)
+            .ok()
+            .and_then(Path::to_str)
+            .filter(|relative| !relative.is_empty())?
+            .to_owned();
+        let file_identity = movie_path_identity(&path, true).ok()?;
+        Some(TrustedTvFile {
+            path,
+            identity: parse_tv_relative_identity(&relative_path),
+            relative_path,
+            file_identity,
+            fingerprint: movie_file_fingerprint(&metadata),
+            size: metadata.len(),
+            modified: metadata.modified().ok()?,
+        })
+    })
+    .map_err(|_| TV_LIBRARY_SCAN_FAILED)?;
     Ok((folder_identity, files))
 }
 
@@ -1708,7 +1680,7 @@ fn validate_tv_file(
     if !metadata.is_file() {
         return Err(TvFileValidationError::NotFile);
     }
-    if !is_supported_media(requested_path) {
+    if !is_supported_library_media(requested_path) {
         return Err(TvFileValidationError::Unsupported);
     }
     let canonical_path =
@@ -2216,7 +2188,7 @@ mod tests {
             .expect("TV folder must be configured");
         scan_tv_library_with(&state).expect("scan must complete");
         let directory = fixture.path.join("directory.mkv");
-        let unsupported = fixture.path.join("unsupported.avi");
+        let unsupported = fixture.path.join("unsupported.txt");
         fs::create_dir(&directory).expect("directory must be created");
         fs::write(&unsupported, b"unsupported").expect("unsupported file must be written");
         let dispatched = Cell::new(false);
@@ -2252,7 +2224,7 @@ mod tests {
     #[test]
     fn file_actions_dispatch_only_the_exact_trusted_file_and_report_failures() {
         let fixture = Fixture::new("dispatch");
-        let movie = fixture.path.join("Show.S01E02.mp4");
+        let movie = fixture.path.join("Show.S01E02.MOV");
         fs::write(&movie, b"movie").expect("movie must be written");
         let state = TvLibraryState::default();
         set_tv_folder(&state, &fixture.path.join("config"), fixture.path.clone())
@@ -2292,7 +2264,7 @@ mod tests {
     #[test]
     fn trash_dispatches_one_exact_scanned_file_and_updates_state_only_after_success() {
         let fixture = Fixture::new("trash-exact");
-        let first = fixture.path.join("Show.S01E01.mp4");
+        let first = fixture.path.join("Show.S01E01.AVI");
         let sibling = fixture.path.join("Show.S01E02.mkv");
         let unassociated = fixture.path.join("Special feature.mp4");
         fs::write(&first, b"first").expect("first episode must be written");
@@ -2360,7 +2332,7 @@ mod tests {
         fs::write(&neighbor, b"neighbor").expect("neighbor must be written");
         let directory = trusted.path.join("directory.mkv");
         fs::create_dir(&directory).expect("directory must be created");
-        let unsupported = trusted.path.join("unsupported.avi");
+        let unsupported = trusted.path.join("unsupported.txt");
         fs::write(&unsupported, b"unsupported").expect("unsupported file must be written");
         fs::write(&changed, b"different content").expect("episode must change");
         fs::remove_file(&missing).expect("episode must be removed");

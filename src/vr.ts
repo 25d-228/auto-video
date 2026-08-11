@@ -1,3 +1,5 @@
+import { hasSupportedLibraryExtension } from "@/library-media";
+
 export type JavdbCatalogItem = {
   code: string;
   title: string | null;
@@ -210,6 +212,8 @@ const vrLibraryPartPattern =
   /(^|[^A-Za-z0-9])((?:part|pt|cd|disc|disk)[ _-]*0*([0-9]{1,4}))(?=$|[^A-Za-z0-9])/gi;
 const vrLibraryPartPrefixes = new Set(["PART", "PT", "CD", "DISC", "DISK"]);
 const javdbBaseUrl = "https://javdb.com";
+const javdbImageHost = "tp.cmastd.com";
+const javdbImageOrigin = `https://${javdbImageHost}`;
 const javdbVrTagId = "212";
 const javdbSourceAspectRatio = 1.48;
 const javdbProviderItemPattern = /^[A-Za-z0-9]{1,64}$/;
@@ -250,12 +254,17 @@ function javdbImageUrl(value: unknown) {
       ? null
       : undefined;
   }
+  if (
+    /[\s\\]/u.test(value) ||
+    !value.startsWith(`${javdbImageOrigin}/`)
+  ) {
+    return undefined;
+  }
   try {
     const url = new URL(value);
     if (
       url.protocol !== "https:" ||
-      !url.hostname.startsWith("tp.") ||
-      !url.hostname.endsWith(".com") ||
+      url.hostname !== javdbImageHost ||
       url.port !== "" ||
       url.username !== "" ||
       url.password !== ""
@@ -579,9 +588,13 @@ export async function fetchJavdbImageObjectUrl(
   category: JavdbBrowseCategory,
   sourceUrl: string,
 ) {
+  const acceptedSourceUrl = javdbImageUrl(sourceUrl);
+  if (acceptedSourceUrl === null || acceptedSourceUrl === undefined) {
+    throw new Error("JavDB returned an invalid image URL.");
+  }
   const value = await window.__TAURI__.core.invoke<unknown>(
     "fetch_javdb_image",
-    { category, sourceUrl },
+    { category, sourceUrl: acceptedSourceUrl },
   );
   if (
     !Array.isArray(value) ||
@@ -1213,7 +1226,7 @@ function parseVrLibrary(value: unknown): VrLibraryScan {
     }
     paths.add(path);
     const filename = vrFilename(path);
-    if (filename === "") {
+    if (filename === "" || !hasSupportedLibraryExtension(filename)) {
       throw new Error("The native VR Library scanner returned invalid data.");
     }
     const title = vrTitle(filename);

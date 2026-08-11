@@ -1,3 +1,5 @@
+import { hasSupportedLibraryExtension } from "@/library-media";
+
 export type TvFolderState =
   | { status: "unconfigured" }
   | { status: "ready"; path: string }
@@ -185,7 +187,6 @@ function parseTvLibrary(value: unknown): TvLibraryScan {
       ? (value.slice(index + 8, index + 16) as string[])
       : Array.from({ length: 8 }, () => "");
     const filename = exactFilename(relativePath);
-    const extension = filename?.slice(filename.lastIndexOf(".") + 1) ?? "";
     const unassociated = showTitle === "" && seasonText === "" && episodeText === "";
     const season = Number(seasonText);
     const episode = Number(episodeText);
@@ -194,7 +195,7 @@ function parseTvLibrary(value: unknown): TvLibraryScan {
       filename === null ||
       paths.has(path) ||
       relativePaths.has(relativePath) ||
-      !/^(?:mp4|mkv)$/i.test(extension) ||
+      !hasSupportedLibraryExtension(filename) ||
       !unsignedU64Pattern.test(sizeBytes) ||
       BigInt(sizeBytes) > maximumU64 ||
       (!unassociated &&
