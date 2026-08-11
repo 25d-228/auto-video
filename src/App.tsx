@@ -111,16 +111,23 @@ import {
 } from "@/tv-release";
 import {
   chooseTvFolder,
+  clearTvShowMetadataMatch,
   clearTvFolder,
+  invalidateTvShowMetadataContext,
   loadTvFolder,
   openTvFile,
   queryTvStorage,
   revealTvFile,
+  saveTvShowMetadataMatch,
   scanTvLibrary,
+  searchTvShowMetadata,
   trashTvFile,
+  verifyTvShowMetadataCandidate,
   type TvFolderState,
   type TvLibraryFile,
   type TvLibraryItem,
+  type TvShowMetadataAssociation,
+  type TvShowMetadataCandidate,
 } from "@/tv";
 import {
   applyVrOrganization,
@@ -304,14 +311,53 @@ type MovieMetadataFailureStatus = Exclude<
 >;
 type MovieMetadataMutationFailure = "stale" | "unavailable" | "persistence-failed";
 type MovieMetadataSaveState = "idle" | "saving" | MovieMetadataMutationFailure;
+type TvMetadataSearchState =
+  | { status: "ready"; matchingRequestId: string; candidates: TvShowMetadataCandidate[] }
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "empty" }
+  | { status: "unauthorized" }
+  | { status: "rate-limited" }
+  | { status: "network-error" }
+  | { status: "provider-error" }
+  | { status: "malformed-provider" }
+  | { status: "stale" };
+type TvMetadataVerificationState =
+  | { status: "idle" }
+  | { status: "loading"; candidateId: number }
+  | {
+      status: "ready";
+      verificationId: string;
+      association: TvShowMetadataAssociation;
+    }
+  | { status: "unauthorized" }
+  | { status: "rate-limited" }
+  | { status: "network-error" }
+  | { status: "provider-error" }
+  | { status: "malformed-provider" }
+  | { status: "stale" };
+type TvMetadataFailureStatus = Exclude<
+  TvMetadataSearchState["status"],
+  "idle" | "loading" | "ready" | "empty"
+>;
+type TvMetadataSaveState = "idle" | "saving" | MovieMetadataMutationFailure;
 type TvLibraryScanState =
   | { status: "loading" }
   | { status: "unconfigured" }
   | { status: "scanning" }
-  | { status: "empty"; generation: string }
+  | {
+      status: "empty";
+      generation: string;
+      metadataStatus: "ready" | "attention" | "unavailable";
+    }
   | { status: "unavailable" }
   | { status: "error" }
-  | { status: "ready"; generation: string; items: TvLibraryItem[] };
+  | {
+      status: "ready";
+      generation: string;
+      items: TvLibraryItem[];
+      metadataStatus: "ready" | "attention" | "unavailable";
+    };
 type VolumeStorageState =
   | { status: "unconfigured" }
   | { status: "loading" }
@@ -4366,6 +4412,347 @@ function MovieMetadataDetailsDialog({
   );
 }
 
+function TvMetadataMatchDialog({
+  item,
+  onClose,
+  onQueryChange,
+  onSave,
+  onSearch,
+  onSelectCandidate,
+  query,
+  saveState,
+  searchState,
+  triggerId,
+  verificationState,
+}: {
+  item: TvLibraryItem;
+  onClose: () => void;
+  onQueryChange: (query: string) => void;
+  onSave: () => void;
+  onSearch: () => void;
+  onSelectCandidate: (candidate: TvShowMetadataCandidate) => void;
+  query: string;
+  saveState: TvMetadataSaveState;
+  searchState: TvMetadataSearchState;
+  triggerId: string;
+  verificationState: TvMetadataVerificationState;
+}) {
+  const queryInput = useRef<HTMLInputElement | null>(null);
+  const isBusy =
+    searchState.status === "loading" ||
+    verificationState.status === "loading" ||
+    saveState === "saving";
+  const searchFailure = [
+    "unauthorized",
+    "rate-limited",
+    "network-error",
+    "provider-error",
+    "malformed-provider",
+    "stale",
+  ].includes(searchState.status)
+    ? tvMetadataFailureMessages[searchState.status as TvMetadataFailureStatus]
+    : null;
+  const verificationFailure = [
+    "unauthorized",
+    "rate-limited",
+    "network-error",
+    "provider-error",
+    "malformed-provider",
+    "stale",
+  ].includes(verificationState.status)
+    ? tvMetadataFailureMessages[
+        verificationState.status as TvMetadataFailureStatus
+      ]
+    : null;
+  return (
+    <Dialog.Root
+      onOpenChange={(open) => {
+        if (!open) {
+          onClose();
+        }
+      }}
+      open
+    >
+      <Dialog.Portal>
+        <Dialog.Backdrop className="movie-metadata__backdrop" />
+        <Dialog.Viewport className="movie-metadata__viewport">
+          <Dialog.Popup
+            aria-busy={isBusy}
+            className="movie-metadata__popup"
+            finalFocus={() => tvMetadataFocusTarget(triggerId)}
+            initialFocus={() => queryInput.current}
+          >
+            <div className="movie-metadata__heading">
+              <div>
+                <p className="card-eyebrow">Explicit TMDB TV show match</p>
+                <Dialog.Title>
+                  Match show metadata for {item.showTitle}
+                </Dialog.Title>
+              </div>
+              <Dialog.Close
+                render={
+                  <Button
+                    aria-label="Close show metadata matching"
+                    type="button"
+                    variant="ghost"
+                  >
+                    <AppIcon name="close" />
+                    Close
+                  </Button>
+                }
+              />
+            </div>
+            <Dialog.Description className="movie-metadata__description">
+              Search does not select a result or change local episodes. Choose
+              one exact TMDB TV show manually, verify its canonical IMDb series
+              identity, then save the show-level match.
+            </Dialog.Description>
+            <form
+              aria-label="Search TMDB TV show metadata"
+              className="movie-metadata__search"
+              onSubmit={(event) => {
+                event.preventDefault();
+                onSearch();
+              }}
+            >
+              <label htmlFor="tv-show-metadata-query">TV show title query</label>
+              <div>
+                <input
+                  disabled={isBusy}
+                  id="tv-show-metadata-query"
+                  onChange={(event) => onQueryChange(event.target.value)}
+                  ref={queryInput}
+                  type="text"
+                  value={query}
+                />
+                <Button disabled={isBusy || query.trim() === ""} type="submit">
+                  <AppIcon name="search" />
+                  {searchState.status === "loading"
+                    ? "Searching…"
+                    : "Search TMDB TV shows"}
+                </Button>
+              </div>
+            </form>
+            {searchState.status === "empty" ? (
+              <p className="movie-metadata__notice" role="status">
+                No TMDB TV shows matched this exact query. No show was selected.
+              </p>
+            ) : null}
+            {searchFailure === null ? null : (
+              <p className="movie-metadata__error" role="alert">
+                {searchFailure}
+              </p>
+            )}
+            {searchState.status === "ready" ? (
+              <section aria-labelledby="tv-show-metadata-results-heading">
+                <h3 id="tv-show-metadata-results-heading">
+                  TMDB TV show candidates
+                </h3>
+                <p aria-atomic="true" role="status">
+                  {searchState.candidates.length}{" "}
+                  {searchState.candidates.length === 1
+                    ? "TMDB TV show candidate was found"
+                    : "TMDB TV show candidates were found"}
+                  . No candidate was selected automatically.
+                </p>
+                <ul
+                  aria-label="TMDB TV show metadata candidates"
+                  className="movie-metadata__candidates"
+                >
+                  {searchState.candidates.map((candidate) => (
+                    <li key={candidate.tmdbTvId}>
+                      <button
+                        aria-label={`Select TMDB TV show: ${candidate.name}${candidate.firstAirDate === null ? "" : ` (${candidate.firstAirDate.slice(0, 4)})`}`}
+                        disabled={isBusy}
+                        onClick={() => onSelectCandidate(candidate)}
+                        type="button"
+                      >
+                        <span>
+                          <strong>{candidate.name}</strong>
+                          {candidate.originalName === null ||
+                          candidate.originalName === candidate.name ? null : (
+                            <span>Original name: {candidate.originalName}</span>
+                          )}
+                        </span>
+                        <span>
+                          {candidate.firstAirDate ?? "First-air date unavailable"}
+                          {` · TMDB ${candidate.tmdbTvId}`}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+            {verificationState.status === "loading" ? (
+              <p className="movie-metadata__notice" role="status">
+                Verifying the exact TMDB TV show and canonical IMDb series
+                identity…
+              </p>
+            ) : null}
+            {verificationFailure === null ? null : (
+              <p className="movie-metadata__error" role="alert">
+                {verificationFailure}
+              </p>
+            )}
+            {verificationState.status === "ready" ? (
+              <section
+                aria-labelledby="tv-show-metadata-verified-heading"
+                className="movie-metadata__verified"
+              >
+                <h3 id="tv-show-metadata-verified-heading">
+                  Verified show metadata match
+                </h3>
+                <dl>
+                  <div><dt>TMDB name</dt><dd>{verificationState.association.name}</dd></div>
+                  <div><dt>TMDB TV show</dt><dd>{verificationState.association.tmdbTvId}</dd></div>
+                  <div><dt>Canonical IMDb series ID</dt><dd>{verificationState.association.imdbId}</dd></div>
+                </dl>
+                {saveState === "idle" || saveState === "saving" ? null : (
+                  <p className="movie-metadata__error" role="alert">
+                    {tvMetadataSaveFailureMessages[saveState]}
+                  </p>
+                )}
+                <Button
+                  disabled={saveState === "saving"}
+                  onClick={onSave}
+                  type="button"
+                >
+                  <AppIcon name="details" />
+                  {saveState === "saving"
+                    ? "Saving show metadata match…"
+                    : "Save show metadata match"}
+                </Button>
+              </section>
+            ) : null}
+          </Dialog.Popup>
+        </Dialog.Viewport>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+function TvMetadataDetailsDialog({
+  clearState,
+  item,
+  onClear,
+  onClose,
+  triggerId,
+}: {
+  clearState: "idle" | "clearing" | MovieMetadataMutationFailure;
+  item: TvLibraryItem;
+  onClear: () => void;
+  onClose: () => void;
+  triggerId: string;
+}) {
+  const [posterUnavailable, setPosterUnavailable] = useState(false);
+  const association = item.association ?? null;
+  if (association === null) {
+    return null;
+  }
+  return (
+    <Dialog.Root
+      onOpenChange={(open) => {
+        if (!open && clearState !== "clearing") {
+          onClose();
+        }
+      }}
+      open
+    >
+      <Dialog.Portal>
+        <Dialog.Backdrop className="movie-metadata__backdrop" />
+        <Dialog.Viewport className="movie-metadata__viewport">
+          <Dialog.Popup
+            aria-busy={clearState === "clearing"}
+            className="movie-metadata__popup"
+            finalFocus={() => tvMetadataFocusTarget(triggerId)}
+          >
+            <div className="movie-metadata__heading">
+              <div>
+                <p className="card-eyebrow">Accepted TMDB show metadata</p>
+                <Dialog.Title>{association.name}</Dialog.Title>
+              </div>
+              <Dialog.Close
+                render={
+                  <Button disabled={clearState === "clearing"} type="button" variant="ghost">
+                    <AppIcon name="close" />
+                    Close
+                  </Button>
+                }
+              />
+            </div>
+            <Dialog.Description className="movie-metadata__description">
+              Provider show metadata is separate from the exact local grouping
+              and episode files.
+            </Dialog.Description>
+            <div className="movie-metadata__details">
+              {association.posterPath === null || posterUnavailable ? (
+                <div className="movie-metadata__poster-unavailable">
+                  <AppIcon name="poster" />
+                  Poster unavailable
+                </div>
+              ) : (
+                <img
+                  alt={`TMDB poster for ${association.name}`}
+                  onError={() => setPosterUnavailable(true)}
+                  src={tmdbPosterUrl(association.posterPath)}
+                />
+              )}
+              <div>
+                <dl>
+                  <div><dt>Source</dt><dd>TMDB</dd></div>
+                  <div><dt>Accepted show name</dt><dd>{association.name}</dd></div>
+                  {association.originalName === null ? null : (
+                    <div><dt>Original name</dt><dd>{association.originalName}</dd></div>
+                  )}
+                  {association.firstAirDate === null ? null : (
+                    <div><dt>First-air date</dt><dd>{association.firstAirDate}</dd></div>
+                  )}
+                  <div><dt>Canonical IMDb series ID</dt><dd>{association.imdbId}</dd></div>
+                  <div><dt>Exact local show title</dt><dd>{item.showTitle}</dd></div>
+                </dl>
+                {association.overview === null ? null : (
+                  <section className="movie-metadata__overview">
+                    <h3>Overview</h3>
+                    <p>{association.overview}</p>
+                  </section>
+                )}
+                <section className="movie-metadata__overview">
+                  <h3>Current local members</h3>
+                  <ul aria-label={`Current local members for ${item.showTitle}`}>
+                    {item.files.map((file) => (
+                      <li key={file.path}>{file.relativePath}</li>
+                    ))}
+                  </ul>
+                </section>
+              </div>
+            </div>
+            {clearState === "idle" || clearState === "clearing" ? null : (
+              <p className="movie-metadata__error" role="alert">
+                {tvMetadataClearFailureMessages[clearState]}
+              </p>
+            )}
+            <div className="movie-metadata__dialog-actions">
+              <Button
+                aria-label="Clear show metadata match"
+                disabled={clearState === "clearing"}
+                onClick={onClear}
+                type="button"
+                variant="outline"
+              >
+                <AppIcon name="close" />
+                {clearState === "clearing"
+                  ? "Clearing show metadata match…"
+                  : "Clear show metadata match"}
+              </Button>
+            </div>
+          </Dialog.Popup>
+        </Dialog.Viewport>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
 function LibraryMovieCard({
   folder,
   movie,
@@ -5294,21 +5681,47 @@ function TvLibraryFileRow({
 
 function TvLibraryCard({
   item,
+  metadataActionsDisabled,
+  onMatchMetadata,
   onFileTrashed,
   onTrashPendingChange,
+  onViewMetadataDetails,
   scanGeneration,
   trashActionsDisabled,
   trashPendingPath,
 }: {
   item: TvLibraryItem;
+  metadataActionsDisabled: boolean;
+  onMatchMetadata: (item: TvLibraryItem, triggerId: string) => void;
   onFileTrashed: (file: TvLibraryFile, scanGeneration: string) => void;
   onTrashPendingChange: (path: string | null) => void;
+  onViewMetadataDetails: (item: TvLibraryItem, triggerId: string) => void;
   scanGeneration: string;
   trashActionsDisabled: boolean;
   trashPendingPath: string | null;
 }) {
+  const metadataTriggerId = useId();
+  const [posterUnavailable, setPosterUnavailable] = useState(false);
+
+  useEffect(() => {
+    setPosterUnavailable(false);
+  }, [item.association?.generation, item.association?.posterPath]);
+
   return (
     <article className="movie-card vr-library-card tv-library-card">
+      <div className="movie-card__header">
+        <span className="movie-card__icon">
+          {item.association?.posterPath == null || posterUnavailable ? (
+            <AppIcon name="tv" />
+          ) : (
+            <img
+              alt=""
+              onError={() => setPosterUnavailable(true)}
+              src={tmdbPosterUrl(item.association.posterPath)}
+            />
+          )}
+        </span>
+      </div>
       <div className="media-title-row">
         <div>
           <p className="card-eyebrow">
@@ -5317,9 +5730,51 @@ function TvLibraryCard({
               : `${item.files.length} ${item.files.length === 1 ? "episode" : "episodes"}`}
           </p>
           <h3>{item.title}</h3>
+          {item.association == null ? null : (
+            <p className="movie-card__metadata-line">
+              TMDB
+              {item.association.firstAirDate === null
+                ? ""
+                : ` · ${item.association.firstAirDate.slice(0, 4)}`}
+            </p>
+          )}
         </div>
-        <CopyTitleAction title={item.title} />
+        <div className="movie-card__title-actions">
+          <CopyTitleAction title={item.title} />
+          {item.groupId === undefined || item.showTitle === null ? null : item.association == null ? (
+            <Button
+              aria-label={`Match show metadata: ${item.showTitle}`}
+              disabled={metadataActionsDisabled || item.metadataState === "attention"}
+              id={metadataTriggerId}
+              onClick={() => onMatchMetadata(item, metadataTriggerId)}
+              size="icon-xs"
+              title="Match show metadata"
+              type="button"
+              variant="outline"
+            >
+              <AppIcon name="search" />
+            </Button>
+          ) : (
+            <Button
+              aria-label={`View show metadata details: ${item.title}`}
+              disabled={metadataActionsDisabled}
+              id={metadataTriggerId}
+              onClick={() => onViewMetadataDetails(item, metadataTriggerId)}
+              size="icon-xs"
+              title="View show metadata details"
+              type="button"
+              variant="outline"
+            >
+              <AppIcon name="details" />
+            </Button>
+          )}
+        </div>
       </div>
+      {item.metadataState === "attention" ? (
+        <p className="movie-metadata__error" role="alert">
+          The saved show association no longer matches its trusted local member anchors. Local episodes remain available without enrichment.
+        </p>
+      ) : null}
       <ul
         aria-label={
           item.showTitle === null
@@ -6416,6 +6871,71 @@ function movieMetadataFocusTarget(triggerId: string) {
   return refresh instanceof HTMLElement && refresh.isConnected ? refresh : null;
 }
 
+function tvMetadataFailureStatus(error: unknown): TvMetadataFailureStatus {
+  switch (nativeErrorCode(error)) {
+    case "tv_metadata_tmdb_unauthorized":
+      return "unauthorized";
+    case "tv_metadata_tmdb_rate_limited":
+      return "rate-limited";
+    case "tv_metadata_tmdb_network_error":
+      return "network-error";
+    case "tv_metadata_malformed_provider":
+      return "malformed-provider";
+    case "tv_metadata_context_invalid":
+    case "tv_metadata_stale":
+      return "stale";
+    default:
+      return "provider-error";
+  }
+}
+
+const tvMetadataFailureMessages: Record<TvMetadataFailureStatus, string> = {
+  unauthorized: "The saved TMDB token is unavailable or was not accepted.",
+  "rate-limited": "TMDB is rate-limiting metadata requests. Retry later.",
+  "network-error": "TMDB could not be reached. The local TV show remains available.",
+  "provider-error": "TMDB could not complete this show metadata request.",
+  "malformed-provider":
+    "TMDB returned invalid or conflicting TV show identity data.",
+  stale: "This TV show, folder, token, or matching request is no longer current.",
+};
+
+const tvMetadataSaveFailureMessages: Record<
+  MovieMetadataMutationFailure,
+  string
+> = {
+  stale:
+    "This TV show or verified metadata context is no longer current. The local show remains unchanged.",
+  unavailable:
+    "TV show metadata storage is unavailable. The association was not saved and the local show remains unchanged.",
+  "persistence-failed":
+    "The exact show metadata association could not be persisted. The local show remains unchanged.",
+};
+
+const tvMetadataClearFailureMessages: Record<
+  MovieMetadataMutationFailure,
+  string
+> = {
+  stale:
+    "This TV show or metadata association is no longer current. The local files and existing association remain unchanged.",
+  unavailable:
+    "TV show metadata storage is unavailable. The existing association and local files remain unchanged.",
+  "persistence-failed":
+    "The show metadata removal could not be persisted. The existing association and local files remain unchanged.",
+};
+
+function tvMetadataFocusTarget(triggerId: string) {
+  const trigger = document.getElementById(triggerId);
+  if (trigger instanceof HTMLElement && trigger.isConnected) {
+    return trigger;
+  }
+  const search = document.getElementById("tv-library-title-search");
+  if (search instanceof HTMLElement && search.isConnected) {
+    return search;
+  }
+  const refresh = document.getElementById("tv-library-refresh");
+  return refresh instanceof HTMLElement && refresh.isConnected ? refresh : null;
+}
+
 function downloadStartError(
   error: unknown,
   category: "Adult" | "Movie" | "TV" | "VR",
@@ -6493,6 +7013,32 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   });
   const [tvLibraryScanState, setTvLibraryScanState] =
     useState<TvLibraryScanState>({ status: "loading" });
+  const [tvMetadataContext, setTvMetadataContext] = useState<{
+    groupId: string;
+    triggerId: string;
+  } | null>(null);
+  const [tvMetadataQuery, setTvMetadataQuery] = useState("");
+  const [tvMetadataSearchState, setTvMetadataSearchState] =
+    useState<TvMetadataSearchState>({ status: "idle" });
+  const [tvMetadataVerificationState, setTvMetadataVerificationState] =
+    useState<TvMetadataVerificationState>({ status: "idle" });
+  const [tvMetadataSaveState, setTvMetadataSaveState] =
+    useState<TvMetadataSaveState>("idle");
+  const [tvMetadataAnnouncement, setTvMetadataAnnouncement] = useState<
+    string | null
+  >(null);
+  const [tvMetadataClearState, setTvMetadataClearState] = useState<{
+    groupId: string;
+    status: "clearing" | MovieMetadataMutationFailure;
+  } | null>(null);
+  const [tvMetadataDetailsContext, setTvMetadataDetailsContext] = useState<{
+    groupId: string;
+    triggerId: string;
+  } | null>(null);
+  const [tvMetadataFocusRequest, setTvMetadataFocusRequest] = useState<{
+    generation: number;
+    triggerId: string;
+  } | null>(null);
   const [tvLibraryRefreshVersion, setTvLibraryRefreshVersion] = useState(0);
   const [tvStorageRefreshVersion, setTvStorageRefreshVersion] = useState(0);
   const [tvStorageState, setTvStorageState] = useState<VolumeStorageState>({
@@ -6795,6 +7341,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const movieMetadataVerificationPending = useRef(false);
   const movieMetadataSavePending = useRef(false);
   const movieMetadataClearPending = useRef(false);
+  const tvMetadataRequestId = useRef(0);
+  const tvMetadataSearchPending = useRef(false);
+  const tvMetadataVerificationPending = useRef(false);
+  const tvMetadataSavePending = useRef(false);
+  const tvMetadataClearPending = useRef(false);
   const storageRequestId = useRef(0);
   const discoverRequestId = useRef(0);
   const movieDetailsRequestId = useRef(0);
@@ -7275,12 +7826,12 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     setTvLibraryScanState({ status: "scanning" });
     void scanTvLibrary()
-      .then(({ generation, items }) => {
+      .then(({ generation, items, metadataStatus = "ready" }) => {
         if (requestId === tvLibraryScanRequestId.current) {
           setTvLibraryScanState(
             items.length === 0
-              ? { status: "empty", generation }
-              : { status: "ready", generation, items },
+              ? { status: "empty", generation, metadataStatus }
+              : { status: "ready", generation, items, metadataStatus },
           );
         }
       })
@@ -8322,8 +8873,17 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     const remainingItems = removeTvLibraryFile(currentScan.items, file.path);
     const localState: TvLibraryScanState =
       remainingItems.length === 0
-        ? { status: "empty", generation: scanGeneration }
-        : { status: "ready", generation: scanGeneration, items: remainingItems };
+        ? {
+            status: "empty",
+            generation: scanGeneration,
+            metadataStatus: currentScan.metadataStatus,
+          }
+        : {
+            status: "ready",
+            generation: scanGeneration,
+            items: remainingItems,
+            metadataStatus: currentScan.metadataStatus,
+          };
     currentTvLibraryScanState.current = localState;
     setTvLibraryScanState(localState);
     setTvTrashAnnouncement(
@@ -8358,11 +8918,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
               ? {
                   status: "empty",
                   generation: scanResult.value.generation,
+                  metadataStatus: scanResult.value.metadataStatus ?? "ready",
                 }
               : {
                   status: "ready",
                   generation: scanResult.value.generation,
                   items: reconciledItems,
+                  metadataStatus: scanResult.value.metadataStatus ?? "ready",
                 };
           currentTvLibraryScanState.current = reconciledState;
           setTvLibraryScanState(reconciledState);
@@ -8417,11 +8979,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     let needsAttention = false;
     if (scanResult.status === "fulfilled") {
-      const { generation, items } = scanResult.value;
+      const { generation, items, metadataStatus = "ready" } = scanResult.value;
       const reconciledState: TvLibraryScanState =
         items.length === 0
-          ? { status: "empty", generation }
-          : { status: "ready", generation, items };
+          ? { status: "empty", generation, metadataStatus }
+          : { status: "ready", generation, items, metadataStatus };
       currentTvLibraryScanState.current = reconciledState;
       setTvLibraryScanState(reconciledState);
     } else {
@@ -9672,6 +10234,381 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     movieMetadataFocusTarget(movieMetadataFocusRequest.triggerId)?.focus();
     setMovieMetadataFocusRequest(null);
   }, [movieMetadataFocusRequest]);
+
+  const currentTvItemByGroupId = (groupId: string) => {
+    const current = currentTvLibraryScanState.current;
+    return current.status === "ready"
+      ? (current.items.find((item) => item.groupId === groupId) ?? null)
+      : null;
+  };
+
+  const resetTvMetadataContext = ({
+    closeDetails = true,
+    closeMatch = true,
+    invalidateNative = true,
+    restoreFocus = false,
+  }: {
+    closeDetails?: boolean;
+    closeMatch?: boolean;
+    invalidateNative?: boolean;
+    restoreFocus?: boolean;
+  } = {}) => {
+    const contextGeneration = ++tvMetadataRequestId.current;
+    const triggerId =
+      tvMetadataContext?.triggerId ?? tvMetadataDetailsContext?.triggerId;
+    tvMetadataSearchPending.current = false;
+    tvMetadataVerificationPending.current = false;
+    tvMetadataSavePending.current = false;
+    tvMetadataClearPending.current = false;
+    if (closeMatch) {
+      setTvMetadataContext(null);
+    }
+    setTvMetadataSearchState({ status: "idle" });
+    setTvMetadataVerificationState({ status: "idle" });
+    setTvMetadataSaveState("idle");
+    setTvMetadataClearState(null);
+    if (closeDetails) {
+      setTvMetadataDetailsContext(null);
+    }
+    if (restoreFocus && triggerId !== undefined) {
+      setTvMetadataFocusRequest({
+        generation: contextGeneration,
+        triggerId,
+      });
+    }
+    if (invalidateNative) {
+      void invalidateTvShowMetadataContext(contextGeneration).catch(
+        () => undefined,
+      );
+    }
+  };
+
+  const closeTvMetadataMatch = () => {
+    resetTvMetadataContext({ restoreFocus: true });
+  };
+
+  const openTvMetadataMatch = (item: TvLibraryItem, triggerId: string) => {
+    if (
+      item.groupId === undefined ||
+      item.showTitle === null ||
+      item.association != null
+    ) {
+      return;
+    }
+    tvMetadataRequestId.current += 1;
+    tvMetadataSearchPending.current = false;
+    tvMetadataVerificationPending.current = false;
+    tvMetadataSavePending.current = false;
+    tvMetadataClearPending.current = false;
+    setTvMetadataAnnouncement(null);
+    setTvMetadataDetailsContext(null);
+    setTvMetadataClearState(null);
+    setTvMetadataContext({ groupId: item.groupId, triggerId });
+    setTvMetadataQuery(item.showTitle);
+    setTvMetadataSearchState({ status: "idle" });
+    setTvMetadataVerificationState({ status: "idle" });
+    setTvMetadataSaveState("idle");
+  };
+
+  const updateTvMetadataQuery = (query: string) => {
+    setTvMetadataQuery(query);
+    if (
+      tvMetadataSearchState.status !== "idle" ||
+      tvMetadataVerificationState.status !== "idle" ||
+      tvMetadataSaveState !== "idle" ||
+      tvMetadataSearchPending.current ||
+      tvMetadataVerificationPending.current ||
+      tvMetadataSavePending.current
+    ) {
+      resetTvMetadataContext({ closeMatch: false });
+    }
+  };
+
+  const runTvMetadataSearch = async () => {
+    if (
+      tvMetadataContext === null ||
+      tvMetadataQuery.trim() === "" ||
+      tvMetadataSearchPending.current
+    ) {
+      return;
+    }
+    const requestId = ++tvMetadataRequestId.current;
+    const groupId = tvMetadataContext.groupId;
+    tvMetadataSearchPending.current = true;
+    setTvMetadataSearchState({ status: "loading" });
+    setTvMetadataVerificationState({ status: "idle" });
+    setTvMetadataSaveState("idle");
+    try {
+      const result = await searchTvShowMetadata(
+        groupId,
+        tvMetadataQuery,
+        requestId,
+      );
+      if (
+        requestId !== tvMetadataRequestId.current ||
+        tvMetadataContext.groupId !== groupId
+      ) {
+        return;
+      }
+      setTvMetadataSearchState(
+        result.candidates.length === 0
+          ? { status: "empty" }
+          : { status: "ready", ...result },
+      );
+    } catch (error: unknown) {
+      if (requestId === tvMetadataRequestId.current) {
+        setTvMetadataSearchState({
+          status: tvMetadataFailureStatus(error),
+        });
+      }
+    } finally {
+      if (requestId === tvMetadataRequestId.current) {
+        tvMetadataSearchPending.current = false;
+      }
+    }
+  };
+
+  const selectTvMetadataCandidate = async (
+    candidate: TvShowMetadataCandidate,
+  ) => {
+    if (
+      tvMetadataContext === null ||
+      tvMetadataSearchState.status !== "ready" ||
+      tvMetadataVerificationPending.current
+    ) {
+      return;
+    }
+    const requestId = ++tvMetadataRequestId.current;
+    const groupId = tvMetadataContext.groupId;
+    const matchingRequestId = tvMetadataSearchState.matchingRequestId;
+    tvMetadataVerificationPending.current = true;
+    setTvMetadataVerificationState({
+      status: "loading",
+      candidateId: candidate.tmdbTvId,
+    });
+    setTvMetadataSaveState("idle");
+    try {
+      const verified = await verifyTvShowMetadataCandidate(
+        matchingRequestId,
+        candidate.tmdbTvId,
+        requestId,
+      );
+      if (
+        requestId !== tvMetadataRequestId.current ||
+        tvMetadataContext.groupId !== groupId
+      ) {
+        return;
+      }
+      setTvMetadataVerificationState({ status: "ready", ...verified });
+    } catch (error: unknown) {
+      if (requestId === tvMetadataRequestId.current) {
+        setTvMetadataVerificationState({
+          status: tvMetadataFailureStatus(error),
+        });
+      }
+    } finally {
+      if (requestId === tvMetadataRequestId.current) {
+        tvMetadataVerificationPending.current = false;
+      }
+    }
+  };
+
+  const persistTvMetadataMatch = async () => {
+    if (
+      tvMetadataContext === null ||
+      tvMetadataVerificationState.status !== "ready" ||
+      tvMetadataSavePending.current
+    ) {
+      return;
+    }
+    const requestId = ++tvMetadataRequestId.current;
+    const groupId = tvMetadataContext.groupId;
+    const verificationId = tvMetadataVerificationState.verificationId;
+    tvMetadataSavePending.current = true;
+    setTvMetadataSaveState("saving");
+    try {
+      const association = await saveTvShowMetadataMatch(verificationId);
+      if (requestId !== tvMetadataRequestId.current) {
+        return;
+      }
+      setTvLibraryScanState((current) => {
+        if (current.status !== "ready") {
+          return current;
+        }
+        const updated: TvLibraryScanState = {
+          ...current,
+          items: current.items.map((item) =>
+            item.groupId === groupId
+              ? {
+                  ...item,
+                  association,
+                  metadataState: "ready",
+                  title: association.name,
+                }
+              : item,
+          ),
+        };
+        currentTvLibraryScanState.current = updated;
+        return updated;
+      });
+      setTvMetadataAnnouncement(
+        `${association.name} metadata was matched to the exact local TV show. No episode identity was added or changed.`,
+      );
+      resetTvMetadataContext({
+        invalidateNative: false,
+        restoreFocus: true,
+      });
+    } catch (error: unknown) {
+      if (requestId === tvMetadataRequestId.current) {
+        setTvMetadataSaveState(movieMetadataMutationFailure(error));
+      }
+    } finally {
+      if (requestId === tvMetadataRequestId.current) {
+        tvMetadataSavePending.current = false;
+      }
+    }
+  };
+
+  const openTvMetadataDetails = (item: TvLibraryItem, triggerId: string) => {
+    if (item.groupId === undefined || item.association == null) {
+      return;
+    }
+    tvMetadataRequestId.current += 1;
+    tvMetadataSearchPending.current = false;
+    tvMetadataVerificationPending.current = false;
+    tvMetadataSavePending.current = false;
+    tvMetadataClearPending.current = false;
+    setTvMetadataContext(null);
+    setTvMetadataSearchState({ status: "idle" });
+    setTvMetadataVerificationState({ status: "idle" });
+    setTvMetadataSaveState("idle");
+    setTvMetadataClearState(null);
+    setTvMetadataDetailsContext({ groupId: item.groupId, triggerId });
+  };
+
+  const closeTvMetadataDetails = () => {
+    resetTvMetadataContext({ restoreFocus: true });
+  };
+
+  const clearCurrentTvMetadata = async () => {
+    if (
+      tvMetadataDetailsContext === null ||
+      tvMetadataClearPending.current
+    ) {
+      return;
+    }
+    const groupId = tvMetadataDetailsContext.groupId;
+    const current = currentTvItemByGroupId(groupId);
+    if (current?.association == null) {
+      return;
+    }
+    const requestId = ++tvMetadataRequestId.current;
+    const clearedTitle = current.association.name;
+    tvMetadataClearPending.current = true;
+    setTvMetadataClearState({ groupId, status: "clearing" });
+    try {
+      await clearTvShowMetadataMatch(groupId);
+      if (requestId !== tvMetadataRequestId.current) {
+        return;
+      }
+      setTvLibraryScanState((scan) => {
+        if (scan.status !== "ready") {
+          return scan;
+        }
+        const updated: TvLibraryScanState = {
+          ...scan,
+          items: scan.items.map((item) =>
+            item.groupId === groupId
+              ? {
+                  ...item,
+                  association: null,
+                  metadataState: "ready",
+                  title: item.showTitle ?? item.title,
+                }
+              : item,
+          ),
+        };
+        currentTvLibraryScanState.current = updated;
+        return updated;
+      });
+      setTvMetadataAnnouncement(
+        `${clearedTitle} show metadata was cleared. Local episode files and identities were not changed.`,
+      );
+      resetTvMetadataContext({
+        invalidateNative: false,
+        restoreFocus: true,
+      });
+    } catch (error: unknown) {
+      if (requestId === tvMetadataRequestId.current) {
+        setTvMetadataClearState({
+          groupId,
+          status: movieMetadataMutationFailure(error),
+        });
+      }
+    } finally {
+      if (requestId === tvMetadataRequestId.current) {
+        tvMetadataClearPending.current = false;
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (
+      (tvMetadataContext !== null || tvMetadataDetailsContext !== null) &&
+      (activeDestination.id !== "library" || libraryCategory !== "tv")
+    ) {
+      resetTvMetadataContext();
+    }
+    // Navigation changes are the invalidation boundary; the reset reads the current dialog context.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeDestination.id,
+    libraryCategory,
+    tvMetadataContext,
+    tvMetadataDetailsContext,
+  ]);
+
+  useEffect(() => {
+    if (tvMetadataContext !== null || tvMetadataDetailsContext !== null) {
+      resetTvMetadataContext({ restoreFocus: true });
+    }
+    // Folder, token, and fresh-scan changes invalidate exact native group/provider authority.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tvFolderState, tmdbToken, tvLibraryRefreshVersion]);
+
+  useEffect(() => {
+    if (
+      tvLibraryScanState.status !== "ready" &&
+      tvLibraryScanState.status !== "empty"
+    ) {
+      return;
+    }
+    const currentGroupIds = new Set(
+      tvLibraryScanState.status === "ready"
+        ? tvLibraryScanState.items.flatMap((item) =>
+            item.groupId === undefined ? [] : [item.groupId],
+          )
+        : [],
+    );
+    if (
+      (tvMetadataContext !== null &&
+        !currentGroupIds.has(tvMetadataContext.groupId)) ||
+      (tvMetadataDetailsContext !== null &&
+        !currentGroupIds.has(tvMetadataDetailsContext.groupId))
+    ) {
+      resetTvMetadataContext({ restoreFocus: true });
+    }
+    // Trusted scan and Trash reconciliation can replace an exact local group independently.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tvLibraryScanState, tvMetadataContext, tvMetadataDetailsContext]);
+
+  useEffect(() => {
+    if (tvMetadataFocusRequest === null) {
+      return;
+    }
+    tvMetadataFocusTarget(tvMetadataFocusRequest.triggerId)?.focus();
+    setTvMetadataFocusRequest(null);
+  }, [tvMetadataFocusRequest]);
 
   const refreshMovies = () => {
     if (moviesFolder === null) {
@@ -11059,12 +11996,25 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       : tvLibraryScanMessages[tvLibraryScanState.status];
   const completeTvLibraryItems =
     tvLibraryScanState.status === "ready" ? tvLibraryScanState.items : [];
+  const tvMetadataItem =
+    tvMetadataContext === null
+      ? null
+      : (completeTvLibraryItems.find(
+          (item) => item.groupId === tvMetadataContext.groupId,
+        ) ?? null);
+  const tvMetadataDetailsItem =
+    tvMetadataDetailsContext === null
+      ? null
+      : (completeTvLibraryItems.find(
+          (item) => item.groupId === tvMetadataDetailsContext.groupId,
+        ) ?? null);
   const tvLibrarySearch = tvLibrarySearchQuery.toLowerCase();
   const isTvLibrarySearchActive = tvLibrarySearchQuery.trim() !== "";
   const matchingTvLibraryItems = isTvLibrarySearchActive
     ? completeTvLibraryItems.filter(
         (item) =>
           item.title.toLowerCase().includes(tvLibrarySearch) ||
+          (item.showTitle?.toLowerCase().includes(tvLibrarySearch) ?? false) ||
           item.files.some((file) =>
             file.filename.toLowerCase().includes(tvLibrarySearch),
           ),
@@ -11506,6 +12456,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           libraryCategory !== "movies" ? null : (
             <p aria-atomic="true" className="library-action-status" role="status">
               {movieMetadataAnnouncement}
+            </p>
+          )}
+          {tvMetadataAnnouncement === null ||
+          activeDestination.id !== "library" ||
+          libraryCategory !== "tv" ? null : (
+            <p aria-atomic="true" className="library-action-status" role="status">
+              {tvMetadataAnnouncement}
             </p>
           )}
 
@@ -12709,6 +13666,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         tvOrganizationReconciliationState === "pending" ||
                         tvTrashPendingPath !== null
                       }
+                      id="tv-library-refresh"
                       onClick={refreshTvLibrary}
                       type="button"
                       variant="outline"
@@ -13095,6 +14053,23 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
               ) : libraryCategory === "tv" ? (
                 tvLibraryScanState.status === "ready" ? (
                   <>
+                    {tvLibraryScanState.metadataStatus === "ready" ? null : (
+                      <div className="library-action-attention" role="alert">
+                        <p>
+                          {tvLibraryScanState.metadataStatus === "attention"
+                            ? "TV show metadata associations are invalid or conflicting. Local groups and file actions remain available without enrichment."
+                            : "TV show metadata associations could not be read. Local groups and exact file actions remain available."}
+                        </p>
+                        <Button
+                          onClick={refreshTvLibrary}
+                          type="button"
+                          variant="outline"
+                        >
+                          <AppIcon name="refresh" />
+                          Retry metadata
+                        </Button>
+                      </div>
+                    )}
                     <p
                       aria-atomic="true"
                       aria-live="polite"
@@ -13130,8 +14105,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         renderItem={(item) => (
                           <TvLibraryCard
                             item={item}
+                            metadataActionsDisabled={
+                              tvLibraryScanState.metadataStatus !== "ready"
+                            }
+                            onMatchMetadata={openTvMetadataMatch}
                             onFileTrashed={recordTrashedTvFile}
                             onTrashPendingChange={setTvTrashPendingPath}
+                            onViewMetadataDetails={openTvMetadataDetails}
                             scanGeneration={tvLibraryScanState.generation}
                             trashActionsDisabled={
                               tvTrashReconciliationState !== null
@@ -13422,8 +14402,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   <div>
                     <h2 id="tmdb-token-heading">TMDB API Read Access Token</h2>
                     <p>
-                      Save one token locally for Discover Movies. The saved
-                      value is never shown.
+                      Save one token locally for Discover and explicit Movie
+                      or TV Library metadata matching. The saved value is never
+                      shown.
                     </p>
                   </div>
                 </div>
@@ -14035,6 +15016,39 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           onClear={() => void clearCurrentMovieMetadata()}
           onClose={closeMovieMetadataDetails}
           triggerId={movieMetadataDetailsContext.triggerId}
+        />
+      )}
+      {tvMetadataItem === null || tvMetadataContext === null ? null : (
+        <TvMetadataMatchDialog
+          item={tvMetadataItem}
+          onClose={closeTvMetadataMatch}
+          onQueryChange={updateTvMetadataQuery}
+          onSave={() => void persistTvMetadataMatch()}
+          onSearch={() => void runTvMetadataSearch()}
+          onSelectCandidate={(candidate) =>
+            void selectTvMetadataCandidate(candidate)
+          }
+          query={tvMetadataQuery}
+          saveState={tvMetadataSaveState}
+          searchState={tvMetadataSearchState}
+          triggerId={tvMetadataContext.triggerId}
+          verificationState={tvMetadataVerificationState}
+        />
+      )}
+      {tvMetadataDetailsItem === null ||
+      tvMetadataDetailsContext === null ||
+      tvMetadataDetailsItem.association == null ? null : (
+        <TvMetadataDetailsDialog
+          clearState={
+            tvMetadataClearState !== null &&
+            tvMetadataClearState.groupId === tvMetadataDetailsItem.groupId
+              ? tvMetadataClearState.status
+              : "idle"
+          }
+          item={tvMetadataDetailsItem}
+          onClear={() => void clearCurrentTvMetadata()}
+          onClose={closeTvMetadataDetails}
+          triggerId={tvMetadataDetailsContext.triggerId}
         />
       )}
       <Dialog.Root

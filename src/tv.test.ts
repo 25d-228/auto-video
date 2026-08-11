@@ -2,12 +2,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   chooseTvFolder,
+  clearTvShowMetadataMatch,
+  invalidateTvShowMetadataContext,
   loadTvFolder,
   openTvFile,
   queryTvStorage,
   revealTvFile,
+  saveTvShowMetadataMatch,
   scanTvLibrary,
+  searchTvShowMetadata,
   trashTvFile,
+  verifyTvShowMetadataCandidate,
 } from "./tv";
 
 let invokeMock: ReturnType<typeof vi.fn>;
@@ -446,6 +451,228 @@ describe("conservative parsed TV Library identity", () => {
       invokeMock.mockResolvedValueOnce(response);
       await expect(scanTvLibrary()).rejects.toThrow("invalid data");
     }
+  });
+});
+
+describe("explicit TV show metadata boundary", () => {
+  const groupId = "1".repeat(40);
+  const matchingRequestId = "2".repeat(40);
+  const verificationId = "3".repeat(40);
+  const association = [
+    "701",
+    "tt1234567",
+    "Canonical  番組",
+    "Original  番組",
+    "2020-04-03",
+    "/poster.jpg",
+    "Exact  overview.",
+    "9",
+  ];
+
+  it("parses native group authority and exact accepted show metadata without enriching episodes", async () => {
+    invokeMock.mockResolvedValue([
+      "tv-library-metadata-v1",
+      "ready",
+      "14",
+      "2",
+      "/TV/Local  Show.S01E01.mp4",
+      "Local  Show.S01E01.mp4",
+      "10",
+      "Local  Show",
+      "1",
+      "1",
+      groupId,
+      "ready",
+      ...association,
+      "/TV/Local  Show.S01E02.MKV",
+      "Local  Show.S01E02.MKV",
+      "20",
+      "Local  Show",
+      "1",
+      "2",
+      groupId,
+      "ready",
+      ...association,
+    ]);
+
+    await expect(scanTvLibrary()).resolves.toEqual({
+      generation: "14",
+      metadataStatus: "ready",
+      items: [
+        {
+          id: groupId,
+          groupId,
+          metadataState: "ready",
+          title: "Canonical  番組",
+          showTitle: "Local  Show",
+          association: {
+            tmdbTvId: 701,
+            imdbId: "tt1234567",
+            name: "Canonical  番組",
+            originalName: "Original  番組",
+            firstAirDate: "2020-04-03",
+            posterPath: "/poster.jpg",
+            overview: "Exact  overview.",
+            generation: "9",
+          },
+          files: [
+            expect.objectContaining({ season: 1, episode: 1 }),
+            expect.objectContaining({ season: 1, episode: 2 }),
+          ],
+        },
+      ],
+    });
+  });
+
+  it("fails closed on conflicting group metadata and leaves attention data unenriched", async () => {
+    invokeMock.mockResolvedValueOnce([
+      "tv-library-metadata-v1",
+      "attention",
+      "15",
+      "1",
+      "/TV/Local Show.S01E01.mp4",
+      "Local Show.S01E01.mp4",
+      "10",
+      "Local Show",
+      "1",
+      "1",
+      groupId,
+      "attention",
+      ...Array.from({ length: 8 }, () => ""),
+    ]);
+    await expect(scanTvLibrary()).resolves.toEqual({
+      generation: "15",
+      metadataStatus: "attention",
+      items: [
+        expect.objectContaining({
+          id: groupId,
+          title: "Local Show",
+          association: null,
+          metadataState: "attention",
+        }),
+      ],
+    });
+
+    for (const malformed of [
+      [
+        "tv-library-metadata-v1",
+        "ready",
+        "16",
+        "1",
+        "/TV/Show.S01E01.mp4",
+        "Show.S01E01.mp4",
+        "10",
+        "Show",
+        "1",
+        "1",
+        "fabricated",
+        "",
+        ...Array.from({ length: 8 }, () => ""),
+      ],
+      [
+        "tv-library-metadata-v1",
+        "ready",
+        "16",
+        "1",
+        "/TV/Show.S01E01.mp4",
+        "Show.S01E01.mp4",
+        "10",
+        "Show",
+        "1",
+        "1",
+        groupId,
+        "ready",
+        ...association.map((field, index) => (index === 1 ? "tt0x" : field)),
+      ],
+    ]) {
+      invokeMock.mockResolvedValueOnce(malformed);
+      await expect(scanTvLibrary()).rejects.toThrow("invalid data");
+    }
+  });
+
+  it("dispatches only exact bounded Search, verification, Save, clear, and invalidation values", async () => {
+    invokeMock
+      .mockResolvedValueOnce([
+        matchingRequestId,
+        "2",
+        "701",
+        "Same Name",
+        "Original One",
+        "2001-01-01",
+        "/one.jpg",
+        "702",
+        "Same Name",
+        "Original Two",
+        "2021-01-01",
+        "",
+      ])
+      .mockResolvedValueOnce([verificationId, ...association])
+      .mockResolvedValueOnce(association)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined);
+
+    await expect(
+      searchTvShowMetadata(groupId, "完全  Local  Show", 1),
+    ).resolves.toEqual({
+      matchingRequestId,
+      candidates: [
+        expect.objectContaining({ tmdbTvId: 701, firstAirDate: "2001-01-01" }),
+        expect.objectContaining({ tmdbTvId: 702, firstAirDate: "2021-01-01" }),
+      ],
+    });
+    await verifyTvShowMetadataCandidate(matchingRequestId, 702, 2);
+    await saveTvShowMetadataMatch(verificationId);
+    await clearTvShowMetadataMatch(groupId);
+    await invalidateTvShowMetadataContext(3);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "search_tv_show_metadata", {
+      groupId,
+      query: "完全  Local  Show",
+      contextGeneration: 1,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      2,
+      "verify_tv_show_metadata_candidate",
+      { matchingRequestId, tmdbTvId: 702, contextGeneration: 2 },
+    );
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "save_tv_show_metadata_match", {
+      verificationId,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(4, "clear_tv_show_metadata_match", {
+      groupId,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      5,
+      "invalidate_tv_show_metadata_context",
+      { contextGeneration: 3 },
+    );
+  });
+
+  it("rejects duplicate candidates and malformed exact verification responses", async () => {
+    invokeMock.mockResolvedValueOnce([
+      matchingRequestId,
+      "2",
+      "701",
+      "Same",
+      "",
+      "",
+      "",
+      "701",
+      "Conflict",
+      "",
+      "",
+      "",
+    ]);
+    await expect(searchTvShowMetadata(groupId, "Show", 1)).rejects.toThrow(
+      "invalid data",
+    );
+    invokeMock.mockResolvedValueOnce([
+      verificationId,
+      ...association.map((field, index) => (index === 1 ? "nm123" : field)),
+    ]);
+    await expect(
+      verifyTvShowMetadataCandidate(matchingRequestId, 701, 2),
+    ).rejects.toThrow("invalid data");
   });
 });
 
