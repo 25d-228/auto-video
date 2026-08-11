@@ -18,6 +18,45 @@ export type JavdbCatalogResult =
 export type VrCatalogItem = JavdbCatalogItem;
 export type VrCatalogResult = JavdbCatalogResult;
 
+export type JavdbBrowseCategory = "adult" | "vr";
+export type JavdbBrowseMode = "category" | "ranking";
+export type JavdbBrowsePeriod = "daily" | "weekly" | "monthly";
+export type JavdbBrowseSort =
+  | "newest"
+  | "oldest"
+  | "recently-updated"
+  | "top-rated"
+  | "most-viewed"
+  | "most-wanted"
+  | "most-watched";
+
+export type JavdbBrowseRequest = {
+  category: JavdbBrowseCategory;
+  mode: JavdbBrowseMode;
+  period: JavdbBrowsePeriod;
+  year: string | null;
+  month: number | null;
+  sort: JavdbBrowseSort;
+  count: 10 | 25 | 50 | 100;
+};
+
+export type JavdbBrowseItem = JavdbCatalogItem & {
+  category: JavdbBrowseCategory;
+  providerItemId: string;
+  requestGeneration: string;
+  releaseDate: string | null;
+  coverAuthorityId: string | null;
+  sourceAspectRatio: number;
+};
+
+export type JavdbBrowseResult =
+  | { status: "ready"; items: JavdbBrowseItem[] }
+  | { status: "source-unavailable" }
+  | { status: "network-error" }
+  | { status: "malformed-provider" }
+  | { status: "conflicting-provider" }
+  | { status: "provider-error" };
+
 export type SukebeiRelease = {
   artifact?: SukebeiReleaseArtifact;
   name: string;
@@ -153,6 +192,22 @@ const vrLibraryPartPattern =
   /(^|[^A-Za-z0-9])((?:part|pt|cd|disc|disk)[ _-]*0*([0-9]{1,4}))(?=$|[^A-Za-z0-9])/gi;
 const vrLibraryPartPrefixes = new Set(["PART", "PT", "CD", "DISC", "DISK"]);
 const javdbBaseUrl = "https://javdb.com";
+const javdbProviderItemPattern = /^[A-Za-z0-9]{1,64}$/;
+const javdbCoverAuthorityPattern =
+  /^javdb-cover-[1-9][0-9]*-[1-9][0-9]*-[a-f0-9]{8}$/;
+const javdbSourceAspectRatio = 1.48;
+const javdbResultCounts = new Set([10, 25, 50, 100]);
+const javdbBrowseModes = new Set(["category", "ranking"]);
+const javdbBrowsePeriods = new Set(["daily", "weekly", "monthly"]);
+const javdbBrowseSorts = new Set([
+  "newest",
+  "oldest",
+  "recently-updated",
+  "top-rated",
+  "most-viewed",
+  "most-wanted",
+  "most-watched",
+]);
 
 function invokeErrorStatus(error: unknown): Exclude<
   JavdbCatalogResult["status"],
@@ -398,6 +453,242 @@ export function canonicalizeProductCode(value: string) {
   }
 
   return `${match[1].toUpperCase()}-${number}`;
+}
+
+function validJavdbBrowseRequest(request: JavdbBrowseRequest) {
+  return (
+    (request.category === "adult" || request.category === "vr") &&
+    javdbBrowseModes.has(request.mode) &&
+    javdbBrowsePeriods.has(request.period) &&
+    javdbBrowseSorts.has(request.sort) &&
+    javdbResultCounts.has(request.count) &&
+    (request.year === null ||
+      (/^\d{4}$/.test(request.year) &&
+        Number(request.year) >= 2001 &&
+        Number(request.year) <= new Date().getFullYear())) &&
+    (request.month === null ||
+      (Number.isInteger(request.month) &&
+        request.month >= 1 &&
+        request.month <= 12)) &&
+    (request.mode !== "ranking" ||
+      (request.category === "adult" &&
+        request.year === null &&
+        request.month === null &&
+        request.sort === "newest"))
+  );
+}
+
+function javdbBrowseErrorStatus(
+  category: JavdbBrowseCategory,
+  error: unknown,
+): Exclude<JavdbBrowseResult["status"], "ready"> {
+  const errorCode =
+    typeof error === "string"
+      ? error
+      : error instanceof Error
+        ? error.message
+        : "";
+  if (errorCode === `${category}_source_unavailable`) {
+    return "source-unavailable";
+  }
+  if (errorCode === `${category}_network_error`) {
+    return "network-error";
+  }
+  if (errorCode === `${category}_javdb_malformed_provider`) {
+    return "malformed-provider";
+  }
+  if (errorCode === `${category}_javdb_conflicting_provider`) {
+    return "conflicting-provider";
+  }
+  return "provider-error";
+}
+
+export function parseJavdbBrowseResponse(
+  value: unknown,
+  request: JavdbBrowseRequest,
+): JavdbBrowseResult {
+  if (
+    !validJavdbBrowseRequest(request) ||
+    !Array.isArray(value) ||
+    value.length < 2 ||
+    !value.every((entry) => typeof entry === "string")
+  ) {
+    return { status: "malformed-provider" };
+  }
+  const [requestGeneration, itemCountText, ...fields] = value as string[];
+  const itemCount = Number(itemCountText);
+  if (
+    !unsignedU64Pattern.test(requestGeneration) ||
+    BigInt(requestGeneration) === 0n ||
+    BigInt(requestGeneration) > maximumU64 ||
+    !/^\d{1,3}$/.test(itemCountText) ||
+    !Number.isSafeInteger(itemCount) ||
+    itemCount < 0 ||
+    itemCount > request.count ||
+    fields.length !== itemCount * 7
+  ) {
+    return { status: "malformed-provider" };
+  }
+
+  const items: JavdbBrowseItem[] = [];
+  const providerItemIds = new Set<string>();
+  for (let index = 0; index < fields.length; index += 7) {
+    const [
+      category,
+      providerItemId,
+      code,
+      title,
+      releaseDate,
+      coverAuthorityId,
+      sourceAspectRatio,
+    ] = fields.slice(index, index + 7) as string[];
+    if (
+      category !== request.category ||
+      !javdbProviderItemPattern.test(providerItemId) ||
+      providerItemIds.has(providerItemId) ||
+      canonicalizeProductCode(code) !== code ||
+      (coverAuthorityId !== "" &&
+        !javdbCoverAuthorityPattern.test(coverAuthorityId)) ||
+      Number(sourceAspectRatio) !== javdbSourceAspectRatio
+    ) {
+      return { status: "malformed-provider" };
+    }
+    providerItemIds.add(providerItemId);
+    items.push({
+      category,
+      providerItemId,
+      requestGeneration,
+      code,
+      title: title === "" ? null : title,
+      releaseDate: releaseDate === "" ? null : releaseDate,
+      coverAuthorityId:
+        coverAuthorityId === "" ? null : coverAuthorityId,
+      coverUrl: null,
+      source: "JavDB",
+      sourceAspectRatio: javdbSourceAspectRatio,
+    });
+  }
+  return { status: "ready", items };
+}
+
+export async function fetchJavdbBrowse(
+  request: JavdbBrowseRequest,
+  contextGeneration: string,
+): Promise<JavdbBrowseResult> {
+  if (
+    !validJavdbBrowseRequest(request) ||
+    !unsignedU64Pattern.test(contextGeneration) ||
+    BigInt(contextGeneration) === 0n ||
+    BigInt(contextGeneration) > maximumU64
+  ) {
+    throw new Error("A valid JavDB browse request is required.");
+  }
+  try {
+    const response = await window.__TAURI__.core.invoke<unknown>(
+      "fetch_javdb_catalog",
+      {
+        ...request,
+        contextGeneration,
+        year: request.year,
+        month: request.month,
+      },
+    );
+    return parseJavdbBrowseResponse(response, request);
+  } catch (error: unknown) {
+    return { status: javdbBrowseErrorStatus(request.category, error) };
+  }
+}
+
+function javdbCoverMimeType(bytes: Uint8Array) {
+  if (bytes.length < 12) {
+    return null;
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47
+  ) {
+    return "image/png";
+  }
+  if (
+    bytes[0] === 0x47 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x38
+  ) {
+    return "image/gif";
+  }
+  if (
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
+export async function fetchJavdbCoverObjectUrl(item: JavdbBrowseItem) {
+  if (
+    item.coverAuthorityId === null ||
+    !javdbCoverAuthorityPattern.test(item.coverAuthorityId) ||
+    !javdbProviderItemPattern.test(item.providerItemId) ||
+    !unsignedU64Pattern.test(item.requestGeneration) ||
+    (item.category !== "adult" && item.category !== "vr")
+  ) {
+    throw new Error("A current JavDB cover authority is required.");
+  }
+  const value = await window.__TAURI__.core.invoke<unknown>(
+    "fetch_javdb_cover",
+    {
+      category: item.category,
+      requestGeneration: item.requestGeneration,
+      providerItemId: item.providerItemId,
+      coverAuthorityId: item.coverAuthorityId,
+    },
+  );
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > 16 * 1024 * 1024 ||
+    !value.every(
+      (byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255,
+    )
+  ) {
+    throw new Error("The native JavDB cover response was invalid.");
+  }
+  const bytes = Uint8Array.from(value as number[]);
+  const mimeType = javdbCoverMimeType(bytes);
+  if (mimeType === null) {
+    throw new Error("The native JavDB cover response was invalid.");
+  }
+  return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+}
+
+export async function invalidateJavdbBrowse(
+  category: JavdbBrowseCategory,
+  contextGeneration: string,
+) {
+  if (
+    !unsignedU64Pattern.test(contextGeneration) ||
+    BigInt(contextGeneration) === 0n ||
+    BigInt(contextGeneration) > maximumU64
+  ) {
+    throw new Error("A valid JavDB catalog context is required.");
+  }
+  await window.__TAURI__.core.invoke("invalidate_javdb_catalog", {
+    category,
+    contextGeneration,
+  });
 }
 
 export async function fetchExactJavdbVrItem(
