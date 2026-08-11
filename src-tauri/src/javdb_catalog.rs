@@ -90,6 +90,7 @@ impl CatalogCategory {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JavdbCatalogRequest {
     pub category: String,
+    pub context_generation: String,
     pub mode: String,
     pub period: String,
     pub year: Option<String>,
@@ -120,12 +121,15 @@ struct AuthorizedCatalogItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CatalogAuthority {
     generation: u64,
+    context_generation: u64,
     items: Vec<AuthorizedCatalogItem>,
 }
 
 #[derive(Default)]
 struct CatalogContext {
     generation: u64,
+    adult_context_generation: u64,
+    vr_context_generation: u64,
     adult: Option<CatalogAuthority>,
     vr: Option<CatalogAuthority>,
 }
@@ -137,6 +141,14 @@ pub(crate) struct JavdbCatalogState(Arc<Mutex<CatalogContext>>);
 enum CatalogDocumentError {
     Malformed,
     Provider,
+    Conflicting,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdultCategoryCheck {
+    Adult,
+    NotAdult,
+    Inconclusive,
     Conflicting,
 }
 
@@ -287,40 +299,53 @@ fn parse_listing(document: &str) -> Result<ParsedListing, CatalogDocumentError> 
     })
 }
 
-fn adult_item_category(document: &str, provider_item_id: &str) -> Option<CatalogCategory> {
-    let JsonValue::Object(envelope) = JsonParser::new(document).parse()? else {
-        return None;
+fn adult_item_category(
+    document: &str,
+    provider_item_id: &str,
+    retained_code: &str,
+) -> AdultCategoryCheck {
+    let Some(JsonValue::Object(envelope)) = JsonParser::new(document).parse() else {
+        return AdultCategoryCheck::Inconclusive;
     };
     if envelope.get("success") != Some(&JsonValue::Number("1".to_owned())) {
-        return None;
+        return AdultCategoryCheck::Inconclusive;
     }
-    let JsonValue::Object(data) = envelope.get("data")? else {
-        return None;
+    let Some(JsonValue::Object(data)) = envelope.get("data") else {
+        return AdultCategoryCheck::Inconclusive;
     };
-    let JsonValue::Object(movie) = data.get("movie")? else {
-        return None;
+    let Some(JsonValue::Object(movie)) = data.get("movie") else {
+        return AdultCategoryCheck::Inconclusive;
     };
     if movie.get("id") != Some(&JsonValue::String(provider_item_id.to_owned())) {
-        return None;
+        return AdultCategoryCheck::Inconclusive;
     }
-    let JsonValue::Array(tags) = movie.get("tags")? else {
-        return None;
+    match movie.get("number") {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::String(number)) => match canonical_product_code(number) {
+            Some(code) if code == retained_code => {}
+            Some(_) => return AdultCategoryCheck::Conflicting,
+            None => return AdultCategoryCheck::Inconclusive,
+        },
+        Some(_) => return AdultCategoryCheck::Inconclusive,
+    }
+    let Some(JsonValue::Array(tags)) = movie.get("tags") else {
+        return AdultCategoryCheck::Inconclusive;
     };
     let mut is_vr = false;
     for tag in tags {
         let JsonValue::Object(tag) = tag else {
-            return None;
+            return AdultCategoryCheck::Inconclusive;
         };
-        let JsonValue::String(tag_id) = tag.get("id")? else {
-            return None;
+        let Some(JsonValue::String(tag_id)) = tag.get("id") else {
+            return AdultCategoryCheck::Inconclusive;
         };
         is_vr |= tag_id == "212";
     }
-    Some(if is_vr {
-        CatalogCategory::Vr
+    if is_vr {
+        AdultCategoryCheck::NotAdult
     } else {
-        CatalogCategory::Adult
-    })
+        AdultCategoryCheck::Adult
+    }
 }
 
 fn sort_parameters(value: &str) -> Option<(&'static str, &'static str)> {
@@ -355,7 +380,12 @@ fn current_calendar_year() -> Option<u16> {
 
 fn validated_request(request: &JavdbCatalogRequest) -> Option<CatalogCategory> {
     let category = CatalogCategory::parse(&request.category)?;
-    if !matches!(request.count, 10 | 25 | 50 | 100)
+    if request
+        .context_generation
+        .parse::<u64>()
+        .ok()
+        .is_none_or(|generation| generation == 0)
+        || !matches!(request.count, 10 | 25 | 50 | 100)
         || !matches!(request.period.as_str(), "daily" | "weekly" | "monthly")
         || request.year.as_deref().is_some_and(|year| {
             year.len() != 4
@@ -414,17 +444,27 @@ fn listing_urls(request: &JavdbCatalogRequest, category: CatalogCategory) -> Vec
 fn begin_request(
     state: &JavdbCatalogState,
     category: CatalogCategory,
+    context_generation: u64,
 ) -> Result<u64, &'static str> {
     let mut context = state
         .0
         .lock()
         .map_err(|_| category.provider_error(ProviderRequestError::Provider))?;
+    let current_context_generation = match category {
+        CatalogCategory::Adult => &mut context.adult_context_generation,
+        CatalogCategory::Vr => &mut context.vr_context_generation,
+    };
+    if context_generation <= *current_context_generation {
+        return Err(category.stale_error());
+    }
+    *current_context_generation = context_generation;
     context.generation = context
         .generation
         .checked_add(1)
         .ok_or_else(|| category.provider_error(ProviderRequestError::Provider))?;
     let authority = CatalogAuthority {
         generation: context.generation,
+        context_generation,
         items: Vec::new(),
     };
     match category {
@@ -524,7 +564,11 @@ pub(crate) fn fetch_catalog_with(
     if validated_request(request) != Some(category) {
         return Err(category.provider_error(ProviderRequestError::Provider));
     }
-    let generation = begin_request(state, category)?;
+    let context_generation = request
+        .context_generation
+        .parse::<u64>()
+        .map_err(|_| category.provider_error(ProviderRequestError::Provider))?;
+    let generation = begin_request(state, category, context_generation)?;
     let mut items = Vec::new();
     let mut accepted_codes = HashMap::<String, String>::new();
     for url in listing_urls(request, category) {
@@ -546,16 +590,25 @@ pub(crate) fn fetch_catalog_with(
     }
 
     if category == CatalogCategory::Adult {
-        items.retain(|item| {
+        let mut accepted_adult_items = Vec::new();
+        for item in items {
             let url = format!(
                 "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
                 item.provider_item_id
             );
-            fetch(&url)
+            let category_check = fetch(&url)
                 .ok()
-                .and_then(|document| adult_item_category(&document, &item.provider_item_id))
-                == Some(CatalogCategory::Adult)
-        });
+                .map(|document| adult_item_category(&document, &item.provider_item_id, &item.code))
+                .unwrap_or(AdultCategoryCheck::Inconclusive);
+            match category_check {
+                AdultCategoryCheck::Adult => accepted_adult_items.push(item),
+                AdultCategoryCheck::Conflicting => {
+                    return Err(category.conflicting_error());
+                }
+                AdultCategoryCheck::NotAdult | AdultCategoryCheck::Inconclusive => {}
+            }
+        }
+        items = accepted_adult_items;
     }
     items.truncate(request.count as usize);
     finish_request(state, category, generation, items)
@@ -564,19 +617,45 @@ pub(crate) fn fetch_catalog_with(
 pub(crate) fn invalidate_catalog(
     state: &JavdbCatalogState,
     category: &str,
+    context_generation: &str,
 ) -> Result<(), &'static str> {
     let category = CatalogCategory::parse(category).ok_or(VR_PROVIDER_ERROR)?;
+    let context_generation = context_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| category.provider_error(ProviderRequestError::Provider))?;
     let mut context = state
         .0
         .lock()
         .map_err(|_| category.provider_error(ProviderRequestError::Provider))?;
-    context.generation = context
-        .generation
-        .checked_add(1)
-        .ok_or_else(|| category.provider_error(ProviderRequestError::Provider))?;
+    let current_context_generation = match category {
+        CatalogCategory::Adult => &mut context.adult_context_generation,
+        CatalogCategory::Vr => &mut context.vr_context_generation,
+    };
+    if context_generation < *current_context_generation {
+        return Ok(());
+    }
+    *current_context_generation = context_generation;
     match category {
-        CatalogCategory::Adult => context.adult = None,
-        CatalogCategory::Vr => context.vr = None,
+        CatalogCategory::Adult => {
+            if context
+                .adult
+                .as_ref()
+                .is_some_and(|authority| authority.context_generation <= context_generation)
+            {
+                context.adult = None;
+            }
+        }
+        CatalogCategory::Vr => {
+            if context
+                .vr
+                .as_ref()
+                .is_some_and(|authority| authority.context_generation <= context_generation)
+            {
+                context.vr = None;
+            }
+        }
     }
     Ok(())
 }
@@ -975,12 +1054,18 @@ pub(crate) fn fetch_cover_bytes(_url: &str) -> Result<Vec<u8>, ProviderRequestEr
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    static NEXT_CONTEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
     fn request(category: &str) -> JavdbCatalogRequest {
         JavdbCatalogRequest {
             category: category.to_owned(),
+            context_generation: NEXT_CONTEXT_GENERATION
+                .fetch_add(1, Ordering::Relaxed)
+                .to_string(),
             mode: "category".to_owned(),
             period: "daily".to_owned(),
             year: None,
@@ -992,6 +1077,12 @@ mod tests {
 
     fn detail(item_id: &str, tags: &str) -> String {
         format!(r#"{{"success":1,"data":{{"movie":{{"id":"{item_id}","tags":{tags}}}}}}}"#)
+    }
+
+    fn detail_with_number(item_id: &str, number: &str, tags: &str) -> String {
+        format!(
+            r#"{{"success":1,"data":{{"movie":{{"id":"{item_id}","number":"{number}","tags":{tags}}}}}}}"#
+        )
     }
 
     fn jpeg() -> Vec<u8> {
@@ -1014,6 +1105,9 @@ mod tests {
         for period in ["daily", "weekly", "monthly"] {
             let ranking = JavdbCatalogRequest {
                 category: "adult".to_owned(),
+                context_generation: NEXT_CONTEXT_GENERATION
+                    .fetch_add(1, Ordering::Relaxed)
+                    .to_string(),
                 mode: "ranking".to_owned(),
                 period: period.to_owned(),
                 year: None,
@@ -1186,6 +1280,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_the_complete_adult_request_when_detail_reuses_an_item_for_another_code() {
+        let state = JavdbCatalogState::default();
+        let dispatched_urls = RefCell::new(Vec::new());
+        let result = fetch_catalog_with(&state, &request("adult"), |url| {
+            dispatched_urls.borrow_mut().push(url.to_owned());
+            if url.contains("movies/tags") {
+                Ok(r#"{"success":1,"data":{"movies":[{"id":"AdultA","number":"ADLT-123"},{"id":"AdultB","number":"ADLT-124"}]}}"#.to_owned())
+            } else if url.contains("AdultA") {
+                Ok(detail_with_number("AdultA", "ADLT-999", r#"[{"id":"28"}]"#))
+            } else {
+                Ok(detail_with_number("AdultB", "ADLT-124", r#"[{"id":"28"}]"#))
+            }
+        });
+
+        assert_eq!(result, Err(ADULT_JAVDB_CONFLICTING));
+        assert_eq!(dispatched_urls.borrow().len(), 2);
+        let context = state.0.lock().expect("catalog state must remain available");
+        assert!(context
+            .adult
+            .as_ref()
+            .is_some_and(|authority| authority.items.is_empty()));
+    }
+
+    #[test]
     fn accepts_only_exact_retained_rotating_cover_authority() {
         let state = JavdbCatalogState::default();
         let response = fetch_catalog_with(&state, &request("vr"), |_| {
@@ -1247,7 +1365,14 @@ mod tests {
             );
             assert!(!dispatched.get());
         }
-        invalidate_catalog(&state, "vr").expect("invalidation must succeed");
+        invalidate_catalog(
+            &state,
+            "vr",
+            &NEXT_CONTEXT_GENERATION
+                .fetch_add(1, Ordering::Relaxed)
+                .to_string(),
+        )
+        .expect("invalidation must succeed");
         let dispatched = Cell::new(false);
         assert!(
             fetch_cover_with(&state, "vr", &generation, "A", &authority, |_| {
@@ -1285,8 +1410,9 @@ mod tests {
     #[test]
     fn a_late_catalog_or_cover_cannot_replace_a_newer_generation() {
         let state = JavdbCatalogState::default();
-        let first_generation =
-            begin_request(&state, CatalogCategory::Vr).expect("first request must begin");
+        let first_context_generation = NEXT_CONTEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let first_generation = begin_request(&state, CatalogCategory::Vr, first_context_generation)
+            .expect("first request must begin");
         let second = fetch_catalog_with(&state, &request("vr"), |_| {
             Ok(r#"{"success":1,"data":{"movies":[{"id":"Current","number":"MDVR-422","cover_url":"https://tp.cmastd.com/current.jpg"}]}}"#.to_owned())
         })
@@ -1310,10 +1436,45 @@ mod tests {
         let cover_result =
             fetch_cover_with(&state, "vr", &second[0], "Current", &second[7], |_| {
                 cover_started.set(true);
-                invalidate_catalog(&state, "vr").expect("cover must invalidate");
+                invalidate_catalog(
+                    &state,
+                    "vr",
+                    &NEXT_CONTEXT_GENERATION
+                        .fetch_add(1, Ordering::Relaxed)
+                        .to_string(),
+                )
+                .expect("cover must invalidate");
                 Ok(jpeg())
             });
         assert!(cover_started.get());
         assert_eq!(cover_result, Err(VR_JAVDB_STALE));
+    }
+
+    #[test]
+    fn an_older_invalidation_cannot_clear_a_newer_catalog_or_cover_authority() {
+        let state = JavdbCatalogState::default();
+        let older_context = NEXT_CONTEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let current_request = request("vr");
+        let current_context = current_request
+            .context_generation
+            .parse::<u64>()
+            .expect("test context must be valid");
+        assert!(current_context > older_context);
+        let current = fetch_catalog_with(&state, &current_request, |_| {
+            Ok(r#"{"success":1,"data":{"movies":[{"id":"Current","number":"MDVR-419","cover_url":"https://tp.cmastd.com/current.jpg"}]}}"#.to_owned())
+        })
+        .expect("newer catalog must finish");
+
+        invalidate_catalog(&state, "vr", &older_context.to_string())
+            .expect("older invalidation must complete as a no-op");
+        let dispatched = Cell::new(false);
+        assert_eq!(
+            fetch_cover_with(&state, "vr", &current[0], "Current", &current[7], |_| {
+                dispatched.set(true);
+                Ok(jpeg())
+            }),
+            Ok(jpeg())
+        );
+        assert!(dispatched.get());
     }
 }

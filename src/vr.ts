@@ -573,8 +573,14 @@ export function parseJavdbBrowseResponse(
 
 export async function fetchJavdbBrowse(
   request: JavdbBrowseRequest,
+  contextGeneration: string,
 ): Promise<JavdbBrowseResult> {
-  if (!validJavdbBrowseRequest(request)) {
+  if (
+    !validJavdbBrowseRequest(request) ||
+    !unsignedU64Pattern.test(contextGeneration) ||
+    BigInt(contextGeneration) === 0n ||
+    BigInt(contextGeneration) > maximumU64
+  ) {
     throw new Error("A valid JavDB browse request is required.");
   }
   try {
@@ -582,6 +588,7 @@ export async function fetchJavdbBrowse(
       "fetch_javdb_catalog",
       {
         ...request,
+        contextGeneration,
         year: request.year,
         month: request.month,
       },
@@ -667,8 +674,21 @@ export async function fetchJavdbCoverObjectUrl(item: JavdbBrowseItem) {
   return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
 }
 
-export async function invalidateJavdbBrowse(category: JavdbBrowseCategory) {
-  await window.__TAURI__.core.invoke("invalidate_javdb_catalog", { category });
+export async function invalidateJavdbBrowse(
+  category: JavdbBrowseCategory,
+  contextGeneration: string,
+) {
+  if (
+    !unsignedU64Pattern.test(contextGeneration) ||
+    BigInt(contextGeneration) === 0n ||
+    BigInt(contextGeneration) > maximumU64
+  ) {
+    throw new Error("A valid JavDB catalog context is required.");
+  }
+  await window.__TAURI__.core.invoke("invalidate_javdb_catalog", {
+    category,
+    contextGeneration,
+  });
 }
 
 export async function fetchExactJavdbVrItem(

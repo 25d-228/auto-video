@@ -314,11 +314,14 @@ describe("native-owned JavDB browse boundary", () => {
 
   it("submits the complete exact browse request and maps native local states", async () => {
     invokeMock.mockResolvedValueOnce(["8", "0"]);
-    await expect(fetchJavdbBrowse(request)).resolves.toEqual({
+    await expect(fetchJavdbBrowse(request, "1")).resolves.toEqual({
       status: "ready",
       items: [],
     });
-    expect(invokeMock).toHaveBeenLastCalledWith("fetch_javdb_catalog", request);
+    expect(invokeMock).toHaveBeenLastCalledWith("fetch_javdb_catalog", {
+      ...request,
+      contextGeneration: "1",
+    });
 
     for (const [error, status] of [
       ["vr_source_unavailable", "source-unavailable"],
@@ -328,12 +331,12 @@ describe("native-owned JavDB browse boundary", () => {
       ["vr_provider_error", "provider-error"],
     ]) {
       invokeMock.mockRejectedValueOnce(error);
-      await expect(fetchJavdbBrowse(request)).resolves.toEqual({ status });
+      await expect(fetchJavdbBrowse(request, "2")).resolves.toEqual({ status });
     }
 
     invokeMock.mockClear();
     for (const year of ["2000", String(new Date().getFullYear() + 1)]) {
-      await expect(fetchJavdbBrowse({ ...request, year })).rejects.toThrow(
+      await expect(fetchJavdbBrowse({ ...request, year }, "3")).rejects.toThrow(
         "A valid JavDB browse request is required.",
       );
     }

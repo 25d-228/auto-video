@@ -3232,6 +3232,7 @@ async fn fetch_javdb_adult_catalog(code: String) -> Result<String, String> {
 #[allow(clippy::too_many_arguments)]
 async fn fetch_javdb_catalog(
     category: String,
+    context_generation: String,
     mode: String,
     period: String,
     year: Option<String>,
@@ -3248,6 +3249,7 @@ async fn fetch_javdb_catalog(
     };
     let request = JavdbCatalogRequest {
         category,
+        context_generation,
         mode,
         period,
         year,
@@ -3265,9 +3267,11 @@ async fn fetch_javdb_catalog(
 #[tauri::command]
 fn invalidate_javdb_catalog(
     category: String,
+    context_generation: String,
     state: tauri::State<'_, JavdbCatalogState>,
 ) -> Result<(), String> {
-    invalidate_javdb_catalog_with(state.inner(), &category).map_err(str::to_owned)
+    invalidate_javdb_catalog_with(state.inner(), &category, &context_generation)
+        .map_err(str::to_owned)
 }
 
 #[tauri::command]

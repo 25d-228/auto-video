@@ -2234,6 +2234,7 @@ function DiscoverJavdbBrowseCard({
       aria-labelledby={`${cardId}-title`}
       className="javdb-browse-card"
       data-cover-ratio={coverRatio}
+      data-narrow-cover={coverRatio < 0.9}
       style={{ width: `${Math.round(javdbCoverHeight * coverRatio)}px` }}
     >
       <div className="javdb-browse-card__cover">
@@ -2281,14 +2282,21 @@ const javdbBrowseCardHeight = 260;
 const javdbBrowseColumnGap = 14;
 const javdbBrowseRowGap = 16;
 
-function javdbPageCapacity(
+function javdbBrowseItemKey(item: JavdbBrowseItem) {
+  return `${item.category}:${item.requestGeneration}:${item.providerItemId}`;
+}
+
+function javdbBrowsePages(
   items: JavdbBrowseItem[],
   ratios: Map<string, number>,
   width: number,
   height: number,
 ) {
+  if (items.length === 0) {
+    return [[]];
+  }
   if (width <= 0 || height <= 0) {
-    return 1;
+    return items.map((item) => [item]);
   }
   const rowCount = Math.max(
     1,
@@ -2297,27 +2305,40 @@ function javdbPageCapacity(
         (javdbBrowseCardHeight + javdbBrowseRowGap),
     ),
   );
+  const pages: JavdbBrowseItem[][] = [];
+  let page: JavdbBrowseItem[] = [];
   let rows = 1;
   let rowWidth = 0;
-  let capacity = 0;
   for (const item of items) {
-    const cardWidth = Math.round(
-      javdbCoverHeight *
-        (ratios.get(item.providerItemId) ?? item.sourceAspectRatio),
+    const cardWidth = Math.min(
+      width,
+      Math.round(
+        javdbCoverHeight *
+          (ratios.get(javdbBrowseItemKey(item)) ?? item.sourceAspectRatio),
+      ),
     );
-    const nextWidth = rowWidth === 0 ? cardWidth : rowWidth + javdbBrowseColumnGap + cardWidth;
+    const nextWidth =
+      rowWidth === 0
+        ? cardWidth
+        : rowWidth + javdbBrowseColumnGap + cardWidth;
     if (rowWidth !== 0 && nextWidth > width) {
-      rows += 1;
-      if (rows > rowCount) {
-        break;
+      if (rows === rowCount) {
+        pages.push(page);
+        page = [];
+        rows = 1;
+      } else {
+        rows += 1;
       }
       rowWidth = cardWidth;
     } else {
       rowWidth = nextWidth;
     }
-    capacity += 1;
+    page.push(item);
   }
-  return Math.max(1, capacity);
+  if (page.length > 0) {
+    pages.push(page);
+  }
+  return pages;
 }
 
 function JavdbBrowseGallery({
@@ -2367,19 +2388,15 @@ function JavdbBrowseGallery({
     return () => observer.disconnect();
   }, []);
 
-  const capacity = javdbPageCapacity(
+  const pages = javdbBrowsePages(
     items,
     ratios,
     bounds.width,
     bounds.height,
   );
-  const pageCount = Math.max(1, Math.ceil(items.length / capacity));
+  const pageCount = pages.length;
   const currentPage = Math.min(selectedPage, pageCount);
-  const firstVisibleIndex = (currentPage - 1) * capacity;
-  const visibleItems = items.slice(
-    firstVisibleIndex,
-    firstVisibleIndex + capacity,
-  );
+  const visibleItems = pages[currentPage - 1] ?? [];
 
   useLayoutEffect(() => {
     if (selectedPage !== currentPage) {
@@ -2392,24 +2409,25 @@ function JavdbBrowseGallery({
       className="media-gallery media-gallery--javdb"
       data-current-page={currentPage}
       data-gallery="discover"
-      data-page-capacity={capacity}
+      data-page-capacity={visibleItems.length}
       data-page-count={pageCount}
     >
       <div className="media-gallery__viewport" ref={viewport}>
         <ul aria-label={ariaLabel} className="javdb-browse-grid">
           {visibleItems.map((item) => (
-            <li key={`${item.requestGeneration}-${item.providerItemId}`}>
+            <li key={javdbBrowseItemKey(item)}>
               <DiscoverJavdbBrowseCard
                 inLibrary={getInLibrary(item)}
                 item={item}
                 onFindReleases={onFindReleases}
                 onRatioChange={(currentItem, ratio) => {
                   setRatios((current) => {
-                    if (current.get(currentItem.providerItemId) === ratio) {
+                    const itemKey = javdbBrowseItemKey(currentItem);
+                    if (current.get(itemKey) === ratio) {
                       return current;
                     }
                     const next = new Map(current);
-                    next.set(currentItem.providerItemId, ratio);
+                    next.set(itemKey, ratio);
                     return next;
                   });
                 }}
@@ -7995,12 +8013,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const tvTorrentStartRequestId = useRef(0);
   const adultCatalogRequestId = useRef(0);
   const adultBrowseRequestId = useRef(0);
+  const adultBrowseContextGeneration = useRef(0);
   const adultReleaseRequestId = useRef(0);
   const adultTorrentInspectionRequestId = useRef(0);
   const adultTorrentSaveRequestId = useRef(0);
   const adultTorrentStartRequestId = useRef(0);
   const vrCatalogRequestId = useRef(0);
   const vrBrowseRequestId = useRef(0);
+  const vrBrowseContextGeneration = useRef(0);
   const releaseRequestId = useRef(0);
   const torrentInspectionRequestId = useRef(0);
   const torrentSaveRequestId = useRef(0);
@@ -9171,7 +9191,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       count: adultBrowseCount,
     };
     setAdultBrowseState({ status: "loading" });
-    void fetchJavdbBrowse(request).then((result) => {
+    const contextGeneration = String(++adultBrowseContextGeneration.current);
+    void fetchJavdbBrowse(request, contextGeneration).then((result) => {
       if (requestId === adultBrowseRequestId.current) {
         setAdultBrowseState(result);
       }
@@ -9266,7 +9287,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       count: vrBrowseCount,
     };
     setVrBrowseState({ status: "loading" });
-    void fetchJavdbBrowse(request).then((result) => {
+    const contextGeneration = String(++vrBrowseContextGeneration.current);
+    void fetchJavdbBrowse(request, contextGeneration).then((result) => {
       if (requestId === vrBrowseRequestId.current) {
         setVrBrowseState(result);
       }
@@ -11966,7 +11988,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       setAdultBrowseActivated(false);
       setAdultBrowseState({ status: "idle" });
       setAdultBrowseSelectedPage(1);
-      void invalidateJavdbBrowse("adult").catch(() => undefined);
+      const contextGeneration = String(++adultBrowseContextGeneration.current);
+      void invalidateJavdbBrowse("adult", contextGeneration).catch(
+        () => undefined,
+      );
     }
     if (discoverCategory === "vr") {
       vrCatalogRequestId.current += 1;
@@ -11979,7 +12004,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       setVrBrowseActivated(false);
       setVrBrowseState({ status: "idle" });
       setVrBrowseSelectedPage(1);
-      void invalidateJavdbBrowse("vr").catch(() => undefined);
+      const contextGeneration = String(++vrBrowseContextGeneration.current);
+      void invalidateJavdbBrowse("vr", contextGeneration).catch(
+        () => undefined,
+      );
     }
     if (category === "tv") {
       setIsTvDiscoverActivated(true);
@@ -12001,11 +12029,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setAdultBrowseState({ status: "idle" });
     setAdultBrowseActivated(workflow === "browse");
     if (workflow === "exact") {
-      void invalidateJavdbBrowse("adult").catch(() => undefined);
-      adultCatalogRequestId.current += 1;
-      setAdultCatalogState((current) =>
-        current.status === "loading" ? { status: "idle" } : current,
+      const contextGeneration = String(++adultBrowseContextGeneration.current);
+      void invalidateJavdbBrowse("adult", contextGeneration).catch(
+        () => undefined,
       );
+    } else {
+      adultCatalogRequestId.current += 1;
+      setAdultCatalogState({ status: "idle" });
     }
     setAdultWorkflow(workflow);
   };
@@ -12020,11 +12050,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setVrBrowseState({ status: "idle" });
     setVrBrowseActivated(workflow === "browse");
     if (workflow === "exact") {
-      void invalidateJavdbBrowse("vr").catch(() => undefined);
-      vrCatalogRequestId.current += 1;
-      setVrCatalogState((current) =>
-        current.status === "loading" ? { status: "idle" } : current,
+      const contextGeneration = String(++vrBrowseContextGeneration.current);
+      void invalidateJavdbBrowse("vr", contextGeneration).catch(
+        () => undefined,
       );
+    } else {
+      vrCatalogRequestId.current += 1;
+      setVrCatalogState({ status: "idle" });
     }
     setVrWorkflow(workflow);
   };

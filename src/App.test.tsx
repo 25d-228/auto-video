@@ -9104,6 +9104,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     ).toEqual(["ADLT-123", "ADLT-124", "ADLT-125"]);
     expect(fetchJavdbBrowseMock).toHaveBeenCalledWith({
       category: "adult",
+      contextGeneration: "1",
       mode: "ranking",
       period: "daily",
       year: null,
@@ -9216,6 +9217,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     await waitFor(() =>
       expect(fetchJavdbBrowseMock).toHaveBeenLastCalledWith({
         category: "adult",
+        contextGeneration: expect.any(String),
         mode: "category",
         period: "daily",
         year: "2001",
@@ -9247,6 +9249,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     ).toBeTruthy();
     expect(fetchJavdbBrowseMock).toHaveBeenCalledWith({
       category: "vr",
+      contextGeneration: "1",
       mode: "category",
       period: "daily",
       year: null,
@@ -9504,7 +9507,296 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:javdb-cover");
     expect(invalidateJavdbBrowseMock).toHaveBeenCalledWith({
       category: "adult",
+      contextGeneration: "3",
     });
+  });
+
+  it.each([
+    { category: "adult" as const, code: "ADLT-123", label: "Adult" },
+    { category: "vr" as const, code: "MDVR-419", label: "VR" },
+  ])(
+    "keeps the newer $label catalog and cover authority after an older invalidation completes",
+    async ({ category, code, label }) => {
+      const olderInvalidation = createDeferred<void>();
+      invalidateJavdbBrowseMock.mockReturnValueOnce(olderInvalidation.promise);
+      fetchJavdbBrowseMock
+        .mockResolvedValueOnce(
+          javdbBrowseFixture(category, [
+            { code, cover: false, id: "OlderItem" },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          javdbBrowseFixture(
+            category,
+            [{ code, id: "CurrentItem" }],
+            "8",
+          ),
+        );
+
+      render(<App />);
+      selectDiscover();
+      fireEvent.click(screen.getByRole("radio", { name: label }));
+      expect(
+        await screen.findByRole("heading", { level: 3, name: code }),
+      ).toBeTruthy();
+      fireEvent.click(screen.getByRole("radio", { name: "Exact code" }));
+      await waitFor(() =>
+        expect(invalidateJavdbBrowseMock).toHaveBeenCalledWith({
+          category,
+          contextGeneration: "2",
+        }),
+      );
+      fireEvent.click(screen.getByRole("radio", { name: "Browse" }));
+      await waitFor(() =>
+        expect(fetchJavdbBrowseMock).toHaveBeenLastCalledWith(
+          expect.objectContaining({ category, contextGeneration: "3" }),
+        ),
+      );
+      await waitFor(() =>
+        expect(fetchJavdbCoverMock).toHaveBeenCalledWith({
+          category,
+          requestGeneration: "8",
+          providerItemId: "CurrentItem",
+          coverAuthorityId: "javdb-cover-8-1-0123abcd",
+        }),
+      );
+
+      await act(async () => {
+        olderInvalidation.resolve();
+        await olderInvalidation.promise;
+      });
+      expect(
+        screen.getByRole("heading", { level: 3, name: code }),
+      ).toBeTruthy();
+      expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([
+    { category: "adult" as const, code: "ADLT-123", label: "Adult" },
+    { category: "vr" as const, code: "MDVR-419", label: "VR" },
+  ])(
+    "rejects a late $label Exact code result after switching to Browse",
+    async ({ category, code, label }) => {
+      const lateExactResult = createDeferred<string>();
+      fetchJavdbCatalogMock.mockReturnValue(lateExactResult.promise);
+      fetchJavdbBrowseMock
+        .mockResolvedValueOnce(
+          javdbBrowseFixture(category, [
+            { code, cover: false, id: "BrowseBeforeExact" },
+          ]),
+        )
+        .mockResolvedValueOnce(
+          javdbBrowseFixture(
+            category,
+            [{ code, cover: false, id: "BrowseAfterExact" }],
+            "8",
+          ),
+        );
+
+      render(<App />);
+      selectDiscover();
+      fireEvent.click(screen.getByRole("radio", { name: label }));
+      await screen.findByRole("heading", { level: 3, name: code });
+      fireEvent.click(screen.getByRole("radio", { name: "Exact code" }));
+      fireEvent.change(
+        screen.getByRole("textbox", { name: "Search product code" }),
+        { target: { value: code } },
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Search" }));
+      await waitFor(() =>
+        expect(fetchJavdbCatalogMock).toHaveBeenCalledWith({ code }),
+      );
+
+      fireEvent.click(screen.getByRole("radio", { name: "Browse" }));
+      await waitFor(() =>
+        expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(2),
+      );
+      await act(async () => {
+        lateExactResult.resolve(javdbCatalogFixture(code, "Stale exact title"));
+        await lateExactResult.promise;
+      });
+      fireEvent.click(screen.getByRole("radio", { name: "Exact code" }));
+
+      expect(screen.queryByText("Stale exact title")).toBeNull();
+      expect(screen.queryByRole("heading", { level: 3, name: code })).toBeNull();
+      expect(fetchJavdbCatalogMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("packs every JavDB page from that page's decoded natural cover widths", async () => {
+    gallerySizes.discover = { width: 600, height: 260 };
+    fetchJavdbBrowseMock.mockResolvedValue(
+      javdbBrowseFixture("vr", [
+        { code: "MDVR-419", id: "Narrow1" },
+        { code: "MDVR-420", id: "Narrow2" },
+        { code: "MDVR-421", id: "Narrow3" },
+        { code: "MDVR-422", id: "Narrow4" },
+        { code: "MDVR-423", id: "Wide1" },
+        { code: "MDVR-424", id: "Wide2" },
+      ]),
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+
+    for (const code of ["MDVR-419", "MDVR-420", "MDVR-421", "MDVR-422"]) {
+      const card = (
+        await screen.findByRole("heading", { level: 3, name: code })
+      ).closest("article") as HTMLElement;
+      const cover = await waitFor(() => {
+        const image = card.querySelector("img");
+        expect(image).not.toBeNull();
+        return image as HTMLImageElement;
+      });
+      Object.defineProperties(cover, {
+        naturalHeight: { configurable: true, value: 180 },
+        naturalWidth: { configurable: true, value: 90 },
+      });
+      fireEvent.load(cover);
+    }
+    const gallery = document.querySelector('[data-gallery="discover"]');
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("4");
+    expect(gallery?.getAttribute("data-page-count")).toBe("2");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Next JavDB VR catalog page" }),
+    );
+    const wideCard = screen
+      .getByRole("heading", { level: 3, name: "MDVR-423" })
+      .closest("article") as HTMLElement;
+    const wideCover = await waitFor(() => {
+      const image = wideCard.querySelector("img");
+      expect(image).not.toBeNull();
+      return image as HTMLImageElement;
+    });
+    Object.defineProperties(wideCover, {
+      naturalHeight: { configurable: true, value: 180 },
+      naturalWidth: { configurable: true, value: 360 },
+    });
+    fireEvent.load(wideCover);
+
+    expect(gallery?.getAttribute("data-current-page")).toBe("2");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("1");
+    expect(gallery?.getAttribute("data-page-count")).toBe("3");
+    expect(visibleCardCount("JavDB VR catalog")).toBe(1);
+    expect(wideCard.style.width).toBe("360px");
+    expect(screen.queryByRole("heading", { name: "MDVR-424" })).toBeNull();
+
+    resizeGallery("discover", 700, 260);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("2");
+    expect(gallery?.getAttribute("data-page-count")).toBe("2");
+    expect(
+      screen.getByRole("heading", { level: 3, name: "MDVR-424" }),
+    ).toBeTruthy();
+  });
+
+  it("does not reuse a decoded cover ratio for the same provider item in a newer generation", async () => {
+    fetchJavdbBrowseMock
+      .mockResolvedValueOnce(
+        javdbBrowseFixture("vr", [{ code: "MDVR-419", id: "SameItem" }]),
+      )
+      .mockResolvedValueOnce(
+        javdbBrowseFixture(
+          "vr",
+          [{ code: "MDVR-419", cover: false, id: "SameItem" }],
+          "8",
+        ),
+      );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const firstCard = (
+      await screen.findByRole("heading", { level: 3, name: "MDVR-419" })
+    ).closest("article") as HTMLElement;
+    const firstCover = await waitFor(() => {
+      const image = firstCard.querySelector("img");
+      expect(image).not.toBeNull();
+      return image as HTMLImageElement;
+    });
+    Object.defineProperties(firstCover, {
+      naturalHeight: { configurable: true, value: 180 },
+      naturalWidth: { configurable: true, value: 360 },
+    });
+    fireEvent.load(firstCover);
+    expect(firstCard.style.width).toBe("360px");
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    const currentCard = await waitFor(() => {
+      const heading = screen.getByRole("heading", {
+        level: 3,
+        name: "MDVR-419",
+      });
+      const card = heading.closest("article") as HTMLElement;
+      expect(card).not.toBe(firstCard);
+      return card;
+    });
+    expect(currentCard.style.width).toBe("266px");
+    expect(
+      within(currentCard).getByText("MDVR-419", {
+        selector: ".javdb-cover__placeholder span",
+      }),
+    ).toBeTruthy();
+    expect(fetchJavdbCoverMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps both actions visible, focusable, and layout-stable on a narrow 720 by 520 card", async () => {
+    gallerySizes.discover = { width: 720, height: 520 };
+    fetchJavdbBrowseMock.mockResolvedValue(
+      javdbBrowseFixture("vr", [{ code: "MDVR-419", id: "Portrait" }]),
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const card = (
+      await screen.findByRole("heading", { level: 3, name: "MDVR-419" })
+    ).closest("article") as HTMLElement;
+    const cover = await waitFor(() => {
+      const image = card.querySelector("img");
+      expect(image).not.toBeNull();
+      return image as HTMLImageElement;
+    });
+    Object.defineProperties(cover, {
+      naturalHeight: { configurable: true, value: 180 },
+      naturalWidth: { configurable: true, value: 80 },
+    });
+    fireEvent.load(cover);
+
+    const copy = within(card).getByRole("button", {
+      name: "Copy title: MDVR-419",
+    });
+    const releases = within(card).getByRole("button", {
+      name: "Find releases: MDVR-419",
+    });
+    const cardStyle = card.getAttribute("style");
+    expect(card.dataset.narrowCover).toBe("true");
+    expect(copy.textContent).toContain("Copy");
+    expect(releases.textContent).toBe("Find releases");
+    expect(copy.tabIndex).toBe(0);
+    expect(releases.tabIndex).toBe(0);
+    copy.focus();
+    releases.focus();
+    expect(document.activeElement).toBe(releases);
+    expect(card.getAttribute("style")).toBe(cardStyle);
+    expect(card.style.width).toBe("80px");
+  });
+
+  it("keeps a conflicting Adult detail identity out of cards and release lookup", async () => {
+    fetchJavdbBrowseMock.mockRejectedValue(
+      "adult_javdb_conflicting_provider",
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "JavDB returned conflicting catalog identities",
+      }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("list", { name: "JavDB Adult catalog" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Find releases:/ })).toBeNull();
+    expect(fetchSukebeiAdultReleasesMock).not.toHaveBeenCalled();
   });
 
   it("keeps source, malformed, conflicting, provider, and empty states local and retryable", async () => {
