@@ -10160,7 +10160,7 @@ describe("aggregate Movie, TV, Adult, and VR download limit and transfer summari
     expect(queryTvStorageMock).toHaveBeenCalledOnce();
   });
 
-  it("confirms exact Windows cleanup files with safe focus and serializes every cleanup row", async () => {
+  it("confirms exact macOS or Windows cleanup files with safe focus and serializes every cleanup row", async () => {
     savedMoviesFolder = "/Movies";
     savedVrFolder = "/VR";
     const movieFiles = [
@@ -10216,11 +10216,48 @@ describe("aggregate Movie, TV, Adult, and VR download limit and transfer summari
         within(confirmation).getByText((_, element) => element?.textContent === path),
       ).toBeTruthy();
     }
+    expect(
+      within(confirmation).getByText(
+        /Permanently delete 2 selected Movie transfer files for “Cancelled Movie transfer” \(tt0123456\)/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(confirmation).getByText(
+        /On macOS, cleanup is crash-reconciled; on Windows, deletion is bound to the exact file handle/,
+      ),
+    ).toBeTruthy();
     const keepFiles = within(confirmation).getByRole("button", {
       name: "Keep files",
     });
     await waitFor(() => expect(document.activeElement).toBe(keepFiles));
-    fireEvent.click(keepFiles);
+
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "Close confirmation" }),
+    );
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(cleanupCancelledVrDownloadMock).not.toHaveBeenCalled();
+
+    fireEvent.click(trigger);
+    confirmation = await screen.findByRole("alertdialog");
+    fireEvent.keyDown(confirmation, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(cleanupCancelledVrDownloadMock).not.toHaveBeenCalled();
+
+    fireEvent.click(trigger);
+    confirmation = await screen.findByRole("alertdialog");
+    const backdrop = Array.from(
+      document.querySelectorAll<HTMLElement>(".trash-dialog__backdrop"),
+    ).at(-1) as HTMLElement;
+    fireEvent.pointerDown(backdrop);
+    fireEvent.click(backdrop);
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(cleanupCancelledVrDownloadMock).not.toHaveBeenCalled();
+
+    fireEvent.click(trigger);
+    confirmation = await screen.findByRole("alertdialog");
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "Keep files" }),
+    );
     expect(cleanupCancelledVrDownloadMock).not.toHaveBeenCalled();
 
     fireEvent.click(trigger);
@@ -10259,7 +10296,75 @@ describe("aggregate Movie, TV, Adult, and VR download limit and transfer summari
     expect(queryVrStorageMock).toHaveBeenCalledOnce();
   });
 
-  it("does not expose permanent cleanup without native Windows capability", async () => {
+  it("keeps the cleanup confirmation usable at 720 by 520 in light, dark, and system modes", async () => {
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 720,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 520,
+    });
+    const selectedPath =
+      "Provider/非常に長い MDVR-419 exact selected filename — part 01.MKV";
+    loadVrDownloadsMock.mockResolvedValue(
+      vrDownloadFixture({
+        cleanupAvailable: "true",
+        releaseName: "Cancelled MDVR-419 — exact cleanup identity",
+        selectedFiles: [selectedPath],
+        speedBytesPerSecond: "0",
+        state: "cancelled",
+        transferId: "cancelled-responsive-vr",
+      }),
+    );
+
+    for (const [appearance, resolvedTheme] of [
+      ["light", "light"],
+      ["dark", "dark"],
+      ["system", "dark"],
+    ] as const) {
+      cleanup();
+      window.localStorage.clear();
+      setSystemPreference(appearance === "system");
+      render(<App />);
+      selectSettings();
+      fireEvent.click(screen.getByRole("radio", { name: new RegExp(appearance, "i") }));
+      expect(document.documentElement.dataset.appearance).toBe(appearance);
+      expect(document.documentElement.dataset.theme).toBe(resolvedTheme);
+
+      fireEvent.click(screen.getByRole("button", { name: "Downloads" }));
+      const card = (
+        await screen.findByRole("heading", {
+          name: "Cancelled MDVR-419 — exact cleanup identity",
+        })
+      ).closest("article") as HTMLElement;
+      fireEvent.click(
+        within(card).getByRole("button", {
+          name: "Permanently clean transfer files",
+        }),
+      );
+      const confirmation = await screen.findByRole("alertdialog");
+      expect(within(confirmation).getByRole("listitem").textContent).toBe(
+        selectedPath,
+      );
+      expect(
+        confirmation.closest(".trash-dialog__viewport"),
+      ).not.toBeNull();
+      const keepFiles = within(confirmation).getByRole("button", {
+        name: "Keep files",
+      });
+      await waitFor(() => expect(document.activeElement).toBe(keepFiles));
+      expect(
+        within(confirmation).getByRole("button", {
+          name: "Permanently delete selected files",
+        }),
+      ).toBeTruthy();
+      fireEvent.click(keepFiles);
+      expect(cleanupCancelledVrDownloadMock).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not expose permanent cleanup without native platform capability", async () => {
     loadVrDownloadsMock.mockResolvedValue(
       vrDownloadFixture({
         releaseName: "Cancelled on macOS",

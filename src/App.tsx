@@ -5285,6 +5285,7 @@ function VrDownloadCard({
 }) {
   const organizationCancelButton = useRef<HTMLButtonElement | null>(null);
   const cleanupSafeButton = useRef<HTMLButtonElement | null>(null);
+  const [cleanupConfirmationOpen, setCleanupConfirmationOpen] = useState(false);
   const totalBytes = BigInt(download.totalBytes);
   const downloadedBytes = BigInt(download.downloadedBytes);
   const percent =
@@ -5616,7 +5617,10 @@ function VrDownloadCard({
         ) : (
           <>
             {download.state === "cancelled" && download.cleanupAvailable ? (
-              <AlertDialog.Root>
+              <AlertDialog.Root
+                onOpenChange={setCleanupConfirmationOpen}
+                open={cleanupConfirmationOpen}
+              >
                 <AlertDialog.Trigger
                   render={
                     <Button
@@ -5630,19 +5634,46 @@ function VrDownloadCard({
                   }
                 />
                 <AlertDialog.Portal>
-                  <AlertDialog.Backdrop className="trash-dialog__backdrop" />
+                  <AlertDialog.Backdrop
+                    className="trash-dialog__backdrop"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setCleanupConfirmationOpen(false);
+                    }}
+                    onPointerDown={(event) => event.stopPropagation()}
+                  />
                   <AlertDialog.Viewport className="trash-dialog__viewport">
                     <AlertDialog.Popup
                       className="trash-dialog__popup"
                       initialFocus={() => cleanupSafeButton.current}
                     >
-                      <AlertDialog.Title>
-                        Permanently delete these selected files?
-                      </AlertDialog.Title>
+                      <div className="trash-dialog__heading">
+                        <AlertDialog.Title>
+                          Permanently delete these selected files?
+                        </AlertDialog.Title>
+                        <AlertDialog.Close
+                          render={
+                            <Button
+                              aria-label="Close confirmation"
+                              disabled={cleanupActionsDisabled}
+                              size="icon-xs"
+                              type="button"
+                              variant="ghost"
+                            >
+                              <AppIcon name="close" />
+                            </Button>
+                          }
+                        />
+                      </div>
                       <AlertDialog.Description>
-                        Windows will permanently delete only the exact selected
-                        transfer files listed below. This does not use the
-                        Recycle Bin and cannot be undone.
+                        Permanently delete {download.selectedFileCount} selected
+                        {" "}{categoryLabel} transfer {download.selectedFileCount === 1
+                          ? "file"
+                          : "files"} for “{download.releaseName}” ({download.identity}).
+                        On macOS, cleanup is crash-reconciled; on Windows,
+                        deletion is bound to the exact file handle. This does
+                        not use Finder Trash or the Recycle Bin and cannot be
+                        undone.
                       </AlertDialog.Description>
                       <ul aria-label={`Selected files for ${download.releaseName}`}>
                         {download.selectedFiles?.map((path) => (
@@ -8756,7 +8787,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       const message = (() => {
         switch (nativeErrorCode(error)) {
           case "vr_download_action_invalid":
-            return "Permanent cleanup is available only for an exact durably cancelled Windows transfer.";
+            return "Permanent cleanup is available only for an exact durably cancelled macOS or Windows transfer.";
           case "vr_download_stale":
             return "Cleanup stopped because an exact file or ownership record changed. No replacement or unrelated file was deleted.";
           case "vr_download_persistence_failed":
@@ -12355,7 +12386,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     Cancel stops a transfer and keeps every downloaded file
                     and partial byte on macOS and Windows. A separate,
                     explicitly confirmed permanent cleanup is available only
-                    for durably cancelled Windows transfers.
+                    for exact durably cancelled transfers.
                   </p>
                 </div>
                 <Button
