@@ -258,7 +258,7 @@ struct CleanupRecovery {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CleanupDeletionOutcome {
     TargetAbsent,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     ReplacementPreserved,
 }
 
@@ -272,18 +272,18 @@ impl From<()> for CleanupDeletionOutcome {
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 enum CleanupReconciliation {
     Continue,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     DeletionCompleted,
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 impl CleanupReconciliation {
     fn deletion_completed(self) -> bool {
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(target_os = "macos")]
         {
             matches!(self, Self::DeletionCompleted)
         }
-        #[cfg(all(target_os = "windows", not(test)))]
+        #[cfg(not(target_os = "macos"))]
         {
             match self {
                 Self::Continue => false,
@@ -6568,7 +6568,7 @@ where
                         match (deletion, fs::symlink_metadata(&target)) {
                             (CleanupDeletionOutcome::TargetAbsent, Err(error))
                                 if error.kind() == io::ErrorKind::NotFound => {}
-                            #[cfg(any(target_os = "macos", test))]
+                            #[cfg(target_os = "macos")]
                             (CleanupDeletionOutcome::ReplacementPreserved, Ok(metadata))
                                 if !metadata.file_type().is_symlink() && metadata.is_file() => {}
                             _ => return Err(VR_DOWNLOAD_STALE),
