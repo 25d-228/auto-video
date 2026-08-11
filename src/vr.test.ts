@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   applyVrOrganization,
@@ -7,6 +7,8 @@ import {
   dismissVrOrganization,
   fetchExactJavdbAdultItem,
   fetchExactJavdbVrItem,
+  fetchJavdbBrowse,
+  fetchJavdbCoverObjectUrl,
   fetchVerifiedAdultSukebeiReleases,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedAdultSukebeiTorrent,
@@ -15,6 +17,7 @@ import {
   loadVrDownloadLimit,
   loadVrDownloads,
   loadVrFolder,
+  parseJavdbBrowseResponse,
   previewVrOrganization,
   queryVrStorage,
   scanVrLibrary,
@@ -24,6 +27,7 @@ import {
   startVerifiedVrDownload,
   trashVrFile,
 } from "./vr";
+import type { JavdbBrowseItem, JavdbBrowseRequest } from "./vr";
 
 const catalogFixture = `
   <!doctype html>
@@ -78,6 +82,10 @@ let invokeMock: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   invokeMock = vi.fn();
   vi.stubGlobal("__TAURI__", { core: { invoke: invokeMock } });
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe("VR product-code identity", () => {
@@ -226,6 +234,146 @@ describe("parsed VR Library identity", () => {
     });
     invokeMock.mockResolvedValueOnce(["0", "0"]);
     await expect(queryVrStorage()).rejects.toThrow("inconsistent");
+  });
+});
+
+describe("native-owned JavDB browse boundary", () => {
+  const request: JavdbBrowseRequest = {
+    category: "vr",
+    mode: "category",
+    period: "daily",
+    year: null,
+    month: null,
+    sort: "newest",
+    count: 25,
+  };
+
+  it("accepts only one strict structured category generation and item identity", () => {
+    expect(
+      parseJavdbBrowseResponse(
+        [
+          "7",
+          "2",
+          "vr",
+          "VrA",
+          "MDVR-419",
+          "Exact title",
+          "2026-08-12",
+          "javdb-cover-7-1-0123abcd",
+          "1.48",
+          "vr",
+          "VrB",
+          "MDVR-422",
+          "",
+          "",
+          "",
+          "1.48",
+        ],
+        request,
+      ),
+    ).toEqual({
+      status: "ready",
+      items: [
+        {
+          category: "vr",
+          providerItemId: "VrA",
+          requestGeneration: "7",
+          code: "MDVR-419",
+          title: "Exact title",
+          releaseDate: "2026-08-12",
+          coverAuthorityId: "javdb-cover-7-1-0123abcd",
+          coverUrl: null,
+          source: "JavDB",
+          sourceAspectRatio: 1.48,
+        },
+        {
+          category: "vr",
+          providerItemId: "VrB",
+          requestGeneration: "7",
+          code: "MDVR-422",
+          title: null,
+          releaseDate: null,
+          coverAuthorityId: null,
+          coverUrl: null,
+          source: "JavDB",
+          sourceAspectRatio: 1.48,
+        },
+      ],
+    });
+    for (const response of [
+      ["7", "1", "adult", "VrA", "MDVR-419", "", "", "", "1.48"],
+      ["7", "1", "vr", "Bad Id", "MDVR-419", "", "", "", "1.48"],
+      ["7", "1", "vr", "VrA", "MDVR-0419", "", "", "", "1.48"],
+      ["7", "1", "vr", "VrA", "MDVR-419", "", "", "https://tp.evil.com/a.jpg", "1.48"],
+    ]) {
+      expect(parseJavdbBrowseResponse(response, request)).toEqual({
+        status: "malformed-provider",
+      });
+    }
+  });
+
+  it("submits the complete exact browse request and maps native local states", async () => {
+    invokeMock.mockResolvedValueOnce(["8", "0"]);
+    await expect(fetchJavdbBrowse(request)).resolves.toEqual({
+      status: "ready",
+      items: [],
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith("fetch_javdb_catalog", request);
+
+    for (const [error, status] of [
+      ["vr_source_unavailable", "source-unavailable"],
+      ["vr_network_error", "network-error"],
+      ["vr_javdb_malformed_provider", "malformed-provider"],
+      ["vr_javdb_conflicting_provider", "conflicting-provider"],
+      ["vr_provider_error", "provider-error"],
+    ]) {
+      invokeMock.mockRejectedValueOnce(error);
+      await expect(fetchJavdbBrowse(request)).resolves.toEqual({ status });
+    }
+
+    invokeMock.mockClear();
+    for (const year of ["2000", String(new Date().getFullYear() + 1)]) {
+      await expect(fetchJavdbBrowse({ ...request, year })).rejects.toThrow(
+        "A valid JavDB browse request is required.",
+      );
+    }
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("requests cover bytes with opaque exact identity and no source URL", async () => {
+    const createObjectURL = vi.fn().mockReturnValue("blob:exact-cover");
+    vi.stubGlobal("URL", { createObjectURL });
+    invokeMock.mockResolvedValue([
+      0xff, 0xd8, 0xff, 0xe0, 0, 16, 0, 0, 0, 0, 0, 0,
+    ]);
+    const item: JavdbBrowseItem = {
+      category: "vr",
+      providerItemId: "VrA",
+      requestGeneration: "7",
+      code: "MDVR-419",
+      title: null,
+      releaseDate: null,
+      coverAuthorityId: "javdb-cover-7-1-0123abcd",
+      coverUrl: null,
+      source: "JavDB",
+      sourceAspectRatio: 1.48,
+    };
+
+    await expect(fetchJavdbCoverObjectUrl(item)).resolves.toBe(
+      "blob:exact-cover",
+    );
+    expect(invokeMock).toHaveBeenCalledWith("fetch_javdb_cover", {
+      category: "vr",
+      requestGeneration: "7",
+      providerItemId: "VrA",
+      coverAuthorityId: "javdb-cover-7-1-0123abcd",
+    });
+    expect(invokeMock.mock.calls[0]?.[1]).not.toHaveProperty("sourceUrl");
+    expect(createObjectURL).toHaveBeenCalledOnce();
+
+    invokeMock.mockResolvedValueOnce([0xff, 0xd8, 0xff, 0xe0]);
+    await expect(fetchJavdbCoverObjectUrl(item)).rejects.toThrow("invalid");
+    expect(createObjectURL).toHaveBeenCalledOnce();
   });
 });
 

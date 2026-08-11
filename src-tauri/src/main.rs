@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adult_library;
+mod javdb_catalog;
 mod library_scan;
 mod tv_library;
 mod tv_release;
@@ -28,6 +29,11 @@ use adult_library::{
     set_adult_folder, trash_adult_file_with, AdultLibraryState, ADULT_FILE_OPEN_FAILED,
     ADULT_FILE_REVEAL_FAILED, ADULT_FILE_TRASH_FAILED, ADULT_FOLDER_STORAGE_FAILED,
     ADULT_FOLDER_UNAVAILABLE, ADULT_LIBRARY_SCAN_FAILED,
+};
+use javdb_catalog::{
+    fetch_api_document as fetch_javdb_api_document, fetch_catalog_with as fetch_javdb_catalog_with,
+    fetch_cover_bytes as fetch_javdb_cover_bytes, fetch_cover_with as fetch_javdb_cover_with,
+    invalidate_catalog as invalidate_javdb_catalog_with, JavdbCatalogRequest, JavdbCatalogState,
 };
 use library_scan::{is_supported_library_media, scan_library_files};
 use tauri::Manager;
@@ -263,7 +269,7 @@ struct TrashMovieRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum ProviderRequestError {
+pub(crate) enum ProviderRequestError {
     SourceUnavailable,
     Network,
     Provider,
@@ -3223,6 +3229,77 @@ async fn fetch_javdb_adult_catalog(code: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn fetch_javdb_catalog(
+    category: String,
+    mode: String,
+    period: String,
+    year: Option<String>,
+    month: Option<u8>,
+    sort: String,
+    count: u16,
+    state: tauri::State<'_, JavdbCatalogState>,
+) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    let request = JavdbCatalogRequest {
+        category,
+        mode,
+        period,
+        year,
+        month,
+        sort,
+        count,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_javdb_catalog_with(&state, &request, fetch_javdb_api_document).map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
+fn invalidate_javdb_catalog(
+    category: String,
+    state: tauri::State<'_, JavdbCatalogState>,
+) -> Result<(), String> {
+    invalidate_javdb_catalog_with(state.inner(), &category).map_err(str::to_owned)
+}
+
+#[tauri::command]
+async fn fetch_javdb_cover(
+    category: String,
+    request_generation: String,
+    provider_item_id: String,
+    cover_authority_id: String,
+    state: tauri::State<'_, JavdbCatalogState>,
+) -> Result<Vec<u8>, String> {
+    let state = state.inner().clone();
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_javdb_cover_with(
+            &state,
+            &category,
+            &request_generation,
+            &provider_item_id,
+            &cover_authority_id,
+            fetch_javdb_cover_bytes,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
 async fn fetch_sukebei_adult_releases(
     code: String,
     state: tauri::State<'_, AdultTorrentState>,
@@ -3947,6 +4024,7 @@ fn main() {
         .manage(MovieTorrentState::default())
         .manage(AdultLibraryState::default())
         .manage(AdultTorrentState::default())
+        .manage(JavdbCatalogState::default())
         .manage(TvLibraryState::default())
         .manage(TvReleaseState::default())
         .manage(TvTorrentState::default())
@@ -4017,6 +4095,9 @@ fn main() {
             dismiss_vr_organization,
             fetch_javdb_vr_catalog,
             fetch_javdb_adult_catalog,
+            fetch_javdb_catalog,
+            invalidate_javdb_catalog,
+            fetch_javdb_cover,
             fetch_sukebei_adult_releases,
             fetch_sukebei_vr_releases,
             fetch_yts_movie_releases,

@@ -140,10 +140,13 @@ import {
   dismissVrOrganization,
   fetchExactJavdbAdultItem,
   fetchExactJavdbVrItem,
+  fetchJavdbBrowse,
+  fetchJavdbCoverObjectUrl,
   fetchVerifiedAdultSukebeiReleases,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedAdultSukebeiTorrent,
   inspectVerifiedSukebeiTorrent,
+  invalidateJavdbBrowse,
   invalidateVerifiedAdultTorrent,
   invalidateVerifiedVrTorrent,
   listVrDownloads,
@@ -171,6 +174,12 @@ import {
   type VrOrganizationPreview,
   type JavdbCatalogItem,
   type JavdbCatalogResult,
+  type JavdbBrowseItem,
+  type JavdbBrowseMode,
+  type JavdbBrowsePeriod,
+  type JavdbBrowseRequest,
+  type JavdbBrowseResult,
+  type JavdbBrowseSort,
   type SukebeiRelease,
   type SukebeiReleasesResult,
   type TorrentInspectionResult,
@@ -422,6 +431,11 @@ type AdultCatalogState =
   | { status: "idle" }
   | { status: "loading" }
   | JavdbCatalogResult;
+type JavdbWorkflow = "browse" | "exact";
+type JavdbBrowseState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | JavdbBrowseResult;
 type AdultReleaseComparisonState =
   | { status: "loading" }
   | SukebeiReleasesResult<SukebeiRelease>;
@@ -519,6 +533,43 @@ const minimumGalleryCardWidth = 208;
 // Fixed title limits keep every calculated row within its observed viewport.
 const discoverCardBodyHeight = 160;
 const libraryCardHeight = 136;
+const javdbCoverHeight = 180;
+const javdbBrowsePeriods: Array<{
+  label: string;
+  value: JavdbBrowsePeriod;
+}> = [
+  { label: "Daily", value: "daily" },
+  { label: "Weekly", value: "weekly" },
+  { label: "Monthly", value: "monthly" },
+];
+const javdbBrowseSorts: Array<{ label: string; value: JavdbBrowseSort }> = [
+  { label: "Newest", value: "newest" },
+  { label: "Oldest", value: "oldest" },
+  { label: "Recently updated", value: "recently-updated" },
+  { label: "Top rated", value: "top-rated" },
+  { label: "Most viewed", value: "most-viewed" },
+  { label: "Most wanted", value: "most-wanted" },
+  { label: "Most watched", value: "most-watched" },
+];
+const javdbBrowseMonths = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+const javdbBrowseYears = Array.from(
+  { length: Math.max(0, new Date().getFullYear() - 2000) },
+  (_, index) => String(new Date().getFullYear() - index),
+);
+const javdbBrowseCounts = [10, 25, 50, 100] as const;
 
 const movieScanMessages = {
   unconfigured: {
@@ -1091,6 +1142,49 @@ const adultCatalogMessages = {
   "network-error": vrCatalogMessages["network-error"],
   "malformed-provider": vrCatalogMessages["malformed-provider"],
   "provider-error": vrCatalogMessages["provider-error"],
+} as const;
+
+const javdbBrowseMessages = {
+  idle: {
+    heading: "Browse JavDB",
+    message: "Choose the current catalog request.",
+    role: undefined,
+  },
+  loading: {
+    heading: "Loading JavDB catalog",
+    message: "Requesting and verifying the exact provider catalog.",
+    role: "status",
+  },
+  empty: {
+    heading: "No catalog titles found",
+    message: "JavDB returned no accepted titles for this exact request.",
+    role: undefined,
+  },
+  "source-unavailable": {
+    heading: "JavDB is unavailable",
+    message: "The catalog source is not available. Retry this exact request later.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "JavDB could not be reached",
+    message: "Check the network connection and retry this exact request.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "JavDB returned invalid catalog data",
+    message: "The provider response did not contain a valid catalog structure.",
+    role: "alert",
+  },
+  "conflicting-provider": {
+    heading: "JavDB returned conflicting catalog identities",
+    message: "The provider reused an item identity for different product codes.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "JavDB could not load the catalog",
+    message: "The provider returned an unexpected error. Retry this exact request later.",
+    role: "alert",
+  },
 } as const;
 
 const vrReleaseMessages = {
@@ -1862,6 +1956,495 @@ function DiscoverJavdbCard({
         </dl>
       </div>
     </article>
+  );
+}
+
+function JavdbBrowseControls({
+  category,
+  count,
+  mode,
+  month,
+  onCountChange,
+  onModeChange,
+  onMonthChange,
+  onPeriodChange,
+  onRefresh,
+  onSortChange,
+  onWorkflowChange,
+  onYearChange,
+  period,
+  sort,
+  workflow,
+  year,
+}: {
+  category: "adult" | "vr";
+  count: JavdbBrowseRequest["count"];
+  mode: JavdbBrowseMode;
+  month: number | null;
+  onCountChange: (count: JavdbBrowseRequest["count"]) => void;
+  onModeChange: (mode: JavdbBrowseMode) => void;
+  onMonthChange: (month: number | null) => void;
+  onPeriodChange: (period: JavdbBrowsePeriod) => void;
+  onRefresh: () => void;
+  onSortChange: (sort: JavdbBrowseSort) => void;
+  onWorkflowChange: (workflow: JavdbWorkflow) => void;
+  onYearChange: (year: string | null) => void;
+  period: JavdbBrowsePeriod;
+  sort: JavdbBrowseSort;
+  workflow: JavdbWorkflow;
+  year: string | null;
+}) {
+  const showsCategoryControls = category === "vr" || mode === "category";
+
+  return (
+    <div className="javdb-browse-controls">
+      <fieldset className="discover-category javdb-workflow">
+        <legend>{category === "vr" ? "VR" : "Adult"} workflow</legend>
+        <div>
+          {(["browse", "exact"] as const).map((value) => (
+            <label key={value}>
+              <input
+                checked={workflow === value}
+                name={`${category}-discover-workflow`}
+                onChange={() => onWorkflowChange(value)}
+                type="radio"
+                value={value}
+              />
+              <span>{value === "browse" ? "Browse" : "Exact code"}</span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+      {workflow === "browse" ? (
+        <div className="javdb-browse-controls__request">
+          <span className="javdb-provider-label">
+            <span>Provider</span>
+            <strong>JavDB</strong>
+          </span>
+          {category === "adult" ? (
+            <label className="javdb-select-label">
+              <span>Mode</span>
+              <select
+                aria-label="Adult browse mode"
+                onChange={(event) =>
+                  onModeChange(event.target.value as JavdbBrowseMode)
+                }
+                value={mode}
+              >
+                <option value="ranking">Ranking</option>
+                <option value="category">Category</option>
+              </select>
+            </label>
+          ) : null}
+          {category === "adult" && mode === "ranking" ? (
+            <label className="javdb-select-label">
+              <span>Period</span>
+              <select
+                aria-label="Adult ranking period"
+                onChange={(event) =>
+                  onPeriodChange(event.target.value as JavdbBrowsePeriod)
+                }
+                value={period}
+              >
+                {javdbBrowsePeriods.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          {showsCategoryControls ? (
+            <>
+              <label className="javdb-select-label">
+                <span>Year</span>
+                <select
+                  aria-label={`${category === "vr" ? "VR" : "Adult"} year`}
+                  onChange={(event) =>
+                    onYearChange(event.target.value || null)
+                  }
+                  value={year ?? ""}
+                >
+                  <option value="">All years</option>
+                  {javdbBrowseYears.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="javdb-select-label">
+                <span>Month</span>
+                <select
+                  aria-label={`${category === "vr" ? "VR" : "Adult"} month`}
+                  onChange={(event) =>
+                    onMonthChange(
+                      event.target.value === ""
+                        ? null
+                        : Number(event.target.value),
+                    )
+                  }
+                  value={month ?? ""}
+                >
+                  <option value="">All months</option>
+                  {javdbBrowseMonths.map((option, index) => (
+                    <option key={option} value={index + 1}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="javdb-select-label">
+                <span>Sort</span>
+                <select
+                  aria-label={`${category === "vr" ? "VR" : "Adult"} sort`}
+                  onChange={(event) =>
+                    onSortChange(event.target.value as JavdbBrowseSort)
+                  }
+                  value={sort}
+                >
+                  {javdbBrowseSorts.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </>
+          ) : null}
+          <label className="javdb-select-label">
+            <span>Results</span>
+            <select
+              aria-label={`${category === "vr" ? "VR" : "Adult"} result count`}
+              onChange={(event) =>
+                onCountChange(
+                  Number(event.target.value) as JavdbBrowseRequest["count"],
+                )
+              }
+              value={count}
+            >
+              {javdbBrowseCounts.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </label>
+          <Button onClick={onRefresh} size="sm" type="button" variant="outline">
+            <AppIcon name="refresh" />
+            Refresh
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function JavdbCover({
+  item,
+  onRatio,
+}: {
+  item: JavdbBrowseItem;
+  onRatio: (ratio: number) => void;
+}) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(item.coverAuthorityId === null);
+
+  useEffect(() => {
+    let current = true;
+    setObjectUrl(null);
+    setFailed(item.coverAuthorityId === null);
+    if (item.coverAuthorityId === null) {
+      return () => {
+        current = false;
+      };
+    }
+    void fetchJavdbCoverObjectUrl(item)
+      .then((url) => {
+        if (!current) {
+          URL.revokeObjectURL(url);
+        } else {
+          setObjectUrl(url);
+        }
+      })
+      .catch(() => {
+        if (current) {
+          setFailed(true);
+        }
+      });
+    return () => {
+      current = false;
+    };
+  }, [item]);
+
+  useEffect(
+    () => () => {
+      if (objectUrl !== null) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    },
+    [objectUrl],
+  );
+
+  if (objectUrl === null || failed) {
+    return (
+      <div className="javdb-cover__placeholder">
+        <AppIcon name="poster" />
+        <span>{item.code}</span>
+      </div>
+    );
+  }
+  return (
+    <img
+      alt=""
+      onError={() => {
+        setFailed(true);
+        setObjectUrl(null);
+      }}
+      onLoad={(event) => {
+        const { naturalHeight, naturalWidth } = event.currentTarget;
+        if (naturalHeight > 0 && naturalWidth > 0) {
+          onRatio(naturalWidth / naturalHeight);
+        }
+      }}
+      src={objectUrl}
+    />
+  );
+}
+
+function DiscoverJavdbBrowseCard({
+  inLibrary,
+  item,
+  onFindReleases,
+  onRatioChange,
+  transferState,
+}: {
+  inLibrary: boolean;
+  item: JavdbBrowseItem;
+  onFindReleases: (item: JavdbBrowseItem, triggerId: string) => void;
+  onRatioChange: (item: JavdbBrowseItem, ratio: number) => void;
+  transferState: VrDownload["state"] | null;
+}) {
+  const [coverRatio, setCoverRatio] = useState(item.sourceAspectRatio);
+  const cardId = `javdb-card-${item.category}-${item.providerItemId}`;
+  const releasesTriggerId = `${cardId}-releases`;
+
+  return (
+    <article
+      aria-labelledby={`${cardId}-title`}
+      className="javdb-browse-card"
+      data-cover-ratio={coverRatio}
+      style={{ width: `${Math.round(javdbCoverHeight * coverRatio)}px` }}
+    >
+      <div className="javdb-browse-card__cover">
+        <JavdbCover
+          item={item}
+          onRatio={(ratio) => {
+            setCoverRatio(ratio);
+            onRatioChange(item, ratio);
+          }}
+        />
+        <div className="javdb-browse-card__badges">
+          {inLibrary ? <span>In library</span> : null}
+          {transferState === null ? null : <span>{transferState}</span>}
+        </div>
+      </div>
+      <div className="javdb-browse-card__body">
+        <h3 id={`${cardId}-title`}>{item.code}</h3>
+        <p>{item.title ?? item.releaseDate ?? "Title unavailable"}</p>
+        <span>JavDB</span>
+      </div>
+      <div className="javdb-browse-card__actions">
+        <CopyTitleAction title={item.code} />
+        <Button
+          aria-label={`Find releases: ${item.code}`}
+          id={releasesTriggerId}
+          onClick={(event) => {
+            event.stopPropagation();
+            onFindReleases(item, releasesTriggerId);
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          Find releases
+        </Button>
+      </div>
+    </article>
+  );
+}
+
+// These values mirror the fixed card body and gallery gaps in index.css.
+const javdbBrowseCardHeight = 260;
+const javdbBrowseColumnGap = 14;
+const javdbBrowseRowGap = 16;
+
+function javdbPageCapacity(
+  items: JavdbBrowseItem[],
+  ratios: Map<string, number>,
+  width: number,
+  height: number,
+) {
+  if (width <= 0 || height <= 0) {
+    return 1;
+  }
+  const rowCount = Math.max(
+    1,
+    Math.floor(
+      (height + javdbBrowseRowGap) /
+        (javdbBrowseCardHeight + javdbBrowseRowGap),
+    ),
+  );
+  let rows = 1;
+  let rowWidth = 0;
+  let capacity = 0;
+  for (const item of items) {
+    const cardWidth = Math.round(
+      javdbCoverHeight *
+        (ratios.get(item.providerItemId) ?? item.sourceAspectRatio),
+    );
+    const nextWidth = rowWidth === 0 ? cardWidth : rowWidth + javdbBrowseColumnGap + cardWidth;
+    if (rowWidth !== 0 && nextWidth > width) {
+      rows += 1;
+      if (rows > rowCount) {
+        break;
+      }
+      rowWidth = cardWidth;
+    } else {
+      rowWidth = nextWidth;
+    }
+    capacity += 1;
+  }
+  return Math.max(1, capacity);
+}
+
+function JavdbBrowseGallery({
+  ariaLabel,
+  getInLibrary,
+  getTransferState,
+  items,
+  onFindReleases,
+  onSelectedPageChange,
+  selectedPage,
+}: {
+  ariaLabel: string;
+  getInLibrary: (item: JavdbBrowseItem) => boolean;
+  getTransferState: (item: JavdbBrowseItem) => VrDownload["state"] | null;
+  items: JavdbBrowseItem[];
+  onFindReleases: (item: JavdbBrowseItem, triggerId: string) => void;
+  onSelectedPageChange: (page: number) => void;
+  selectedPage: number;
+}) {
+  const viewport = useRef<HTMLDivElement | null>(null);
+  const [bounds, setBounds] = useState({ width: 0, height: 0 });
+  const [ratios, setRatios] = useState<Map<string, number>>(() => new Map());
+
+  useLayoutEffect(() => {
+    const element = viewport.current;
+    if (element === null) {
+      return;
+    }
+    const updateBounds = (width: number, height: number) => {
+      if (width > 0 && height > 0) {
+        setBounds((current) =>
+          current.width === width && current.height === height
+            ? current
+            : { width, height },
+        );
+      }
+    };
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries.find(({ target }) => target === element);
+      if (entry !== undefined) {
+        updateBounds(entry.contentRect.width, entry.contentRect.height);
+      }
+    });
+    const initialBounds = element.getBoundingClientRect();
+    updateBounds(initialBounds.width, initialBounds.height);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  const capacity = javdbPageCapacity(
+    items,
+    ratios,
+    bounds.width,
+    bounds.height,
+  );
+  const pageCount = Math.max(1, Math.ceil(items.length / capacity));
+  const currentPage = Math.min(selectedPage, pageCount);
+  const firstVisibleIndex = (currentPage - 1) * capacity;
+  const visibleItems = items.slice(
+    firstVisibleIndex,
+    firstVisibleIndex + capacity,
+  );
+
+  useLayoutEffect(() => {
+    if (selectedPage !== currentPage) {
+      onSelectedPageChange(currentPage);
+    }
+  }, [currentPage, onSelectedPageChange, selectedPage]);
+
+  return (
+    <div
+      className="media-gallery media-gallery--javdb"
+      data-current-page={currentPage}
+      data-gallery="discover"
+      data-page-capacity={capacity}
+      data-page-count={pageCount}
+    >
+      <div className="media-gallery__viewport" ref={viewport}>
+        <ul aria-label={ariaLabel} className="javdb-browse-grid">
+          {visibleItems.map((item) => (
+            <li key={`${item.requestGeneration}-${item.providerItemId}`}>
+              <DiscoverJavdbBrowseCard
+                inLibrary={getInLibrary(item)}
+                item={item}
+                onFindReleases={onFindReleases}
+                onRatioChange={(currentItem, ratio) => {
+                  setRatios((current) => {
+                    if (current.get(currentItem.providerItemId) === ratio) {
+                      return current;
+                    }
+                    const next = new Map(current);
+                    next.set(currentItem.providerItemId, ratio);
+                    return next;
+                  });
+                }}
+                transferState={getTransferState(item)}
+              />
+            </li>
+          ))}
+        </ul>
+      </div>
+      <nav aria-label={`${ariaLabel} pagination`} className="media-pagination">
+        <Button
+          aria-label={`Previous ${ariaLabel} page`}
+          disabled={currentPage === 1}
+          onClick={() => onSelectedPageChange(currentPage - 1)}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          Previous
+        </Button>
+        <p aria-atomic="true" aria-live="polite">
+          Page {currentPage} of {pageCount}
+        </p>
+        <Button
+          aria-label={`Next ${ariaLabel} page`}
+          disabled={currentPage === pageCount}
+          onClick={() => onSelectedPageChange(currentPage + 1)}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          Next
+        </Button>
+      </nav>
+    </div>
   );
 }
 
@@ -7250,6 +7833,24 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [selectedTvTorrentFileIds, setSelectedTvTorrentFileIds] =
     useState<Set<number>>(new Set());
   const [adultSearchInput, setAdultSearchInput] = useState("");
+  const [adultWorkflow, setAdultWorkflow] =
+    useState<JavdbWorkflow>("browse");
+  const [adultBrowseActivated, setAdultBrowseActivated] = useState(false);
+  const [adultBrowseMode, setAdultBrowseMode] =
+    useState<JavdbBrowseMode>("ranking");
+  const [adultBrowsePeriod, setAdultBrowsePeriod] =
+    useState<JavdbBrowsePeriod>("daily");
+  const [adultBrowseYear, setAdultBrowseYear] = useState<string | null>(null);
+  const [adultBrowseMonth, setAdultBrowseMonth] = useState<number | null>(null);
+  const [adultBrowseSort, setAdultBrowseSort] =
+    useState<JavdbBrowseSort>("newest");
+  const [adultBrowseCount, setAdultBrowseCount] =
+    useState<JavdbBrowseRequest["count"]>(25);
+  const [adultBrowseState, setAdultBrowseState] = useState<JavdbBrowseState>({
+    status: "idle",
+  });
+  const [adultBrowseRequestVersion, setAdultBrowseRequestVersion] = useState(0);
+  const [adultBrowseSelectedPage, setAdultBrowseSelectedPage] = useState(1);
   const [adultSearchInputError, setAdultSearchInputError] = useState<
     string | null
   >(null);
@@ -7287,6 +7888,19 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [selectedAdultTorrentFileIds, setSelectedAdultTorrentFileIds] =
     useState<Set<number>>(new Set());
   const [vrSearchInput, setVrSearchInput] = useState("");
+  const [vrWorkflow, setVrWorkflow] = useState<JavdbWorkflow>("browse");
+  const [vrBrowseActivated, setVrBrowseActivated] = useState(false);
+  const [vrBrowseYear, setVrBrowseYear] = useState<string | null>(null);
+  const [vrBrowseMonth, setVrBrowseMonth] = useState<number | null>(null);
+  const [vrBrowseSort, setVrBrowseSort] =
+    useState<JavdbBrowseSort>("newest");
+  const [vrBrowseCount, setVrBrowseCount] =
+    useState<JavdbBrowseRequest["count"]>(25);
+  const [vrBrowseState, setVrBrowseState] = useState<JavdbBrowseState>({
+    status: "idle",
+  });
+  const [vrBrowseRequestVersion, setVrBrowseRequestVersion] = useState(0);
+  const [vrBrowseSelectedPage, setVrBrowseSelectedPage] = useState(1);
   const [vrSearchInputError, setVrSearchInputError] = useState<string | null>(
     null,
   );
@@ -7380,11 +7994,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const tvTorrentSaveRequestId = useRef(0);
   const tvTorrentStartRequestId = useRef(0);
   const adultCatalogRequestId = useRef(0);
+  const adultBrowseRequestId = useRef(0);
   const adultReleaseRequestId = useRef(0);
   const adultTorrentInspectionRequestId = useRef(0);
   const adultTorrentSaveRequestId = useRef(0);
   const adultTorrentStartRequestId = useRef(0);
   const vrCatalogRequestId = useRef(0);
+  const vrBrowseRequestId = useRef(0);
   const releaseRequestId = useRef(0);
   const torrentInspectionRequestId = useRef(0);
   const torrentSaveRequestId = useRef(0);
@@ -8541,6 +9157,40 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   }, [adultCatalogRequestVersion, submittedAdultCode]);
 
   useEffect(() => {
+    if (!adultBrowseActivated) {
+      return;
+    }
+    const requestId = ++adultBrowseRequestId.current;
+    const request: JavdbBrowseRequest = {
+      category: "adult",
+      mode: adultBrowseMode,
+      period: adultBrowsePeriod,
+      year: adultBrowseMode === "category" ? adultBrowseYear : null,
+      month: adultBrowseMode === "category" ? adultBrowseMonth : null,
+      sort: adultBrowseMode === "category" ? adultBrowseSort : "newest",
+      count: adultBrowseCount,
+    };
+    setAdultBrowseState({ status: "loading" });
+    void fetchJavdbBrowse(request).then((result) => {
+      if (requestId === adultBrowseRequestId.current) {
+        setAdultBrowseState(result);
+      }
+    });
+    return () => {
+      adultBrowseRequestId.current += 1;
+    };
+  }, [
+    adultBrowseActivated,
+    adultBrowseCount,
+    adultBrowseMode,
+    adultBrowseMonth,
+    adultBrowsePeriod,
+    adultBrowseRequestVersion,
+    adultBrowseSort,
+    adultBrowseYear,
+  ]);
+
+  useEffect(() => {
     const requestId = ++adultReleaseRequestId.current;
     if (adultReleaseComparisonItem === null) {
       return;
@@ -8600,6 +9250,38 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       vrCatalogRequestId.current += 1;
     };
   }, [submittedVrCode, vrCatalogRequestVersion]);
+
+  useEffect(() => {
+    if (!vrBrowseActivated) {
+      return;
+    }
+    const requestId = ++vrBrowseRequestId.current;
+    const request: JavdbBrowseRequest = {
+      category: "vr",
+      mode: "category",
+      period: "daily",
+      year: vrBrowseYear,
+      month: vrBrowseMonth,
+      sort: vrBrowseSort,
+      count: vrBrowseCount,
+    };
+    setVrBrowseState({ status: "loading" });
+    void fetchJavdbBrowse(request).then((result) => {
+      if (requestId === vrBrowseRequestId.current) {
+        setVrBrowseState(result);
+      }
+    });
+    return () => {
+      vrBrowseRequestId.current += 1;
+    };
+  }, [
+    vrBrowseActivated,
+    vrBrowseCount,
+    vrBrowseMonth,
+    vrBrowseRequestVersion,
+    vrBrowseSort,
+    vrBrowseYear,
+  ]);
 
   useEffect(() => {
     const requestId = ++releaseRequestId.current;
@@ -11280,6 +11962,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           ? { status: "idle" }
           : currentState,
       );
+      adultBrowseRequestId.current += 1;
+      setAdultBrowseActivated(false);
+      setAdultBrowseState({ status: "idle" });
+      setAdultBrowseSelectedPage(1);
+      void invalidateJavdbBrowse("adult").catch(() => undefined);
     }
     if (discoverCategory === "vr") {
       vrCatalogRequestId.current += 1;
@@ -11288,11 +11975,74 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           ? { status: "idle" }
           : currentState,
       );
+      vrBrowseRequestId.current += 1;
+      setVrBrowseActivated(false);
+      setVrBrowseState({ status: "idle" });
+      setVrBrowseSelectedPage(1);
+      void invalidateJavdbBrowse("vr").catch(() => undefined);
     }
     if (category === "tv") {
       setIsTvDiscoverActivated(true);
+    } else if (category === "adult" && adultWorkflow === "browse") {
+      setAdultBrowseActivated(true);
+    } else if (category === "vr" && vrWorkflow === "browse") {
+      setVrBrowseActivated(true);
     }
     setDiscoverCategory(category);
+  };
+
+  const changeAdultWorkflow = (workflow: JavdbWorkflow) => {
+    if (workflow === adultWorkflow) {
+      return;
+    }
+    closeAdultReleaseComparison();
+    adultBrowseRequestId.current += 1;
+    setAdultBrowseSelectedPage(1);
+    setAdultBrowseState({ status: "idle" });
+    setAdultBrowseActivated(workflow === "browse");
+    if (workflow === "exact") {
+      void invalidateJavdbBrowse("adult").catch(() => undefined);
+      adultCatalogRequestId.current += 1;
+      setAdultCatalogState((current) =>
+        current.status === "loading" ? { status: "idle" } : current,
+      );
+    }
+    setAdultWorkflow(workflow);
+  };
+
+  const changeVrWorkflow = (workflow: JavdbWorkflow) => {
+    if (workflow === vrWorkflow) {
+      return;
+    }
+    closeVrReleaseComparison();
+    vrBrowseRequestId.current += 1;
+    setVrBrowseSelectedPage(1);
+    setVrBrowseState({ status: "idle" });
+    setVrBrowseActivated(workflow === "browse");
+    if (workflow === "exact") {
+      void invalidateJavdbBrowse("vr").catch(() => undefined);
+      vrCatalogRequestId.current += 1;
+      setVrCatalogState((current) =>
+        current.status === "loading" ? { status: "idle" } : current,
+      );
+    }
+    setVrWorkflow(workflow);
+  };
+
+  const restartAdultBrowse = () => {
+    closeAdultReleaseComparison();
+    adultBrowseRequestId.current += 1;
+    setAdultBrowseSelectedPage(1);
+    setAdultBrowseState({ status: "loading" });
+    setAdultBrowseRequestVersion((version) => version + 1);
+  };
+
+  const restartVrBrowse = () => {
+    closeVrReleaseComparison();
+    vrBrowseRequestId.current += 1;
+    setVrBrowseSelectedPage(1);
+    setVrBrowseState({ status: "loading" });
+    setVrBrowseRequestVersion((version) => version + 1);
   };
 
   const searchAdultCatalog = (event: FormEvent<HTMLFormElement>) => {
@@ -11927,6 +12677,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     submittedAdultCode === null
       ? "Adult product-code search"
       : `Adult result for ${submittedAdultCode}`;
+  const adultBrowseItems =
+    adultBrowseState.status === "ready" ? adultBrowseState.items : [];
+  const currentAdultBrowseMessage =
+    adultBrowseState.status === "ready"
+      ? adultBrowseState.items.length === 0
+        ? javdbBrowseMessages.empty
+        : null
+      : javdbBrowseMessages[adultBrowseState.status];
+  const adultBrowseGalleryLabel = "JavDB Adult catalog";
   // Exact-code production results contain one item; the fixture exercises the real responsive pager.
   const adultGalleryItems =
     adultCatalogState.status === "ready"
@@ -11940,6 +12699,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     submittedVrCode === null
       ? "VR product-code search"
       : `VR result for ${submittedVrCode}`;
+  const vrBrowseItems =
+    vrBrowseState.status === "ready" ? vrBrowseState.items : [];
+  const currentVrBrowseMessage =
+    vrBrowseState.status === "ready"
+      ? vrBrowseState.items.length === 0
+        ? javdbBrowseMessages.empty
+        : null
+      : javdbBrowseMessages[vrBrowseState.status];
+  const vrBrowseGalleryLabel = "JavDB VR catalog";
   const isLibrarySearchActive = librarySearchQuery.trim() !== "";
   const completeLibraryMovies =
     movieScanState.status === "ready" ? movieScanState.movies : [];
@@ -12092,6 +12860,16 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     completeAdultLibraryItems.length - completeAdultLibraryGroupedCount;
   const currentVrDownloads =
     vrDownloadsState.status === "ready" ? vrDownloadsState.downloads : [];
+  const isJavdbItemInLibrary = (item: JavdbBrowseItem) =>
+    (item.category === "adult"
+      ? completeAdultLibraryItems
+      : completeVrLibraryItems
+    ).some((libraryItem) => libraryItem.code === item.code);
+  const javdbItemTransferState = (item: JavdbBrowseItem) =>
+    currentVrDownloads.find(
+      (download) =>
+        download.category === item.category && download.identity === item.code,
+    )?.state ?? null;
   const vrDownloadSummary = summarizeVrDownloads(currentVrDownloads);
   const vrDownloadLimitRequiresAttention =
     vrDownloadLimitState.status === "error" ||
@@ -12920,9 +13698,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   ? discoverState.status === "loading"
                   : discoverCategory === "tv"
                     ? tvDiscoverState.status === "loading"
-                    : discoverCategory === "adult"
-                      ? adultCatalogState.status === "loading"
-                      : vrCatalogState.status === "loading"
+                  : discoverCategory === "adult"
+                      ? adultWorkflow === "browse"
+                        ? adultBrowseState.status === "loading"
+                        : adultCatalogState.status === "loading"
+                      : vrWorkflow === "browse"
+                        ? vrBrowseState.status === "loading"
+                        : vrCatalogState.status === "loading"
               }
               aria-labelledby="discover-heading"
               className="discover-content"
@@ -12952,18 +13734,28 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         : discoverCategory === "tv"
                           ? tvDiscoverGalleryLabel
                           : discoverCategory === "adult"
-                            ? adultGalleryLabel
-                            : vrGalleryLabel}
+                            ? adultWorkflow === "browse"
+                              ? adultBrowseGalleryLabel
+                              : adultGalleryLabel
+                            : vrWorkflow === "browse"
+                              ? vrBrowseGalleryLabel
+                              : vrGalleryLabel}
                     </h2>
                     <p className="library-folder">
                       {discoverCategory === "vr" ? (
-                        submittedVrCode === null ? (
+                        vrWorkflow === "browse" ? (
+                          "Exact tag-212 VR catalog"
+                        ) : submittedVrCode === null ? (
                           "Exact product-code lookup"
                         ) : (
                           <>Requested code {submittedVrCode}</>
                         )
                       ) : discoverCategory === "adult" ? (
-                        submittedAdultCode === null ? (
+                        adultWorkflow === "browse" ? (
+                          adultBrowseMode === "ranking"
+                            ? `${adultBrowsePeriod} Adult ranking`
+                            : "Adult category catalog"
+                        ) : submittedAdultCode === null ? (
                           "Exact product-code lookup"
                         ) : (
                           <>Requested code {submittedAdultCode}</>
@@ -13018,7 +13810,39 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     </div>
                   </fieldset>
                   {discoverCategory === "vr" ? (
-                    <form
+                    <>
+                      <JavdbBrowseControls
+                        category="vr"
+                        count={vrBrowseCount}
+                        mode="category"
+                        month={vrBrowseMonth}
+                        onCountChange={(count) => {
+                          setVrBrowseCount(count);
+                          restartVrBrowse();
+                        }}
+                        onModeChange={() => undefined}
+                        onMonthChange={(month) => {
+                          setVrBrowseMonth(month);
+                          restartVrBrowse();
+                        }}
+                        onPeriodChange={() => undefined}
+                        onRefresh={restartVrBrowse}
+                        onSortChange={(sort) => {
+                          setVrBrowseSort(sort);
+                          restartVrBrowse();
+                        }}
+                        onWorkflowChange={changeVrWorkflow}
+                        onYearChange={(year) => {
+                          setVrBrowseYear(year);
+                          restartVrBrowse();
+                        }}
+                        period="daily"
+                        sort={vrBrowseSort}
+                        workflow={vrWorkflow}
+                        year={vrBrowseYear}
+                      />
+                    {vrWorkflow === "exact" ? (
+                      <form
                       aria-label="Search JavDB VR titles"
                       className="discover-search"
                       onSubmit={searchVrCatalog}
@@ -13065,9 +13889,49 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           {vrSearchInputError}
                         </p>
                       )}
-                    </form>
+                      </form>
+                    ) : null}
+                    </>
                   ) : discoverCategory === "adult" ? (
-                    <form
+                    <>
+                      <JavdbBrowseControls
+                        category="adult"
+                        count={adultBrowseCount}
+                        mode={adultBrowseMode}
+                        month={adultBrowseMonth}
+                        onCountChange={(count) => {
+                          setAdultBrowseCount(count);
+                          restartAdultBrowse();
+                        }}
+                        onModeChange={(mode) => {
+                          setAdultBrowseMode(mode);
+                          restartAdultBrowse();
+                        }}
+                        onMonthChange={(month) => {
+                          setAdultBrowseMonth(month);
+                          restartAdultBrowse();
+                        }}
+                        onPeriodChange={(period) => {
+                          setAdultBrowsePeriod(period);
+                          restartAdultBrowse();
+                        }}
+                        onRefresh={restartAdultBrowse}
+                        onSortChange={(sort) => {
+                          setAdultBrowseSort(sort);
+                          restartAdultBrowse();
+                        }}
+                        onWorkflowChange={changeAdultWorkflow}
+                        onYearChange={(year) => {
+                          setAdultBrowseYear(year);
+                          restartAdultBrowse();
+                        }}
+                        period={adultBrowsePeriod}
+                        sort={adultBrowseSort}
+                        workflow={adultWorkflow}
+                        year={adultBrowseYear}
+                      />
+                    {adultWorkflow === "exact" ? (
+                      <form
                       aria-label="Search JavDB Adult titles"
                       className="discover-search"
                       onSubmit={searchAdultCatalog}
@@ -13112,7 +13976,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           {adultSearchInputError}
                         </p>
                       )}
-                    </form>
+                      </form>
+                    ) : null}
+                    </>
                   ) : isTmdbTokenLoaded &&
                     !tmdbCredentialLoadFailed &&
                     tmdbToken !== null ? (
@@ -13258,7 +14124,51 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
               </div>
 
               {discoverCategory === "vr" ? (
-                vrCatalogState.status === "ready" ? (
+                vrWorkflow === "browse" ? (
+                  vrBrowseState.status === "ready" &&
+                  vrBrowseItems.length > 0 ? (
+                    <>
+                      <span aria-live="polite" className="sr-only" role="status">
+                        {vrBrowseItems.length} accepted JavDB VR titles.
+                      </span>
+                      <JavdbBrowseGallery
+                        ariaLabel={vrBrowseGalleryLabel}
+                        getInLibrary={isJavdbItemInLibrary}
+                        getTransferState={javdbItemTransferState}
+                        items={vrBrowseItems}
+                        onFindReleases={openVrReleaseComparison}
+                        onSelectedPageChange={setVrBrowseSelectedPage}
+                        selectedPage={vrBrowseSelectedPage}
+                      />
+                    </>
+                  ) : (
+                    <div
+                      className="empty-state discover-state"
+                      role={currentVrBrowseMessage?.role}
+                    >
+                      <span className="empty-state__icon">
+                        <AppIcon name="vr" />
+                      </span>
+                      <h2>{currentVrBrowseMessage?.heading}</h2>
+                      <p>{currentVrBrowseMessage?.message}</p>
+                      {vrBrowseState.status === "source-unavailable" ||
+                      vrBrowseState.status === "network-error" ||
+                      vrBrowseState.status === "malformed-provider" ||
+                      vrBrowseState.status === "conflicting-provider" ||
+                      vrBrowseState.status === "provider-error" ? (
+                        <Button
+                          className="empty-state__action"
+                          onClick={restartVrBrowse}
+                          type="button"
+                          variant="outline"
+                        >
+                          <AppIcon name="refresh" />
+                          Retry
+                        </Button>
+                      ) : null}
+                    </div>
+                  )
+                ) : vrCatalogState.status === "ready" ? (
                   <ResizeAwareGallery
                     ariaLabel={vrGalleryLabel}
                     getItemKey={(item) => item.code}
@@ -13301,7 +14211,51 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   </div>
                 )
               ) : discoverCategory === "adult" ? (
-                adultCatalogState.status === "ready" ? (
+                adultWorkflow === "browse" ? (
+                  adultBrowseState.status === "ready" &&
+                  adultBrowseItems.length > 0 ? (
+                    <>
+                      <span aria-live="polite" className="sr-only" role="status">
+                        {adultBrowseItems.length} accepted JavDB Adult titles.
+                      </span>
+                      <JavdbBrowseGallery
+                        ariaLabel={adultBrowseGalleryLabel}
+                        getInLibrary={isJavdbItemInLibrary}
+                        getTransferState={javdbItemTransferState}
+                        items={adultBrowseItems}
+                        onFindReleases={openAdultReleaseComparison}
+                        onSelectedPageChange={setAdultBrowseSelectedPage}
+                        selectedPage={adultBrowseSelectedPage}
+                      />
+                    </>
+                  ) : (
+                    <div
+                      className="empty-state discover-state"
+                      role={currentAdultBrowseMessage?.role}
+                    >
+                      <span className="empty-state__icon">
+                        <AppIcon name="adult" />
+                      </span>
+                      <h2>{currentAdultBrowseMessage?.heading}</h2>
+                      <p>{currentAdultBrowseMessage?.message}</p>
+                      {adultBrowseState.status === "source-unavailable" ||
+                      adultBrowseState.status === "network-error" ||
+                      adultBrowseState.status === "malformed-provider" ||
+                      adultBrowseState.status === "conflicting-provider" ||
+                      adultBrowseState.status === "provider-error" ? (
+                        <Button
+                          className="empty-state__action"
+                          onClick={restartAdultBrowse}
+                          type="button"
+                          variant="outline"
+                        >
+                          <AppIcon name="refresh" />
+                          Retry
+                        </Button>
+                      ) : null}
+                    </div>
+                  )
+                ) : adultCatalogState.status === "ready" ? (
                   <ResizeAwareGallery
                     ariaLabel={adultGalleryLabel}
                     getItemKey={(item, resultIndex) =>
