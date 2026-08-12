@@ -13319,6 +13319,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     adultBrowseRequestId.current += 1;
     setAdultBrowseSelectedPage(1);
     setAdultBrowseState({ status: "loading" });
+    setAdultBrowseActivated(true);
     setAdultBrowseRequestVersion((version) => version + 1);
   };
 
@@ -13328,6 +13329,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     vrBrowseRequestId.current += 1;
     setVrBrowseSelectedPage(1);
     setVrBrowseState({ status: "loading" });
+    setVrBrowseActivated(true);
     setVrBrowseRequestVersion((version) => version + 1);
   };
 

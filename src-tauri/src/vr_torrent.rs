@@ -1672,10 +1672,16 @@ fn product_code_candidates(name: &str) -> Vec<(String, String)> {
             separated_number_end += 1;
         }
         let (prefix_end, number_start) = if compact_number_start < token_end {
+            let separated_number_is_year = separated_number_end - separated_number_start == 4
+                && ((bytes[separated_number_start] == b'1'
+                    && bytes[separated_number_start + 1] == b'9')
+                    || (bytes[separated_number_start] == b'2'
+                        && bytes[separated_number_start + 1] == b'0'));
             if separated_number_start > token_end
                 && separated_number_end > separated_number_start
                 && (separated_number_end == bytes.len()
                     || !bytes[separated_number_end].is_ascii_alphanumeric())
+                && !separated_number_is_year
             {
                 index = prefix_start + 1;
                 continue;
@@ -3009,6 +3015,9 @@ mod tests {
             "3DSVR1947 1080p",
             "3DSVR-1947"
         ));
+        assert!(release_matches_product_code("MDVR419 2024", "MDVR-419"));
+        assert!(release_matches_product_code("3DSVR1947 2025", "3DSVR-1947"));
+        assert!(product_code_candidates("MDVR419 420").is_empty());
         assert!(product_code_candidates("AB1-2 unsupported").is_empty());
         assert!(!release_matches_product_code(
             "3DSVR-1947 + ABC-123 pack",

@@ -417,8 +417,12 @@ export function productCodeCandidates(value: string) {
   const candidates: Array<{ code: string; prefix: string }> = [];
   for (const match of value.matchAll(identityPattern)) {
     const matchEnd = (match.index ?? 0) + match[0].length;
+    const separatedNumber = value
+      .slice(matchEnd)
+      .match(/^[ _-]+([0-9]{1,10})(?=$|[^A-Za-z0-9])/u)?.[1];
     if (
-      /^[ _-]+[0-9]{1,10}(?=$|[^A-Za-z0-9])/u.test(value.slice(matchEnd))
+      separatedNumber !== undefined &&
+      !/^(?:19|20)[0-9]{2}$/u.test(separatedNumber)
     ) {
       continue;
     }

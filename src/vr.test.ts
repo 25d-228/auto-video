@@ -120,6 +120,12 @@ describe("VR product-code identity", () => {
     expect(productCodeCandidates("3DSVR1947 1080p")).toEqual([
       { code: "3DSVR-1947", prefix: "3DSVR" },
     ]);
+    expect(productCodeCandidates("MDVR419 2024")).toEqual([
+      { code: "MDVR-419", prefix: "MDVR" },
+    ]);
+    expect(productCodeCandidates("3DSVR1947 2025")).toEqual([
+      { code: "3DSVR-1947", prefix: "3DSVR" },
+    ]);
   });
 
   it("rejects missing, malformed, and zero product codes", () => {
@@ -134,6 +140,7 @@ describe("VR product-code identity", () => {
     ])
       expect(canonicalizeProductCode(value)).toBeNull();
     expect(productCodeCandidates("AB1-2 unsupported")).toEqual([]);
+    expect(productCodeCandidates("MDVR419 420")).toEqual([]);
     expect(productCodeCandidates("MDVR419 + ABC123 pack")).toEqual([
       { code: "MDVR-419", prefix: "MDVR" },
       { code: "ABC-123", prefix: "ABC" },

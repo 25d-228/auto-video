@@ -9442,6 +9442,204 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    { category: "adult" as const, label: "Adult" },
+    { category: "vr" as const, label: "VR" },
+  ])(
+    "restarts each retained $label JavDB request exactly once and rejects an older replacement",
+    async ({ category, label }) => {
+      const lateReplacement = createDeferred<string[]>();
+      let requestCount = 0;
+      const codeForRequest = (requestNumber: number) =>
+        category === "adult"
+          ? `ADLT-${122 + requestNumber}`
+          : `MDVR-${418 + requestNumber}`;
+      fetchJavdbBrowseMock.mockImplementation((request) => {
+        expect(request?.category).toBe(category);
+        requestCount += 1;
+        if (requestCount === 2) {
+          return lateReplacement.promise;
+        }
+        return Promise.resolve(
+          javdbBrowseFixture(
+            category,
+            [
+              {
+                code: codeForRequest(requestCount),
+                cover: false,
+                id: `${label}${requestCount}`,
+              },
+            ],
+            String(6 + requestCount),
+          ),
+        );
+      });
+
+      render(<App />);
+      selectDiscover();
+      fireEvent.click(screen.getByRole("radio", { name: label }));
+      if (category === "vr") {
+        selectJavdbBrowseProvider("VR");
+      }
+      expect(
+        await screen.findByRole("heading", {
+          level: 3,
+          name: codeForRequest(1),
+        }),
+      ).toBeTruthy();
+
+      fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+      fireEvent.click(screen.getByRole("radio", { name: label }));
+      expect(
+        screen.getByRole("heading", {
+          level: 3,
+          name: codeForRequest(1),
+        }),
+      ).toBeTruthy();
+      expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(1);
+
+      const provider = screen.getByRole("combobox", {
+        name: `${label} provider`,
+      });
+      fireEvent.change(provider, { target: { value: "fanza" } });
+      fireEvent.change(provider, { target: { value: "javdb" } });
+      expect(
+        screen.getByRole("heading", {
+          level: 3,
+          name: codeForRequest(1),
+        }),
+      ).toBeTruthy();
+      expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(1);
+
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      await waitFor(() =>
+        expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(2),
+      );
+
+      if (category === "adult") {
+        fireEvent.change(
+          screen.getByRole("combobox", { name: "Adult ranking period" }),
+          { target: { value: "weekly" } },
+        );
+      } else {
+        fireEvent.change(
+          screen.getByRole("combobox", { name: "VR year" }),
+          { target: { value: "2024" } },
+        );
+      }
+      expect(
+        await screen.findByRole("heading", {
+          level: 3,
+          name: codeForRequest(3),
+        }),
+      ).toBeTruthy();
+      expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(3);
+
+      await act(async () => {
+        lateReplacement.resolve(
+          javdbBrowseFixture(
+            category,
+            [
+              {
+                code: codeForRequest(2),
+                cover: false,
+                id: `${label}Late`,
+              },
+            ],
+            "8",
+          ),
+        );
+        await lateReplacement.promise;
+      });
+      expect(
+        screen.getByRole("heading", {
+          level: 3,
+          name: codeForRequest(3),
+        }),
+      ).toBeTruthy();
+      expect(screen.queryByText(codeForRequest(2))).toBeNull();
+
+      const remainingControls =
+        category === "adult"
+          ? [
+              ["Adult browse mode", "category"],
+              ["Adult year", "2024"],
+              ["Adult month", "12"],
+              ["Adult sort", "most-watched"],
+              ["Adult result count", "10"],
+            ]
+          : [
+              ["VR month", "12"],
+              ["VR sort", "top-rated"],
+              ["VR result count", "10"],
+            ];
+      for (const [name, value] of remainingControls) {
+        const expectedRequestCount = requestCount + 1;
+        fireEvent.change(screen.getByRole("combobox", { name }), {
+          target: { value },
+        });
+        expect(
+          await screen.findByRole("heading", {
+            level: 3,
+            name: codeForRequest(expectedRequestCount),
+          }),
+        ).toBeTruthy();
+        expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(
+          expectedRequestCount,
+        );
+      }
+    },
+  );
+
+  it.each([
+    {
+      category: "adult" as const,
+      code: "ADLT-123",
+      error: "adult_network_error",
+      label: "Adult",
+    },
+    {
+      category: "vr" as const,
+      code: "MDVR-419",
+      error: "vr_network_error",
+      label: "VR",
+    },
+  ])(
+    "retries a retained $label JavDB failure with one current request",
+    async ({ category, code, error, label }) => {
+      fetchJavdbBrowseMock
+        .mockRejectedValueOnce(error)
+        .mockResolvedValueOnce(
+          javdbBrowseFixture(category, [
+            { code, cover: false, id: `${label}Current` },
+          ]),
+        );
+      render(<App />);
+      selectDiscover();
+      fireEvent.click(screen.getByRole("radio", { name: label }));
+      if (category === "vr") {
+        selectJavdbBrowseProvider("VR");
+      }
+      expect(
+        await screen.findByRole("heading", {
+          name: "JavDB could not be reached",
+        }),
+      ).toBeTruthy();
+
+      fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
+      fireEvent.click(screen.getByRole("radio", { name: label }));
+      expect(
+        screen.getByRole("heading", { name: "JavDB could not be reached" }),
+      ).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+      expect(
+        await screen.findByRole("heading", { level: 3, name: code }),
+      ).toBeTruthy();
+      expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it("shows only exact same-category Library and transfer badges", async () => {
     savedAdultFolder = "/Adult";
     scanAdultLibraryMock.mockResolvedValue([
