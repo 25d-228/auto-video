@@ -1031,8 +1031,10 @@ pub(crate) fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, ProviderRequestErr
         .output()
         .map_err(|_| ProviderRequestError::Network)?;
     let encoded = parse_text_response(&output.stdout, FANZA_IMAGE_MAX_BYTES * 2)?;
-    crate::decode_base64(std::str::from_utf8(&encoded).map_err(|_| ProviderRequestError::Provider)?)
-        .ok_or(ProviderRequestError::Provider)
+    crate::javdb_catalog::decode_base64(
+        std::str::from_utf8(&encoded).map_err(|_| ProviderRequestError::Provider)?,
+    )
+    .ok_or(ProviderRequestError::Provider)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

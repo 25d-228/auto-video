@@ -1508,7 +1508,7 @@ fn parse_binary_response(output: &[u8]) -> Result<Vec<u8>, ProviderRequestError>
 }
 
 #[cfg(target_os = "windows")]
-fn decode_base64(value: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64(value: &str) -> Option<Vec<u8>> {
     fn digit(character: u8) -> Option<u8> {
         match character {
             b'A'..=b'Z' => Some(character - b'A'),
