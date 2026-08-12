@@ -211,7 +211,7 @@ export type SukebeiReleasesResult<Release extends SukebeiRelease> =
 
 export type VrReleasesResult = SukebeiReleasesResult<VrRelease>;
 
-const productCodePattern = /^([A-Za-z]{2,16})[ _-]*([0-9]{1,10})$/;
+const productCodePattern = /^([A-Za-z0-9]{1,15}[A-Za-z])[ _-]*([0-9]{1,10})$/;
 const unsignedU64Pattern = /^\d{1,20}$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const maximumSelectedVrFiles = 100_000;
@@ -413,9 +413,15 @@ function releaseArtifact(item: Element): SukebeiReleaseArtifact | null {
 
 export function productCodeCandidates(value: string) {
   const identityPattern =
-    /(^|[^A-Za-z0-9])([A-Za-z]{2,16})[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])/gi;
+    /(^|[^A-Za-z0-9])([A-Za-z0-9]{1,15}[A-Za-z])[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])/gi;
   const candidates: Array<{ code: string; prefix: string }> = [];
   for (const match of value.matchAll(identityPattern)) {
+    const matchEnd = (match.index ?? 0) + match[0].length;
+    if (
+      /^[ _-]+[0-9]{1,10}(?=$|[^A-Za-z0-9])/u.test(value.slice(matchEnd))
+    ) {
+      continue;
+    }
     const identity = canonicalizeProductCode(`${match[2]}-${match[3]}`);
     if (identity !== null) {
       candidates.push({ code: identity, prefix: match[2].toUpperCase() });

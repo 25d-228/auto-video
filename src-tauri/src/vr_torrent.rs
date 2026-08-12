@@ -1652,18 +1652,44 @@ fn product_code_candidates(name: &str) -> Vec<(String, String)> {
         }
 
         let prefix_start = index;
-        while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+        while index < bytes.len() && bytes[index].is_ascii_alphanumeric() {
             index += 1;
         }
-        let prefix_length = index - prefix_start;
-        if !(2..=16).contains(&prefix_length) {
+        let token_end = index;
+        let compact_number_start = bytes[prefix_start..token_end]
+            .iter()
+            .rposition(|byte| !byte.is_ascii_digit())
+            .map(|position| prefix_start + position + 1)
+            .unwrap_or(prefix_start);
+        let mut separated_number_start = token_end;
+        while separated_number_start < bytes.len()
+            && matches!(bytes[separated_number_start], b' ' | b'_' | b'-')
+        {
+            separated_number_start += 1;
+        }
+        let (prefix_end, number_start) = if compact_number_start < token_end {
+            if separated_number_start > token_end
+                && bytes
+                    .get(separated_number_start)
+                    .is_some_and(u8::is_ascii_digit)
+            {
+                index = prefix_start + 1;
+                continue;
+            }
+            (compact_number_start, compact_number_start)
+        } else {
+            (token_end, separated_number_start)
+        };
+        let prefix_length = prefix_end - prefix_start;
+        if !(2..=16).contains(&prefix_length)
+            || !bytes[prefix_start..prefix_end]
+                .last()
+                .is_some_and(u8::is_ascii_alphabetic)
+        {
             index = prefix_start + 1;
             continue;
         }
-        while index < bytes.len() && matches!(bytes[index], b' ' | b'_' | b'-') {
-            index += 1;
-        }
-        let number_start = index;
+        index = number_start;
         while index < bytes.len() && bytes[index].is_ascii_digit() {
             index += 1;
         }
@@ -1679,7 +1705,7 @@ fn product_code_candidates(name: &str) -> Vec<(String, String)> {
             .ok()
             .and_then(|value| value.parse::<u64>().ok());
         if let Some(number) = number.filter(|number| *number > 0) {
-            let prefix = std::str::from_utf8(&bytes[prefix_start..prefix_start + prefix_length])
+            let prefix = std::str::from_utf8(&bytes[prefix_start..prefix_end])
                 .expect("ASCII product-code prefixes are valid UTF-8");
             let prefix = prefix.to_ascii_uppercase();
             candidates.push((format!("{prefix}-{number}"), prefix));
@@ -2962,6 +2988,23 @@ mod tests {
     #[test]
     fn computes_the_standard_sha1_vector() {
         assert_eq!(hex_sha1(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn release_identity_accepts_letter_ending_alphanumeric_prefixes_only() {
+        assert!(release_matches_product_code(
+            "Exact 3DSVR-1947 release",
+            "3DSVR-1947"
+        ));
+        assert!(release_matches_product_code(
+            "Compact 3DSVR1947 release",
+            "3DSVR-1947"
+        ));
+        assert!(product_code_candidates("AB1-2 unsupported").is_empty());
+        assert!(!release_matches_product_code(
+            "3DSVR-1947 + ABC-123 pack",
+            "3DSVR-1947"
+        ));
     }
 
     #[test]

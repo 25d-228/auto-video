@@ -23,6 +23,7 @@ import {
   openJavdbDetailSource,
   parseJavdbBrowseResponse,
   parseJavdbDetailResponse,
+  productCodeCandidates,
   previewVrOrganization,
   queryVrStorage,
   scanVrLibrary,
@@ -108,11 +109,25 @@ describe("VR product-code identity", () => {
     ]) {
       expect(canonicalizeProductCode(value)).toBe("MDVR-419");
     }
+    expect(canonicalizeProductCode("13dsvr_01947")).toBe("13DSVR-1947");
+    expect(canonicalizeProductCode("3DSVR-1947")).toBe("3DSVR-1947");
+    expect(productCodeCandidates("Exact 3DSVR1947 release")).toEqual([
+      { code: "3DSVR-1947", prefix: "3DSVR" },
+    ]);
   });
 
   it("rejects missing, malformed, and zero product codes", () => {
-    for (const value of ["", "   ", "MDVR", "419", "MDVR-0", "MDVR-41A"])
+    for (const value of [
+      "",
+      "   ",
+      "MDVR",
+      "419",
+      "MDVR-0",
+      "MDVR-41A",
+      "AB1-2",
+    ])
       expect(canonicalizeProductCode(value)).toBeNull();
+    expect(productCodeCandidates("AB1-2 unsupported")).toEqual([]);
   });
 });
 
@@ -658,6 +673,32 @@ describe("JavDB exact-code catalog request", () => {
 });
 
 describe("Sukebei identity-verified release request", () => {
+  it("accepts a letter-ending alphanumeric prefix and rejects a digit-ending prefix before dispatch", async () => {
+    invokeMock.mockResolvedValue(
+      releaseFeed(releaseItem("Exact 3DSVR-1947 release")),
+    );
+    await expect(fetchVerifiedSukebeiReleases("3DSVR-1947")).resolves.toEqual({
+      status: "ready",
+      releases: [
+        {
+          name: "Exact 3DSVR-1947 release",
+          source: "Sukebei",
+          size: "12.5 GiB",
+          seeders: 10,
+        },
+      ],
+    });
+    expect(invokeMock).toHaveBeenCalledWith("fetch_sukebei_vr_releases", {
+      code: "3DSVR-1947",
+    });
+
+    invokeMock.mockClear();
+    await expect(fetchVerifiedSukebeiReleases("AB1-2")).rejects.toThrow(
+      "A canonical VR product code is required.",
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
   it("keeps only valid MDVR-419 representations and accepted comparison fields", async () => {
     invokeMock.mockResolvedValue(
       releaseFeed(

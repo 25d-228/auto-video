@@ -45,6 +45,16 @@ import {
 import tmdbLogo from "@/assets/tmdb-logo.svg";
 import { Button } from "@/components/ui/button";
 import {
+  fetchFanzaCatalog,
+  fetchFanzaCoverObjectUrl,
+  invalidateFanzaCatalog,
+  type FanzaCatalogItem,
+  type FanzaCatalogRequest,
+  type FanzaCatalogResult,
+  type FanzaFeed,
+  type FanzaResultCount,
+} from "@/fanza";
+import {
   chooseAdultFolder,
   clearAdultFolder,
   loadAdultFolder,
@@ -210,7 +220,8 @@ const destinations = [
   {
     id: "discover",
     label: "Discover",
-    description: "Browse TMDB Movies and TV or find Adult and VR titles by exact product code.",
+    description:
+      "Browse TMDB Movies and TV, provider catalogs, or exact Adult and VR product codes.",
     emptyHeading: "Discovery is not configured",
     emptyMessage:
       "Add a TMDB API Read Access Token in Settings to load weekly trending Movies.",
@@ -439,6 +450,7 @@ type AdultCatalogState =
   | { status: "loading" }
   | JavdbCatalogResult;
 type JavdbWorkflow = "browse" | "exact";
+type DiscoverBrowseProvider = "fanza" | "javdb";
 type JavdbBrowseState =
   | { status: "idle" }
   | { status: "loading" }
@@ -449,6 +461,11 @@ type JavdbDetailContext = {
   triggerId: string;
   surface: "details" | "preview";
 };
+type FanzaCatalogState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | FanzaCatalogResult;
+type ProviderCatalogItem = JavdbCatalogItem | FanzaCatalogItem;
 type AdultReleaseComparisonState =
   | { status: "loading" }
   | SukebeiReleasesResult<SukebeiRelease>;
@@ -502,12 +519,12 @@ type VrDownloadSummary = {
   aggregateSpeedBytesPerSecond: bigint;
 };
 type VrTorrentInspectionContext = {
-  item: VrCatalogItem;
+  item: VrCatalogItem | FanzaCatalogItem;
   release: VrRelease;
   triggerId: string;
 };
 type AdultTorrentInspectionContext = {
-  item: JavdbCatalogItem;
+  item: ProviderCatalogItem;
   release: SukebeiRelease;
   triggerId: string;
 };
@@ -546,7 +563,7 @@ const minimumGalleryCardWidth = 208;
 // Fixed title limits keep every calculated row within its observed viewport.
 const discoverCardBodyHeight = 160;
 const libraryCardHeight = 136;
-const javdbCoverHeight = 180;
+const naturalWidthCoverHeight = 180;
 const javdbBrowsePeriods: Array<{
   label: string;
   value: JavdbBrowsePeriod;
@@ -583,6 +600,13 @@ const javdbBrowseYears = Array.from(
   (_, index) => String(new Date().getFullYear() - index),
 );
 const javdbBrowseCounts = [10, 25, 50, 100] as const;
+const fanzaFeeds: Array<{ label: string; value: FanzaFeed }> = [
+  { label: "Popular", value: "popular" },
+  { label: "Newest", value: "newest" },
+  { label: "Top Rated", value: "top-rated" },
+  { label: "Trending", value: "trending" },
+  { label: "Monthly", value: "monthly" },
+];
 
 const movieScanMessages = {
   unconfigured: {
@@ -1196,6 +1220,54 @@ const javdbBrowseMessages = {
   "provider-error": {
     heading: "JavDB could not load the catalog",
     message: "The provider returned an unexpected error. Retry this exact request later.",
+    role: "alert",
+  },
+} as const;
+
+const fanzaCatalogMessages = {
+  idle: {
+    heading: "Browse FANZA",
+    message: "Choose the current FANZA digital feed.",
+    role: undefined,
+  },
+  loading: {
+    heading: "Loading FANZA catalog",
+    message: "Requesting and verifying the exact FANZA digital catalog.",
+    role: "status",
+  },
+  empty: {
+    heading: "No FANZA titles found",
+    message: "FANZA returned no accepted titles for this exact request.",
+    role: undefined,
+  },
+  "source-unavailable": {
+    heading: "FANZA is unavailable",
+    message: "The FANZA digital source is unavailable. Retry this exact request later.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "FANZA could not be reached",
+    message: "Check the network connection and retry this exact request.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "FANZA returned invalid data",
+    message: "The provider response did not contain a valid exact catalog.",
+    role: "alert",
+  },
+  "conflicting-provider": {
+    heading: "FANZA returned conflicting identities",
+    message: "The provider reused an item identity for conflicting catalog data.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "FANZA could not load this request",
+    message: "The provider returned an unexpected error. Retry this exact request later.",
+    role: "alert",
+  },
+  stale: {
+    heading: "This FANZA catalog is no longer current",
+    message: "Refresh the current provider request.",
     role: "alert",
   },
 } as const;
@@ -2043,37 +2115,45 @@ function DiscoverJavdbCard({
   );
 }
 
-function JavdbBrowseControls({
+function ProviderBrowseControls({
   category,
   count,
+  fanzaFeed,
   mode,
   month,
   onCountChange,
+  onFanzaFeedChange,
   onModeChange,
   onMonthChange,
   onPeriodChange,
+  onProviderChange,
   onRefresh,
   onSortChange,
   onWorkflowChange,
   onYearChange,
   period,
+  provider,
   sort,
   workflow,
   year,
 }: {
   category: "adult" | "vr";
-  count: JavdbBrowseRequest["count"];
+  count: FanzaResultCount;
+  fanzaFeed: FanzaFeed;
   mode: JavdbBrowseMode;
   month: number | null;
-  onCountChange: (count: JavdbBrowseRequest["count"]) => void;
+  onCountChange: (count: FanzaResultCount) => void;
+  onFanzaFeedChange: (feed: FanzaFeed) => void;
   onModeChange: (mode: JavdbBrowseMode) => void;
   onMonthChange: (month: number | null) => void;
   onPeriodChange: (period: JavdbBrowsePeriod) => void;
+  onProviderChange: (provider: DiscoverBrowseProvider) => void;
   onRefresh: () => void;
   onSortChange: (sort: JavdbBrowseSort) => void;
   onWorkflowChange: (workflow: JavdbWorkflow) => void;
   onYearChange: (year: string | null) => void;
   period: JavdbBrowsePeriod;
+  provider: DiscoverBrowseProvider;
   sort: JavdbBrowseSort;
   workflow: JavdbWorkflow;
   year: string | null;
@@ -2081,8 +2161,8 @@ function JavdbBrowseControls({
   const showsCategoryControls = category === "vr" || mode === "category";
 
   return (
-    <div className="javdb-browse-controls">
-      <fieldset className="discover-category javdb-workflow">
+    <div className="provider-browse-controls">
+      <fieldset className="discover-category provider-workflow">
         <legend>{category === "vr" ? "VR" : "Adult"} workflow</legend>
         <div>
           {(["browse", "exact"] as const).map((value) => (
@@ -2100,13 +2180,40 @@ function JavdbBrowseControls({
         </div>
       </fieldset>
       {workflow === "browse" ? (
-        <div className="javdb-browse-controls__request">
-          <span className="javdb-provider-label">
+        <div className="provider-browse-controls__request">
+          <label className="provider-select-label">
             <span>Provider</span>
-            <strong>JavDB</strong>
-          </span>
-          {category === "adult" ? (
-            <label className="javdb-select-label">
+            <select
+              aria-label={`${category === "vr" ? "VR" : "Adult"} provider`}
+              id={`${category}-provider`}
+              onChange={(event) =>
+                onProviderChange(event.target.value as DiscoverBrowseProvider)
+              }
+              value={provider}
+            >
+              <option value="fanza">FANZA</option>
+              <option value="javdb">JavDB</option>
+            </select>
+          </label>
+          {provider === "fanza" ? (
+            <label className="provider-select-label">
+              <span>Feed</span>
+              <select
+                aria-label={`${category === "vr" ? "VR" : "Adult"} FANZA feed`}
+                onChange={(event) =>
+                  onFanzaFeedChange(event.target.value as FanzaFeed)
+                }
+                value={fanzaFeed}
+              >
+                {fanzaFeeds.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : category === "adult" ? (
+            <label className="provider-select-label">
               <span>Mode</span>
               <select
                 aria-label="Adult browse mode"
@@ -2120,8 +2227,8 @@ function JavdbBrowseControls({
               </select>
             </label>
           ) : null}
-          {category === "adult" && mode === "ranking" ? (
-            <label className="javdb-select-label">
+          {provider === "javdb" && category === "adult" && mode === "ranking" ? (
+            <label className="provider-select-label">
               <span>Period</span>
               <select
                 aria-label="Adult ranking period"
@@ -2138,9 +2245,9 @@ function JavdbBrowseControls({
               </select>
             </label>
           ) : null}
-          {showsCategoryControls ? (
+          {provider === "javdb" && showsCategoryControls ? (
             <>
-              <label className="javdb-select-label">
+              <label className="provider-select-label">
                 <span>Year</span>
                 <select
                   aria-label={`${category === "vr" ? "VR" : "Adult"} year`}
@@ -2157,7 +2264,7 @@ function JavdbBrowseControls({
                   ))}
                 </select>
               </label>
-              <label className="javdb-select-label">
+              <label className="provider-select-label">
                 <span>Month</span>
                 <select
                   aria-label={`${category === "vr" ? "VR" : "Adult"} month`}
@@ -2178,7 +2285,7 @@ function JavdbBrowseControls({
                   ))}
                 </select>
               </label>
-              <label className="javdb-select-label">
+              <label className="provider-select-label">
                 <span>Sort</span>
                 <select
                   aria-label={`${category === "vr" ? "VR" : "Adult"} sort`}
@@ -2196,13 +2303,13 @@ function JavdbBrowseControls({
               </label>
             </>
           ) : null}
-          <label className="javdb-select-label">
+          <label className="provider-select-label">
             <span>Results</span>
             <select
               aria-label={`${category === "vr" ? "VR" : "Adult"} result count`}
               onChange={(event) =>
                 onCountChange(
-                  Number(event.target.value) as JavdbBrowseRequest["count"],
+                  Number(event.target.value) as FanzaResultCount,
                 )
               }
               value={count}
@@ -2215,7 +2322,7 @@ function JavdbBrowseControls({
             </select>
           </label>
           <Button
-            id={`${category}-javdb-refresh`}
+            id={`${category}-${provider}-refresh`}
             onClick={onRefresh}
             size="sm"
             type="button"
@@ -2278,7 +2385,7 @@ function JavdbCover({
 
   if (objectUrl === null || failed) {
     return (
-      <div className="javdb-cover__placeholder">
+      <div className="provider-cover__placeholder">
         <AppIcon name="poster" />
         <span>{item.code}</span>
       </div>
@@ -2328,19 +2435,20 @@ function DiscoverJavdbBrowseCard({
   return (
     <article
       aria-labelledby={`${cardId}-title`}
-      className="javdb-browse-card"
+      className="provider-browse-card"
+      data-actions-only="true"
       data-cover-ratio={coverRatio}
       data-narrow-cover={coverRatio < 0.9}
-      style={{ width: `${Math.round(javdbCoverHeight * coverRatio)}px` }}
+      style={{ width: `${Math.round(naturalWidthCoverHeight * coverRatio)}px` }}
     >
       <button
         aria-label={`View details: ${item.code}`}
-        className="javdb-browse-card__details-control"
+        className="provider-browse-card__details-control"
         id={detailsTriggerId}
         onClick={() => onDetails(item, detailsTriggerId)}
         type="button"
       />
-      <div className="javdb-browse-card__cover">
+      <div className="provider-browse-card__cover">
         <JavdbCover
           item={item}
           onRatio={(ratio) => {
@@ -2348,18 +2456,18 @@ function DiscoverJavdbBrowseCard({
             onRatioChange(item, ratio);
           }}
         />
-        <div className="javdb-browse-card__badges">
+        <div className="provider-browse-card__badges">
           {inLibrary ? <span>In library</span> : null}
           {transferState === null ? null : <span>{transferState}</span>}
         </div>
       </div>
-      <div className="javdb-browse-card__body">
+      <div className="provider-browse-card__body">
         <h3 id={`${cardId}-title`}>{item.code}</h3>
         <p>{item.title ?? item.releaseDate ?? "Title unavailable"}</p>
         <span>JavDB</span>
       </div>
       <div
-        className="javdb-browse-card__actions"
+        className="provider-browse-card__actions"
         onClick={(event) => event.stopPropagation()}
         onKeyDown={(event) => event.stopPropagation()}
         onPointerDown={(event) => event.stopPropagation()}
@@ -2401,19 +2509,21 @@ function DiscoverJavdbBrowseCard({
 }
 
 // These values mirror the fixed card body and gallery gaps in index.css.
-const javdbBrowseCardHeight = 260;
-const javdbBrowseColumnGap = 14;
-const javdbBrowseRowGap = 16;
+const naturalWidthCardHeight = 260;
+const naturalWidthColumnGap = 14;
+const naturalWidthRowGap = 16;
 
 function javdbBrowseItemKey(item: JavdbBrowseItem) {
   return `${item.category}:${item.requestGeneration}:${item.providerItemId}`;
 }
 
-function javdbBrowsePages(
-  items: JavdbBrowseItem[],
+function naturalWidthBrowsePages<Item>(
+  items: Item[],
   ratios: Map<string, number>,
   width: number,
   height: number,
+  getItemKey: (item: Item) => string,
+  getSourceAspectRatio: (item: Item) => number,
 ) {
   if (items.length === 0) {
     return [[]];
@@ -2424,26 +2534,26 @@ function javdbBrowsePages(
   const rowCount = Math.max(
     1,
     Math.floor(
-      (height + javdbBrowseRowGap) /
-        (javdbBrowseCardHeight + javdbBrowseRowGap),
+      (height + naturalWidthRowGap) /
+        (naturalWidthCardHeight + naturalWidthRowGap),
     ),
   );
-  const pages: JavdbBrowseItem[][] = [];
-  let page: JavdbBrowseItem[] = [];
+  const pages: Item[][] = [];
+  let page: Item[] = [];
   let rows = 1;
   let rowWidth = 0;
   for (const item of items) {
     const cardWidth = Math.min(
       width,
       Math.round(
-        javdbCoverHeight *
-          (ratios.get(javdbBrowseItemKey(item)) ?? item.sourceAspectRatio),
+        naturalWidthCoverHeight *
+          (ratios.get(getItemKey(item)) ?? getSourceAspectRatio(item)),
       ),
     );
     const nextWidth =
       rowWidth === 0
         ? cardWidth
-        : rowWidth + javdbBrowseColumnGap + cardWidth;
+        : rowWidth + naturalWidthColumnGap + cardWidth;
     if (rowWidth !== 0 && nextWidth > width) {
       if (rows === rowCount) {
         pages.push(page);
@@ -2464,25 +2574,21 @@ function javdbBrowsePages(
   return pages;
 }
 
-function JavdbBrowseGallery({
+function NaturalWidthBrowseGallery<Item>({
   ariaLabel,
-  getInLibrary,
-  getTransferState,
+  getItemKey,
+  getSourceAspectRatio,
   items,
-  onDetails,
-  onFindReleases,
-  onPreview,
   onSelectedPageChange,
+  renderItem,
   selectedPage,
 }: {
   ariaLabel: string;
-  getInLibrary: (item: JavdbBrowseItem) => boolean;
-  getTransferState: (item: JavdbBrowseItem) => VrDownload["state"] | null;
-  items: JavdbBrowseItem[];
-  onDetails: (item: JavdbBrowseItem, triggerId: string) => void;
-  onFindReleases: (item: JavdbBrowseItem, triggerId: string) => void;
-  onPreview: (item: JavdbBrowseItem, triggerId: string) => void;
+  getItemKey: (item: Item) => string;
+  getSourceAspectRatio: (item: Item) => number;
+  items: Item[];
   onSelectedPageChange: (page: number) => void;
+  renderItem: (item: Item, onRatioChange: (ratio: number) => void) => ReactNode;
   selectedPage: number;
 }) {
   const viewport = useRef<HTMLDivElement | null>(null);
@@ -2515,11 +2621,13 @@ function JavdbBrowseGallery({
     return () => observer.disconnect();
   }, []);
 
-  const pages = javdbBrowsePages(
+  const pages = naturalWidthBrowsePages(
     items,
     ratios,
     bounds.width,
     bounds.height,
+    getItemKey,
+    getSourceAspectRatio,
   );
   const pageCount = pages.length;
   const currentPage = Math.min(selectedPage, pageCount);
@@ -2533,35 +2641,27 @@ function JavdbBrowseGallery({
 
   return (
     <div
-      className="media-gallery media-gallery--javdb"
+      className="media-gallery media-gallery--natural-width"
       data-current-page={currentPage}
       data-gallery="discover"
       data-page-capacity={visibleItems.length}
       data-page-count={pageCount}
     >
       <div className="media-gallery__viewport" ref={viewport}>
-        <ul aria-label={ariaLabel} className="javdb-browse-grid">
+        <ul aria-label={ariaLabel} className="provider-browse-grid">
           {visibleItems.map((item) => (
-            <li key={javdbBrowseItemKey(item)}>
-              <DiscoverJavdbBrowseCard
-                inLibrary={getInLibrary(item)}
-                item={item}
-                onDetails={onDetails}
-                onFindReleases={onFindReleases}
-                onPreview={onPreview}
-                onRatioChange={(currentItem, ratio) => {
-                  setRatios((current) => {
-                    const itemKey = javdbBrowseItemKey(currentItem);
-                    if (current.get(itemKey) === ratio) {
-                      return current;
-                    }
-                    const next = new Map(current);
-                    next.set(itemKey, ratio);
-                    return next;
-                  });
-                }}
-                transferState={getTransferState(item)}
-              />
+            <li key={getItemKey(item)}>
+              {renderItem(item, (ratio) => {
+                setRatios((current) => {
+                  const itemKey = getItemKey(item);
+                  if (current.get(itemKey) === ratio) {
+                    return current;
+                  }
+                  const next = new Map(current);
+                  next.set(itemKey, ratio);
+                  return next;
+                });
+              })}
             </li>
           ))}
         </ul>
@@ -2595,12 +2695,299 @@ function JavdbBrowseGallery({
   );
 }
 
+function JavdbBrowseGallery({
+  ariaLabel,
+  getInLibrary,
+  getTransferState,
+  items,
+  onDetails,
+  onFindReleases,
+  onPreview,
+  onSelectedPageChange,
+  selectedPage,
+}: {
+  ariaLabel: string;
+  getInLibrary: (item: JavdbBrowseItem) => boolean;
+  getTransferState: (item: JavdbBrowseItem) => VrDownload["state"] | null;
+  items: JavdbBrowseItem[];
+  onDetails: (item: JavdbBrowseItem, triggerId: string) => void;
+  onFindReleases: (item: JavdbBrowseItem, triggerId: string) => void;
+  onPreview: (item: JavdbBrowseItem, triggerId: string) => void;
+  onSelectedPageChange: (page: number) => void;
+  selectedPage: number;
+}) {
+  return (
+    <NaturalWidthBrowseGallery
+      ariaLabel={ariaLabel}
+      getItemKey={javdbBrowseItemKey}
+      getSourceAspectRatio={(item) => item.sourceAspectRatio}
+      items={items}
+      onSelectedPageChange={onSelectedPageChange}
+      renderItem={(item, onRatioChange) => (
+        <DiscoverJavdbBrowseCard
+          inLibrary={getInLibrary(item)}
+          item={item}
+          onDetails={onDetails}
+          onFindReleases={onFindReleases}
+          onPreview={onPreview}
+          onRatioChange={(_, ratio) => onRatioChange(ratio)}
+          transferState={getTransferState(item)}
+        />
+      )}
+      selectedPage={selectedPage}
+    />
+  );
+}
+
+function FanzaCover({
+  item,
+  onRatio,
+}: {
+  item: FanzaCatalogItem;
+  onRatio: (ratio: number) => void;
+}) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(item.coverAuthorityId === null);
+
+  useEffect(() => {
+    let current = true;
+    setObjectUrl(null);
+    setFailed(item.coverAuthorityId === null);
+    if (item.coverAuthorityId === null) {
+      return () => {
+        current = false;
+      };
+    }
+    void fetchFanzaCoverObjectUrl(item)
+      .then((url) => {
+        if (current) {
+          setObjectUrl(url);
+        } else {
+          URL.revokeObjectURL(url);
+        }
+      })
+      .catch(() => {
+        if (current) {
+          setFailed(true);
+        }
+      });
+    return () => {
+      current = false;
+    };
+  }, [item]);
+
+  useEffect(
+    () => () => {
+      if (objectUrl !== null) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    },
+    [objectUrl],
+  );
+
+  if (objectUrl === null || failed) {
+    return (
+      <div className="provider-cover__placeholder">
+        <AppIcon name="poster" />
+        <span>{item.code}</span>
+      </div>
+    );
+  }
+  return (
+    <img
+      alt=""
+      onError={() => {
+        setObjectUrl(null);
+        setFailed(true);
+      }}
+      onLoad={(event) => {
+        const { naturalHeight, naturalWidth } = event.currentTarget;
+        if (naturalHeight > 0 && naturalWidth > 0) {
+          onRatio(naturalWidth / naturalHeight);
+        }
+      }}
+      src={objectUrl}
+    />
+  );
+}
+
+function DiscoverFanzaCard({
+  inLibrary,
+  item,
+  onFindReleases,
+  onRatioChange,
+  transferState,
+}: {
+  inLibrary: boolean;
+  item: FanzaCatalogItem;
+  onFindReleases: (item: FanzaCatalogItem, triggerId: string) => void;
+  onRatioChange: (ratio: number) => void;
+  transferState: VrDownload["state"] | null;
+}) {
+  const [coverRatio, setCoverRatio] = useState(item.sourceAspectRatio);
+  const cardId = `fanza-card-${item.category}-${item.contextGeneration}-${item.requestGeneration}-${item.providerItemId}`;
+  const releasesTriggerId = `${cardId}-releases`;
+  return (
+    <article
+      aria-labelledby={`${cardId}-title`}
+      className="provider-browse-card"
+      data-cover-ratio={coverRatio}
+      data-narrow-cover={coverRatio < 0.9}
+      style={{ width: `${Math.round(naturalWidthCoverHeight * coverRatio)}px` }}
+    >
+      <div className="provider-browse-card__cover">
+        <FanzaCover
+          item={item}
+          onRatio={(ratio) => {
+            setCoverRatio(ratio);
+            onRatioChange(ratio);
+          }}
+        />
+        <div className="provider-browse-card__badges">
+          {inLibrary ? <span>In library</span> : null}
+          {transferState === null ? null : <span>{transferState}</span>}
+        </div>
+      </div>
+      <div className="provider-browse-card__body">
+        <h3 id={`${cardId}-title`}>{item.code}</h3>
+        <p>{item.title ?? "Title unavailable"}</p>
+        <span>FANZA</span>
+      </div>
+      <div
+        className="provider-browse-card__actions"
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => event.stopPropagation()}
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <CopyTitleAction title={item.code} />
+        <Button
+          aria-label={`Find releases: ${item.code}`}
+          id={releasesTriggerId}
+          onClick={(event) => {
+            event.stopPropagation();
+            onFindReleases(item, releasesTriggerId);
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          Find releases
+        </Button>
+      </div>
+    </article>
+  );
+}
+
+function fanzaItemKey(item: FanzaCatalogItem) {
+  return `${item.category}:${item.contextGeneration}:${item.requestGeneration}:${item.providerItemId}`;
+}
+
+function FanzaBrowseSurface({
+  ariaLabel,
+  category,
+  getInLibrary,
+  getTransferState,
+  items,
+  message,
+  onFindReleases,
+  onRetry,
+  onSelectedPageChange,
+  selectedPage,
+  state,
+}: {
+  ariaLabel: string;
+  category: "adult" | "vr";
+  getInLibrary: (item: FanzaCatalogItem) => boolean;
+  getTransferState: (item: FanzaCatalogItem) => VrDownload["state"] | null;
+  items: FanzaCatalogItem[];
+  message: (typeof fanzaCatalogMessages)[keyof typeof fanzaCatalogMessages] | null;
+  onFindReleases: (item: FanzaCatalogItem, triggerId: string) => void;
+  onRetry: () => void;
+  onSelectedPageChange: (page: number) => void;
+  selectedPage: number;
+  state: FanzaCatalogState;
+}) {
+  if (state.status === "ready" && items.length > 0) {
+    return (
+      <>
+        <span aria-live="polite" className="sr-only" role="status">
+          {items.length} accepted FANZA {category === "vr" ? "VR" : "Adult"} titles.
+        </span>
+        <NaturalWidthBrowseGallery
+          ariaLabel={ariaLabel}
+          getItemKey={fanzaItemKey}
+          getSourceAspectRatio={(item) => item.sourceAspectRatio}
+          items={items}
+          onSelectedPageChange={onSelectedPageChange}
+          renderItem={(item, onRatioChange) => (
+            <DiscoverFanzaCard
+              inLibrary={getInLibrary(item)}
+              item={item}
+              onFindReleases={onFindReleases}
+              onRatioChange={onRatioChange}
+              transferState={getTransferState(item)}
+            />
+          )}
+          selectedPage={selectedPage}
+        />
+      </>
+    );
+  }
+  const retryable =
+    state.status === "source-unavailable" ||
+    state.status === "network-error" ||
+    state.status === "malformed-provider" ||
+    state.status === "conflicting-provider" ||
+    state.status === "provider-error" ||
+    state.status === "stale";
+  return (
+    <div className="empty-state discover-state" role={message?.role}>
+      <span className="empty-state__icon">
+        <AppIcon name={category} />
+      </span>
+      <h2>{message?.heading}</h2>
+      <p>{message?.message}</p>
+      {retryable ? (
+        <Button
+          className="empty-state__action"
+          onClick={onRetry}
+          type="button"
+          variant="outline"
+        >
+          <AppIcon name="refresh" />
+          Retry
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
 function javdbFocusTarget(category: "adult" | "vr", triggerId: string) {
   return (
     document.getElementById(triggerId) ??
     document.getElementById(`${category}-javdb-refresh`) ??
     document.getElementById("adult-javdb-refresh") ??
     document.getElementById("vr-javdb-refresh")
+  );
+}
+
+function providerBrowseFocusTarget(
+  category: "adult" | "vr",
+  triggerId: string,
+) {
+  return (
+    document.getElementById(triggerId) ??
+    document.getElementById(`${category}-provider`) ??
+    document.getElementById(`${category}-fanza-refresh`) ??
+    document.getElementById(`${category}-javdb-refresh`) ??
+    document.querySelector<HTMLInputElement>(
+      'input[name="discover-category"]:checked',
+    ) ??
+    document.querySelector<HTMLButtonElement>(
+      '.primary-navigation button[aria-current="page"]',
+    )
   );
 }
 
@@ -4086,7 +4473,7 @@ function VrReleaseComparison({
   state,
   triggerId,
 }: {
-  item: VrCatalogItem;
+  item: VrCatalogItem | FanzaCatalogItem;
   onInspectRelease: (release: VrRelease, triggerId: string) => void;
   onRetry: () => void;
   onSelectRelease: (release: VrRelease) => void;
@@ -4106,7 +4493,7 @@ function VrReleaseComparison({
         <Dialog.Popup
           aria-busy={state.status === "loading"}
           className="vr-releases__popup"
-          finalFocus={() => document.getElementById(triggerId)}
+          finalFocus={() => providerBrowseFocusTarget("vr", triggerId)}
           onClick={(event) => event.stopPropagation()}
           onPointerDown={(event) => event.stopPropagation()}
         >
@@ -4262,7 +4649,7 @@ function AdultReleaseComparison({
   state,
   triggerId,
 }: {
-  item: JavdbCatalogItem;
+  item: ProviderCatalogItem;
   onInspectRelease: (release: SukebeiRelease, triggerId: string) => void;
   onRetry: () => void;
   onSelectRelease: (release: SukebeiRelease) => void;
@@ -4282,7 +4669,7 @@ function AdultReleaseComparison({
         <Dialog.Popup
           aria-busy={state.status === "loading"}
           className="vr-releases__popup"
-          finalFocus={() => document.getElementById(triggerId)}
+          finalFocus={() => providerBrowseFocusTarget("adult", triggerId)}
           onClick={(event) => event.stopPropagation()}
           onPointerDown={(event) => event.stopPropagation()}
         >
@@ -8474,6 +8861,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [adultSearchInput, setAdultSearchInput] = useState("");
   const [adultWorkflow, setAdultWorkflow] =
     useState<JavdbWorkflow>("browse");
+  const [adultBrowseProvider, setAdultBrowseProvider] =
+    useState<DiscoverBrowseProvider>("javdb");
   const [adultBrowseActivated, setAdultBrowseActivated] = useState(false);
   const [adultBrowseMode, setAdultBrowseMode] =
     useState<JavdbBrowseMode>("ranking");
@@ -8490,6 +8879,16 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   });
   const [adultBrowseRequestVersion, setAdultBrowseRequestVersion] = useState(0);
   const [adultBrowseSelectedPage, setAdultBrowseSelectedPage] = useState(1);
+  const [adultFanzaActivated, setAdultFanzaActivated] = useState(false);
+  const [adultFanzaFeed, setAdultFanzaFeed] =
+    useState<FanzaFeed>("popular");
+  const [adultFanzaCount, setAdultFanzaCount] =
+    useState<FanzaResultCount>(25);
+  const [adultFanzaState, setAdultFanzaState] = useState<FanzaCatalogState>({
+    status: "idle",
+  });
+  const [adultFanzaRequestVersion, setAdultFanzaRequestVersion] = useState(0);
+  const [adultFanzaSelectedPage, setAdultFanzaSelectedPage] = useState(1);
   const [adultSearchInputError, setAdultSearchInputError] = useState<
     string | null
   >(null);
@@ -8503,7 +8902,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     useState(0);
   const [adultSelectedPage, setAdultSelectedPage] = useState(1);
   const [adultReleaseComparisonItem, setAdultReleaseComparisonItem] =
-    useState<JavdbCatalogItem | null>(null);
+    useState<ProviderCatalogItem | null>(null);
   const [adultReleaseComparisonState, setAdultReleaseComparisonState] =
     useState<AdultReleaseComparisonState | null>(null);
   const [adultReleaseComparisonTriggerId, setAdultReleaseComparisonTriggerId] =
@@ -8528,6 +8927,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     useState<Set<number>>(new Set());
   const [vrSearchInput, setVrSearchInput] = useState("");
   const [vrWorkflow, setVrWorkflow] = useState<JavdbWorkflow>("browse");
+  const [vrBrowseProvider, setVrBrowseProvider] =
+    useState<DiscoverBrowseProvider>("fanza");
   const [vrBrowseActivated, setVrBrowseActivated] = useState(false);
   const [vrBrowseYear, setVrBrowseYear] = useState<string | null>(null);
   const [vrBrowseMonth, setVrBrowseMonth] = useState<number | null>(null);
@@ -8540,6 +8941,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   });
   const [vrBrowseRequestVersion, setVrBrowseRequestVersion] = useState(0);
   const [vrBrowseSelectedPage, setVrBrowseSelectedPage] = useState(1);
+  const [vrFanzaActivated, setVrFanzaActivated] = useState(false);
+  const [vrFanzaFeed, setVrFanzaFeed] = useState<FanzaFeed>("popular");
+  const [vrFanzaCount, setVrFanzaCount] = useState<FanzaResultCount>(25);
+  const [vrFanzaState, setVrFanzaState] = useState<FanzaCatalogState>({
+    status: "idle",
+  });
+  const [vrFanzaRequestVersion, setVrFanzaRequestVersion] = useState(0);
+  const [vrFanzaSelectedPage, setVrFanzaSelectedPage] = useState(1);
   const [javdbDetailContext, setJavdbDetailContext] =
     useState<JavdbDetailContext | null>(null);
   const [javdbDetailState, setJavdbDetailState] =
@@ -8555,7 +8964,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [vrCatalogRequestVersion, setVrCatalogRequestVersion] = useState(0);
   const [vrSelectedPage, setVrSelectedPage] = useState(1);
   const [releaseComparisonItem, setReleaseComparisonItem] =
-    useState<VrCatalogItem | null>(null);
+    useState<VrCatalogItem | FanzaCatalogItem | null>(null);
   const [releaseComparisonState, setReleaseComparisonState] =
     useState<VrReleaseComparisonState | null>(null);
   const [releaseComparisonTriggerId, setReleaseComparisonTriggerId] =
@@ -8640,6 +9049,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const adultCatalogRequestId = useRef(0);
   const adultBrowseRequestId = useRef(0);
   const adultBrowseContextGeneration = useRef(0);
+  const adultFanzaRequestId = useRef(0);
+  const adultFanzaContextGeneration = useRef(0);
   const javdbDetailRequestId = useRef(0);
   const adultReleaseRequestId = useRef(0);
   const adultTorrentInspectionRequestId = useRef(0);
@@ -8648,6 +9059,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const vrCatalogRequestId = useRef(0);
   const vrBrowseRequestId = useRef(0);
   const vrBrowseContextGeneration = useRef(0);
+  const vrFanzaRequestId = useRef(0);
+  const vrFanzaContextGeneration = useRef(0);
   const releaseRequestId = useRef(0);
   const torrentInspectionRequestId = useRef(0);
   const torrentSaveRequestId = useRef(0);
@@ -9839,6 +10252,33 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   ]);
 
   useEffect(() => {
+    if (!adultFanzaActivated) {
+      return;
+    }
+    const requestId = ++adultFanzaRequestId.current;
+    const request: FanzaCatalogRequest = {
+      category: "adult",
+      feed: adultFanzaFeed,
+      count: adultFanzaCount,
+    };
+    const contextGeneration = String(++adultFanzaContextGeneration.current);
+    setAdultFanzaState({ status: "loading" });
+    void fetchFanzaCatalog(request, contextGeneration).then((result) => {
+      if (requestId === adultFanzaRequestId.current) {
+        setAdultFanzaState(result);
+      }
+    });
+    return () => {
+      adultFanzaRequestId.current += 1;
+    };
+  }, [
+    adultFanzaActivated,
+    adultFanzaCount,
+    adultFanzaFeed,
+    adultFanzaRequestVersion,
+  ]);
+
+  useEffect(() => {
     const requestId = ++adultReleaseRequestId.current;
     if (adultReleaseComparisonItem === null) {
       return;
@@ -9931,6 +10371,28 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     vrBrowseSort,
     vrBrowseYear,
   ]);
+
+  useEffect(() => {
+    if (!vrFanzaActivated) {
+      return;
+    }
+    const requestId = ++vrFanzaRequestId.current;
+    const request: FanzaCatalogRequest = {
+      category: "vr",
+      feed: vrFanzaFeed,
+      count: vrFanzaCount,
+    };
+    const contextGeneration = String(++vrFanzaContextGeneration.current);
+    setVrFanzaState({ status: "loading" });
+    void fetchFanzaCatalog(request, contextGeneration).then((result) => {
+      if (requestId === vrFanzaRequestId.current) {
+        setVrFanzaState(result);
+      }
+    });
+    return () => {
+      vrFanzaRequestId.current += 1;
+    };
+  }, [vrFanzaActivated, vrFanzaCount, vrFanzaFeed, vrFanzaRequestVersion]);
 
   const currentJavdbDetailItem = javdbDetailContext?.item ?? null;
   useEffect(() => {
@@ -10140,6 +10602,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           : currentState,
       );
       closeAdultReleaseComparison();
+      closeVrReleaseComparison();
       closeMovieReleaseComparison();
       closeTvTorrentInspection();
       closeTvReleaseComparison();
@@ -12671,8 +13134,18 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       setAdultBrowseActivated(false);
       setAdultBrowseState({ status: "idle" });
       setAdultBrowseSelectedPage(1);
-      const contextGeneration = String(++adultBrowseContextGeneration.current);
-      void invalidateJavdbBrowse("adult", contextGeneration).catch(
+      const javdbGeneration = String(
+        ++adultBrowseContextGeneration.current,
+      );
+      void invalidateJavdbBrowse("adult", javdbGeneration).catch(
+        () => undefined,
+      );
+      adultFanzaRequestId.current += 1;
+      setAdultFanzaActivated(false);
+      setAdultFanzaState({ status: "idle" });
+      setAdultFanzaSelectedPage(1);
+      const fanzaGeneration = String(++adultFanzaContextGeneration.current);
+      void invalidateFanzaCatalog("adult", fanzaGeneration).catch(
         () => undefined,
       );
     }
@@ -12687,17 +13160,35 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       setVrBrowseActivated(false);
       setVrBrowseState({ status: "idle" });
       setVrBrowseSelectedPage(1);
-      const contextGeneration = String(++vrBrowseContextGeneration.current);
-      void invalidateJavdbBrowse("vr", contextGeneration).catch(
-        () => undefined,
-      );
+      const javdbGeneration = String(++vrBrowseContextGeneration.current);
+      void invalidateJavdbBrowse("vr", javdbGeneration).catch(() => undefined);
+      vrFanzaRequestId.current += 1;
+      setVrFanzaActivated(false);
+      setVrFanzaState({ status: "idle" });
+      setVrFanzaSelectedPage(1);
+      const fanzaGeneration = String(++vrFanzaContextGeneration.current);
+      void invalidateFanzaCatalog("vr", fanzaGeneration).catch(() => undefined);
     }
     if (category === "tv") {
       setIsTvDiscoverActivated(true);
     } else if (category === "adult" && adultWorkflow === "browse") {
-      setAdultBrowseActivated(true);
+      if (adultBrowseProvider === "javdb" && adultBrowseState.status === "idle") {
+        setAdultBrowseActivated(true);
+      } else if (
+        adultBrowseProvider === "fanza" &&
+        adultFanzaState.status === "idle"
+      ) {
+        setAdultFanzaActivated(true);
+      }
     } else if (category === "vr" && vrWorkflow === "browse") {
-      setVrBrowseActivated(true);
+      if (vrBrowseProvider === "javdb" && vrBrowseState.status === "idle") {
+        setVrBrowseActivated(true);
+      } else if (
+        vrBrowseProvider === "fanza" &&
+        vrFanzaState.status === "idle"
+      ) {
+        setVrFanzaActivated(true);
+      }
     }
     setDiscoverCategory(category);
   };
@@ -12711,15 +13202,30 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     adultBrowseRequestId.current += 1;
     setAdultBrowseSelectedPage(1);
     setAdultBrowseState({ status: "idle" });
-    setAdultBrowseActivated(workflow === "browse");
+    setAdultBrowseActivated(false);
+    adultFanzaRequestId.current += 1;
+    setAdultFanzaSelectedPage(1);
+    setAdultFanzaState({ status: "idle" });
+    setAdultFanzaActivated(false);
     if (workflow === "exact") {
-      const contextGeneration = String(++adultBrowseContextGeneration.current);
-      void invalidateJavdbBrowse("adult", contextGeneration).catch(
+      const javdbGeneration = String(
+        ++adultBrowseContextGeneration.current,
+      );
+      void invalidateJavdbBrowse("adult", javdbGeneration).catch(
+        () => undefined,
+      );
+      const fanzaGeneration = String(++adultFanzaContextGeneration.current);
+      void invalidateFanzaCatalog("adult", fanzaGeneration).catch(
         () => undefined,
       );
     } else {
       adultCatalogRequestId.current += 1;
       setAdultCatalogState({ status: "idle" });
+      if (adultBrowseProvider === "javdb") {
+        setAdultBrowseActivated(true);
+      } else {
+        setAdultFanzaActivated(true);
+      }
     }
     setAdultWorkflow(workflow);
   };
@@ -12733,15 +13239,24 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     vrBrowseRequestId.current += 1;
     setVrBrowseSelectedPage(1);
     setVrBrowseState({ status: "idle" });
-    setVrBrowseActivated(workflow === "browse");
+    setVrBrowseActivated(false);
+    vrFanzaRequestId.current += 1;
+    setVrFanzaSelectedPage(1);
+    setVrFanzaState({ status: "idle" });
+    setVrFanzaActivated(false);
     if (workflow === "exact") {
-      const contextGeneration = String(++vrBrowseContextGeneration.current);
-      void invalidateJavdbBrowse("vr", contextGeneration).catch(
-        () => undefined,
-      );
+      const javdbGeneration = String(++vrBrowseContextGeneration.current);
+      void invalidateJavdbBrowse("vr", javdbGeneration).catch(() => undefined);
+      const fanzaGeneration = String(++vrFanzaContextGeneration.current);
+      void invalidateFanzaCatalog("vr", fanzaGeneration).catch(() => undefined);
     } else {
       vrCatalogRequestId.current += 1;
       setVrCatalogState({ status: "idle" });
+      if (vrBrowseProvider === "javdb") {
+        setVrBrowseActivated(true);
+      } else {
+        setVrFanzaActivated(true);
+      }
     }
     setVrWorkflow(workflow);
   };
@@ -12762,6 +13277,84 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setVrBrowseSelectedPage(1);
     setVrBrowseState({ status: "loading" });
     setVrBrowseRequestVersion((version) => version + 1);
+  };
+
+  const restartAdultFanza = () => {
+    closeAdultReleaseComparison();
+    adultFanzaRequestId.current += 1;
+    setAdultFanzaSelectedPage(1);
+    setAdultFanzaState({ status: "loading" });
+    setAdultFanzaActivated(true);
+    setAdultFanzaRequestVersion((version) => version + 1);
+  };
+
+  const restartVrFanza = () => {
+    closeVrReleaseComparison();
+    vrFanzaRequestId.current += 1;
+    setVrFanzaSelectedPage(1);
+    setVrFanzaState({ status: "loading" });
+    setVrFanzaActivated(true);
+    setVrFanzaRequestVersion((version) => version + 1);
+  };
+
+  const changeAdultBrowseProvider = (provider: DiscoverBrowseProvider) => {
+    if (provider === adultBrowseProvider) {
+      return;
+    }
+    closeAdultReleaseComparison();
+    closeJavdbDetail();
+    setAdultBrowseActivated(false);
+    setAdultFanzaActivated(false);
+    if (adultBrowseProvider === "javdb" && adultBrowseState.status === "loading") {
+      adultBrowseRequestId.current += 1;
+      setAdultBrowseState({ status: "idle" });
+      const generation = String(++adultBrowseContextGeneration.current);
+      void invalidateJavdbBrowse("adult", generation).catch(() => undefined);
+    } else if (
+      adultBrowseProvider === "fanza" &&
+      adultFanzaState.status === "loading"
+    ) {
+      adultFanzaRequestId.current += 1;
+      setAdultFanzaState({ status: "idle" });
+      const generation = String(++adultFanzaContextGeneration.current);
+      void invalidateFanzaCatalog("adult", generation).catch(() => undefined);
+    }
+    setAdultBrowseProvider(provider);
+    if (provider === "javdb" && adultBrowseState.status === "idle") {
+      setAdultBrowseActivated(true);
+    } else if (provider === "fanza" && adultFanzaState.status === "idle") {
+      setAdultFanzaActivated(true);
+    }
+  };
+
+  const changeVrBrowseProvider = (provider: DiscoverBrowseProvider) => {
+    if (provider === vrBrowseProvider) {
+      return;
+    }
+    closeVrReleaseComparison();
+    closeJavdbDetail();
+    setVrBrowseActivated(false);
+    setVrFanzaActivated(false);
+    if (vrBrowseProvider === "javdb" && vrBrowseState.status === "loading") {
+      vrBrowseRequestId.current += 1;
+      setVrBrowseState({ status: "idle" });
+      const generation = String(++vrBrowseContextGeneration.current);
+      void invalidateJavdbBrowse("vr", generation).catch(() => undefined);
+    } else if (
+      vrBrowseProvider === "fanza" &&
+      vrFanzaState.status === "loading"
+    ) {
+      vrFanzaRequestId.current += 1;
+      setVrFanzaState({ status: "idle" });
+      const generation = String(++vrFanzaContextGeneration.current);
+      void invalidateFanzaCatalog("vr", generation).catch(() => undefined);
+    }
+    setVrBrowseProvider(provider);
+    if (provider === "javdb" && vrBrowseState.status === "idle") {
+      setVrBrowseActivated(true);
+    } else if (provider === "fanza" && vrFanzaState.status === "idle") {
+      setVrFanzaActivated(true);
+    }
   };
 
   const searchAdultCatalog = (event: FormEvent<HTMLFormElement>) => {
@@ -12796,7 +13389,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   };
 
   const openAdultReleaseComparison = (
-    item: JavdbCatalogItem,
+    item: ProviderCatalogItem,
     triggerId: string,
   ) => {
     setAdultReleaseComparisonTriggerId(triggerId);
@@ -12998,7 +13591,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   };
 
   const openVrReleaseComparison = (
-    item: VrCatalogItem,
+    item: VrCatalogItem | FanzaCatalogItem,
     triggerId: string,
   ) => {
     releaseRequestId.current += 1;
@@ -13405,6 +13998,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         : null
       : javdbBrowseMessages[adultBrowseState.status];
   const adultBrowseGalleryLabel = "JavDB Adult catalog";
+  const adultFanzaItems =
+    adultFanzaState.status === "ready" ? adultFanzaState.items : [];
+  const currentAdultFanzaMessage =
+    adultFanzaState.status === "ready"
+      ? adultFanzaState.items.length === 0
+        ? fanzaCatalogMessages.empty
+        : null
+      : fanzaCatalogMessages[adultFanzaState.status];
+  const adultFanzaGalleryLabel = "FANZA Adult catalog";
   // Exact-code production results contain one item; the fixture exercises the real responsive pager.
   const adultGalleryItems =
     adultCatalogState.status === "ready"
@@ -13427,6 +14029,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         : null
       : javdbBrowseMessages[vrBrowseState.status];
   const vrBrowseGalleryLabel = "JavDB VR catalog";
+  const vrFanzaItems =
+    vrFanzaState.status === "ready" ? vrFanzaState.items : [];
+  const currentVrFanzaMessage =
+    vrFanzaState.status === "ready"
+      ? vrFanzaState.items.length === 0
+        ? fanzaCatalogMessages.empty
+        : null
+      : fanzaCatalogMessages[vrFanzaState.status];
+  const vrFanzaGalleryLabel = "FANZA VR catalog";
   const isLibrarySearchActive = librarySearchQuery.trim() !== "";
   const completeLibraryMovies =
     movieScanState.status === "ready" ? movieScanState.movies : [];
@@ -13579,12 +14190,16 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     completeAdultLibraryItems.length - completeAdultLibraryGroupedCount;
   const currentVrDownloads =
     vrDownloadsState.status === "ready" ? vrDownloadsState.downloads : [];
-  const isJavdbItemInLibrary = (item: JavdbBrowseItem) =>
+  const isProviderItemInLibrary = (
+    item: JavdbBrowseItem | FanzaCatalogItem,
+  ) =>
     (item.category === "adult"
       ? completeAdultLibraryItems
       : completeVrLibraryItems
     ).some((libraryItem) => libraryItem.code === item.code);
-  const javdbItemTransferState = (item: JavdbBrowseItem) =>
+  const providerItemTransferState = (
+    item: JavdbBrowseItem | FanzaCatalogItem,
+  ) =>
     currentVrDownloads.find(
       (download) =>
         download.category === item.category && download.identity === item.code,
@@ -14419,10 +15034,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     ? tvDiscoverState.status === "loading"
                   : discoverCategory === "adult"
                       ? adultWorkflow === "browse"
-                        ? adultBrowseState.status === "loading"
+                        ? adultBrowseProvider === "fanza"
+                          ? adultFanzaState.status === "loading"
+                          : adultBrowseState.status === "loading"
                         : adultCatalogState.status === "loading"
                       : vrWorkflow === "browse"
-                        ? vrBrowseState.status === "loading"
+                        ? vrBrowseProvider === "fanza"
+                          ? vrFanzaState.status === "loading"
+                          : vrBrowseState.status === "loading"
                         : vrCatalogState.status === "loading"
               }
               aria-labelledby="discover-heading"
@@ -14442,9 +15061,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   <div>
                     <p className="card-eyebrow">
                       {discoverCategory === "vr"
-                        ? "JavDB VR Discover"
+                        ? `${vrWorkflow === "browse" && vrBrowseProvider === "fanza" ? "FANZA" : "JavDB"} VR Discover`
                         : discoverCategory === "adult"
-                          ? "JavDB Adult Discover"
+                          ? `${adultWorkflow === "browse" && adultBrowseProvider === "fanza" ? "FANZA" : "JavDB"} Adult Discover`
                           : "TMDB Discover"}
                     </p>
                     <h2 id="discover-heading">
@@ -14454,16 +15073,22 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           ? tvDiscoverGalleryLabel
                           : discoverCategory === "adult"
                             ? adultWorkflow === "browse"
-                              ? adultBrowseGalleryLabel
+                              ? adultBrowseProvider === "fanza"
+                                ? adultFanzaGalleryLabel
+                                : adultBrowseGalleryLabel
                               : adultGalleryLabel
                             : vrWorkflow === "browse"
-                              ? vrBrowseGalleryLabel
+                              ? vrBrowseProvider === "fanza"
+                                ? vrFanzaGalleryLabel
+                                : vrBrowseGalleryLabel
                               : vrGalleryLabel}
                     </h2>
                     <p className="library-folder">
                       {discoverCategory === "vr" ? (
                         vrWorkflow === "browse" ? (
-                          "Exact tag-212 VR catalog"
+                          vrBrowseProvider === "fanza"
+                            ? `${fanzaFeeds.find((feed) => feed.value === vrFanzaFeed)?.label} FANZA VR feed`
+                            : "Exact tag-212 VR catalog"
                         ) : submittedVrCode === null ? (
                           "Exact product-code lookup"
                         ) : (
@@ -14471,9 +15096,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         )
                       ) : discoverCategory === "adult" ? (
                         adultWorkflow === "browse" ? (
-                          adultBrowseMode === "ranking"
-                            ? `${adultBrowsePeriod} Adult ranking`
-                            : "Adult category catalog"
+                          adultBrowseProvider === "fanza"
+                            ? `${fanzaFeeds.find((feed) => feed.value === adultFanzaFeed)?.label} FANZA Adult feed`
+                            : adultBrowseMode === "ranking"
+                              ? `${adultBrowsePeriod} Adult ranking`
+                              : "Adult category catalog"
                         ) : submittedAdultCode === null ? (
                           "Exact product-code lookup"
                         ) : (
@@ -14530,14 +15157,28 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   </fieldset>
                   {discoverCategory === "vr" ? (
                     <>
-                      <JavdbBrowseControls
+                      <ProviderBrowseControls
                         category="vr"
-                        count={vrBrowseCount}
+                        count={
+                          vrBrowseProvider === "fanza"
+                            ? vrFanzaCount
+                            : vrBrowseCount
+                        }
+                        fanzaFeed={vrFanzaFeed}
                         mode="category"
                         month={vrBrowseMonth}
                         onCountChange={(count) => {
-                          setVrBrowseCount(count);
-                          restartVrBrowse();
+                          if (vrBrowseProvider === "fanza") {
+                            setVrFanzaCount(count);
+                            restartVrFanza();
+                          } else {
+                            setVrBrowseCount(count);
+                            restartVrBrowse();
+                          }
+                        }}
+                        onFanzaFeedChange={(feed) => {
+                          setVrFanzaFeed(feed);
+                          restartVrFanza();
                         }}
                         onModeChange={() => undefined}
                         onMonthChange={(month) => {
@@ -14545,7 +15186,12 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           restartVrBrowse();
                         }}
                         onPeriodChange={() => undefined}
-                        onRefresh={restartVrBrowse}
+                        onProviderChange={changeVrBrowseProvider}
+                        onRefresh={
+                          vrBrowseProvider === "fanza"
+                            ? restartVrFanza
+                            : restartVrBrowse
+                        }
                         onSortChange={(sort) => {
                           setVrBrowseSort(sort);
                           restartVrBrowse();
@@ -14556,6 +15202,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           restartVrBrowse();
                         }}
                         period="daily"
+                        provider={vrBrowseProvider}
                         sort={vrBrowseSort}
                         workflow={vrWorkflow}
                         year={vrBrowseYear}
@@ -14613,14 +15260,28 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     </>
                   ) : discoverCategory === "adult" ? (
                     <>
-                      <JavdbBrowseControls
+                      <ProviderBrowseControls
                         category="adult"
-                        count={adultBrowseCount}
+                        count={
+                          adultBrowseProvider === "fanza"
+                            ? adultFanzaCount
+                            : adultBrowseCount
+                        }
+                        fanzaFeed={adultFanzaFeed}
                         mode={adultBrowseMode}
                         month={adultBrowseMonth}
                         onCountChange={(count) => {
-                          setAdultBrowseCount(count);
-                          restartAdultBrowse();
+                          if (adultBrowseProvider === "fanza") {
+                            setAdultFanzaCount(count);
+                            restartAdultFanza();
+                          } else {
+                            setAdultBrowseCount(count);
+                            restartAdultBrowse();
+                          }
+                        }}
+                        onFanzaFeedChange={(feed) => {
+                          setAdultFanzaFeed(feed);
+                          restartAdultFanza();
                         }}
                         onModeChange={(mode) => {
                           setAdultBrowseMode(mode);
@@ -14634,7 +15295,12 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           setAdultBrowsePeriod(period);
                           restartAdultBrowse();
                         }}
-                        onRefresh={restartAdultBrowse}
+                        onProviderChange={changeAdultBrowseProvider}
+                        onRefresh={
+                          adultBrowseProvider === "fanza"
+                            ? restartAdultFanza
+                            : restartAdultBrowse
+                        }
                         onSortChange={(sort) => {
                           setAdultBrowseSort(sort);
                           restartAdultBrowse();
@@ -14645,6 +15311,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           restartAdultBrowse();
                         }}
                         period={adultBrowsePeriod}
+                        provider={adultBrowseProvider}
                         sort={adultBrowseSort}
                         workflow={adultWorkflow}
                         year={adultBrowseYear}
@@ -14844,7 +15511,21 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
               {discoverCategory === "vr" ? (
                 vrWorkflow === "browse" ? (
-                  vrBrowseState.status === "ready" &&
+                  vrBrowseProvider === "fanza" ? (
+                    <FanzaBrowseSurface
+                      ariaLabel={vrFanzaGalleryLabel}
+                      category="vr"
+                      getInLibrary={isProviderItemInLibrary}
+                      getTransferState={providerItemTransferState}
+                      items={vrFanzaItems}
+                      message={currentVrFanzaMessage}
+                      onFindReleases={openVrReleaseComparison}
+                      onRetry={restartVrFanza}
+                      onSelectedPageChange={setVrFanzaSelectedPage}
+                      selectedPage={vrFanzaSelectedPage}
+                      state={vrFanzaState}
+                    />
+                  ) : vrBrowseState.status === "ready" &&
                   vrBrowseItems.length > 0 ? (
                     <>
                       <span aria-live="polite" className="sr-only" role="status">
@@ -14852,8 +15533,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       </span>
                       <JavdbBrowseGallery
                         ariaLabel={vrBrowseGalleryLabel}
-                        getInLibrary={isJavdbItemInLibrary}
-                        getTransferState={javdbItemTransferState}
+                        getInLibrary={isProviderItemInLibrary}
+                        getTransferState={providerItemTransferState}
                         items={vrBrowseItems}
                         onDetails={openJavdbDetails}
                         onFindReleases={openVrReleaseComparison}
@@ -14933,7 +15614,21 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                 )
               ) : discoverCategory === "adult" ? (
                 adultWorkflow === "browse" ? (
-                  adultBrowseState.status === "ready" &&
+                  adultBrowseProvider === "fanza" ? (
+                    <FanzaBrowseSurface
+                      ariaLabel={adultFanzaGalleryLabel}
+                      category="adult"
+                      getInLibrary={isProviderItemInLibrary}
+                      getTransferState={providerItemTransferState}
+                      items={adultFanzaItems}
+                      message={currentAdultFanzaMessage}
+                      onFindReleases={openAdultReleaseComparison}
+                      onRetry={restartAdultFanza}
+                      onSelectedPageChange={setAdultFanzaSelectedPage}
+                      selectedPage={adultFanzaSelectedPage}
+                      state={adultFanzaState}
+                    />
+                  ) : adultBrowseState.status === "ready" &&
                   adultBrowseItems.length > 0 ? (
                     <>
                       <span aria-live="polite" className="sr-only" role="status">
@@ -14941,8 +15636,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       </span>
                       <JavdbBrowseGallery
                         ariaLabel={adultBrowseGalleryLabel}
-                        getInLibrary={isJavdbItemInLibrary}
-                        getTransferState={javdbItemTransferState}
+                        getInLibrary={isProviderItemInLibrary}
+                        getTransferState={providerItemTransferState}
                         items={adultBrowseItems}
                         onDetails={openJavdbDetails}
                         onFindReleases={openAdultReleaseComparison}
@@ -16910,7 +17605,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       >
         {javdbDetailContext === null || javdbDetailState === null ? null : (
           <JavdbDetailsDialog
-            inLibrary={isJavdbItemInLibrary(javdbDetailContext.item)}
+            inLibrary={isProviderItemInLibrary(javdbDetailContext.item)}
             item={javdbDetailContext.item}
             onFindReleases={(item) => {
               const triggerId = javdbDetailContext.triggerId;
@@ -16928,7 +17623,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
             }
             onRetry={retryJavdbDetail}
             state={javdbDetailState}
-            transferState={javdbItemTransferState(javdbDetailContext.item)}
+            transferState={providerItemTransferState(javdbDetailContext.item)}
             triggerId={javdbDetailContext.triggerId}
           />
         )}

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adult_library;
+mod fanza_catalog;
 mod javdb_catalog;
 mod library_scan;
 mod tv_library;
@@ -29,6 +30,12 @@ use adult_library::{
     set_adult_folder, trash_adult_file_with, AdultLibraryState, ADULT_FILE_OPEN_FAILED,
     ADULT_FILE_REVEAL_FAILED, ADULT_FILE_TRASH_FAILED, ADULT_FOLDER_STORAGE_FAILED,
     ADULT_FOLDER_UNAVAILABLE, ADULT_LIBRARY_SCAN_FAILED,
+};
+use fanza_catalog::{
+    fetch_catalog_with as fetch_fanza_catalog_with, fetch_cover_bytes as fetch_fanza_cover_bytes,
+    fetch_cover_with as fetch_fanza_cover_with,
+    fetch_graphql_document as fetch_fanza_graphql_document,
+    invalidate_catalog as invalidate_fanza_catalog_with, FanzaCatalogRequest, FanzaCatalogState,
 };
 use javdb_catalog::{
     fetch_api_document as fetch_javdb_api_document, fetch_catalog_with as fetch_javdb_catalog_with,
@@ -1498,7 +1505,7 @@ fn clear_tmdb_token_file(path: &Path) -> Result<(), &'static str> {
     }
 }
 
-fn is_canonical_product_code(code: &str) -> bool {
+pub(crate) fn is_canonical_product_code(code: &str) -> bool {
     let Some((prefix, number)) = code.split_once('-') else {
         return false;
     };
@@ -1506,7 +1513,14 @@ fn is_canonical_product_code(code: &str) -> bool {
     (2..=16).contains(&prefix.len())
         && prefix
             .bytes()
-            .all(|character| character.is_ascii_uppercase())
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
+        && prefix
+            .bytes()
+            .any(|character| character.is_ascii_uppercase())
+        && prefix
+            .bytes()
+            .last()
+            .is_some_and(|character| character.is_ascii_uppercase())
         && (1..=10).contains(&number.len())
         && !number.starts_with('0')
         && number.bytes().all(|character| character.is_ascii_digit())
@@ -3270,6 +3284,78 @@ async fn fetch_javdb_catalog(
 }
 
 #[tauri::command]
+async fn fetch_fanza_catalog(
+    category: String,
+    context_generation: String,
+    feed: String,
+    count: u16,
+    state: tauri::State<'_, FanzaCatalogState>,
+) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    let request = FanzaCatalogRequest {
+        category,
+        context_generation,
+        feed,
+        count,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_fanza_catalog_with(&state, &request, fetch_fanza_graphql_document)
+            .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
+fn invalidate_fanza_catalog(
+    category: String,
+    context_generation: String,
+    state: tauri::State<'_, FanzaCatalogState>,
+) -> Result<(), String> {
+    invalidate_fanza_catalog_with(state.inner(), &category, &context_generation)
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn fetch_fanza_cover(
+    category: String,
+    context_generation: String,
+    request_generation: String,
+    provider_item_id: String,
+    code: String,
+    cover_authority_id: String,
+    state: tauri::State<'_, FanzaCatalogState>,
+) -> Result<Vec<u8>, String> {
+    let state = state.inner().clone();
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_fanza_cover_with(
+            &state,
+            &category,
+            &context_generation,
+            &request_generation,
+            &provider_item_id,
+            &code,
+            &cover_authority_id,
+            fetch_fanza_cover_bytes,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
 fn invalidate_javdb_catalog(
     category: String,
     context_generation: String,
@@ -4144,6 +4230,7 @@ fn main() {
         .manage(MovieTorrentState::default())
         .manage(AdultLibraryState::default())
         .manage(AdultTorrentState::default())
+        .manage(FanzaCatalogState::default())
         .manage(JavdbCatalogState::default())
         .manage(TvLibraryState::default())
         .manage(TvReleaseState::default())
@@ -4218,6 +4305,9 @@ fn main() {
             fetch_javdb_catalog,
             invalidate_javdb_catalog,
             fetch_javdb_cover,
+            fetch_fanza_catalog,
+            invalidate_fanza_catalog,
+            fetch_fanza_cover,
             fetch_javdb_detail,
             fetch_javdb_detail_image,
             invalidate_javdb_detail,
@@ -4365,6 +4455,19 @@ mod tests {
             sukebei_url.into_inner().as_deref(),
             Some("https://sukebei.nyaa.si/?page=rss&q=%22MDVR-419%22&c=0_0&f=0")
         );
+
+        let numeric_prefix_url = RefCell::new(None);
+        assert_eq!(
+            fetch_sukebei_vr_releases_with("3DSVR-1947", |url| {
+                numeric_prefix_url.replace(Some(url.to_owned()));
+                Ok("releases".to_owned())
+            }),
+            Ok("releases".to_owned())
+        );
+        assert_eq!(
+            numeric_prefix_url.into_inner().as_deref(),
+            Some("https://sukebei.nyaa.si/?page=rss&q=%223DSVR-1947%22&c=0_0&f=0")
+        );
     }
 
     #[test]
@@ -4493,6 +4596,7 @@ mod tests {
             "ADLT_123",
             "ADLT-0123",
             "ADLT-0",
+            "AB1-2",
             "XADLT-123 extra",
         ] {
             let javdb_dispatched = RefCell::new(false);

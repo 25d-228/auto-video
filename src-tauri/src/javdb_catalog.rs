@@ -218,14 +218,27 @@ fn valid_provider_item_id(value: &str) -> bool {
 
 fn canonical_product_code(value: &str) -> Option<String> {
     let value = value.trim();
-    let prefix_end = value
+    let number_start = value
         .bytes()
-        .position(|character| !character.is_ascii_alphabetic())?;
-    let prefix = &value[..prefix_end];
-    if !(2..=16).contains(&prefix.len()) {
+        .rposition(|character| !character.is_ascii_digit())?
+        .checked_add(1)?;
+    if number_start == value.len() {
         return None;
     }
-    let number = value[prefix_end..].trim_start_matches([' ', '_', '-']);
+    let prefix = value[..number_start].trim_end_matches([' ', '_', '-']);
+    if !(2..=16).contains(&prefix.len())
+        || !prefix
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric())
+        || prefix.bytes().all(|character| character.is_ascii_digit())
+        || !prefix
+            .bytes()
+            .last()
+            .is_some_and(|character| character.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let number = &value[number_start..];
     if number.is_empty()
         || number.len() > 10
         || !number.bytes().all(|character| character.is_ascii_digit())
@@ -1507,8 +1520,8 @@ fn parse_binary_response(output: &[u8]) -> Result<Vec<u8>, ProviderRequestError>
     }
 }
 
-#[cfg(target_os = "windows")]
-fn decode_base64(value: &str) -> Option<Vec<u8>> {
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) fn decode_base64(value: &str) -> Option<Vec<u8>> {
     fn digit(character: u8) -> Option<u8> {
         match character {
             b'A'..=b'Z' => Some(character - b'A'),
@@ -1713,6 +1726,15 @@ mod tests {
         let mut detail = detail_request(category, &catalog, provider_item_id, code);
         detail.context_generation = context_generation;
         detail
+    }
+
+    #[test]
+    fn canonical_product_codes_accept_letter_ending_alphanumeric_prefixes_only() {
+        assert_eq!(
+            canonical_product_code("3dsvr_01947").as_deref(),
+            Some("3DSVR-1947")
+        );
+        assert_eq!(canonical_product_code("AB1-2"), None);
     }
 
     #[test]
