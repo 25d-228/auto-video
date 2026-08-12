@@ -607,6 +607,10 @@ const fanzaFeeds: Array<{ label: string; value: FanzaFeed }> = [
 ];
 const fanzaResultCounts: FanzaResultCount[] = [10, 25, 50, 100];
 
+function getFanzaFeedLabel(feed: FanzaFeed) {
+  return fanzaFeeds.find((option) => option.value === feed)!.label;
+}
+
 const movieScanMessages = {
   unconfigured: {
     heading: "Choose a Movies folder to begin",
@@ -14002,6 +14006,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         : null
       : fanzaCatalogMessages[adultFanzaState.status];
   const adultFanzaGalleryLabel = "FANZA Adult catalog";
+  const adultFanzaFeedLabel = getFanzaFeedLabel(adultFanzaFeed);
   // Exact-code production results contain one item; the fixture exercises the real responsive pager.
   const adultGalleryItems =
     adultCatalogState.status === "ready"
@@ -14033,6 +14038,23 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         : null
       : fanzaCatalogMessages[vrFanzaState.status];
   const vrFanzaGalleryLabel = "FANZA VR catalog";
+  const vrFanzaFeedLabel = getFanzaFeedLabel(vrFanzaFeed);
+  const activeFanzaDiscoverCategory =
+    activeDestination.id === "discover" &&
+    discoverCategory === "adult" &&
+    adultWorkflow === "browse" &&
+    adultBrowseProvider === "fanza"
+      ? "Adult"
+      : activeDestination.id === "discover" &&
+          discoverCategory === "vr" &&
+          vrWorkflow === "browse" &&
+          vrBrowseProvider === "fanza"
+        ? "VR"
+        : null;
+  const activeDestinationDescription =
+    activeFanzaDiscoverCategory === null
+      ? activeDestination.description
+      : `Browse the current FANZA ${activeFanzaDiscoverCategory} catalog.`;
   const isLibrarySearchActive = librarySearchQuery.trim() !== "";
   const completeLibraryMovies =
     movieScanState.status === "ready" ? movieScanState.movies : [];
@@ -14561,7 +14583,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           <header className="page-header">
             <p className="page-eyebrow">Auto-Video workspace</p>
             <h1>{activeDestination.label}</h1>
-            <p>{activeDestination.description}</p>
+            <p>{activeDestinationDescription}</p>
           </header>
 
           {movieTrashAnnouncement === null ? null : (
@@ -15025,10 +15047,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     ? tvDiscoverState.status === "loading"
                   : discoverCategory === "adult"
                       ? adultWorkflow === "browse"
-                        ? adultBrowseState.status === "loading"
+                        ? adultBrowseProvider === "fanza"
+                          ? adultFanzaState.status === "loading"
+                          : adultBrowseState.status === "loading"
                         : adultCatalogState.status === "loading"
                       : vrWorkflow === "browse"
-                        ? vrBrowseState.status === "loading"
+                        ? vrBrowseProvider === "fanza"
+                          ? vrFanzaState.status === "loading"
+                          : vrBrowseState.status === "loading"
                         : vrCatalogState.status === "loading"
               }
               aria-labelledby="discover-heading"
@@ -15048,9 +15074,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   <div>
                     <p className="card-eyebrow">
                       {discoverCategory === "vr"
-                        ? "JavDB VR Discover"
+                        ? vrWorkflow === "browse" &&
+                          vrBrowseProvider === "fanza"
+                          ? "FANZA VR Discover"
+                          : "JavDB VR Discover"
                         : discoverCategory === "adult"
-                          ? "JavDB Adult Discover"
+                          ? adultWorkflow === "browse" &&
+                            adultBrowseProvider === "fanza"
+                            ? "FANZA Adult Discover"
+                            : "JavDB Adult Discover"
                           : "TMDB Discover"}
                     </p>
                     <h2 id="discover-heading">
@@ -15060,16 +15092,24 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           ? tvDiscoverGalleryLabel
                           : discoverCategory === "adult"
                             ? adultWorkflow === "browse"
-                              ? adultBrowseGalleryLabel
+                              ? adultBrowseProvider === "fanza"
+                                ? adultFanzaGalleryLabel
+                                : adultBrowseGalleryLabel
                               : adultGalleryLabel
                             : vrWorkflow === "browse"
-                              ? vrBrowseGalleryLabel
+                              ? vrBrowseProvider === "fanza"
+                                ? vrFanzaGalleryLabel
+                                : vrBrowseGalleryLabel
                               : vrGalleryLabel}
                     </h2>
                     <p className="library-folder">
                       {discoverCategory === "vr" ? (
                         vrWorkflow === "browse" ? (
-                          "Exact tag-212 VR catalog"
+                          vrBrowseProvider === "fanza" ? (
+                            `${vrFanzaFeedLabel} FANZA VR feed`
+                          ) : (
+                            "Exact tag-212 VR catalog"
+                          )
                         ) : submittedVrCode === null ? (
                           "Exact product-code lookup"
                         ) : (
@@ -15077,9 +15117,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         )
                       ) : discoverCategory === "adult" ? (
                         adultWorkflow === "browse" ? (
-                          adultBrowseMode === "ranking"
-                            ? `${adultBrowsePeriod} Adult ranking`
-                            : "Adult category catalog"
+                          adultBrowseProvider === "fanza" ? (
+                            `${adultFanzaFeedLabel} FANZA Adult feed`
+                          ) : adultBrowseMode === "ranking" ? (
+                            `${adultBrowsePeriod} Adult ranking`
+                          ) : (
+                            "Adult category catalog"
+                          )
                         ) : submittedAdultCode === null ? (
                           "Exact product-code lookup"
                         ) : (

@@ -47,7 +47,7 @@ const counts = new Set<FanzaResultCount>([10, 25, 50, 100]);
 const u64Pattern = /^(?:0|[1-9][0-9]{0,19})$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const contentIdPattern = /^[a-z0-9_]{1,64}$/;
-const displayCodePattern = /^(?=.{4,27}$)[A-Z0-9]*[A-Z]-[1-9][0-9]{0,9}$/;
+const displayCodePattern = /^[A-Z0-9]{1,15}[A-Z]-[1-9][0-9]{0,9}$/;
 const coverAuthorityPattern = /^fanza-cover-[1-9][0-9]{0,19}-[1-9][0-9]{0,2}$/;
 const sourceAspectRatio = 0.72;
 
@@ -116,22 +116,29 @@ export function parseFanzaCatalogResponse(
   }
 
   const contentIds = new Set<string>();
+  const coverAuthorityIds = new Set<string>();
   const items: FanzaCatalogItem[] = [];
   for (let index = 0; index < fields.length; index += 6) {
     const [category, contentId, displayCode, title, coverAuthorityId, ratio] =
       fields.slice(index, index + 6) as string[];
+    const expectedCoverAuthorityId =
+      `fanza-cover-${requestGeneration}-${index / 6 + 1}`;
     if (
       category !== request.category ||
       !contentIdPattern.test(contentId) ||
       contentIds.has(contentId) ||
       !displayCodePattern.test(displayCode) ||
       (coverAuthorityId !== "" &&
-        !coverAuthorityPattern.test(coverAuthorityId)) ||
+        (coverAuthorityId !== expectedCoverAuthorityId ||
+          coverAuthorityIds.has(coverAuthorityId))) ||
       Number(ratio) !== sourceAspectRatio
     ) {
       return { status: "malformed-provider" };
     }
     contentIds.add(contentId);
+    if (coverAuthorityId !== "") {
+      coverAuthorityIds.add(coverAuthorityId);
+    }
     items.push({
       category,
       contextGeneration,

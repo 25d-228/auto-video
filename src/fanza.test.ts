@@ -103,6 +103,76 @@ describe("FANZA catalog boundary", () => {
     ).toEqual({ status: "malformed-provider" });
   });
 
+  it("matches the native display-code prefix and number bounds", () => {
+    for (const displayCode of ["AB-1", "123456789012345A-1234567890"]) {
+      expect(
+        parseFanzaCatalogResponse(
+          ["1", "1", "vr", "exact1", displayCode, "", "", "0.72"],
+          request,
+          "1",
+        ),
+      ).toEqual({
+        status: "ready",
+        items: [expect.objectContaining({ displayCode })],
+      });
+    }
+
+    for (const displayCode of [
+      "A-12",
+      "1234567890123456A-1",
+      "AB1-2",
+      "AB-0",
+      "AB-12345678901",
+    ]) {
+      expect(
+        parseFanzaCatalogResponse(
+          ["1", "1", "vr", "exact1", displayCode, "", "", "0.72"],
+          request,
+          "1",
+        ),
+      ).toEqual({ status: "malformed-provider" });
+    }
+  });
+
+  it("requires cover authority for the returned generation and row position", () => {
+    for (const coverAuthorityId of [
+      "fanza-cover-7-1",
+      "fanza-cover-8-2",
+      "fanza-cover-8-0",
+      "fanza-cover-8-01",
+      "fanza-cover-8-1-extra",
+    ]) {
+      expect(
+        parseFanzaCatalogResponse(
+          [
+            "8",
+            "1",
+            "vr",
+            "vrkm01577",
+            "VRKM-1577",
+            "",
+            coverAuthorityId,
+            "0.72",
+          ],
+          request,
+          "4",
+        ),
+      ).toEqual({ status: "malformed-provider" });
+    }
+
+    expect(
+      parseFanzaCatalogResponse(
+        [
+          "8", "2",
+          "vr", "vrkm01577", "VRKM-1577", "", "fanza-cover-8-1", "0.72",
+          "vr", "ovvr616", "OVVR-616", "", "fanza-cover-8-1", "0.72",
+        ],
+        request,
+        "4",
+      ),
+    ).toEqual({ status: "malformed-provider" });
+  });
+
   it("maps provider failures locally without changing the request", async () => {
     for (const [error, status] of [
       ["vr_source_unavailable", "source-unavailable"],

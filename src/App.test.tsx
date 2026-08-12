@@ -10551,6 +10551,119 @@ describe("native-owned FANZA Adult and VR catalogs", () => {
     expect(fetchFanzaCoverMock.mock.calls[0]?.[0]).not.toHaveProperty("url");
   });
 
+  it.each([
+    {
+      category: "adult" as const,
+      label: "Adult",
+      javdbFeed: "daily Adult ranking",
+    },
+    {
+      category: "vr" as const,
+      label: "VR",
+      javdbFeed: "Exact tag-212 VR catalog",
+    },
+  ])(
+    "uses the active FANZA request and wording for deferred $label catalogs",
+    async ({ category, label, javdbFeed }) => {
+      const deferredCatalog = createDeferred<string[]>();
+      fetchFanzaCatalogMock.mockReturnValueOnce(deferredCatalog.promise);
+      render(<App />);
+      selectDiscover();
+      fireEvent.click(screen.getByRole("radio", { name: label }));
+      if (category === "adult") {
+        fireEvent.change(
+          screen.getByRole("combobox", { name: "Adult provider" }),
+          { target: { value: "fanza" } },
+        );
+      }
+
+      const fanzaSection = screen.getByRole("region", {
+        name: `FANZA ${label} catalog`,
+      });
+      const pageHeader = screen
+        .getByRole("heading", { level: 1, name: "Discover" })
+        .closest("header") as HTMLElement;
+      expect(fanzaSection.getAttribute("aria-busy")).toBe("true");
+      expect(
+        within(fanzaSection).getByText(`FANZA ${label} Discover`),
+      ).toBeTruthy();
+      expect(
+        within(fanzaSection).getByRole("heading", {
+          level: 2,
+          name: `FANZA ${label} catalog`,
+        }),
+      ).toBeTruthy();
+      expect(
+        within(fanzaSection).getByText(`Popular FANZA ${label} feed`),
+      ).toBeTruthy();
+      expect(
+        within(fanzaSection).getByRole("heading", {
+          name: "Loading FANZA catalog",
+        }),
+      ).toBeTruthy();
+      expect(
+        within(pageHeader).getByText(
+          `Browse the current FANZA ${label} catalog.`,
+        ),
+      ).toBeTruthy();
+
+      await act(async () => {
+        deferredCatalog.resolve(
+          fanzaCatalogFixture(category, [
+            {
+              code: category === "adult" ? "MARAA-244" : "VRKM-1577",
+              contentId: category === "adult" ? "maraa244" : "vrkm01577",
+              cover: false,
+            },
+          ]),
+        );
+        await deferredCatalog.promise;
+      });
+      await waitFor(() =>
+        expect(fanzaSection.getAttribute("aria-busy")).toBe("false"),
+      );
+
+      fireEvent.change(
+        screen.getByRole("combobox", { name: `${label} provider` }),
+        { target: { value: "javdb" } },
+      );
+      const javdbSection = screen.getByRole("region", {
+        name: `JavDB ${label} catalog`,
+      });
+      expect(
+        within(javdbSection).getByText(`JavDB ${label} Discover`),
+      ).toBeTruthy();
+      expect(within(javdbSection).getByText(javdbFeed)).toBeTruthy();
+      expect(
+        within(pageHeader).getByText(
+          "Browse TMDB Movies and TV or find Adult and VR titles by exact product code.",
+        ),
+      ).toBeTruthy();
+    },
+  );
+
+  it("rejects impossible structured cover authority without dispatching a cover", async () => {
+    fetchFanzaCatalogMock.mockResolvedValue([
+      "9",
+      "1",
+      "vr",
+      "vrkm01577",
+      "VRKM-1577",
+      "",
+      "fanza-cover-8-1",
+      "0.72",
+    ]);
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      await screen.findByRole("heading", {
+        name: "FANZA returned invalid catalog data",
+      }),
+    ).toBeTruthy();
+    expect(fetchFanzaCoverMock).not.toHaveBeenCalled();
+  });
+
   it("offers the five exact feeds, four result counts, and one current Refresh request", async () => {
     fetchFanzaCatalogMock.mockResolvedValue(
       fanzaCatalogFixture("vr", [
