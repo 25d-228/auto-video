@@ -142,11 +142,15 @@ import {
   fetchExactJavdbVrItem,
   fetchJavdbBrowse,
   fetchJavdbCoverObjectUrl,
+  fetchJavdbDetail,
+  fetchJavdbDetailImageObjectUrl,
   fetchVerifiedAdultSukebeiReleases,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedAdultSukebeiTorrent,
   inspectVerifiedSukebeiTorrent,
   invalidateJavdbBrowse,
+  invalidateJavdbDetail,
+  javdbDetailErrorStatus,
   invalidateVerifiedAdultTorrent,
   invalidateVerifiedVrTorrent,
   listVrDownloads,
@@ -154,6 +158,7 @@ import {
   loadVrDownloads,
   loadVrFolder,
   openVrFile,
+  openJavdbDetailSource,
   pauseVrDownload,
   previewVrOrganization,
   queryVrStorage,
@@ -180,6 +185,8 @@ import {
   type JavdbBrowseRequest,
   type JavdbBrowseResult,
   type JavdbBrowseSort,
+  type JavdbDetail,
+  type JavdbDetailResult,
   type SukebeiRelease,
   type SukebeiReleasesResult,
   type TorrentInspectionResult,
@@ -436,6 +443,12 @@ type JavdbBrowseState =
   | { status: "idle" }
   | { status: "loading" }
   | JavdbBrowseResult;
+type JavdbDetailState = { status: "loading" } | JavdbDetailResult;
+type JavdbDetailContext = {
+  item: JavdbBrowseItem;
+  triggerId: string;
+  surface: "details" | "preview";
+};
 type AdultReleaseComparisonState =
   | { status: "loading" }
   | SukebeiReleasesResult<SukebeiRelease>;
@@ -1183,6 +1196,77 @@ const javdbBrowseMessages = {
   "provider-error": {
     heading: "JavDB could not load the catalog",
     message: "The provider returned an unexpected error. Retry this exact request later.",
+    role: "alert",
+  },
+} as const;
+
+const javdbDetailMessages = {
+  loading: {
+    heading: "Loading JavDB details",
+    message: "Verifying the exact provider item and category.",
+    role: "status",
+  },
+  "source-unavailable": {
+    heading: "JavDB details are unavailable",
+    message: "The exact provider item is not available. Retry it later.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "JavDB details could not be reached",
+    message: "Check the network connection and retry this exact item.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "JavDB returned invalid details",
+    message: "The provider response did not contain valid exact-item details.",
+    role: "alert",
+  },
+  "conflicting-provider": {
+    heading: "JavDB returned a conflicting identity",
+    message: "The details did not match this product code and category.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "JavDB details could not be loaded",
+    message: "The provider returned an unexpected error. Retry this exact item.",
+    role: "alert",
+  },
+  stale: {
+    heading: "These JavDB details are no longer current",
+    message: "Return to the current catalog and open the item again.",
+    role: "alert",
+  },
+} as const;
+
+const javdbPreviewMessages = {
+  "source-unavailable": {
+    heading: "JavDB previews are unavailable",
+    message: "The retained preview source is not available. Retry it later.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "JavDB previews could not be reached",
+    message: "Check the network connection and retry these exact images.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "JavDB returned invalid preview data",
+    message: "The retained preview response was invalid.",
+    role: "alert",
+  },
+  "conflicting-provider": {
+    heading: "JavDB returned a conflicting preview identity",
+    message: "The preview no longer belongs to this exact item.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "JavDB previews could not be loaded",
+    message: "The provider returned an unexpected image error. Retry these exact images.",
+    role: "alert",
+  },
+  stale: {
+    heading: "These JavDB previews are no longer current",
+    message: "Return to the current catalog and open Preview again.",
     role: "alert",
   },
 } as const;
@@ -2130,7 +2214,13 @@ function JavdbBrowseControls({
               ))}
             </select>
           </label>
-          <Button onClick={onRefresh} size="sm" type="button" variant="outline">
+          <Button
+            id={`${category}-javdb-refresh`}
+            onClick={onRefresh}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
             <AppIcon name="refresh" />
             Refresh
           </Button>
@@ -2215,18 +2305,24 @@ function JavdbCover({
 function DiscoverJavdbBrowseCard({
   inLibrary,
   item,
+  onDetails,
   onFindReleases,
+  onPreview,
   onRatioChange,
   transferState,
 }: {
   inLibrary: boolean;
   item: JavdbBrowseItem;
+  onDetails: (item: JavdbBrowseItem, triggerId: string) => void;
   onFindReleases: (item: JavdbBrowseItem, triggerId: string) => void;
+  onPreview: (item: JavdbBrowseItem, triggerId: string) => void;
   onRatioChange: (item: JavdbBrowseItem, ratio: number) => void;
   transferState: VrDownload["state"] | null;
 }) {
   const [coverRatio, setCoverRatio] = useState(item.sourceAspectRatio);
-  const cardId = `javdb-card-${item.category}-${item.providerItemId}`;
+  const cardId = `javdb-card-${item.category}-${item.requestGeneration}-${item.providerItemId}`;
+  const detailsTriggerId = `${cardId}-details`;
+  const previewTriggerId = `${cardId}-preview`;
   const releasesTriggerId = `${cardId}-releases`;
 
   return (
@@ -2237,6 +2333,13 @@ function DiscoverJavdbBrowseCard({
       data-narrow-cover={coverRatio < 0.9}
       style={{ width: `${Math.round(javdbCoverHeight * coverRatio)}px` }}
     >
+      <button
+        aria-label={`View details: ${item.code}`}
+        className="javdb-browse-card__details-control"
+        id={detailsTriggerId}
+        onClick={() => onDetails(item, detailsTriggerId)}
+        type="button"
+      />
       <div className="javdb-browse-card__cover">
         <JavdbCover
           item={item}
@@ -2255,8 +2358,28 @@ function DiscoverJavdbBrowseCard({
         <p>{item.title ?? item.releaseDate ?? "Title unavailable"}</p>
         <span>JavDB</span>
       </div>
-      <div className="javdb-browse-card__actions">
+      <div
+        className="javdb-browse-card__actions"
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => event.stopPropagation()}
+        onPointerDown={(event) => event.stopPropagation()}
+      >
         <CopyTitleAction title={item.code} />
+        <Button
+          aria-label={`Preview: ${item.code}`}
+          id={previewTriggerId}
+          onClick={(event) => {
+            event.stopPropagation();
+            onPreview(item, previewTriggerId);
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+          size="xs"
+          type="button"
+          variant="outline"
+        >
+          Preview
+        </Button>
         <Button
           aria-label={`Find releases: ${item.code}`}
           id={releasesTriggerId}
@@ -2346,7 +2469,9 @@ function JavdbBrowseGallery({
   getInLibrary,
   getTransferState,
   items,
+  onDetails,
   onFindReleases,
+  onPreview,
   onSelectedPageChange,
   selectedPage,
 }: {
@@ -2354,7 +2479,9 @@ function JavdbBrowseGallery({
   getInLibrary: (item: JavdbBrowseItem) => boolean;
   getTransferState: (item: JavdbBrowseItem) => VrDownload["state"] | null;
   items: JavdbBrowseItem[];
+  onDetails: (item: JavdbBrowseItem, triggerId: string) => void;
   onFindReleases: (item: JavdbBrowseItem, triggerId: string) => void;
+  onPreview: (item: JavdbBrowseItem, triggerId: string) => void;
   onSelectedPageChange: (page: number) => void;
   selectedPage: number;
 }) {
@@ -2419,7 +2546,9 @@ function JavdbBrowseGallery({
               <DiscoverJavdbBrowseCard
                 inLibrary={getInLibrary(item)}
                 item={item}
+                onDetails={onDetails}
                 onFindReleases={onFindReleases}
+                onPreview={onPreview}
                 onRatioChange={(currentItem, ratio) => {
                   setRatios((current) => {
                     const itemKey = javdbBrowseItemKey(currentItem);
@@ -2463,6 +2592,498 @@ function JavdbBrowseGallery({
         </Button>
       </nav>
     </div>
+  );
+}
+
+function javdbFocusTarget(category: "adult" | "vr", triggerId: string) {
+  return (
+    document.getElementById(triggerId) ??
+    document.getElementById(`${category}-javdb-refresh`) ??
+    document.getElementById("adult-javdb-refresh") ??
+    document.getElementById("vr-javdb-refresh")
+  );
+}
+
+function JavdbDetailCover({ detail }: { detail: JavdbDetail }) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(detail.coverAuthorityId === null);
+
+  useEffect(() => {
+    let current = true;
+    let createdUrl: string | null = null;
+    setObjectUrl(null);
+    setFailed(detail.coverAuthorityId === null);
+    if (detail.coverAuthorityId !== null) {
+      void fetchJavdbDetailImageObjectUrl(
+        detail,
+        detail.coverAuthorityId,
+      )
+        .then((url) => {
+          createdUrl = url;
+          if (current) {
+            setObjectUrl(url);
+          } else {
+            URL.revokeObjectURL(url);
+          }
+        })
+        .catch(() => {
+          if (current) {
+            setFailed(true);
+          }
+        });
+    }
+    return () => {
+      current = false;
+      if (createdUrl !== null) {
+        URL.revokeObjectURL(createdUrl);
+      }
+    };
+  }, [detail]);
+
+  if (failed || objectUrl === null) {
+    return (
+      <div className="javdb-detail__placeholder">
+        <AppIcon name="poster" />
+        <span>{detail.code}</span>
+      </div>
+    );
+  }
+  return (
+    <img
+      alt=""
+      onError={() => {
+        URL.revokeObjectURL(objectUrl);
+        setObjectUrl(null);
+        setFailed(true);
+      }}
+      src={objectUrl}
+    />
+  );
+}
+
+function JavdbDetailsDialog({
+  inLibrary,
+  item,
+  onFindReleases,
+  onPreview,
+  onRetry,
+  state,
+  transferState,
+  triggerId,
+}: {
+  inLibrary: boolean;
+  item: JavdbBrowseItem;
+  onFindReleases: (item: JavdbBrowseItem, triggerId: string) => void;
+  onPreview: () => void;
+  onRetry: () => void;
+  state: JavdbDetailState;
+  transferState: VrDownload["state"] | null;
+  triggerId: string;
+}) {
+  const [sourceError, setSourceError] = useState(false);
+  const detail = state.status === "ready" ? state.detail : null;
+  const currentMessage =
+    state.status === "ready" ? null : javdbDetailMessages[state.status];
+  const releaseTriggerId = `javdb-details-${item.category}-${item.requestGeneration}-${item.providerItemId}-releases`;
+
+  useEffect(() => setSourceError(false), [detail]);
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="movie-details__backdrop" />
+      <Dialog.Viewport className="movie-details__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading"}
+          className="movie-details__popup javdb-detail__popup"
+          finalFocus={() => javdbFocusTarget(item.category, triggerId)}
+          onClick={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <div className="movie-details__heading">
+            <div>
+              <p className="card-eyebrow">JavDB provider details</p>
+              <Dialog.Title>{item.code}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="movie-details__description">
+            Exact {item.category === "vr" ? "VR" : "Adult"} details for the
+            current accepted JavDB catalog item.
+          </Dialog.Description>
+          {detail === null ? (
+            <div className="movie-details__state" role={currentMessage?.role}>
+              <span className="empty-state__icon">
+                <AppIcon name="details" />
+              </span>
+              <div>
+                <h3>{currentMessage?.heading}</h3>
+                <p>{currentMessage?.message}</p>
+                {state.status !== "loading" && state.status !== "stale" ? (
+                  <Button onClick={onRetry} type="button" variant="outline">
+                    <AppIcon name="refresh" />
+                    Retry details
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ) : (
+            <div className="movie-details__content javdb-detail__content">
+              <span aria-live="polite" className="sr-only" role="status">
+                JavDB details loaded for {detail.code}.
+              </span>
+              <div className="movie-details__poster">
+                <JavdbDetailCover detail={detail} />
+                <div className="javdb-detail__badges">
+                  {inLibrary ? <span>In library</span> : null}
+                  {transferState === null ? null : <span>{transferState}</span>}
+                </div>
+              </div>
+              <div className="movie-details__information">
+                <h3>{detail.title ?? "Title unavailable"}</h3>
+                {detail.originalTitle === null ? null : (
+                  <p className="javdb-detail__original-title">
+                    {detail.originalTitle}
+                  </p>
+                )}
+                <dl>
+                  <div>
+                    <dt>Release date</dt>
+                    <dd>{detail.releaseDate ?? "Unavailable"}</dd>
+                  </div>
+                  <div>
+                    <dt>Runtime</dt>
+                    <dd>
+                      {detail.duration === null
+                        ? "Unavailable"
+                        : `${detail.duration} minutes`}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Cast</dt>
+                    <dd>
+                      {detail.actors.length === 0
+                        ? "Unavailable"
+                        : detail.actors.join(", ")}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Tags</dt>
+                    <dd>
+                      {detail.tags.length === 0
+                        ? "Unavailable"
+                        : detail.tags.join(", ")}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Source</dt>
+                    <dd>JavDB</dd>
+                  </div>
+                </dl>
+                <div className="movie-details__overview">
+                  <h3>Summary</h3>
+                  <p>{detail.summary ?? "Unavailable"}</p>
+                </div>
+                <div className="javdb-detail__actions">
+                  <Button
+                    onClick={onPreview}
+                    type="button"
+                    variant="outline"
+                  >
+                    Preview
+                  </Button>
+                  <Button
+                    id={releaseTriggerId}
+                    onClick={() => onFindReleases(item, releaseTriggerId)}
+                    type="button"
+                  >
+                    <AppIcon name="releases" />
+                    Find releases
+                  </Button>
+                  <Button
+                    onClick={() => {
+                      setSourceError(false);
+                      void openJavdbDetailSource(detail).catch(() =>
+                        setSourceError(true),
+                      );
+                    }}
+                    type="button"
+                    variant="outline"
+                  >
+                    View on JavDB
+                  </Button>
+                </div>
+                {sourceError ? (
+                  <p role="alert">JavDB could not be opened in the browser.</p>
+                ) : null}
+              </div>
+            </div>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
+  );
+}
+
+type JavdbPreviewState =
+  | { status: "loading" }
+  | { status: "no-preview" }
+  | { status: Exclude<JavdbDetailResult["status"], "ready"> }
+  | {
+      status: "ready";
+      images: Array<{ authorityId: string; objectUrl: string }>;
+    };
+
+function JavdbPreviewDialog({
+  detailState,
+  item,
+  onBack,
+  onRetryDetails,
+  triggerId,
+}: {
+  detailState: JavdbDetailState;
+  item: JavdbBrowseItem;
+  onBack: () => void;
+  onRetryDetails: () => void;
+  triggerId: string;
+}) {
+  const [previewState, setPreviewState] = useState<JavdbPreviewState>({
+    status: "loading",
+  });
+  const [requestVersion, setRequestVersion] = useState(0);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const detail = detailState.status === "ready" ? detailState.detail : null;
+
+  useEffect(() => {
+    if (detail === null) {
+      setPreviewState({ status: "loading" });
+      return;
+    }
+    if (detail.previewAuthorityIds.length === 0) {
+      setPreviewState({ status: "no-preview" });
+      return;
+    }
+    let current = true;
+    const createdUrls = new Set<string>();
+    setCurrentIndex(0);
+    setPreviewState({ status: "loading" });
+    void Promise.all(
+      detail.previewAuthorityIds.map(async (authorityId) => {
+        try {
+          const objectUrl = await fetchJavdbDetailImageObjectUrl(
+            detail,
+            authorityId,
+          );
+          if (!current) {
+            URL.revokeObjectURL(objectUrl);
+            return null;
+          }
+          createdUrls.add(objectUrl);
+          return { authorityId, objectUrl };
+        } catch (error: unknown) {
+          return { error };
+        }
+      }),
+    ).then((results) => {
+      if (!current) {
+        return;
+      }
+      const images = results.filter(
+        (result): result is { authorityId: string; objectUrl: string } =>
+          result !== null && "objectUrl" in result,
+      );
+      const firstFailure = results.find(
+        (result): result is { error: unknown } =>
+          result !== null && "error" in result,
+      );
+      if (images.length > 0) {
+        setPreviewState({ status: "ready", images });
+      } else {
+        setPreviewState({
+          status:
+            firstFailure === undefined
+              ? "no-preview"
+              : javdbDetailErrorStatus(item.category, firstFailure.error),
+        });
+      }
+    });
+    return () => {
+      current = false;
+      for (const objectUrl of createdUrls) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [detail, item.category, requestVersion]);
+
+  const removeCurrentImage = () => {
+    if (previewState.status !== "ready") {
+      return;
+    }
+    const currentImage = previewState.images[currentIndex];
+    if (currentImage !== undefined) {
+      URL.revokeObjectURL(currentImage.objectUrl);
+    }
+    const images = previewState.images.filter(
+      (_, index) => index !== currentIndex,
+    );
+    if (images.length === 0) {
+      setPreviewState({ status: "provider-error" });
+      setCurrentIndex(0);
+    } else {
+      setPreviewState({ status: "ready", images });
+      setCurrentIndex((index) => Math.min(index, images.length - 1));
+    }
+  };
+  const move = (direction: -1 | 1) => {
+    if (previewState.status !== "ready") {
+      return;
+    }
+    setCurrentIndex(
+      (index) =>
+        (index + direction + previewState.images.length) %
+        previewState.images.length,
+    );
+  };
+
+  const detailMessage =
+    detailState.status === "ready"
+      ? null
+      : javdbDetailMessages[detailState.status];
+  const previewMessage =
+    previewState.status === "ready" || previewState.status === "loading"
+      ? null
+      : previewState.status === "no-preview"
+        ? {
+            heading: "No preview images available",
+            message: "JavDB did not provide an accepted image for this item.",
+            role: undefined,
+          }
+        : javdbPreviewMessages[previewState.status];
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="vr-torrent__backdrop" />
+      <Dialog.Viewport className="vr-torrent__viewport">
+        <Dialog.Popup
+          aria-busy={
+            detailState.status === "loading" ||
+            previewState.status === "loading"
+          }
+          className="vr-torrent__popup javdb-preview__popup"
+          finalFocus={() => javdbFocusTarget(item.category, triggerId)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft") {
+              event.preventDefault();
+              move(-1);
+            } else if (event.key === "ArrowRight") {
+              event.preventDefault();
+              move(1);
+            }
+          }}
+        >
+          <div className="vr-torrent__heading">
+            <div>
+              <p className="card-eyebrow">JavDB preview</p>
+              <Dialog.Title>{item.code}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="vr-torrent__description">
+            Exact preview images retained for the current accepted JavDB item.
+          </Dialog.Description>
+          {detailState.status !== "ready" ? (
+            <div className="vr-releases__state" role={detailMessage?.role}>
+              <div>
+                <h3>{detailMessage?.heading}</h3>
+                <p>{detailMessage?.message}</p>
+                {detailState.status !== "loading" &&
+                detailState.status !== "stale" ? (
+                  <Button
+                    onClick={onRetryDetails}
+                    type="button"
+                    variant="outline"
+                  >
+                    Retry preview
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ) : previewState.status === "ready" ? (
+            <div className="javdb-preview__content">
+              <span aria-live="polite" className="sr-only" role="status">
+                {previewState.images.length} JavDB preview images loaded.
+              </span>
+              <img
+                alt={`${item.code} preview ${currentIndex + 1} of ${previewState.images.length}`}
+                onError={removeCurrentImage}
+                src={previewState.images[currentIndex]?.objectUrl}
+              />
+              <p aria-live="polite">
+                Image {currentIndex + 1} of {previewState.images.length}
+              </p>
+              {previewState.images.length > 1 ? (
+                <div className="javdb-preview__navigation">
+                  <Button
+                    aria-label={`Previous preview for ${item.code}`}
+                    onClick={() => move(-1)}
+                    type="button"
+                    variant="outline"
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    aria-label={`Next preview for ${item.code}`}
+                    onClick={() => move(1)}
+                    type="button"
+                    variant="outline"
+                  >
+                    Next
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+          ) : previewState.status === "loading" ? (
+            <div className="vr-releases__state" role="status">
+              <h3>Loading preview images</h3>
+              <p>Verifying the retained images for this exact item.</p>
+            </div>
+          ) : (
+            <div className="vr-releases__state" role={previewMessage?.role}>
+              <div>
+                <h3>{previewMessage?.heading}</h3>
+                <p>{previewMessage?.message}</p>
+                {previewState.status === "no-preview" ||
+                previewState.status === "stale" ? null : (
+                  <Button
+                    onClick={() => setRequestVersion((version) => version + 1)}
+                    type="button"
+                    variant="outline"
+                  >
+                    Retry preview
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
+          <Button onClick={onBack} type="button" variant="outline">
+            Back to details
+          </Button>
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
   );
 }
 
@@ -7919,6 +8540,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   });
   const [vrBrowseRequestVersion, setVrBrowseRequestVersion] = useState(0);
   const [vrBrowseSelectedPage, setVrBrowseSelectedPage] = useState(1);
+  const [javdbDetailContext, setJavdbDetailContext] =
+    useState<JavdbDetailContext | null>(null);
+  const [javdbDetailState, setJavdbDetailState] =
+    useState<JavdbDetailState | null>(null);
+  const [javdbDetailRequestVersion, setJavdbDetailRequestVersion] = useState(0);
   const [vrSearchInputError, setVrSearchInputError] = useState<string | null>(
     null,
   );
@@ -8014,6 +8640,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const adultCatalogRequestId = useRef(0);
   const adultBrowseRequestId = useRef(0);
   const adultBrowseContextGeneration = useRef(0);
+  const javdbDetailRequestId = useRef(0);
   const adultReleaseRequestId = useRef(0);
   const adultTorrentInspectionRequestId = useRef(0);
   const adultTorrentSaveRequestId = useRef(0);
@@ -9305,6 +9932,25 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     vrBrowseYear,
   ]);
 
+  const currentJavdbDetailItem = javdbDetailContext?.item ?? null;
+  useEffect(() => {
+    const requestId = ++javdbDetailRequestId.current;
+    if (currentJavdbDetailItem === null) {
+      return;
+    }
+    setJavdbDetailState({ status: "loading" });
+    void fetchJavdbDetail(currentJavdbDetailItem).then((result) => {
+      if (requestId === javdbDetailRequestId.current) {
+        setJavdbDetailState(result);
+      } else if (result.status === "ready") {
+        void invalidateJavdbDetail(result.detail).catch(() => undefined);
+      }
+    });
+    return () => {
+      javdbDetailRequestId.current += 1;
+    };
+  }, [currentJavdbDetailItem, javdbDetailRequestVersion]);
+
   useEffect(() => {
     const requestId = ++releaseRequestId.current;
     if (releaseComparisonItem === null) {
@@ -9446,11 +10092,47 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setSelectedAdultRelease(null);
   };
 
+  const closeJavdbDetail = () => {
+    javdbDetailRequestId.current += 1;
+    if (javdbDetailState?.status === "ready") {
+      void invalidateJavdbDetail(javdbDetailState.detail).catch(
+        () => undefined,
+      );
+    }
+    setJavdbDetailContext(null);
+    setJavdbDetailState(null);
+  };
+
+  const openJavdbDetails = (
+    item: JavdbBrowseItem,
+    triggerId: string,
+  ) => {
+    closeJavdbDetail();
+    setJavdbDetailState({ status: "loading" });
+    setJavdbDetailContext({ item, triggerId, surface: "details" });
+  };
+
+  const openJavdbPreview = (
+    item: JavdbBrowseItem,
+    triggerId: string,
+  ) => {
+    closeJavdbDetail();
+    setJavdbDetailState({ status: "loading" });
+    setJavdbDetailContext({ item, triggerId, surface: "preview" });
+  };
+
+  const retryJavdbDetail = () => {
+    javdbDetailRequestId.current += 1;
+    setJavdbDetailState({ status: "loading" });
+    setJavdbDetailRequestVersion((version) => version + 1);
+  };
+
   const navigateTo = (destination: (typeof destinations)[number]) => {
     if (
       activeDestination.id === "discover" &&
       destination.id !== "discover"
     ) {
+      closeJavdbDetail();
       adultCatalogRequestId.current += 1;
       setAdultCatalogState((currentState) =>
         currentState.status === "loading"
@@ -11971,6 +12653,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     }
 
     closeDiscoverMovieDetails();
+    closeJavdbDetail();
     closeDiscoverTvDetails();
     closeTvTorrentInspection();
     closeTvReleaseComparison();
@@ -12024,6 +12707,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       return;
     }
     closeAdultReleaseComparison();
+    closeJavdbDetail();
     adultBrowseRequestId.current += 1;
     setAdultBrowseSelectedPage(1);
     setAdultBrowseState({ status: "idle" });
@@ -12045,6 +12729,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       return;
     }
     closeVrReleaseComparison();
+    closeJavdbDetail();
     vrBrowseRequestId.current += 1;
     setVrBrowseSelectedPage(1);
     setVrBrowseState({ status: "idle" });
@@ -12063,6 +12748,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
   const restartAdultBrowse = () => {
     closeAdultReleaseComparison();
+    closeJavdbDetail();
     adultBrowseRequestId.current += 1;
     setAdultBrowseSelectedPage(1);
     setAdultBrowseState({ status: "loading" });
@@ -12071,6 +12757,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
   const restartVrBrowse = () => {
     closeVrReleaseComparison();
+    closeJavdbDetail();
     vrBrowseRequestId.current += 1;
     setVrBrowseSelectedPage(1);
     setVrBrowseState({ status: "loading" });
@@ -14168,7 +14855,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         getInLibrary={isJavdbItemInLibrary}
                         getTransferState={javdbItemTransferState}
                         items={vrBrowseItems}
+                        onDetails={openJavdbDetails}
                         onFindReleases={openVrReleaseComparison}
+                        onPreview={openJavdbPreview}
                         onSelectedPageChange={setVrBrowseSelectedPage}
                         selectedPage={vrBrowseSelectedPage}
                       />
@@ -14255,7 +14944,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         getInLibrary={isJavdbItemInLibrary}
                         getTransferState={javdbItemTransferState}
                         items={adultBrowseItems}
+                        onDetails={openJavdbDetails}
                         onFindReleases={openAdultReleaseComparison}
+                        onPreview={openJavdbPreview}
                         onSelectedPageChange={setAdultBrowseSelectedPage}
                         selectedPage={adultBrowseSelectedPage}
                       />
@@ -16206,6 +16897,61 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
             selectedFileIds={selectedTvTorrentFileIds}
             startState={tvTorrentStartState}
             state={tvTorrentInspectionState}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeJavdbDetail();
+          }
+        }}
+        open={javdbDetailContext?.surface === "details"}
+      >
+        {javdbDetailContext === null || javdbDetailState === null ? null : (
+          <JavdbDetailsDialog
+            inLibrary={isJavdbItemInLibrary(javdbDetailContext.item)}
+            item={javdbDetailContext.item}
+            onFindReleases={(item) => {
+              const triggerId = javdbDetailContext.triggerId;
+              closeJavdbDetail();
+              if (item.category === "adult") {
+                openAdultReleaseComparison(item, triggerId);
+              } else {
+                openVrReleaseComparison(item, triggerId);
+              }
+            }}
+            onPreview={() =>
+              setJavdbDetailContext((current) =>
+                current === null ? null : { ...current, surface: "preview" },
+              )
+            }
+            onRetry={retryJavdbDetail}
+            state={javdbDetailState}
+            transferState={javdbItemTransferState(javdbDetailContext.item)}
+            triggerId={javdbDetailContext.triggerId}
+          />
+        )}
+      </Dialog.Root>
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) {
+            closeJavdbDetail();
+          }
+        }}
+        open={javdbDetailContext?.surface === "preview"}
+      >
+        {javdbDetailContext === null || javdbDetailState === null ? null : (
+          <JavdbPreviewDialog
+            detailState={javdbDetailState}
+            item={javdbDetailContext.item}
+            onBack={() =>
+              setJavdbDetailContext((current) =>
+                current === null ? null : { ...current, surface: "details" },
+              )
+            }
+            onRetryDetails={retryJavdbDetail}
+            triggerId={javdbDetailContext.triggerId}
           />
         )}
       </Dialog.Root>
