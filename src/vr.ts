@@ -4,7 +4,7 @@ export type JavdbCatalogItem = {
   code: string;
   title: string | null;
   coverUrl: string | null;
-  source: "JavDB";
+  source: "FANZA" | "JavDB";
 };
 
 export type JavdbCatalogResult =
@@ -211,7 +211,7 @@ export type SukebeiReleasesResult<Release extends SukebeiRelease> =
 
 export type VrReleasesResult = SukebeiReleasesResult<VrRelease>;
 
-const productCodePattern = /^([A-Za-z]{2,16})[ _-]*([0-9]{1,10})$/;
+const productCodePattern = /^([A-Za-z0-9]{1,15}[A-Za-z])[ _-]*([0-9]{1,10})$/;
 const unsignedU64Pattern = /^\d{1,20}$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const maximumSelectedVrFiles = 100_000;
@@ -413,7 +413,7 @@ function releaseArtifact(item: Element): SukebeiReleaseArtifact | null {
 
 export function productCodeCandidates(value: string) {
   const identityPattern =
-    /(^|[^A-Za-z0-9])([A-Za-z]{2,16})[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])/gi;
+    /(^|[^A-Za-z0-9])([A-Za-z0-9]{1,15}[A-Za-z])[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])/gi;
   const candidates: Array<{ code: string; prefix: string }> = [];
   for (const match of value.matchAll(identityPattern)) {
     const identity = canonicalizeProductCode(`${match[2]}-${match[3]}`);
@@ -476,6 +476,9 @@ function parseSukebeiReleases(
 export function canonicalizeProductCode(value: string) {
   const match = productCodePattern.exec(value.trim());
   if (match === null) {
+    return null;
+  }
+  if (!/[A-Za-z]/.test(match[1])) {
     return null;
   }
 

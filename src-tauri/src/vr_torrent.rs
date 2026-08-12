@@ -1652,18 +1652,41 @@ fn product_code_candidates(name: &str) -> Vec<(String, String)> {
         }
 
         let prefix_start = index;
-        while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+        while index < bytes.len() && bytes[index].is_ascii_alphanumeric() {
             index += 1;
         }
-        let prefix_length = index - prefix_start;
-        if !(2..=16).contains(&prefix_length) {
+        let alphanumeric_end = index;
+        let has_separator = index < bytes.len() && matches!(bytes[index], b' ' | b'_' | b'-');
+        let number_start = if has_separator {
+            while index < bytes.len() && matches!(bytes[index], b' ' | b'_' | b'-') {
+                index += 1;
+            }
+            index
+        } else {
+            let mut number_start = alphanumeric_end;
+            while number_start > prefix_start && bytes[number_start - 1].is_ascii_digit() {
+                number_start -= 1;
+            }
+            index = number_start;
+            number_start
+        };
+        let prefix_length = if has_separator {
+            alphanumeric_end - prefix_start
+        } else {
+            number_start - prefix_start
+        };
+        if !(2..=16).contains(&prefix_length)
+            || !bytes[prefix_start..prefix_start + prefix_length]
+                .iter()
+                .all(u8::is_ascii_alphanumeric)
+            || !bytes[prefix_start..prefix_start + prefix_length]
+                .iter()
+                .any(u8::is_ascii_alphabetic)
+            || !bytes[prefix_start + prefix_length - 1].is_ascii_alphabetic()
+        {
             index = prefix_start + 1;
             continue;
         }
-        while index < bytes.len() && matches!(bytes[index], b' ' | b'_' | b'-') {
-            index += 1;
-        }
-        let number_start = index;
         while index < bytes.len() && bytes[index].is_ascii_digit() {
             index += 1;
         }
@@ -4052,6 +4075,22 @@ mod tests {
             state.verified_download_source(&response[0], &[1]),
             Err(VerifiedDownloadSourceError::Context)
         );
+    }
+
+    #[test]
+    fn digit_leading_fanza_code_preserves_exact_release_identity() {
+        assert_eq!(
+            product_code_candidates("Exact 3DSVR-1947 release"),
+            vec![("3DSVR-1947".to_owned(), "3DSVR".to_owned())]
+        );
+        assert!(release_matches_product_code(
+            "Exact 3DSVR-1947 release",
+            "3DSVR-1947"
+        ));
+        assert!(!release_matches_product_code(
+            "3DSVR-1947 + ABC-123 pack",
+            "3DSVR-1947"
+        ));
     }
 
     #[test]

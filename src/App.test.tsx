@@ -157,6 +157,30 @@ let openJavdbDetailSourceMock: Mock<
 let invalidateJavdbBrowseMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
+let fetchFanzaCatalogMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let fetchFanzaImageMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<number[]>
+>;
+let fetchFanzaDetailMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let fetchFanzaPreviewMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let invalidateFanzaCatalogMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let invalidateFanzaPreviewMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let invalidateFanzaDetailMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let openFanzaSourceMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
 let fetchSukebeiAdultReleasesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string>
 >;
@@ -414,6 +438,13 @@ function selectAdultDiscover() {
   fireEvent.click(screen.getByRole("radio", { name: "Exact code" }));
 }
 
+function selectJavdbVrBrowse() {
+  fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+  fireEvent.change(screen.getByRole("combobox", { name: "VR provider" }), {
+    target: { value: "javdb" },
+  });
+}
+
 function selectTvDiscover() {
   fireEvent.click(screen.getByRole("radio", { name: "TV" }));
 }
@@ -502,6 +533,30 @@ function javdbBrowseFixture(
         ? ""
         : `javdb-cover-${generation}-${index + 1}-0123abcd`,
       "1.48",
+    ]),
+  ];
+}
+
+function fanzaCatalogFixture(
+  category: "adult" | "vr",
+  items: Array<{
+    code: string;
+    cover?: boolean;
+    id: string;
+    title?: string;
+  }>,
+  generation = "7",
+) {
+  return [
+    generation,
+    items.length.toString(),
+    ...items.flatMap((item, index) => [
+      category,
+      item.id,
+      item.code,
+      item.title ?? "",
+      item.cover === false ? "" : `fanza-cover-${generation}-${index + 1}`,
+      "0.72",
     ]),
   ];
 }
@@ -1074,6 +1129,18 @@ beforeEach(() => {
   invalidateJavdbDetailMock = vi.fn().mockResolvedValue(undefined);
   openJavdbDetailSourceMock = vi.fn().mockResolvedValue(undefined);
   invalidateJavdbBrowseMock = vi.fn().mockResolvedValue(undefined);
+  fetchFanzaCatalogMock = vi.fn().mockResolvedValue(["1", "0"]);
+  fetchFanzaImageMock = vi
+    .fn()
+    .mockResolvedValue([
+      0xff, 0xd8, 0xff, 0xe0, 0, 16, 0, 0, 0, 0, 0, 0,
+    ]);
+  fetchFanzaDetailMock = vi.fn().mockResolvedValue([]);
+  fetchFanzaPreviewMock = vi.fn().mockResolvedValue(["1", "0"]);
+  invalidateFanzaCatalogMock = vi.fn().mockResolvedValue(undefined);
+  invalidateFanzaPreviewMock = vi.fn().mockResolvedValue(undefined);
+  invalidateFanzaDetailMock = vi.fn().mockResolvedValue(undefined);
+  openFanzaSourceMock = vi.fn().mockResolvedValue(undefined);
   fetchSukebeiAdultReleasesMock = vi
     .fn()
     .mockResolvedValue(sukebeiReleaseFixture([]));
@@ -1336,6 +1403,22 @@ beforeEach(() => {
           return openJavdbDetailSourceMock(parameters);
         case "invalidate_javdb_catalog":
           return invalidateJavdbBrowseMock(parameters);
+        case "fetch_fanza_catalog":
+          return fetchFanzaCatalogMock(parameters);
+        case "fetch_fanza_image":
+          return fetchFanzaImageMock(parameters);
+        case "fetch_fanza_detail":
+          return fetchFanzaDetailMock(parameters);
+        case "fetch_fanza_preview":
+          return fetchFanzaPreviewMock(parameters);
+        case "invalidate_fanza_catalog":
+          return invalidateFanzaCatalogMock(parameters);
+        case "invalidate_fanza_preview":
+          return invalidateFanzaPreviewMock(parameters);
+        case "invalidate_fanza_detail":
+          return invalidateFanzaDetailMock(parameters);
+        case "open_fanza_source":
+          return openFanzaSourceMock(parameters);
         case "fetch_sukebei_adult_releases":
           return fetchSukebeiAdultReleasesMock(parameters);
         case "fetch_sukebei_vr_releases":
@@ -9179,6 +9262,539 @@ describe("TMDB TV Discover", () => {
   });
 });
 
+describe("trusted FANZA Adult and VR digital catalogs", () => {
+  it("starts VR on FANZA Popular with exact controls, source order, and unavailable-cover placeholders", async () => {
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("vr", [
+        { code: "VRKM-1577", id: "vrkm01577", title: "First title" },
+        { code: "OVVR-616", cover: false, id: "ovvr616" },
+      ]),
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+
+    const list = await screen.findByRole("list", { name: "FANZA VR catalog" });
+    expect(
+      within(list)
+        .getAllByRole("heading", { level: 3 })
+        .map((heading) => heading.textContent),
+    ).toEqual(["VRKM-1577", "OVVR-616"]);
+    expect(fetchFanzaCatalogMock).toHaveBeenCalledWith({
+      category: "vr",
+      contextGeneration: "1",
+      feed: "popular",
+      count: 25,
+    });
+    expect(
+      (screen.getByRole("combobox", { name: "VR provider" }) as HTMLSelectElement)
+        .value,
+    ).toBe("fanza");
+    expect(
+      within(screen.getByRole("combobox", { name: "VR provider" }))
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["FANZA", "JavDB"]);
+    expect(
+      within(screen.getByRole("combobox", { name: "VR FANZA feed" }))
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["Popular", "Newest", "Top Rated", "Trending", "Monthly"]);
+    expect(
+      within(list).getByText("OVVR-616", {
+        selector: ".javdb-cover__placeholder span",
+      }),
+    ).toBeTruthy();
+    expect(fetchFanzaImageMock).toHaveBeenCalledTimes(1);
+    expect(fetchFanzaImageMock.mock.calls[0]?.[0]).not.toHaveProperty("url");
+  });
+
+  it("keeps Adult on JavDB by default and restores each provider's accepted request without another call", async () => {
+    fetchJavdbBrowseMock.mockResolvedValue(
+      javdbBrowseFixture("adult", [
+        { code: "ADLT-123", cover: false, id: "AdultA" },
+      ]),
+    );
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("adult", [
+        { code: "SNOS-258", cover: false, id: "k9snos258" },
+      ]),
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { name: "ADLT-123" });
+    expect(
+      (screen.getByRole("combobox", { name: "Adult provider" }) as HTMLSelectElement)
+        .value,
+    ).toBe("javdb");
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Adult provider" }), {
+      target: { value: "fanza" },
+    });
+    await screen.findByRole("heading", { name: "SNOS-258" });
+    fireEvent.change(screen.getByRole("combobox", { name: "Adult FANZA feed" }), {
+      target: { value: "monthly" },
+    });
+    await waitFor(() =>
+      expect(fetchFanzaCatalogMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ category: "adult", feed: "monthly", count: 25 }),
+      ),
+    );
+    const fanzaCalls = fetchFanzaCatalogMock.mock.calls.length;
+    fireEvent.change(screen.getByRole("combobox", { name: "Adult provider" }), {
+      target: { value: "javdb" },
+    });
+    await screen.findByRole("heading", { name: "ADLT-123" });
+    fireEvent.change(screen.getByRole("combobox", { name: "Adult provider" }), {
+      target: { value: "fanza" },
+    });
+    expect(await screen.findByRole("heading", { name: "SNOS-258" })).toBeTruthy();
+    expect(fetchFanzaCatalogMock).toHaveBeenCalledTimes(fanzaCalls);
+    selectSettings();
+    selectDiscover();
+    expect(screen.getByRole("heading", { name: "SNOS-258" })).toBeTruthy();
+    expect(fetchFanzaCatalogMock).toHaveBeenCalledTimes(fanzaCalls);
+  });
+
+  it("keeps Copy, Preview, Find releases, and semantic details isolated on a stable card", async () => {
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("vr", [
+        { code: "3DSVR-1947", cover: false, id: "13dsvr01947" },
+      ]),
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const card = (
+      await screen.findByRole("heading", { name: "3DSVR-1947" })
+    ).closest("article") as HTMLElement;
+    const initialStyle = card.getAttribute("style");
+    const details = within(card).getByRole("button", {
+      name: "View details: 3DSVR-1947",
+    });
+    const copy = within(card).getByRole("button", {
+      name: "Copy title: 3DSVR-1947",
+    });
+    const preview = within(card).getByRole("button", {
+      name: "Preview: 3DSVR-1947",
+    });
+    const releases = within(card).getByRole("button", {
+      name: "Find releases: 3DSVR-1947",
+    });
+    fireEvent.click(copy);
+    await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith("3DSVR-1947"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
+    for (const control of [details, copy, preview, releases]) {
+      control.focus();
+      expect(document.activeElement).toBe(control);
+    }
+    expect(card.getAttribute("style")).toBe(initialStyle);
+  });
+
+  it("loads retained details and previews, derives source and release actions natively, and cleans object URLs", async () => {
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("vr", [
+        { code: "VRKM-1577", id: "vrkm01577", title: "Provider title" },
+      ]),
+    );
+    fetchFanzaDetailMock.mockResolvedValue([
+      "19",
+      "vr",
+      "1",
+      "7",
+      "vrkm01577",
+      "VRKM-1577",
+      "Provider title",
+      "fanza-cover-7-1",
+    ]);
+    fetchFanzaPreviewMock.mockResolvedValue([
+      "13",
+      "2",
+      "fanza-preview-13-1",
+      "fanza-preview-13-2",
+    ]);
+    fetchSukebeiVrReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([{ name: "Exact VRKM-1577 release" }]),
+    );
+    createObjectUrlMock
+      .mockReturnValueOnce("blob:fanza-cover")
+      .mockReturnValueOnce("blob:fanza-detail-cover")
+      .mockReturnValueOnce("blob:fanza-preview-one")
+      .mockReturnValueOnce("blob:fanza-preview-two");
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const card = (
+      await screen.findByRole("heading", { name: "VRKM-1577" })
+    ).closest("article") as HTMLElement;
+    fireEvent.click(
+      within(card).getByRole("button", { name: "View details: VRKM-1577" }),
+    );
+    let dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByText("Provider title")).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "View on FANZA" }));
+    expect(openFanzaSourceMock).toHaveBeenCalledWith({
+      category: "vr",
+      contextGeneration: "1",
+      requestGeneration: "7",
+      providerItemId: "vrkm01577",
+      code: "VRKM-1577",
+      detailGeneration: "19",
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Preview" }));
+    dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByText("Image 1 of 2")).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Next preview for VRKM-1577" }));
+    expect(within(dialog).getByText("Image 2 of 2")).toBeTruthy();
+    fireEvent.keyDown(dialog, { key: "ArrowRight" });
+    expect(within(dialog).getByText("Image 1 of 2")).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(invalidateFanzaPreviewMock).toHaveBeenCalledWith({
+      category: "vr",
+      previewGeneration: "13",
+    });
+    expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:fanza-preview-one");
+    fireEvent.click(within(card).getByRole("button", { name: "Find releases: VRKM-1577" }));
+    await waitFor(() => expect(fetchSukebeiVrReleasesMock).toHaveBeenCalledWith({ code: "VRKM-1577" }));
+  });
+
+  it("keeps catalog failures local and Retry repeats only the exact retained request", async () => {
+    fetchFanzaCatalogMock
+      .mockRejectedValueOnce("vr_network_error")
+      .mockResolvedValueOnce(
+        fanzaCatalogFixture("vr", [
+          { code: "OVVR-616", cover: false, id: "ovvr616" },
+        ]),
+      );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    expect(
+      await screen.findByRole("heading", { name: "FANZA could not be reached" }),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByRole("heading", { name: "OVVR-616" })).toBeTruthy();
+    expect(fetchFanzaCatalogMock).toHaveBeenCalledTimes(2);
+    expect(fetchJavdbBrowseMock).not.toHaveBeenCalled();
+  });
+
+  it("retries retained details and returns focus to the exact card control", async () => {
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("vr", [
+        { code: "VRKM-1577", cover: false, id: "vrkm01577" },
+      ]),
+    );
+    fetchFanzaDetailMock
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        "19",
+        "vr",
+        "1",
+        "7",
+        "vrkm01577",
+        "VRKM-1577",
+        "",
+        "",
+      ]);
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const card = (
+      await screen.findByRole("heading", { name: "VRKM-1577" })
+    ).closest("article") as HTMLElement;
+    const details = within(card).getByRole("button", {
+      name: "View details: VRKM-1577",
+    });
+    fireEvent.click(details);
+    let dialog = await screen.findByRole("dialog");
+    expect(
+      await within(dialog).findByRole("heading", {
+        name: "FANZA returned invalid data",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Retry details" }),
+    );
+    dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByText("Title unavailable")).toBeTruthy();
+    expect(fetchFanzaDetailMock).toHaveBeenCalledTimes(2);
+    expect(fetchFanzaDetailMock.mock.calls[0]).toEqual(
+      fetchFanzaDetailMock.mock.calls[1],
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(document.activeElement).toBe(details));
+  });
+
+  it("retries only the retained preview and preserves accepted images when one fails", async () => {
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("vr", [
+        { code: "OVVR-616", cover: false, id: "ovvr616" },
+      ]),
+    );
+    fetchFanzaDetailMock.mockResolvedValue([
+      "19",
+      "vr",
+      "1",
+      "7",
+      "ovvr616",
+      "OVVR-616",
+      "",
+      "",
+    ]);
+    fetchFanzaPreviewMock
+      .mockRejectedValueOnce("vr_network_error")
+      .mockResolvedValueOnce([
+        "13",
+        "2",
+        "fanza-preview-13-1",
+        "fanza-preview-13-2",
+      ]);
+    fetchFanzaImageMock
+      .mockRejectedValueOnce("vr_provider_error")
+      .mockResolvedValueOnce([
+        0xff, 0xd8, 0xff, 0xe0, 0, 16, 0, 0, 0, 0, 0, 0,
+      ]);
+    createObjectUrlMock.mockReturnValueOnce("blob:fanza-preview-retained");
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const card = (
+      await screen.findByRole("heading", { name: "OVVR-616" })
+    ).closest("article") as HTMLElement;
+    fireEvent.click(
+      within(card).getByRole("button", { name: "Preview: OVVR-616" }),
+    );
+    let dialog = await screen.findByRole("dialog");
+    expect(
+      await within(dialog).findByRole("heading", {
+        name: "FANZA could not be reached",
+      }),
+    ).toBeTruthy();
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Retry preview" }),
+    );
+    dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByText("Image 1 of 1")).toBeTruthy();
+    expect(fetchFanzaPreviewMock).toHaveBeenCalledTimes(2);
+    expect(fetchFanzaPreviewMock.mock.calls[0]).toEqual(
+      fetchFanzaPreviewMock.mock.calls[1],
+    );
+    expect(fetchFanzaImageMock).toHaveBeenCalledTimes(2);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    await waitFor(() =>
+      expect(revokeObjectUrlMock).toHaveBeenCalledWith(
+        "blob:fanza-preview-retained",
+      ),
+    );
+  });
+
+  it("hands an accepted Adult FANZA code to only the verified Adult release workflow", async () => {
+    fetchJavdbBrowseMock.mockResolvedValue(javdbBrowseFixture("adult", []));
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("adult", [
+        { code: "SNOS-258", cover: false, id: "k9snos258" },
+      ]),
+    );
+    fetchSukebeiAdultReleasesMock.mockResolvedValue(
+      sukebeiReleaseFixture([{ name: "Exact SNOS-258 release" }]),
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Adult provider" }), {
+      target: { value: "fanza" },
+    });
+    const card = (
+      await screen.findByRole("heading", { name: "SNOS-258" })
+    ).closest("article") as HTMLElement;
+    fireEvent.click(
+      within(card).getByRole("button", { name: "Find releases: SNOS-258" }),
+    );
+    await waitFor(() =>
+      expect(fetchSukebeiAdultReleasesMock).toHaveBeenCalledWith({
+        code: "SNOS-258",
+      }),
+    );
+    expect(fetchSukebeiVrReleasesMock).not.toHaveBeenCalled();
+  });
+
+  it("packs FANZA pages from current decoded widths and updates immediately after resize", async () => {
+    gallerySizes.discover = { width: 500, height: 260 };
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("vr", [
+        { code: "VRKM-1577", id: "vrkm01577" },
+        { code: "OVVR-616", id: "ovvr616" },
+        { code: "3DSVR-1947", id: "13dsvr01947" },
+        { code: "MARAA-244", id: "n_709maraa244tk" },
+        { code: "SNOS-258", id: "k9snos258" },
+        { code: "IPZZ-855", id: "tkipzz855" },
+      ]),
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+
+    for (const code of ["VRKM-1577", "OVVR-616", "3DSVR-1947", "MARAA-244"]) {
+      const card = (
+        await screen.findByRole("heading", { level: 3, name: code })
+      ).closest("article") as HTMLElement;
+      const cover = await waitFor(() => {
+        const image = card.querySelector("img");
+        expect(image).not.toBeNull();
+        return image as HTMLImageElement;
+      });
+      Object.defineProperties(cover, {
+        naturalHeight: { configurable: true, value: 180 },
+        naturalWidth: { configurable: true, value: 90 },
+      });
+      fireEvent.load(cover);
+    }
+    const gallery = document.querySelector('[data-gallery="discover"]');
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("4");
+    expect(gallery?.getAttribute("data-page-count")).toBe("2");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Next FANZA VR catalog page" }),
+    );
+    const wideCard = screen
+      .getByRole("heading", { level: 3, name: "SNOS-258" })
+      .closest("article") as HTMLElement;
+    const wideCover = await waitFor(() => {
+      const image = wideCard.querySelector("img");
+      expect(image).not.toBeNull();
+      return image as HTMLImageElement;
+    });
+    Object.defineProperties(wideCover, {
+      naturalHeight: { configurable: true, value: 180 },
+      naturalWidth: { configurable: true, value: 360 },
+    });
+    fireEvent.load(wideCover);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("1");
+    expect(gallery?.getAttribute("data-page-count")).toBe("3");
+    expect(screen.queryByRole("heading", { name: "IPZZ-855" })).toBeNull();
+
+    resizeGallery("discover", 520, 260);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("2");
+    expect(gallery?.getAttribute("data-page-count")).toBe("2");
+    expect(screen.getByRole("heading", { name: "IPZZ-855" })).toBeTruthy();
+  });
+
+  it("does not reuse a decoded FANZA cover ratio for an item in a newer request", async () => {
+    fetchFanzaCatalogMock
+      .mockResolvedValueOnce(
+        fanzaCatalogFixture("vr", [{ code: "OVVR-616", id: "ovvr616" }]),
+      )
+      .mockResolvedValueOnce(
+        fanzaCatalogFixture(
+          "vr",
+          [{ code: "OVVR-616", cover: false, id: "ovvr616" }],
+          "8",
+        ),
+      );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const firstCard = (
+      await screen.findByRole("heading", { name: "OVVR-616" })
+    ).closest("article") as HTMLElement;
+    const cover = await waitFor(() => {
+      const image = firstCard.querySelector("img");
+      expect(image).not.toBeNull();
+      return image as HTMLImageElement;
+    });
+    Object.defineProperties(cover, {
+      naturalHeight: { configurable: true, value: 180 },
+      naturalWidth: { configurable: true, value: 360 },
+    });
+    fireEvent.load(cover);
+    expect(firstCard.style.width).toBe("360px");
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    const currentCard = await waitFor(() => {
+      const card = screen
+        .getByRole("heading", { name: "OVVR-616" })
+        .closest("article") as HTMLElement;
+      expect(card).not.toBe(firstCard);
+      return card;
+    });
+    expect(currentCard.style.width).toBe("130px");
+    expect(
+      within(currentCard).getByText("OVVR-616", {
+        selector: ".javdb-cover__placeholder span",
+      }),
+    ).toBeTruthy();
+  });
+
+  it("rejects a late FANZA request after provider change without replacing the current catalog", async () => {
+    const lateFanza = createDeferred<string[]>();
+    fetchFanzaCatalogMock.mockReturnValue(lateFanza.promise);
+    fetchJavdbBrowseMock.mockResolvedValue(
+      javdbBrowseFixture("vr", [
+        { code: "MDVR-419", cover: false, id: "CurrentVr" },
+      ]),
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    await waitFor(() => expect(fetchFanzaCatalogMock).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByRole("combobox", { name: "VR provider" }), {
+      target: { value: "javdb" },
+    });
+    expect(
+      await screen.findByRole("heading", { name: "MDVR-419" }),
+    ).toBeTruthy();
+    await act(async () => {
+      lateFanza.resolve(
+        fanzaCatalogFixture("vr", [
+          { code: "OVVR-616", cover: false, id: "ovvr616" },
+        ]),
+      );
+      await lateFanza.promise;
+    });
+    expect(screen.queryByRole("heading", { name: "OVVR-616" })).toBeNull();
+    expect(invalidateFanzaCatalogMock).toHaveBeenCalledWith({
+      category: "vr",
+      contextGeneration: "2",
+    });
+    expect(screen.getByRole("heading", { name: "MDVR-419" })).toBeTruthy();
+  });
+
+  it("fits a narrow portrait FANZA card at 720 by 520 without hiding actions or adding an inner scrollbar", async () => {
+    gallerySizes.discover = { width: 720, height: 520 };
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("vr", [
+        { code: "OVVR-616", id: "ovvr616" },
+      ]),
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const card = (
+      await screen.findByRole("heading", { name: "OVVR-616" })
+    ).closest("article") as HTMLElement;
+    const image = await waitFor(() => card.querySelector("img") as HTMLImageElement);
+    Object.defineProperties(image, {
+      naturalHeight: { configurable: true, value: 180 },
+      naturalWidth: { configurable: true, value: 80 },
+    });
+    fireEvent.load(image);
+    expect(card.style.width).toBe("80px");
+    for (const name of [
+      "Copy title: OVVR-616",
+      "Preview: OVVR-616",
+      "Find releases: OVVR-616",
+      "View details: OVVR-616",
+    ]) {
+      expect(within(card).getByRole("button", { name }).tabIndex).toBe(0);
+    }
+    const viewport = document.querySelector(".media-gallery__viewport") as HTMLElement;
+    expect(getComputedStyle(viewport).overflowY).not.toBe("auto");
+  });
+});
+
 describe("trusted JavDB Adult and VR browse catalogs", () => {
   it("starts with the exact Adult ranking defaults and preserves provider order and unavailable covers", async () => {
     fetchJavdbBrowseMock.mockResolvedValue(
@@ -9346,7 +9962,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     );
     render(<App />);
     selectDiscover();
-    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectJavdbVrBrowse();
     expect(
       await screen.findByRole("heading", { level: 3, name: "MDVR-419" }),
     ).toBeTruthy();
@@ -9432,7 +10048,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     );
     render(<App />);
     selectDiscover();
-    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectJavdbVrBrowse();
     const firstCard = (
       await screen.findByRole("heading", { level: 3, name: "MDVR-419" })
     ).closest("article") as HTMLElement;
@@ -9620,6 +10236,11 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
           name: category === "adult" ? "Adult" : "VR",
         }),
       );
+      if (category === "vr") {
+        fireEvent.change(screen.getByRole("combobox", { name: "VR provider" }), {
+          target: { value: "javdb" },
+        });
+      }
       const card = (
         await screen.findByRole("heading", { level: 3, name: code })
       ).closest("article") as HTMLElement;
@@ -9671,7 +10292,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
       );
     render(<App />);
     selectDiscover();
-    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectJavdbVrBrowse();
     const card = (
       await screen.findByRole("heading", { level: 3, name: "MDVR-419" })
     ).closest("article") as HTMLElement;
@@ -9741,7 +10362,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
       .mockReturnValueOnce("blob:preview-three");
     render(<App />);
     selectDiscover();
-    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectJavdbVrBrowse();
     const card = (
       await screen.findByRole("heading", { level: 3, name: "MDVR-419" })
     ).closest("article") as HTMLElement;
@@ -9925,7 +10546,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     fetchJavdbDetailMock.mockReturnValueOnce(lateInvalidDetail.promise);
     render(<App />);
     selectDiscover();
-    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectJavdbVrBrowse();
     const detailsControl = await screen.findByRole("button", {
       name: "View details: MDVR-419",
     });
@@ -10021,7 +10642,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     await waitFor(() => expect(document.activeElement).toBe(adultReleasesButton));
 
-    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectJavdbVrBrowse();
     const vrCard = (
       await screen.findByRole("heading", { level: 3, name: "MDVR-419" })
     ).closest("article") as HTMLElement;
@@ -10149,6 +10770,11 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
       render(<App />);
       selectDiscover();
       fireEvent.click(screen.getByRole("radio", { name: label }));
+      if (category === "vr") {
+        fireEvent.change(screen.getByRole("combobox", { name: "VR provider" }), {
+          target: { value: "javdb" },
+        });
+      }
       expect(
         await screen.findByRole("heading", { level: 3, name: code }),
       ).toBeTruthy();
@@ -10210,6 +10836,11 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
       render(<App />);
       selectDiscover();
       fireEvent.click(screen.getByRole("radio", { name: label }));
+      if (category === "vr") {
+        fireEvent.change(screen.getByRole("combobox", { name: "VR provider" }), {
+          target: { value: "javdb" },
+        });
+      }
       await screen.findByRole("heading", { level: 3, name: code });
       fireEvent.click(screen.getByRole("radio", { name: "Exact code" }));
       fireEvent.change(
@@ -10251,7 +10882,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     );
     render(<App />);
     selectDiscover();
-    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectJavdbVrBrowse();
 
     for (const code of ["MDVR-419", "MDVR-420", "MDVR-421", "MDVR-422"]) {
       const card = (
@@ -10318,7 +10949,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
       );
     render(<App />);
     selectDiscover();
-    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectJavdbVrBrowse();
     const firstCard = (
       await screen.findByRole("heading", { level: 3, name: "MDVR-419" })
     ).closest("article") as HTMLElement;
@@ -10360,7 +10991,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     );
     render(<App />);
     selectDiscover();
-    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectJavdbVrBrowse();
     const card = (
       await screen.findByRole("heading", { level: 3, name: "MDVR-419" })
     ).closest("article") as HTMLElement;
@@ -10434,7 +11065,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
       .mockResolvedValueOnce(["9", "0"]);
     render(<App />);
     selectDiscover();
-    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectJavdbVrBrowse();
     for (const heading of [
       "JavDB is unavailable",
       "JavDB could not be reached",

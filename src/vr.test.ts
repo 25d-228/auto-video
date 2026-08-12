@@ -24,6 +24,7 @@ import {
   parseJavdbBrowseResponse,
   parseJavdbDetailResponse,
   previewVrOrganization,
+  productCodeCandidates,
   queryVrStorage,
   scanVrLibrary,
   saveVrDownloadLimit,
@@ -113,6 +114,13 @@ describe("VR product-code identity", () => {
   it("rejects missing, malformed, and zero product codes", () => {
     for (const value of ["", "   ", "MDVR", "419", "MDVR-0", "MDVR-41A"])
       expect(canonicalizeProductCode(value)).toBeNull();
+  });
+
+  it("preserves a supported digit-leading FANZA label", () => {
+    expect(canonicalizeProductCode("3dsvr01947")).toBe("3DSVR-1947");
+    expect(productCodeCandidates("Exact 3DSVR-1947 release")).toEqual([
+      { code: "3DSVR-1947", prefix: "3DSVR" },
+    ]);
   });
 });
 
