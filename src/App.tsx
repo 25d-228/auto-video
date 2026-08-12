@@ -571,7 +571,7 @@ const minimumGalleryCardWidth = 208;
 // Fixed title limits keep every calculated row within its observed viewport.
 const discoverCardBodyHeight = 160;
 const libraryCardHeight = 136;
-const javdbCoverHeight = 180;
+const naturalWidthCoverHeight = 180;
 const javdbBrowsePeriods: Array<{
   label: string;
   value: JavdbBrowsePeriod;
@@ -1384,6 +1384,44 @@ const fanzaPreviewMessages = {
   },
 } as const;
 
+const fanzaDetailMessages = {
+  loading: {
+    heading: "Loading FANZA details",
+    message: "Verifying the exact current FANZA item and retained details.",
+    role: "status",
+  },
+  "source-unavailable": {
+    heading: "FANZA details are unavailable",
+    message: "The exact item details are unavailable. Retry this item later.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "FANZA details could not be reached",
+    message: "Check the network connection and retry this exact item.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "FANZA returned invalid detail data",
+    message: "The detail response did not establish this exact item.",
+    role: "alert",
+  },
+  "conflicting-provider": {
+    heading: "FANZA returned a conflicting detail identity",
+    message: "The detail response did not belong to this exact item.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "FANZA details could not be loaded",
+    message: "The provider returned an unexpected detail error. Retry this exact item.",
+    role: "alert",
+  },
+  stale: {
+    heading: "These FANZA details are no longer current",
+    message: "Return to the current catalog and open this item again.",
+    role: "alert",
+  },
+} as const;
+
 const vrReleaseMessages = {
   loading: {
     heading: "Finding verified releases",
@@ -2156,7 +2194,7 @@ function DiscoverJavdbCard({
   );
 }
 
-function JavdbBrowseControls({
+function ProviderBrowseControls({
   category,
   count,
   fanzaFeed,
@@ -2202,8 +2240,8 @@ function JavdbBrowseControls({
   const showsCategoryControls = category === "vr" || mode === "category";
 
   return (
-    <div className="javdb-browse-controls">
-      <fieldset className="discover-category javdb-workflow">
+    <div className="provider-browse-controls">
+      <fieldset className="discover-category provider-workflow">
         <legend>{category === "vr" ? "VR" : "Adult"} workflow</legend>
         <div>
           {(["browse", "exact"] as const).map((value) => (
@@ -2221,8 +2259,8 @@ function JavdbBrowseControls({
         </div>
       </fieldset>
       {workflow === "browse" ? (
-        <div className="javdb-browse-controls__request">
-          <label className="javdb-select-label">
+        <div className="provider-browse-controls__request">
+          <label className="provider-select-label">
             <span>Provider</span>
             <select
               aria-label={`${category === "vr" ? "VR" : "Adult"} provider`}
@@ -2237,7 +2275,7 @@ function JavdbBrowseControls({
             </select>
           </label>
           {provider === "fanza" ? (
-            <label className="javdb-select-label">
+            <label className="provider-select-label">
               <span>Feed</span>
               <select
                 aria-label={`${category === "vr" ? "VR" : "Adult"} FANZA feed`}
@@ -2254,7 +2292,7 @@ function JavdbBrowseControls({
               </select>
             </label>
           ) : category === "adult" ? (
-            <label className="javdb-select-label">
+            <label className="provider-select-label">
               <span>Mode</span>
               <select
                 aria-label="Adult browse mode"
@@ -2269,7 +2307,7 @@ function JavdbBrowseControls({
             </label>
           ) : null}
           {provider === "javdb" && category === "adult" && mode === "ranking" ? (
-            <label className="javdb-select-label">
+            <label className="provider-select-label">
               <span>Period</span>
               <select
                 aria-label="Adult ranking period"
@@ -2288,7 +2326,7 @@ function JavdbBrowseControls({
           ) : null}
           {provider === "javdb" && showsCategoryControls ? (
             <>
-              <label className="javdb-select-label">
+              <label className="provider-select-label">
                 <span>Year</span>
                 <select
                   aria-label={`${category === "vr" ? "VR" : "Adult"} year`}
@@ -2305,7 +2343,7 @@ function JavdbBrowseControls({
                   ))}
                 </select>
               </label>
-              <label className="javdb-select-label">
+              <label className="provider-select-label">
                 <span>Month</span>
                 <select
                   aria-label={`${category === "vr" ? "VR" : "Adult"} month`}
@@ -2326,7 +2364,7 @@ function JavdbBrowseControls({
                   ))}
                 </select>
               </label>
-              <label className="javdb-select-label">
+              <label className="provider-select-label">
                 <span>Sort</span>
                 <select
                   aria-label={`${category === "vr" ? "VR" : "Adult"} sort`}
@@ -2344,7 +2382,7 @@ function JavdbBrowseControls({
               </label>
             </>
           ) : null}
-          <label className="javdb-select-label">
+          <label className="provider-select-label">
             <span>Results</span>
             <select
               aria-label={`${category === "vr" ? "VR" : "Adult"} result count`}
@@ -2476,19 +2514,19 @@ function DiscoverJavdbBrowseCard({
   return (
     <article
       aria-labelledby={`${cardId}-title`}
-      className="javdb-browse-card"
+      className="provider-browse-card"
       data-cover-ratio={coverRatio}
       data-narrow-cover={coverRatio < 0.9}
-      style={{ width: `${Math.round(javdbCoverHeight * coverRatio)}px` }}
+      style={{ width: `${Math.round(naturalWidthCoverHeight * coverRatio)}px` }}
     >
       <button
         aria-label={`View details: ${item.code}`}
-        className="javdb-browse-card__details-control"
+        className="provider-browse-card__details-control"
         id={detailsTriggerId}
         onClick={() => onDetails(item, detailsTriggerId)}
         type="button"
       />
-      <div className="javdb-browse-card__cover">
+      <div className="provider-browse-card__cover">
         <JavdbCover
           item={item}
           onRatio={(ratio) => {
@@ -2496,18 +2534,18 @@ function DiscoverJavdbBrowseCard({
             onRatioChange(item, ratio);
           }}
         />
-        <div className="javdb-browse-card__badges">
+        <div className="provider-browse-card__badges">
           {inLibrary ? <span>In library</span> : null}
           {transferState === null ? null : <span>{transferState}</span>}
         </div>
       </div>
-      <div className="javdb-browse-card__body">
+      <div className="provider-browse-card__body">
         <h3 id={`${cardId}-title`}>{item.code}</h3>
         <p>{item.title ?? item.releaseDate ?? "Title unavailable"}</p>
         <span>JavDB</span>
       </div>
       <div
-        className="javdb-browse-card__actions"
+        className="provider-browse-card__actions"
         onClick={(event) => event.stopPropagation()}
         onKeyDown={(event) => event.stopPropagation()}
         onPointerDown={(event) => event.stopPropagation()}
@@ -2549,19 +2587,21 @@ function DiscoverJavdbBrowseCard({
 }
 
 // These values mirror the fixed card body and gallery gaps in index.css.
-const javdbBrowseCardHeight = 260;
-const javdbBrowseColumnGap = 14;
-const javdbBrowseRowGap = 16;
+const naturalWidthCardHeight = 260;
+const naturalWidthColumnGap = 14;
+const naturalWidthRowGap = 16;
 
 function javdbBrowseItemKey(item: JavdbBrowseItem) {
   return `${item.category}:${item.requestGeneration}:${item.providerItemId}`;
 }
 
-function javdbBrowsePages(
-  items: JavdbBrowseItem[],
+function naturalWidthBrowsePages<Item>(
+  items: Item[],
   ratios: Map<string, number>,
   width: number,
   height: number,
+  getItemKey: (item: Item) => string,
+  getSourceAspectRatio: (item: Item) => number,
 ) {
   if (items.length === 0) {
     return [[]];
@@ -2572,26 +2612,26 @@ function javdbBrowsePages(
   const rowCount = Math.max(
     1,
     Math.floor(
-      (height + javdbBrowseRowGap) /
-        (javdbBrowseCardHeight + javdbBrowseRowGap),
+      (height + naturalWidthRowGap) /
+        (naturalWidthCardHeight + naturalWidthRowGap),
     ),
   );
-  const pages: JavdbBrowseItem[][] = [];
-  let page: JavdbBrowseItem[] = [];
+  const pages: Item[][] = [];
+  let page: Item[] = [];
   let rows = 1;
   let rowWidth = 0;
   for (const item of items) {
     const cardWidth = Math.min(
       width,
       Math.round(
-        javdbCoverHeight *
-          (ratios.get(javdbBrowseItemKey(item)) ?? item.sourceAspectRatio),
+        naturalWidthCoverHeight *
+          (ratios.get(getItemKey(item)) ?? getSourceAspectRatio(item)),
       ),
     );
     const nextWidth =
       rowWidth === 0
         ? cardWidth
-        : rowWidth + javdbBrowseColumnGap + cardWidth;
+        : rowWidth + naturalWidthColumnGap + cardWidth;
     if (rowWidth !== 0 && nextWidth > width) {
       if (rows === rowCount) {
         pages.push(page);
@@ -2612,25 +2652,21 @@ function javdbBrowsePages(
   return pages;
 }
 
-function JavdbBrowseGallery({
+function NaturalWidthBrowseGallery<Item>({
   ariaLabel,
-  getInLibrary,
-  getTransferState,
+  getItemKey,
+  getSourceAspectRatio,
   items,
-  onDetails,
-  onFindReleases,
-  onPreview,
   onSelectedPageChange,
+  renderItem,
   selectedPage,
 }: {
   ariaLabel: string;
-  getInLibrary: (item: JavdbBrowseItem) => boolean;
-  getTransferState: (item: JavdbBrowseItem) => VrDownload["state"] | null;
-  items: JavdbBrowseItem[];
-  onDetails: (item: JavdbBrowseItem, triggerId: string) => void;
-  onFindReleases: (item: JavdbBrowseItem, triggerId: string) => void;
-  onPreview: (item: JavdbBrowseItem, triggerId: string) => void;
+  getItemKey: (item: Item) => string;
+  getSourceAspectRatio: (item: Item) => number;
+  items: Item[];
   onSelectedPageChange: (page: number) => void;
+  renderItem: (item: Item, onRatioChange: (ratio: number) => void) => ReactNode;
   selectedPage: number;
 }) {
   const viewport = useRef<HTMLDivElement | null>(null);
@@ -2663,11 +2699,13 @@ function JavdbBrowseGallery({
     return () => observer.disconnect();
   }, []);
 
-  const pages = javdbBrowsePages(
+  const pages = naturalWidthBrowsePages(
     items,
     ratios,
     bounds.width,
     bounds.height,
+    getItemKey,
+    getSourceAspectRatio,
   );
   const pageCount = pages.length;
   const currentPage = Math.min(selectedPage, pageCount);
@@ -2681,35 +2719,27 @@ function JavdbBrowseGallery({
 
   return (
     <div
-      className="media-gallery media-gallery--javdb"
+      className="media-gallery media-gallery--natural-width"
       data-current-page={currentPage}
       data-gallery="discover"
       data-page-capacity={visibleItems.length}
       data-page-count={pageCount}
     >
       <div className="media-gallery__viewport" ref={viewport}>
-        <ul aria-label={ariaLabel} className="javdb-browse-grid">
+        <ul aria-label={ariaLabel} className="provider-browse-grid">
           {visibleItems.map((item) => (
-            <li key={javdbBrowseItemKey(item)}>
-              <DiscoverJavdbBrowseCard
-                inLibrary={getInLibrary(item)}
-                item={item}
-                onDetails={onDetails}
-                onFindReleases={onFindReleases}
-                onPreview={onPreview}
-                onRatioChange={(currentItem, ratio) => {
-                  setRatios((current) => {
-                    const itemKey = javdbBrowseItemKey(currentItem);
-                    if (current.get(itemKey) === ratio) {
-                      return current;
-                    }
-                    const next = new Map(current);
-                    next.set(itemKey, ratio);
-                    return next;
-                  });
-                }}
-                transferState={getTransferState(item)}
-              />
+            <li key={getItemKey(item)}>
+              {renderItem(item, (ratio) => {
+                setRatios((current) => {
+                  const itemKey = getItemKey(item);
+                  if (current.get(itemKey) === ratio) {
+                    return current;
+                  }
+                  const next = new Map(current);
+                  next.set(itemKey, ratio);
+                  return next;
+                });
+              })}
             </li>
           ))}
         </ul>
@@ -2827,19 +2857,19 @@ function DiscoverFanzaCard({
   return (
     <article
       aria-labelledby={`${cardId}-title`}
-      className="javdb-browse-card"
+      className="provider-browse-card"
       data-cover-ratio={coverRatio}
       data-narrow-cover={coverRatio < 0.9}
-      style={{ width: `${Math.round(javdbCoverHeight * coverRatio)}px` }}
+      style={{ width: `${Math.round(naturalWidthCoverHeight * coverRatio)}px` }}
     >
       <button
         aria-label={`View details: ${item.code}`}
-        className="javdb-browse-card__details-control"
+        className="provider-browse-card__details-control"
         id={detailsTriggerId}
         onClick={() => onDetails(item, detailsTriggerId)}
         type="button"
       />
-      <div className="javdb-browse-card__cover">
+      <div className="provider-browse-card__cover">
         <FanzaCover
           item={item}
           onRatio={(ratio) => {
@@ -2847,18 +2877,18 @@ function DiscoverFanzaCard({
             onRatioChange(item, ratio);
           }}
         />
-        <div className="javdb-browse-card__badges">
+        <div className="provider-browse-card__badges">
           {inLibrary ? <span>In library</span> : null}
           {transferState === null ? null : <span>{transferState}</span>}
         </div>
       </div>
-      <div className="javdb-browse-card__body">
+      <div className="provider-browse-card__body">
         <h3 id={`${cardId}-title`}>{item.code}</h3>
         <p>{item.title ?? "Title unavailable"}</p>
         <span>FANZA</span>
       </div>
       <div
-        className="javdb-browse-card__actions"
+        className="provider-browse-card__actions"
         onClick={(event) => event.stopPropagation()}
         onKeyDown={(event) => event.stopPropagation()}
         onPointerDown={(event) => event.stopPropagation()}
@@ -2891,155 +2921,6 @@ function DiscoverFanzaCard({
 
 function fanzaItemKey(item: FanzaCatalogItem) {
   return `${item.category}:${item.contextGeneration}:${item.requestGeneration}:${item.providerItemId}`;
-}
-
-function fanzaPages(
-  items: FanzaCatalogItem[],
-  ratios: Map<string, number>,
-  width: number,
-  height: number,
-) {
-  if (items.length === 0) return [[]];
-  if (width <= 0 || height <= 0) return items.map((item) => [item]);
-  const rowCount = Math.max(
-    1,
-    Math.floor(
-      (height + javdbBrowseRowGap) /
-        (javdbBrowseCardHeight + javdbBrowseRowGap),
-    ),
-  );
-  const pages: FanzaCatalogItem[][] = [];
-  let page: FanzaCatalogItem[] = [];
-  let rows = 1;
-  let rowWidth = 0;
-  for (const item of items) {
-    const cardWidth = Math.min(
-      width,
-      Math.round(
-        javdbCoverHeight * (ratios.get(fanzaItemKey(item)) ?? item.sourceAspectRatio),
-      ),
-    );
-    const nextWidth = rowWidth === 0 ? cardWidth : rowWidth + javdbBrowseColumnGap + cardWidth;
-    if (rowWidth !== 0 && nextWidth > width) {
-      if (rows === rowCount) {
-        pages.push(page);
-        page = [];
-        rows = 1;
-      } else {
-        rows += 1;
-      }
-      rowWidth = cardWidth;
-    } else {
-      rowWidth = nextWidth;
-    }
-    page.push(item);
-  }
-  if (page.length > 0) pages.push(page);
-  return pages;
-}
-
-function FanzaGallery({
-  ariaLabel,
-  getInLibrary,
-  getTransferState,
-  items,
-  onDetails,
-  onFindReleases,
-  onPreview,
-  onSelectedPageChange,
-  selectedPage,
-}: {
-  ariaLabel: string;
-  getInLibrary: (item: FanzaCatalogItem) => boolean;
-  getTransferState: (item: FanzaCatalogItem) => VrDownload["state"] | null;
-  items: FanzaCatalogItem[];
-  onDetails: (item: FanzaCatalogItem, triggerId: string) => void;
-  onFindReleases: (item: FanzaCatalogItem, triggerId: string) => void;
-  onPreview: (item: FanzaCatalogItem, triggerId: string) => void;
-  onSelectedPageChange: (page: number) => void;
-  selectedPage: number;
-}) {
-  const viewport = useRef<HTMLDivElement | null>(null);
-  const [bounds, setBounds] = useState({ width: 0, height: 0 });
-  const [ratios, setRatios] = useState<Map<string, number>>(() => new Map());
-  useLayoutEffect(() => {
-    const element = viewport.current;
-    if (element === null) return;
-    const update = (width: number, height: number) => {
-      if (width > 0 && height > 0) setBounds({ width, height });
-    };
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries.find(({ target }) => target === element);
-      if (entry !== undefined) update(entry.contentRect.width, entry.contentRect.height);
-    });
-    const initial = element.getBoundingClientRect();
-    update(initial.width, initial.height);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-  const pages = fanzaPages(items, ratios, bounds.width, bounds.height);
-  const pageCount = pages.length;
-  const currentPage = Math.min(selectedPage, pageCount);
-  const visibleItems = pages[currentPage - 1] ?? [];
-  useLayoutEffect(() => {
-    if (selectedPage !== currentPage) onSelectedPageChange(currentPage);
-  }, [currentPage, onSelectedPageChange, selectedPage]);
-  return (
-    <div
-      className="media-gallery media-gallery--javdb"
-      data-current-page={currentPage}
-      data-gallery="discover"
-      data-page-capacity={visibleItems.length}
-      data-page-count={pageCount}
-    >
-      <div className="media-gallery__viewport" ref={viewport}>
-        <ul aria-label={ariaLabel} className="javdb-browse-grid">
-          {visibleItems.map((item) => (
-            <li key={fanzaItemKey(item)}>
-              <DiscoverFanzaCard
-                inLibrary={getInLibrary(item)}
-                item={item}
-                onDetails={onDetails}
-                onFindReleases={onFindReleases}
-                onPreview={onPreview}
-                onRatioChange={(currentItem, ratio) => {
-                  setRatios((current) => {
-                    const next = new Map(current);
-                    next.set(fanzaItemKey(currentItem), ratio);
-                    return next;
-                  });
-                }}
-                transferState={getTransferState(item)}
-              />
-            </li>
-          ))}
-        </ul>
-      </div>
-      <nav aria-label={`${ariaLabel} pagination`} className="media-pagination">
-        <Button
-          aria-label={`Previous ${ariaLabel} page`}
-          disabled={currentPage === 1}
-          onClick={() => onSelectedPageChange(currentPage - 1)}
-          size="sm"
-          type="button"
-          variant="outline"
-        >
-          Previous
-        </Button>
-        <p aria-atomic="true" aria-live="polite">Page {currentPage} of {pageCount}</p>
-        <Button
-          aria-label={`Next ${ariaLabel} page`}
-          disabled={currentPage === pageCount}
-          onClick={() => onSelectedPageChange(currentPage + 1)}
-          size="sm"
-          type="button"
-          variant="outline"
-        >
-          Next
-        </Button>
-      </nav>
-    </div>
-  );
 }
 
 function FanzaBrowseSurface({
@@ -3077,15 +2958,23 @@ function FanzaBrowseSurface({
         <span aria-live="polite" className="sr-only" role="status">
           {items.length} accepted FANZA {category === "vr" ? "VR" : "Adult"} titles.
         </span>
-        <FanzaGallery
+        <NaturalWidthBrowseGallery
           ariaLabel={ariaLabel}
-          getInLibrary={getInLibrary}
-          getTransferState={getTransferState}
+          getItemKey={fanzaItemKey}
+          getSourceAspectRatio={(item) => item.sourceAspectRatio}
           items={items}
-          onDetails={onDetails}
-          onFindReleases={onFindReleases}
-          onPreview={onPreview}
           onSelectedPageChange={onSelectedPageChange}
+          renderItem={(item, onRatioChange) => (
+            <DiscoverFanzaCard
+              inLibrary={getInLibrary(item)}
+              item={item}
+              onDetails={onDetails}
+              onFindReleases={onFindReleases}
+              onPreview={onPreview}
+              onRatioChange={(_, ratio) => onRatioChange(ratio)}
+              transferState={getTransferState(item)}
+            />
+          )}
           selectedPage={selectedPage}
         />
       </>
@@ -3099,11 +2988,21 @@ function FanzaBrowseSurface({
     state.status === "provider-error";
   return (
     <div className="empty-state discover-state" role={message?.role}>
-      <span className="empty-state__icon"><AppIcon name={category} /></span>
+      <span className="empty-state__icon">
+        <AppIcon name={category} />
+      </span>
       <h2>{message?.heading}</h2>
       <p>{message?.message}</p>
       {retryable ? (
-        <Button className="empty-state__action" onClick={onRetry} type="button" variant="outline"><AppIcon name="refresh" />Retry</Button>
+        <Button
+          className="empty-state__action"
+          onClick={onRetry}
+          type="button"
+          variant="outline"
+        >
+          <AppIcon name="refresh" />
+          Retry
+        </Button>
       ) : null}
     </div>
   );
@@ -3143,9 +3042,32 @@ function FanzaDetailsDialog({
   triggerId: string;
 }) {
   const [sourceError, setSourceError] = useState(false);
+  const sourceRequestId = useRef(0);
   const readyItem = state.status === "ready" ? state.item : null;
-  const message = state.status === "ready" ? null : fanzaMessages[state.status];
+  const detailGeneration =
+    state.status === "ready" ? state.detailGeneration : null;
+  const message =
+    state.status === "ready" ? null : fanzaDetailMessages[state.status];
   const releaseTriggerId = `fanza-details-${item.category}-${item.requestGeneration}-${item.providerItemId}-releases`;
+
+  useEffect(() => {
+    sourceRequestId.current += 1;
+    setSourceError(false);
+  }, [detailGeneration, item]);
+
+  const openSource = () => {
+    if (state.status !== "ready") {
+      return;
+    }
+    const requestId = ++sourceRequestId.current;
+    setSourceError(false);
+    void openFanzaSource(item, state.detailGeneration).catch(() => {
+      if (requestId === sourceRequestId.current) {
+        setSourceError(true);
+      }
+    });
+  };
+
   return (
     <Dialog.Portal>
       <Dialog.Backdrop className="movie-details__backdrop" />
@@ -3156,36 +3078,82 @@ function FanzaDetailsDialog({
           finalFocus={() => fanzaFocusTarget(item.category, triggerId)}
         >
           <div className="movie-details__heading">
-            <div><p className="card-eyebrow">FANZA digital details</p><Dialog.Title>{item.code}</Dialog.Title></div>
-            <Dialog.Close render={<Button type="button" variant="ghost"><AppIcon name="close" />Close</Button>} />
+            <div>
+              <p className="card-eyebrow">FANZA digital details</p>
+              <Dialog.Title>{item.code}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
           </div>
           <Dialog.Description className="movie-details__description">
-            Exact {item.category === "vr" ? "VR" : "Adult"} details retained for this FANZA item.
+            Exact {item.category === "vr" ? "VR" : "Adult"} details retained
+            for this FANZA item.
           </Dialog.Description>
           {readyItem === null ? (
             <div className="movie-details__state" role={message?.role}>
-              <div><h3>{message?.heading}</h3><p>{message?.message}</p>
+              <div>
+                <h3>{message?.heading}</h3>
+                <p>{message?.message}</p>
                 {state.status === "loading" || state.status === "stale" ? null : (
-                  <Button onClick={onRetry} type="button" variant="outline">Retry details</Button>
+                  <Button onClick={onRetry} type="button" variant="outline">
+                    Retry details
+                  </Button>
                 )}
               </div>
             </div>
           ) : (
             <div className="movie-details__content javdb-detail__content">
-              <span aria-live="polite" className="sr-only" role="status">FANZA details loaded for {readyItem.code}.</span>
+              <span aria-live="polite" className="sr-only" role="status">
+                FANZA details loaded for {readyItem.code}.
+              </span>
               <div className="movie-details__poster">
                 <FanzaCover item={readyItem} onRatio={() => undefined} />
-                <div className="javdb-detail__badges">{inLibrary ? <span>In library</span> : null}{transferState === null ? null : <span>{transferState}</span>}</div>
+                <div className="javdb-detail__badges">
+                  {inLibrary ? <span>In library</span> : null}
+                  {transferState === null ? null : <span>{transferState}</span>}
+                </div>
               </div>
               <div className="movie-details__information">
                 <h3>{readyItem.title ?? "Title unavailable"}</h3>
-                <dl><div><dt>Product code</dt><dd>{readyItem.code}</dd></div><div><dt>Category</dt><dd>{readyItem.category === "vr" ? "VR" : "Adult"}</dd></div><div><dt>Source</dt><dd>FANZA</dd></div></dl>
+                <dl>
+                  <div>
+                    <dt>Product code</dt>
+                    <dd>{readyItem.code}</dd>
+                  </div>
+                  <div>
+                    <dt>Category</dt>
+                    <dd>{readyItem.category === "vr" ? "VR" : "Adult"}</dd>
+                  </div>
+                  <div>
+                    <dt>Source</dt>
+                    <dd>FANZA</dd>
+                  </div>
+                </dl>
                 <div className="javdb-detail__actions">
-                  <Button onClick={onPreview} type="button" variant="outline">Preview</Button>
-                  <Button id={releaseTriggerId} onClick={() => onFindReleases(item, releaseTriggerId)} type="button"><AppIcon name="releases" />Find releases</Button>
-                  <Button onClick={() => { if (state.status !== "ready") return; setSourceError(false); void openFanzaSource(item, state.detailGeneration).catch(() => setSourceError(true)); }} type="button" variant="outline">View on FANZA</Button>
+                  <Button onClick={onPreview} type="button" variant="outline">
+                    Preview
+                  </Button>
+                  <Button
+                    id={releaseTriggerId}
+                    onClick={() => onFindReleases(item, releaseTriggerId)}
+                    type="button"
+                  >
+                    <AppIcon name="releases" />
+                    Find releases
+                  </Button>
+                  <Button onClick={openSource} type="button" variant="outline">
+                    View on FANZA
+                  </Button>
                 </div>
-                {sourceError ? <p role="alert">FANZA could not be opened in the browser.</p> : null}
+                {sourceError ? (
+                  <p role="alert">FANZA could not be opened in the browser.</p>
+                ) : null}
               </div>
             </div>
           )}
@@ -3217,93 +3185,117 @@ function FanzaPreviewDialog({
   const [state, setState] = useState<FanzaPreviewState>({ status: "loading" });
   const [requestVersion, setRequestVersion] = useState(0);
   const [currentIndex, setCurrentIndex] = useState(0);
+  const detailGeneration =
+    detailState.status === "ready" ? detailState.detailGeneration : null;
   useEffect(() => {
-    if (detailState.status !== "ready") return;
+    if (detailGeneration === null) {
+      return;
+    }
     let current = true;
     let previewGeneration: string | null = null;
     const objectUrls = new Set<string>();
     setState({ status: "loading" });
     setCurrentIndex(0);
-    void fetchFanzaPreview(item).then(async (result) => {
-      if (!current) {
-        if (result.status === "ready") void invalidateFanzaPreview(item.category, result.previewGeneration).catch(() => undefined);
-        return;
-      }
-      if (result.status !== "ready") {
-        setState(result);
-        return;
-      }
-      previewGeneration = result.previewGeneration;
-      if (result.authorityIds.length === 0) {
-        setState({ status: "no-preview" });
-        return;
-      }
-      const imageResults = await Promise.all(
-        result.authorityIds.map(async (authorityId) => {
-          try {
-            const url = await fetchFanzaPreviewImageObjectUrl(
-              item,
+    void fetchFanzaPreview(item, detailGeneration).then(
+      async (result) => {
+        if (!current) {
+          if (result.status === "ready") {
+            void invalidateFanzaPreview(
+              item.category,
               result.previewGeneration,
-              authorityId,
-            );
-            if (!current) URL.revokeObjectURL(url);
-            else objectUrls.add(url);
-            return current
-              ? ({ status: "ready", url } as const)
-              : ({ status: "stale" } as const);
-          } catch (error: unknown) {
-            return {
-              status: fanzaErrorStatus(item.category, error),
-            } as const;
+            ).catch(() => undefined);
           }
-        }),
-      );
-      if (!current) return;
-      const images = imageResults.flatMap((imageResult) =>
-        imageResult.status === "ready" ? [imageResult.url] : [],
-      );
-      const firstFailure = imageResults.find(
-        (imageResult) => imageResult.status !== "ready",
-      );
-      const hasStaleFailure = imageResults.some(
-        (imageResult) => imageResult.status === "stale",
-      );
-      setState(
-        images.length > 0
-          ? {
-              status: "ready",
-              previewGeneration: result.previewGeneration,
-              images,
+          return;
+        }
+        if (result.status !== "ready") {
+          setState(result);
+          return;
+        }
+        previewGeneration = result.previewGeneration;
+        if (result.authorityIds.length === 0) {
+          setState({ status: "no-preview" });
+          return;
+        }
+        const imageResults = await Promise.all(
+          result.authorityIds.map(async (authorityId) => {
+            try {
+              const url = await fetchFanzaPreviewImageObjectUrl(
+                item,
+                result.previewGeneration,
+                authorityId,
+              );
+              if (current) {
+                objectUrls.add(url);
+                return { status: "ready", url } as const;
+              }
+              URL.revokeObjectURL(url);
+              return { status: "stale" } as const;
+            } catch (error: unknown) {
+              return {
+                status: fanzaErrorStatus(item.category, error),
+              } as const;
             }
-          : {
-              status:
-                hasStaleFailure
+          }),
+        );
+        if (!current) {
+          return;
+        }
+        const images = imageResults.flatMap((imageResult) =>
+          imageResult.status === "ready" ? [imageResult.url] : [],
+        );
+        const firstFailure = imageResults.find(
+          (imageResult) => imageResult.status !== "ready",
+        );
+        const hasStaleFailure = imageResults.some(
+          (imageResult) => imageResult.status === "stale",
+        );
+        setState(
+          images.length > 0
+            ? {
+                status: "ready",
+                previewGeneration: result.previewGeneration,
+                images,
+              }
+            : {
+                status: hasStaleFailure
                   ? "stale"
-                  : firstFailure === undefined
-                  ? "provider-error"
-                  : firstFailure.status,
-            },
-      );
-    });
+                  : (firstFailure?.status ?? "provider-error"),
+              },
+        );
+      },
+    );
     return () => {
       current = false;
-      for (const url of objectUrls) URL.revokeObjectURL(url);
-      if (previewGeneration !== null) void invalidateFanzaPreview(item.category, previewGeneration).catch(() => undefined);
+      for (const url of objectUrls) {
+        URL.revokeObjectURL(url);
+      }
+      if (previewGeneration !== null) {
+        void invalidateFanzaPreview(item.category, previewGeneration).catch(
+          () => undefined,
+        );
+      }
     };
-  }, [detailState.status, item, requestVersion]);
+  }, [detailGeneration, item, requestVersion]);
   const move = (direction: -1 | 1) => {
-    if (state.status === "ready") setCurrentIndex((index) => (index + direction + state.images.length) % state.images.length);
+    if (state.status === "ready") {
+      setCurrentIndex(
+        (index) =>
+          (index + direction + state.images.length) % state.images.length,
+      );
+    }
   };
   const removeCurrentImage = () => {
-    if (state.status !== "ready") return;
+    if (state.status !== "ready") {
+      return;
+    }
     const currentUrl = state.images[currentIndex];
-    if (currentUrl !== undefined) URL.revokeObjectURL(currentUrl);
+    if (currentUrl !== undefined) {
+      URL.revokeObjectURL(currentUrl);
+    }
     const images = state.images.filter((_, index) => index !== currentIndex);
     setCurrentIndex((index) => Math.min(index, Math.max(0, images.length - 1)));
     setState(
-      images.length === 0
-        ? { status: "provider-error" }
-        : { ...state, images },
+      images.length === 0 ? { status: "provider-error" } : { ...state, images },
     );
   };
   const visibleState: FanzaPreviewState =
@@ -3334,7 +3326,9 @@ function FanzaPreviewDialog({
           className="vr-torrent__popup javdb-preview__popup"
           finalFocus={() => fanzaFocusTarget(item.category, triggerId)}
           onKeyDown={(event) => {
-            if (visibleState.status !== "ready") return;
+            if (visibleState.status !== "ready") {
+              return;
+            }
             if (event.key === "ArrowLeft") {
               event.preventDefault();
               move(-1);
@@ -3344,16 +3338,93 @@ function FanzaPreviewDialog({
             }
           }}
         >
-          <div className="vr-torrent__heading"><div><p className="card-eyebrow">FANZA preview</p><Dialog.Title>{item.code}</Dialog.Title></div><Dialog.Close render={<Button type="button" variant="ghost"><AppIcon name="close" />Close</Button>} /></div>
-          <Dialog.Description className="vr-torrent__description">Exact preview images retained for this accepted FANZA item.</Dialog.Description>
+          <div className="vr-torrent__heading">
+            <div>
+              <p className="card-eyebrow">FANZA preview</p>
+              <Dialog.Title>{item.code}</Dialog.Title>
+            </div>
+            <Dialog.Close
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="vr-torrent__description">
+            Exact preview images retained for this accepted FANZA item.
+          </Dialog.Description>
           {visibleState.status === "loading" ? (
-            <div className="vr-releases__state" role="status"><h3>Loading FANZA preview</h3><p>Verifying the current exact item and retained preview images.</p></div>
+            <div className="vr-releases__state" role="status">
+              <h3>Loading FANZA preview</h3>
+              <p>
+                Verifying the current exact item and retained preview images.
+              </p>
+            </div>
           ) : visibleState.status === "ready" ? (
-            <div className="javdb-preview__content"><span aria-live="polite" className="sr-only" role="status">{visibleState.images.length} FANZA preview images loaded.</span><img alt={`${item.code} preview ${currentIndex + 1} of ${visibleState.images.length}`} onError={removeCurrentImage} src={visibleState.images[currentIndex]} /><p aria-live="polite">Image {currentIndex + 1} of {visibleState.images.length}</p>{visibleState.images.length > 1 ? <div className="javdb-preview__navigation"><Button aria-label={`Previous preview for ${item.code}`} onClick={() => move(-1)} type="button" variant="outline">Previous</Button><Button aria-label={`Next preview for ${item.code}`} onClick={() => move(1)} type="button" variant="outline">Next</Button></div> : null}</div>
+            <div className="javdb-preview__content">
+              <span aria-live="polite" className="sr-only" role="status">
+                {visibleState.images.length} FANZA preview images loaded.
+              </span>
+              <img
+                alt={`${item.code} preview ${currentIndex + 1} of ${visibleState.images.length}`}
+                onError={removeCurrentImage}
+                src={visibleState.images[currentIndex]}
+              />
+              <p aria-live="polite">
+                Image {currentIndex + 1} of {visibleState.images.length}
+              </p>
+              {visibleState.images.length > 1 ? (
+                <div className="javdb-preview__navigation">
+                  <Button
+                    aria-label={`Previous preview for ${item.code}`}
+                    onClick={() => move(-1)}
+                    type="button"
+                    variant="outline"
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    aria-label={`Next preview for ${item.code}`}
+                    onClick={() => move(1)}
+                    type="button"
+                    variant="outline"
+                  >
+                    Next
+                  </Button>
+                </div>
+              ) : null}
+            </div>
           ) : (
-            <div className="vr-releases__state" role={message?.role}><div><h3>{visibleState.status === "no-preview" ? "No preview images available" : message?.heading}</h3><p>{visibleState.status === "no-preview" ? "FANZA did not provide an accepted preview for this item." : message?.message}</p>{visibleState.status === "no-preview" || visibleState.status === "stale" ? null : <Button onClick={retryPreview} type="button" variant="outline">Retry preview</Button>}</div></div>
+            <div className="vr-releases__state" role={message?.role}>
+              <div>
+                <h3>
+                  {visibleState.status === "no-preview"
+                    ? "No preview images available"
+                    : message?.heading}
+                </h3>
+                <p>
+                  {visibleState.status === "no-preview"
+                    ? "FANZA did not provide an accepted preview for this item."
+                    : message?.message}
+                </p>
+                {visibleState.status === "no-preview" ||
+                visibleState.status === "stale" ? null : (
+                  <Button
+                    onClick={retryPreview}
+                    type="button"
+                    variant="outline"
+                  >
+                    Retry preview
+                  </Button>
+                )}
+              </div>
+            </div>
           )}
-          <Button onClick={onBack} type="button" variant="outline">Back to details</Button>
+          <Button onClick={onBack} type="button" variant="outline">
+            Back to details
+          </Button>
         </Dialog.Popup>
       </Dialog.Viewport>
     </Dialog.Portal>
@@ -15554,7 +15625,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   </fieldset>
                   {discoverCategory === "vr" ? (
                     <>
-                      <JavdbBrowseControls
+                      <ProviderBrowseControls
                         category="vr"
                         count={vrBrowseProvider === "fanza" ? vrFanzaCount : vrBrowseCount}
                         fanzaFeed={vrFanzaFeed}
@@ -15649,7 +15720,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     </>
                   ) : discoverCategory === "adult" ? (
                     <>
-                      <JavdbBrowseControls
+                      <ProviderBrowseControls
                         category="adult"
                         count={adultBrowseProvider === "fanza" ? adultFanzaCount : adultBrowseCount}
                         fanzaFeed={adultFanzaFeed}
@@ -15914,15 +15985,23 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       <span aria-live="polite" className="sr-only" role="status">
                         {vrBrowseItems.length} accepted JavDB VR titles.
                       </span>
-                      <JavdbBrowseGallery
+                      <NaturalWidthBrowseGallery
                         ariaLabel={vrBrowseGalleryLabel}
-                        getInLibrary={isProviderItemInLibrary}
-                        getTransferState={providerItemTransferState}
+                        getItemKey={javdbBrowseItemKey}
+                        getSourceAspectRatio={(item) => item.sourceAspectRatio}
                         items={vrBrowseItems}
-                        onDetails={openJavdbDetails}
-                        onFindReleases={openVrReleaseComparison}
-                        onPreview={openJavdbPreview}
                         onSelectedPageChange={setVrBrowseSelectedPage}
+                        renderItem={(item, onRatioChange) => (
+                          <DiscoverJavdbBrowseCard
+                            inLibrary={isProviderItemInLibrary(item)}
+                            item={item}
+                            onDetails={openJavdbDetails}
+                            onFindReleases={openVrReleaseComparison}
+                            onPreview={openJavdbPreview}
+                            onRatioChange={(_, ratio) => onRatioChange(ratio)}
+                            transferState={providerItemTransferState(item)}
+                          />
+                        )}
                         selectedPage={vrBrowseSelectedPage}
                       />
                     </>
@@ -16019,15 +16098,23 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       <span aria-live="polite" className="sr-only" role="status">
                         {adultBrowseItems.length} accepted JavDB Adult titles.
                       </span>
-                      <JavdbBrowseGallery
+                      <NaturalWidthBrowseGallery
                         ariaLabel={adultBrowseGalleryLabel}
-                        getInLibrary={isProviderItemInLibrary}
-                        getTransferState={providerItemTransferState}
+                        getItemKey={javdbBrowseItemKey}
+                        getSourceAspectRatio={(item) => item.sourceAspectRatio}
                         items={adultBrowseItems}
-                        onDetails={openJavdbDetails}
-                        onFindReleases={openAdultReleaseComparison}
-                        onPreview={openJavdbPreview}
                         onSelectedPageChange={setAdultBrowseSelectedPage}
+                        renderItem={(item, onRatioChange) => (
+                          <DiscoverJavdbBrowseCard
+                            inLibrary={isProviderItemInLibrary(item)}
+                            item={item}
+                            onDetails={openJavdbDetails}
+                            onFindReleases={openAdultReleaseComparison}
+                            onPreview={openJavdbPreview}
+                            onRatioChange={(_, ratio) => onRatioChange(ratio)}
+                            transferState={providerItemTransferState(item)}
+                          />
+                        )}
                         selectedPage={adultBrowseSelectedPage}
                       />
                     </>

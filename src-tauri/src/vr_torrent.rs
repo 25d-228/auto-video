@@ -4091,6 +4091,11 @@ mod tests {
             "3DSVR-1947 + ABC-123 pack",
             "3DSVR-1947"
         ));
+        assert!(product_code_candidates("Unsupported AB1-2 release").is_empty());
+        assert!(!release_matches_product_code(
+            "Unsupported AB1-2 release",
+            "AB1-2"
+        ));
     }
 
     #[test]

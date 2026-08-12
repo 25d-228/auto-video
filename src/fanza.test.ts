@@ -62,6 +62,7 @@ describe("FANZA structured catalog boundary", () => {
         ],
         "vr",
         "7",
+        10,
       ),
     ).toEqual({
       status: "ready",
@@ -88,13 +89,29 @@ describe("FANZA structured catalog boundary", () => {
       ["11", "1", "adult", "13dsvr01947", "3DSVR-1947", "", "", "0.72"],
       ["11", "1", "vr", "13DSVR01947", "3DSVR-1947", "", "", "0.72"],
       ["11", "1", "vr", "13dsvr01947", "3DSVR-01947", "", "", "0.72"],
+      ["11", "1", "vr", "ab12", "AB1-2", "", "", "0.72"],
       ["11", "1", "vr", "13dsvr01947", "3DSVR-1947", "", "fanza-cover-10-1", "0.72"],
       ["11", "2", "vr", "ovvr616", "OVVR-616", "", "", "0.72", "vr", "ovvr616", "OVVR-616", "", "", "0.72"],
     ]) {
-      expect(parseFanzaCatalogResponse(response, "vr", "7")).toEqual({
+      expect(parseFanzaCatalogResponse(response, "vr", "7", 10)).toEqual({
         status: "malformed-provider",
       });
     }
+  });
+
+  it("rejects a native response that exceeds the exact requested count", () => {
+    const fields = Array.from({ length: 11 }, (_, index) => [
+      "vr",
+      `ovvr${index + 1}`,
+      `OVVR-${index + 1}`,
+      "",
+      "",
+      "0.72",
+    ]).flat();
+
+    expect(
+      parseFanzaCatalogResponse(["11", "11", ...fields], "vr", "7", 10),
+    ).toEqual({ status: "malformed-provider" });
   });
 
   it("submits only category feed count and generation and maps exact errors", async () => {
@@ -160,10 +177,18 @@ describe("FANZA retained item authority", () => {
     invokeMock
       .mockResolvedValueOnce(["17", "2", "fanza-preview-17-1", "fanza-preview-17-2"])
       .mockResolvedValueOnce([0x89, 0x50, 0x4e, 0x47]);
-    await expect(fetchFanzaPreview(item)).resolves.toEqual({
+    await expect(fetchFanzaPreview(item, "19")).resolves.toEqual({
       status: "ready",
       previewGeneration: "17",
       authorityIds: ["fanza-preview-17-1", "fanza-preview-17-2"],
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "fetch_fanza_preview", {
+      category: "vr",
+      contextGeneration: "7",
+      requestGeneration: "11",
+      providerItemId: "13dsvr01947",
+      code: "3DSVR-1947",
+      detailGeneration: "19",
     });
     await expect(
       fetchFanzaPreviewImageObjectUrl(item, "17", "fanza-preview-17-1"),
@@ -184,7 +209,7 @@ describe("FANZA retained item authority", () => {
       .mockResolvedValueOnce(["17", "2", "fanza-preview-17-1"])
       .mockResolvedValueOnce(undefined);
 
-    await expect(fetchFanzaPreview(item)).resolves.toEqual({
+    await expect(fetchFanzaPreview(item, "19")).resolves.toEqual({
       status: "malformed-provider",
     });
     expect(invokeMock).toHaveBeenLastCalledWith("invalidate_fanza_preview", {

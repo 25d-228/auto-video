@@ -112,7 +112,15 @@ describe("VR product-code identity", () => {
   });
 
   it("rejects missing, malformed, and zero product codes", () => {
-    for (const value of ["", "   ", "MDVR", "419", "MDVR-0", "MDVR-41A"])
+    for (const value of [
+      "",
+      "   ",
+      "MDVR",
+      "419",
+      "MDVR-0",
+      "MDVR-41A",
+      "AB1-2",
+    ])
       expect(canonicalizeProductCode(value)).toBeNull();
   });
 
@@ -658,9 +666,14 @@ describe("JavDB exact-code catalog request", () => {
   });
 
   it("rejects a non-canonical request before native dispatch", async () => {
-    await expect(fetchExactJavdbVrItem("mdvr-419")).rejects.toThrow(
-      "A canonical VR product code is required.",
-    );
+    for (const code of ["mdvr-419", "AB1-2"]) {
+      await expect(fetchExactJavdbVrItem(code)).rejects.toThrow(
+        "A canonical VR product code is required.",
+      );
+      await expect(fetchVerifiedSukebeiReleases(code)).rejects.toThrow(
+        "A canonical VR product code is required.",
+      );
+    }
     expect(invokeMock).not.toHaveBeenCalled();
   });
 });

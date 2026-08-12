@@ -1510,7 +1510,7 @@ fn clear_tmdb_token_file(path: &Path) -> Result<(), &'static str> {
     }
 }
 
-fn is_canonical_product_code(code: &str) -> bool {
+pub(crate) fn is_canonical_product_code(code: &str) -> bool {
     let Some((prefix, number)) = code.split_once('-') else {
         return false;
     };
@@ -1522,6 +1522,10 @@ fn is_canonical_product_code(code: &str) -> bool {
         && prefix
             .bytes()
             .any(|character| character.is_ascii_uppercase())
+        && prefix
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphabetic)
         && (1..=10).contains(&number.len())
         && !number.starts_with('0')
         && number.bytes().all(|character| character.is_ascii_digit())
@@ -3501,6 +3505,7 @@ async fn fetch_fanza_preview(
     request_generation: String,
     provider_item_id: String,
     code: String,
+    detail_generation: String,
     state: tauri::State<'_, FanzaCatalogState>,
 ) -> Result<Vec<String>, String> {
     let state = state.inner().clone();
@@ -3517,8 +3522,13 @@ async fn fetch_fanza_preview(
         code,
     };
     tauri::async_runtime::spawn_blocking(move || {
-        fetch_fanza_preview_with(&state, &request, fetch_fanza_graphql_document)
-            .map_err(str::to_owned)
+        fetch_fanza_preview_with(
+            &state,
+            &request,
+            &detail_generation,
+            fetch_fanza_graphql_document,
+        )
+        .map_err(str::to_owned)
     })
     .await
     .map_err(|_| join_error.to_owned())?
@@ -4469,19 +4479,20 @@ mod tests {
         fetch_javdb_vr_catalog_with, fetch_sukebei_adult_releases_with,
         fetch_sukebei_vr_releases_with, fetch_yts_movie_releases_with,
         finish_movie_metadata_search, finish_movie_metadata_verification,
-        invalidate_movie_metadata_client_context, load_movies_folder_file, load_tmdb_token_file,
-        movie_metadata_error, open_movie_path_with, open_movie_request_with,
-        parse_movie_metadata_candidates, parse_movie_provider_response, parse_provider_response,
-        parse_verified_movie_metadata, query_movies_volume_storage_with, reveal_movie_path_with,
-        reveal_movie_request_with, save_movie_metadata_match_with, save_movies_folder_file,
-        save_tmdb_token_file, scan_movie_paths, scan_movies_library, trash_movie_path_with,
-        trash_movie_request_with, MoviePathValidationError, MovieProviderRequestError,
-        MovieTorrentState, MoviesLibraryContext, MoviesVolumeStorageQueryError,
-        ProviderRequestError, TrashMovieRequest, ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE,
-        MOVIES_STORAGE_FAILED, MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID,
-        MOVIE_METADATA_MALFORMED, MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE,
-        MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE,
-        MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
+        invalidate_movie_metadata_client_context, is_canonical_product_code,
+        load_movies_folder_file, load_tmdb_token_file, movie_metadata_error, open_movie_path_with,
+        open_movie_request_with, parse_movie_metadata_candidates, parse_movie_provider_response,
+        parse_provider_response, parse_verified_movie_metadata, query_movies_volume_storage_with,
+        reveal_movie_path_with, reveal_movie_request_with, save_movie_metadata_match_with,
+        save_movies_folder_file, save_tmdb_token_file, scan_movie_paths, scan_movies_library,
+        trash_movie_path_with, trash_movie_request_with, MoviePathValidationError,
+        MovieProviderRequestError, MovieTorrentState, MoviesLibraryContext,
+        MoviesVolumeStorageQueryError, ProviderRequestError, TrashMovieRequest,
+        ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
+        MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID, MOVIE_METADATA_MALFORMED,
+        MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE, MOVIE_OPEN_FAILED,
+        MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED,
+        MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
         MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED,
         MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND,
         MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE, MOVIE_TRASH_UNAVAILABLE,
@@ -4676,7 +4687,14 @@ mod tests {
 
     #[test]
     fn rejects_noncanonical_provider_codes_before_dispatch() {
-        for code in ["", "mdvr-419", "MDVR_419", "MDVR-0419", "MDVR-4190 extra"] {
+        for code in [
+            "",
+            "mdvr-419",
+            "MDVR_419",
+            "MDVR-0419",
+            "MDVR-4190 extra",
+            "AB1-2",
+        ] {
             let dispatched = RefCell::new(false);
             let result = fetch_javdb_vr_catalog_with(code, |_| {
                 dispatched.replace(true);
@@ -4685,6 +4703,9 @@ mod tests {
 
             assert_eq!(result, Err(VR_PROVIDER_ERROR));
             assert!(!dispatched.into_inner());
+        }
+        for code in ["MDVR-419", "3DSVR-1947", "ADLT-123"] {
+            assert!(is_canonical_product_code(code));
         }
     }
 

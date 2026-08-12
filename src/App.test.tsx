@@ -9514,7 +9514,7 @@ describe("trusted FANZA Adult and VR digital catalogs", () => {
     let dialog = await screen.findByRole("dialog");
     expect(
       await within(dialog).findByRole("heading", {
-        name: "FANZA returned invalid data",
+        name: "FANZA returned invalid detail data",
       }),
     ).toBeTruthy();
     fireEvent.click(
@@ -9528,6 +9528,124 @@ describe("trusted FANZA Adult and VR digital catalogs", () => {
     );
     fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
     await waitFor(() => expect(document.activeElement).toBe(details));
+  });
+
+  it("reports detail-specific loading and provider failure states", async () => {
+    const pendingDetail = createDeferred<string[]>();
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("vr", [
+        { code: "VRKM-1577", cover: false, id: "vrkm01577" },
+      ]),
+    );
+    fetchFanzaDetailMock.mockReturnValue(pendingDetail.promise);
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const card = (
+      await screen.findByRole("heading", { name: "VRKM-1577" })
+    ).closest("article") as HTMLElement;
+    fireEvent.click(
+      within(card).getByRole("button", {
+        name: "View details: VRKM-1577",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", { name: "Loading FANZA details" }),
+    ).toBeTruthy();
+
+    await act(async () => {
+      pendingDetail.reject("vr_network_error");
+      await pendingDetail.promise.catch(() => undefined);
+    });
+    expect(
+      await within(dialog).findByRole("heading", {
+        name: "FANZA details could not be reached",
+      }),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByRole("button", { name: "Retry details" }),
+    ).toBeTruthy();
+  });
+
+  it("clears an item-local source failure before another FANZA item opens", async () => {
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("vr", [
+        { code: "VRKM-1577", cover: false, id: "vrkm01577" },
+        { code: "OVVR-616", cover: false, id: "ovvr616" },
+      ]),
+    );
+    fetchFanzaDetailMock
+      .mockResolvedValueOnce([
+        "19",
+        "vr",
+        "1",
+        "7",
+        "vrkm01577",
+        "VRKM-1577",
+        "",
+        "",
+      ])
+      .mockResolvedValueOnce([
+        "20",
+        "vr",
+        "1",
+        "7",
+        "ovvr616",
+        "OVVR-616",
+        "",
+        "",
+      ]);
+    openFanzaSourceMock
+      .mockRejectedValueOnce("vr_provider_error")
+      .mockResolvedValueOnce(undefined);
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+
+    const firstCard = (
+      await screen.findByRole("heading", { name: "VRKM-1577" })
+    ).closest("article") as HTMLElement;
+    fireEvent.click(
+      within(firstCard).getByRole("button", {
+        name: "View details: VRKM-1577",
+      }),
+    );
+    let dialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      await within(dialog).findByRole("button", { name: "View on FANZA" }),
+    );
+    expect(
+      (
+        await within(dialog).findByText(
+          "FANZA could not be opened in the browser.",
+        )
+      ).getAttribute("role"),
+    ).toBe("alert");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+
+    const secondCard = screen
+      .getByRole("heading", { name: "OVVR-616" })
+      .closest("article") as HTMLElement;
+    fireEvent.click(
+      within(secondCard).getByRole("button", {
+        name: "View details: OVVR-616",
+      }),
+    );
+    dialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      await within(dialog).findByRole("button", { name: "View on FANZA" }),
+    );
+    await waitFor(() => expect(openFanzaSourceMock).toHaveBeenCalledTimes(2));
+    expect(openFanzaSourceMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        detailGeneration: "20",
+        providerItemId: "ovvr616",
+      }),
+    );
+    expect(
+      within(dialog).queryByText("FANZA could not be opened in the browser."),
+    ).toBeNull();
   });
 
   it.each([

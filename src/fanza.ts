@@ -105,9 +105,11 @@ export function parseFanzaCatalogResponse(
   value: unknown,
   category: FanzaCategory,
   contextGeneration: string,
+  requestedCount: FanzaCount,
 ): FanzaCatalogResult {
   if (
     !validGeneration(contextGeneration) ||
+    !counts.has(requestedCount) ||
     !Array.isArray(value) ||
     value.length < 2 ||
     !value.every((entry) => typeof entry === "string")
@@ -120,7 +122,7 @@ export function parseFanzaCatalogResponse(
     !validGeneration(requestGeneration) ||
     !/^\d{1,3}$/.test(countText) ||
     !Number.isSafeInteger(count) ||
-    count > 100 ||
+    count > requestedCount ||
     fields.length !== count * 6
   ) {
     return { status: "malformed-provider" };
@@ -176,7 +178,12 @@ export async function fetchFanzaCatalog(
       "fetch_fanza_catalog",
       { category, feed, count, contextGeneration },
     );
-    return parseFanzaCatalogResponse(value, category, contextGeneration);
+    return parseFanzaCatalogResponse(
+      value,
+      category,
+      contextGeneration,
+      count,
+    );
   } catch (error: unknown) {
     return { status: fanzaErrorStatus(category, error) };
   }
@@ -285,14 +292,15 @@ export async function fetchFanzaDetail(
 
 export async function fetchFanzaPreview(
   item: FanzaCatalogItem,
+  detailGeneration: string,
 ): Promise<FanzaPreviewResult> {
-  if (!validItem(item)) {
+  if (!validItem(item) || !validGeneration(detailGeneration)) {
     throw new Error("A current FANZA item is required.");
   }
   try {
     const value = await window.__TAURI__.core.invoke<unknown>(
       "fetch_fanza_preview",
-      itemAuthority(item),
+      { ...itemAuthority(item), detailGeneration },
     );
     const returnedGeneration =
       Array.isArray(value) &&

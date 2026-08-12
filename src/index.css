@@ -864,7 +864,7 @@ button {
   gap: 0.5rem;
 }
 
-.javdb-browse-controls {
+.provider-browse-controls {
   display: flex;
   min-width: 0;
   flex: 1 1 24rem;
@@ -874,11 +874,11 @@ button {
   gap: 0.5rem;
 }
 
-.javdb-workflow {
+.provider-workflow {
   flex: 0 0 auto;
 }
 
-.javdb-browse-controls__request {
+.provider-browse-controls__request {
   display: flex;
   min-width: 0;
   flex: 1 1 24rem;
@@ -888,8 +888,7 @@ button {
   gap: 0.5rem;
 }
 
-.javdb-provider-label,
-.javdb-select-label {
+.provider-select-label {
   display: grid;
   gap: 0.25rem;
   color: var(--foreground);
@@ -897,8 +896,7 @@ button {
   font-weight: 650;
 }
 
-.javdb-provider-label strong,
-.javdb-select-label select {
+.provider-select-label select {
   min-height: 1.75rem;
   padding: 0.25rem 0.5rem;
   border: 1px solid var(--input);
@@ -907,11 +905,6 @@ button {
   color: var(--foreground);
   font-size: 0.75rem;
   font-weight: 500;
-}
-
-.javdb-provider-label strong {
-  display: flex;
-  align-items: center;
 }
 
 .discover-category {
@@ -1173,13 +1166,13 @@ button {
   min-height: 8.5rem;
 }
 
-.media-gallery--javdb .media-gallery__viewport {
+.media-gallery--natural-width .media-gallery__viewport {
   height: clamp(16.25rem, 52vh, 31rem);
   min-height: 16.25rem;
   flex: 0 0 auto;
 }
 
-.javdb-browse-grid {
+.provider-browse-grid {
   display: flex;
   flex-wrap: wrap;
   align-content: flex-start;
@@ -1189,12 +1182,12 @@ button {
   list-style: none;
 }
 
-.javdb-browse-grid > li {
+.provider-browse-grid > li {
   max-width: 100%;
   flex: 0 0 auto;
 }
 
-.javdb-browse-card {
+.provider-browse-card {
   position: relative;
   max-width: 100%;
   height: 16.25rem;
@@ -1206,11 +1199,11 @@ button {
   cursor: pointer;
 }
 
-.javdb-browse-card:focus-within {
+.provider-browse-card:focus-within {
   box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 45%, transparent);
 }
 
-.javdb-browse-card__details-control {
+.provider-browse-card__details-control {
   position: absolute;
   z-index: 1;
   inset: 0;
@@ -1221,12 +1214,12 @@ button {
   cursor: pointer;
 }
 
-.javdb-browse-card__details-control:focus-visible {
+.provider-browse-card__details-control:focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: -3px;
 }
 
-.javdb-browse-card__cover {
+.provider-browse-card__cover {
   position: relative;
   display: grid;
   width: 100%;
@@ -1236,7 +1229,7 @@ button {
   place-items: center;
 }
 
-.javdb-browse-card__cover > img {
+.provider-browse-card__cover > img {
   width: 100%;
   height: 100%;
   object-fit: contain;
@@ -1255,7 +1248,7 @@ button {
   text-align: center;
 }
 
-.javdb-browse-card__badges {
+.provider-browse-card__badges {
   position: absolute;
   top: 0.375rem;
   left: 0.375rem;
@@ -1264,7 +1257,7 @@ button {
   gap: 0.25rem;
 }
 
-.javdb-browse-card__badges span {
+.provider-browse-card__badges span {
   padding: 0.125rem 0.375rem;
   border-radius: var(--radius);
   background: rgb(15 23 42 / 0.78);
@@ -1273,31 +1266,31 @@ button {
   text-transform: capitalize;
 }
 
-.javdb-browse-card__body {
+.provider-browse-card__body {
   height: 5rem;
   padding: 0.625rem;
 }
 
-.javdb-browse-card__body h3,
-.javdb-browse-card__body p {
+.provider-browse-card__body h3,
+.provider-browse-card__body p {
   margin: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.javdb-browse-card__body h3 {
+.provider-browse-card__body h3 {
   font-family: "Geist Mono Variable", ui-monospace, monospace;
   font-size: 0.8125rem;
 }
 
-.javdb-browse-card__body p {
+.provider-browse-card__body p {
   margin-top: 0.25rem;
   color: var(--muted-foreground);
   font-size: 0.6875rem;
 }
 
-.javdb-browse-card__body > span {
+.provider-browse-card__body > span {
   display: inline-block;
   margin-top: 0.375rem;
   padding: 0.0625rem 0.25rem;
@@ -1307,7 +1300,7 @@ button {
   font-size: 0.625rem;
 }
 
-.javdb-browse-card__actions {
+.provider-browse-card__actions {
   position: absolute;
   z-index: 2;
   top: 8.5rem;
@@ -1321,35 +1314,35 @@ button {
   pointer-events: none;
 }
 
-.javdb-browse-card__actions [data-slot="button"] {
+.provider-browse-card__actions [data-slot="button"] {
   width: auto;
   min-width: 0;
   padding-inline: 0.375rem;
 }
 
-.javdb-browse-card[data-narrow-cover="true"] .javdb-browse-card__actions {
+.provider-browse-card[data-narrow-cover="true"] .provider-browse-card__actions {
   top: 8rem;
   flex-direction: column;
   align-items: stretch;
 }
 
-.javdb-browse-card[data-narrow-cover="true"] .javdb-browse-card__actions [data-slot="button"] {
+.provider-browse-card[data-narrow-cover="true"] .provider-browse-card__actions [data-slot="button"] {
   width: 100%;
   padding-inline: 0.125rem;
   font-size: 0.5625rem;
 }
 
-.javdb-browse-card:hover .javdb-browse-card__actions,
-.javdb-browse-card:focus-within .javdb-browse-card__actions,
-.javdb-browse-card__actions:focus-within {
+.provider-browse-card:hover .provider-browse-card__actions,
+.provider-browse-card:focus-within .provider-browse-card__actions,
+.provider-browse-card__actions:focus-within {
   opacity: 1;
   pointer-events: auto;
 }
 
-.javdb-browse-card:hover .title-copy-button,
-.javdb-browse-card:focus-within .title-copy-button,
-.javdb-browse-card .title-copy-button[data-copy-state="success"],
-.javdb-browse-card .title-copy-button[data-copy-state="error"] {
+.provider-browse-card:hover .title-copy-button,
+.provider-browse-card:focus-within .title-copy-button,
+.provider-browse-card .title-copy-button[data-copy-state="success"],
+.provider-browse-card .title-copy-button[data-copy-state="error"] {
   opacity: 1;
   pointer-events: auto;
 }

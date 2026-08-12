@@ -26,25 +26,58 @@ const FANZA_HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_code}
 const WINDOWS_FANZA_GRAPHQL_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Net.Http
+$handler = [System.Net.Http.HttpClientHandler]::new()
+$handler.AllowAutoRedirect = $false
+$client = [System.Net.Http.HttpClient]::new($handler)
+$client.Timeout = [TimeSpan]::FromSeconds(20)
 try {
-  $headers = @{ Accept = 'application/json'; Origin = $env:FANZA_ORIGIN; Referer = $env:FANZA_REFERER }
-  $response = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 20 -Method Post -Uri $env:FANZA_URL -ContentType 'application/json' -Headers $headers -Body $env:FANZA_BODY
-  [Console]::Out.Write($response.Content)
-  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + [int]$response.StatusCode)
+  $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $env:FANZA_URL)
+  $request.Content = [System.Net.Http.StringContent]::new($env:FANZA_BODY, [System.Text.Encoding]::UTF8, 'application/json')
+  $request.Headers.Accept.ParseAdd('application/json')
+  $request.Headers.Referrer = [Uri]$env:FANZA_REFERER
+  $request.Headers.TryAddWithoutValidation('Origin', $env:FANZA_ORIGIN) | Out-Null
+  $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+  $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+  $memory = [System.IO.MemoryStream]::new()
+  $buffer = [byte[]]::new(65536)
+  $tooLarge = $false
+  while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+    if ($memory.Length + $read -gt 4194304) { $tooLarge = $true; break }
+    $memory.Write($buffer, 0, $read)
+  }
+  $output = [Console]::OpenStandardOutput()
+  if (-not $tooLarge) {
+    $responseBytes = $memory.ToArray()
+    $output.Write($responseBytes, 0, $responseBytes.Length)
+  }
+  $status = if ($tooLarge) { 413 } else { [int]$response.StatusCode }
+  $marker = [System.Text.Encoding]::UTF8.GetBytes("`nAUTO_VIDEO_HTTP_STATUS:" + $status)
+  $output.Write($marker, 0, $marker.Length)
 } catch {
-  $status = if ($null -eq $_.Exception.Response) { 0 } else { [int]$_.Exception.Response.StatusCode }
-  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + $status)
+  [Environment]::Exit(28)
+} finally {
+  $client.Dispose()
+  $handler.Dispose()
 }"#;
 #[cfg(any(test, target_os = "windows"))]
 const WINDOWS_FANZA_IMAGE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Net.Http
+$handler = [System.Net.Http.HttpClientHandler]::new()
+$handler.AllowAutoRedirect = $false
+$client = [System.Net.Http.HttpClient]::new($handler)
+$client.Timeout = [TimeSpan]::FromSeconds(20)
 try {
-  $response = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 20 -Uri $env:FANZA_IMAGE -Headers @{ Referer = $env:FANZA_REFERER }
+  $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $env:FANZA_IMAGE)
+  $request.Headers.Referrer = [Uri]$env:FANZA_REFERER
+  $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+  $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
   $memory = [System.IO.MemoryStream]::new()
   $buffer = [byte[]]::new(65536)
   $tooLarge = $false
-  while (($read = $response.RawContentStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+  while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
     if ($memory.Length + $read -gt 16777216) { $tooLarge = $true; break }
     $memory.Write($buffer, 0, $read)
   }
@@ -55,8 +88,10 @@ try {
     [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + [int]$response.StatusCode)
   }
 } catch {
-  $status = if ($null -eq $_.Exception.Response) { 0 } else { [int]$_.Exception.Response.StatusCode }
-  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + $status)
+  [Environment]::Exit(28)
+} finally {
+  $client.Dispose()
+  $handler.Dispose()
 }"#;
 
 pub(crate) const ADULT_FANZA_MALFORMED: &str = "adult_fanza_malformed_provider";
@@ -184,6 +219,7 @@ struct CatalogAuthority {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PreviewAuthority {
     generation: u64,
+    detail_generation: u64,
     catalog_context_generation: u64,
     catalog_request_generation: u64,
     provider_item_id: String,
@@ -233,24 +269,6 @@ fn valid_item_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-fn canonical_code(value: &str) -> Option<String> {
-    let (prefix, number) = value.split_once('-')?;
-    if !(2..=16).contains(&prefix.len())
-        || !prefix
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-        || prefix.bytes().all(|byte| byte.is_ascii_digit())
-        || number.is_empty()
-        || number.len() > 10
-        || number.starts_with('0')
-        || !number.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    number.parse::<u64>().ok().filter(|number| *number > 0)?;
-    Some(value.to_owned())
-}
-
 fn code_from_content_id(value: &str) -> Option<String> {
     if !valid_item_id(value) {
         return None;
@@ -289,11 +307,16 @@ fn code_from_content_id(value: &str) -> Option<String> {
     if !(2..=16).contains(&prefix.len())
         || !prefix.bytes().all(|byte| byte.is_ascii_alphanumeric())
         || prefix.bytes().all(|byte| byte.is_ascii_digit())
+        || !prefix
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphabetic)
     {
         return None;
     }
     let number = content_id[number_start..].parse::<u64>().ok()?;
-    (number > 0).then(|| format!("{}-{number}", prefix.to_ascii_uppercase()))
+    let code = (number > 0).then(|| format!("{}-{number}", prefix.to_ascii_uppercase()))?;
+    crate::is_canonical_product_code(&code).then_some(code)
 }
 
 fn optional_text(
@@ -376,7 +399,11 @@ fn parsed_root(
     Ok(root)
 }
 
-fn parse_catalog_document(document: &str, feed: &str) -> Result<Vec<CatalogItem>, DocumentError> {
+fn parse_catalog_document(
+    document: &str,
+    feed: &str,
+    maximum: usize,
+) -> Result<Vec<CatalogItem>, DocumentError> {
     let root = parsed_root(document)?;
     let Some(JsonValue::Object(data)) = root.get("data") else {
         return Err(DocumentError::Malformed);
@@ -385,21 +412,25 @@ fn parse_catalog_document(document: &str, feed: &str) -> Result<Vec<CatalogItem>
         let Some(JsonValue::Object(search)) = data.get("legacySearchPPV") else {
             return Err(DocumentError::Malformed);
         };
-        let Some(JsonValue::Object(result)) = search.get("result") else {
-            return Err(DocumentError::Malformed);
+        let result = match search.get("result") {
+            Some(JsonValue::Object(result)) => result,
+            Some(JsonValue::Null) | None => return Ok(Vec::new()),
+            _ => return Err(DocumentError::Malformed),
         };
-        let Some(JsonValue::Array(contents)) = result.get("contents") else {
-            return Err(DocumentError::Malformed);
-        };
-        contents
+        match result.get("contents") {
+            Some(JsonValue::Array(contents)) => contents,
+            Some(JsonValue::Null) | None => return Ok(Vec::new()),
+            _ => return Err(DocumentError::Malformed),
+        }
     } else {
         let Some(JsonValue::Object(ranking)) = data.get("ppvContentRanking") else {
             return Err(DocumentError::Malformed);
         };
-        let Some(JsonValue::Array(items)) = ranking.get("items") else {
-            return Err(DocumentError::Malformed);
-        };
-        items
+        match ranking.get("items") {
+            Some(JsonValue::Array(items)) => items,
+            Some(JsonValue::Null) | None => return Ok(Vec::new()),
+            _ => return Err(DocumentError::Malformed),
+        }
     };
     let mut items = Vec::new();
     let mut identities = HashMap::<String, CatalogItem>::new();
@@ -407,10 +438,13 @@ fn parse_catalog_document(document: &str, feed: &str) -> Result<Vec<CatalogItem>
         let content = if matches!(feed, "popular" | "newest" | "top-rated") {
             value
         } else {
-            match value {
-                JsonValue::Object(item) => item.get("content").unwrap_or(value),
-                _ => value,
-            }
+            let JsonValue::Object(item) = value else {
+                continue;
+            };
+            let Some(content) = item.get("content") else {
+                continue;
+            };
+            content
         };
         let Some(item) = parse_content(content) else {
             continue;
@@ -422,7 +456,9 @@ fn parse_catalog_document(document: &str, feed: &str) -> Result<Vec<CatalogItem>
             continue;
         }
         identities.insert(item.provider_item_id.clone(), item.clone());
-        items.push(item);
+        if items.len() < maximum {
+            items.push(item);
+        }
     }
     Ok(items)
 }
@@ -487,6 +523,14 @@ fn set_preview(context: &mut CatalogContext, category: Category, value: Option<P
     }
 }
 
+fn clear_preview_generation(state: &FanzaCatalogState, category: Category, generation: u64) {
+    if let Ok(mut context) = state.0.lock() {
+        if preview(&context, category).is_some_and(|value| value.generation == generation) {
+            set_preview(&mut context, category, None);
+        }
+    }
+}
+
 fn detail_authority(context: &CatalogContext, category: Category) -> Option<&DetailAuthority> {
     match category {
         Category::Adult => context.adult_detail.as_ref(),
@@ -515,8 +559,7 @@ fn parsed_item_request(request: &FanzaItemRequest) -> Result<(Category, u64, u64
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| category.stale())?;
-    if !valid_item_id(&request.provider_item_id)
-        || canonical_code(&request.code).as_deref() != Some(&request.code)
+    if !valid_item_id(&request.provider_item_id) || !crate::is_canonical_product_code(&request.code)
     {
         return Err(category.stale());
     }
@@ -588,11 +631,12 @@ pub(crate) fn fetch_catalog_with(
     };
     let document = fetch(&graphql_body(category, &request.feed, request.count))
         .map_err(|error| category.provider_error(error))?;
-    let items = parse_catalog_document(&document, &request.feed).map_err(|error| match error {
-        DocumentError::Malformed => category.malformed(),
-        DocumentError::Provider => category.provider_error(ProviderRequestError::Provider),
-        DocumentError::Conflicting => category.conflicting(),
-    })?;
+    let items = parse_catalog_document(&document, &request.feed, usize::from(request.count))
+        .map_err(|error| match error {
+            DocumentError::Malformed => category.malformed(),
+            DocumentError::Provider => category.provider_error(ProviderRequestError::Provider),
+            DocumentError::Conflicting => category.conflicting(),
+        })?;
     let mut context = state.0.lock().map_err(|_| category.stale())?;
     let current = match category {
         Category::Adult => context.adult.as_mut(),
@@ -720,6 +764,11 @@ pub(crate) fn invalidate_detail(
     let mut context = state.0.lock().map_err(|_| category.stale())?;
     if detail_authority(&context, category).is_some_and(|detail| detail.generation == generation) {
         set_detail(&mut context, category, None);
+        if preview(&context, category)
+            .is_some_and(|preview| preview.detail_generation == generation)
+        {
+            set_preview(&mut context, category, None);
+        }
     }
     Ok(())
 }
@@ -738,8 +787,10 @@ fn parse_preview_document(
     let Some(JsonValue::Object(data)) = root.get("data") else {
         return Err(DocumentError::Malformed);
     };
-    let Some(JsonValue::Object(content)) = data.get("ppvContent") else {
-        return Err(DocumentError::Malformed);
+    let content = match data.get("ppvContent") {
+        Some(JsonValue::Object(content)) => content,
+        Some(JsonValue::Null) => return Ok(Vec::new()),
+        _ => return Err(DocumentError::Malformed),
     };
     if optional_text(content, "id").as_deref() != Some(provider_item_id) {
         return Err(DocumentError::Conflicting);
@@ -770,12 +821,27 @@ fn parse_preview_document(
 pub(crate) fn fetch_preview_with(
     state: &FanzaCatalogState,
     request: &FanzaItemRequest,
+    detail_generation: &str,
     fetch: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
 ) -> Result<Vec<String>, &'static str> {
     let (category, context_generation, request_generation) = parsed_item_request(request)?;
+    let detail_generation = detail_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| category.stale())?;
     let generation = {
         let mut context = state.0.lock().map_err(|_| category.stale())?;
         if find_item(&context, category, request).is_none() {
+            return Err(category.stale());
+        }
+        if !detail_authority(&context, category).is_some_and(|detail| {
+            detail.generation == detail_generation
+                && detail.catalog_context_generation == context_generation
+                && detail.catalog_request_generation == request_generation
+                && detail.provider_item_id == request.provider_item_id
+                && detail.code == request.code
+        }) {
             return Err(category.stale());
         }
         context.preview_generation = context
@@ -788,6 +854,7 @@ pub(crate) fn fetch_preview_with(
             category,
             Some(PreviewAuthority {
                 generation,
+                detail_generation,
                 catalog_context_generation: context_generation,
                 catalog_request_generation: request_generation,
                 provider_item_id: request.provider_item_id.clone(),
@@ -797,18 +864,40 @@ pub(crate) fn fetch_preview_with(
         );
         generation
     };
-    let document = fetch(&preview_body(&request.provider_item_id))
-        .map_err(|error| category.provider_error(error))?;
-    let urls =
-        parse_preview_document(&document, &request.provider_item_id).map_err(
-            |error| match error {
+    let document = match fetch(&preview_body(&request.provider_item_id)) {
+        Ok(document) => document,
+        Err(error) => {
+            clear_preview_generation(state, category, generation);
+            return Err(category.provider_error(error));
+        }
+    };
+    let urls = match parse_preview_document(&document, &request.provider_item_id) {
+        Ok(urls) => urls,
+        Err(error) => {
+            clear_preview_generation(state, category, generation);
+            return Err(match error {
                 DocumentError::Malformed => category.malformed(),
                 DocumentError::Provider => category.provider_error(ProviderRequestError::Provider),
                 DocumentError::Conflicting => category.conflicting(),
-            },
-        )?;
+            });
+        }
+    };
     let mut context = state.0.lock().map_err(|_| category.stale())?;
-    if find_item(&context, category, request).is_none() {
+    let current_attempt =
+        preview(&context, category).is_some_and(|value| value.generation == generation);
+    if !current_attempt {
+        return Err(category.stale());
+    }
+    let item_is_current = find_item(&context, category, request).is_some();
+    let detail_is_current = detail_authority(&context, category).is_some_and(|detail| {
+        detail.generation == detail_generation
+            && detail.catalog_context_generation == context_generation
+            && detail.catalog_request_generation == request_generation
+            && detail.provider_item_id == request.provider_item_id
+            && detail.code == request.code
+    });
+    if !item_is_current || !detail_is_current {
+        set_preview(&mut context, category, None);
         return Err(category.stale());
     }
     let current = match category {
@@ -962,6 +1051,27 @@ fn parse_text_response(output: &[u8], maximum: usize) -> Result<Vec<u8>, Provide
     }
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn parse_process_text_response(
+    output: &[u8],
+    maximum: usize,
+    process_succeeded: bool,
+) -> Result<Vec<u8>, ProviderRequestError> {
+    if !process_succeeded {
+        return Err(ProviderRequestError::Network);
+    }
+    parse_text_response(output, maximum)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_process_error(exit_code: Option<i32>) -> ProviderRequestError {
+    if exit_code == Some(63) {
+        ProviderRequestError::Provider
+    } else {
+        ProviderRequestError::Network
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn fetch_graphql_document(body: &str) -> Result<String, ProviderRequestError> {
     let output = Command::new("/usr/bin/curl")
@@ -974,6 +1084,8 @@ pub(crate) fn fetch_graphql_document(body: &str) -> Result<String, ProviderReque
             "20",
             "--max-redirs",
             "0",
+            "--max-filesize",
+            &FANZA_RESPONSE_MAX_BYTES.to_string(),
             "--request",
             "POST",
             "--header",
@@ -993,7 +1105,7 @@ pub(crate) fn fetch_graphql_document(body: &str) -> Result<String, ProviderReque
         .output()
         .map_err(|_| ProviderRequestError::Network)?;
     if !output.status.success() {
-        return Err(ProviderRequestError::Network);
+        return Err(macos_process_error(output.status.code()));
     }
     String::from_utf8(parse_text_response(
         &output.stdout,
@@ -1013,9 +1125,10 @@ pub(crate) fn fetch_graphql_document(body: &str) -> Result<String, ProviderReque
         .env("FANZA_BODY", body)
         .output()
         .map_err(|_| ProviderRequestError::Network)?;
-    String::from_utf8(parse_text_response(
+    String::from_utf8(parse_process_text_response(
         &output.stdout,
         FANZA_RESPONSE_MAX_BYTES,
+        output.status.success(),
     )?)
     .map_err(|_| ProviderRequestError::Provider)
 }
@@ -1040,6 +1153,8 @@ pub(crate) fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, ProviderRequestErr
             "20",
             "--max-redirs",
             "0",
+            "--max-filesize",
+            &FANZA_IMAGE_MAX_BYTES.to_string(),
             "--header",
             &format!("Referer: {FANZA_REFERER}"),
             "--write-out",
@@ -1049,7 +1164,7 @@ pub(crate) fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, ProviderRequestErr
         .output()
         .map_err(|_| ProviderRequestError::Network)?;
     if !output.status.success() {
-        return Err(ProviderRequestError::Network);
+        return Err(macos_process_error(output.status.code()));
     }
     parse_text_response(&output.stdout, FANZA_IMAGE_MAX_BYTES)
 }
@@ -1066,17 +1181,30 @@ pub(crate) fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, ProviderRequestErr
         .env("FANZA_REFERER", FANZA_REFERER)
         .output()
         .map_err(|_| ProviderRequestError::Network)?;
-    parse_windows_image_response(&output.stdout)
+    parse_windows_image_response(&output.stdout, output.status.success())
 }
 
 #[cfg(any(test, target_os = "windows"))]
-fn parse_windows_image_response(output: &[u8]) -> Result<Vec<u8>, ProviderRequestError> {
-    let encoded = parse_text_response(output, FANZA_IMAGE_MAX_BYTES * 2)?;
+fn parse_windows_image_response(
+    output: &[u8],
+    process_succeeded: bool,
+) -> Result<Vec<u8>, ProviderRequestError> {
+    parse_windows_image_response_with_limit(output, FANZA_IMAGE_MAX_BYTES, process_succeeded)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn parse_windows_image_response_with_limit(
+    output: &[u8],
+    maximum: usize,
+    process_succeeded: bool,
+) -> Result<Vec<u8>, ProviderRequestError> {
+    let encoded_maximum = maximum.div_ceil(3) * 4;
+    let encoded = parse_process_text_response(output, encoded_maximum, process_succeeded)?;
     let bytes = crate::javdb_catalog::decode_base64(
         std::str::from_utf8(&encoded).map_err(|_| ProviderRequestError::Provider)?,
     )
     .ok_or(ProviderRequestError::Provider)?;
-    if bytes.len() > FANZA_IMAGE_MAX_BYTES {
+    if bytes.len() > maximum {
         return Err(ProviderRequestError::Provider);
     }
     Ok(bytes)
@@ -1101,6 +1229,34 @@ mod tests {
         } else {
             format!(r#"{{"data":{{"ppvContentRanking":{{"items":[{contents}]}}}}}}"#)
         }
+    }
+
+    fn current_vr_item_with_detail(state: &FanzaCatalogState) -> (FanzaItemRequest, String) {
+        let response = fetch_catalog_with(
+            state,
+            &FanzaCatalogRequest {
+                category: "vr".into(),
+                context_generation: "1".into(),
+                feed: "popular".into(),
+                count: 10,
+            },
+            |_| {
+                Ok(catalog_document(
+                    "popular",
+                    r#"{"id":"vrkm01577","title":"First"}"#,
+                ))
+            },
+        )
+        .unwrap();
+        let item = FanzaItemRequest {
+            category: "vr".into(),
+            context_generation: "1".into(),
+            request_generation: response[0].clone(),
+            provider_item_id: "vrkm01577".into(),
+            code: "VRKM-1577".into(),
+        };
+        let detail_generation = detail(state, &item).unwrap()[0].clone();
+        (item, detail_generation)
     }
 
     #[test]
@@ -1163,14 +1319,17 @@ mod tests {
             assert!(script.contains("$ErrorActionPreference = 'Stop'"));
             assert!(script.contains("$ProgressPreference = 'SilentlyContinue'"));
             assert!(script.contains("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8"));
-            assert!(script.contains("[Console]::Out.Write(\"`nAUTO_VIDEO_HTTP_STATUS:"));
+            assert!(script.contains("ResponseHeadersRead"));
+            assert!(script.contains("AllowAutoRedirect = $false"));
+            assert!(script.contains("Timeout = [TimeSpan]::FromSeconds(20)"));
+            assert!(script.contains("ReadAsStreamAsync"));
             assert!(!script.contains("Write('`nAUTO_VIDEO_HTTP_STATUS:"));
-            assert!(script.contains("-MaximumRedirection 0"));
-            assert!(script.contains("-TimeoutSec 20"));
         }
-        assert!(WINDOWS_FANZA_GRAPHQL_SCRIPT.contains("Origin = $env:FANZA_ORIGIN"));
-        assert!(WINDOWS_FANZA_GRAPHQL_SCRIPT.contains("Referer = $env:FANZA_REFERER"));
-        assert!(WINDOWS_FANZA_IMAGE_SCRIPT.contains("$response.RawContentStream.Read"));
+        assert!(WINDOWS_FANZA_GRAPHQL_SCRIPT.contains("'Origin', $env:FANZA_ORIGIN"));
+        assert!(WINDOWS_FANZA_GRAPHQL_SCRIPT.contains("Referrer = [Uri]$env:FANZA_REFERER"));
+        assert!(WINDOWS_FANZA_GRAPHQL_SCRIPT.contains("-gt 4194304"));
+        assert!(WINDOWS_FANZA_GRAPHQL_SCRIPT.contains("GetBytes(\"`nAUTO_VIDEO_HTTP_STATUS:"));
+        assert!(WINDOWS_FANZA_IMAGE_SCRIPT.contains("$stream.Read"));
         assert!(WINDOWS_FANZA_IMAGE_SCRIPT.contains("[System.IO.MemoryStream]::new()"));
         assert!(WINDOWS_FANZA_IMAGE_SCRIPT.contains("-gt 16777216"));
         assert!(WINDOWS_FANZA_IMAGE_SCRIPT.contains("[Convert]::ToBase64String($memory.ToArray())"));
@@ -1205,11 +1364,59 @@ mod tests {
             Err(ProviderRequestError::Provider)
         );
         assert_eq!(
-            parse_windows_image_response(b"AP8QgA==\nAUTO_VIDEO_HTTP_STATUS:200"),
+            parse_windows_image_response(b"AP8QgA==\nAUTO_VIDEO_HTTP_STATUS:200", true),
             Ok(vec![0x00, 0xff, 0x10, 0x80])
         );
         assert_eq!(
-            parse_windows_image_response(b"AP8QgA==\nAUTO_VIDEO_HTTP_STATUS:413"),
+            parse_windows_image_response(b"AP8QgA==\nAUTO_VIDEO_HTTP_STATUS:413", true),
+            Err(ProviderRequestError::Provider)
+        );
+        assert_eq!(
+            parse_process_text_response(
+                b"body\nAUTO_VIDEO_HTTP_STATUS:200",
+                FANZA_RESPONSE_MAX_BYTES,
+                false,
+            ),
+            Err(ProviderRequestError::Network)
+        );
+        assert_eq!(
+            parse_windows_image_response(b"AP8QgA==\nAUTO_VIDEO_HTTP_STATUS:200", false,),
+            Err(ProviderRequestError::Network)
+        );
+        assert_eq!(
+            macos_process_error(Some(63)),
+            ProviderRequestError::Provider
+        );
+        assert_eq!(macos_process_error(Some(28)), ProviderRequestError::Network);
+        assert_eq!(
+            parse_windows_image_response_with_limit(
+                b"AP8QgA==\nAUTO_VIDEO_HTTP_STATUS:200",
+                4,
+                true,
+            ),
+            Ok(vec![0x00, 0xff, 0x10, 0x80])
+        );
+        assert_eq!(
+            parse_windows_image_response_with_limit(
+                b"AP8QgA==\nAUTO_VIDEO_HTTP_STATUS:200",
+                3,
+                true,
+            ),
+            Err(ProviderRequestError::Provider)
+        );
+
+        let mut exact = vec![b'x'; FANZA_RESPONSE_MAX_BYTES];
+        exact.extend_from_slice(b"\nAUTO_VIDEO_HTTP_STATUS:200");
+        assert_eq!(
+            parse_process_text_response(&exact, FANZA_RESPONSE_MAX_BYTES, true)
+                .unwrap()
+                .len(),
+            FANZA_RESPONSE_MAX_BYTES
+        );
+        let mut over = vec![b'x'; FANZA_RESPONSE_MAX_BYTES + 1];
+        over.extend_from_slice(b"\nAUTO_VIDEO_HTTP_STATUS:200");
+        assert_eq!(
+            parse_process_text_response(&over, FANZA_RESPONSE_MAX_BYTES, true),
             Err(ProviderRequestError::Provider)
         );
     }
@@ -1219,7 +1426,7 @@ mod tests {
         let valid = r#"{"id":"vrkm01577","title":"First","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/path/pl.jpg"}}"#;
         let invalid = r#"{"id":"BAD-ID","title":"Bad"}"#;
         let document = catalog_document("popular", &format!("{valid},{invalid}"));
-        let parsed = parse_catalog_document(&document, "popular").unwrap();
+        let parsed = parse_catalog_document(&document, "popular", usize::MAX).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].code, "VRKM-1577");
         assert_eq!(
@@ -1231,8 +1438,238 @@ mod tests {
             &format!("{valid},{{\"id\":\"vrkm01577\",\"title\":\"Different\"}}"),
         );
         assert_eq!(
-            parse_catalog_document(&conflict, "popular"),
+            parse_catalog_document(&conflict, "popular", usize::MAX),
             Err(DocumentError::Conflicting)
+        );
+    }
+
+    #[test]
+    fn preserves_provider_order_with_exact_ranking_rows_and_empty_collections() {
+        let first = r#"{"id":"vrkm01577","title":"First"}"#;
+        let second = r#"{"id":"ovvr616","title":"Second"}"#;
+        let ranking = catalog_document(
+            "trending",
+            &format!(
+                "{{\"content\":{first}}},{{\"id\":\"wrapper-is-not-content\"}},{{\"content\":{second}}}"
+            ),
+        );
+        let parsed = parse_catalog_document(&ranking, "trending", usize::MAX).unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|item| item.code.as_str())
+                .collect::<Vec<_>>(),
+            ["VRKM-1577", "OVVR-616"]
+        );
+
+        for (document, feed) in [
+            (r#"{"data":{"legacySearchPPV":{"result":null}}}"#, "popular"),
+            (
+                r#"{"data":{"legacySearchPPV":{"result":{"contents":null}}}}"#,
+                "popular",
+            ),
+            (r#"{"data":{"legacySearchPPV":{"result":{}}}}"#, "popular"),
+            (
+                r#"{"data":{"ppvContentRanking":{"items":null}}}"#,
+                "trending",
+            ),
+            (r#"{"data":{"ppvContentRanking":{}}}"#, "monthly"),
+        ] {
+            assert!(parse_catalog_document(document, feed, usize::MAX)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn native_catalog_retains_at_most_the_exact_requested_count() {
+        let contents = (1..=11)
+            .map(|number| format!(r#"{{"id":"ovvr{number}","title":"Item {number}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let state = FanzaCatalogState::default();
+        let response = fetch_catalog_with(
+            &state,
+            &FanzaCatalogRequest {
+                category: "vr".into(),
+                context_generation: "1".into(),
+                feed: "popular".into(),
+                count: 10,
+            },
+            |_| Ok(catalog_document("popular", &contents)),
+        )
+        .unwrap();
+
+        assert_eq!(response[1], "10");
+        assert_eq!(response.len(), 62);
+        assert_eq!(response[4], "OVVR-1");
+        assert_eq!(response[58], "OVVR-10");
+        assert!(!response.iter().any(|field| field == "OVVR-11"));
+
+        let conflicting_over_return = format!(
+            "{contents},{}",
+            r#"{"id":"ovvr1","title":"Conflicting over-return"}"#
+        );
+        assert_eq!(
+            parse_catalog_document(
+                &catalog_document("popular", &conflicting_over_return),
+                "popular",
+                10
+            ),
+            Err(DocumentError::Conflicting)
+        );
+    }
+
+    #[test]
+    fn exact_null_preview_content_is_no_preview() {
+        assert_eq!(
+            parse_preview_document(r#"{"data":{"ppvContent":null}}"#, "vrkm01577",),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn failed_preview_authority_cannot_dispatch_and_the_exact_item_can_retry() {
+        let state = FanzaCatalogState::default();
+        let (item, detail_generation) = current_vr_item_with_detail(&state);
+        assert_eq!(
+            fetch_preview_with(&state, &item, &detail_generation, |_| {
+                Err(ProviderRequestError::Network)
+            }),
+            Err(VR_NETWORK_ERROR)
+        );
+        let failed_image = FanzaImageRequest {
+            item: item.clone(),
+            preview_generation: Some("1".into()),
+            image_authority_id: "fanza-preview-1-1".into(),
+        };
+        let dispatched = std::cell::Cell::new(false);
+        assert_eq!(
+            fetch_image_with(&state, &failed_image, |_| {
+                dispatched.set(true);
+                Ok(raster_bytes())
+            }),
+            Err(VR_FANZA_STALE)
+        );
+        assert!(!dispatched.get());
+
+        let retry = fetch_preview_with(&state, &item, &detail_generation, |_| {
+            Ok(r#"{"data":{"ppvContent":{"id":"vrkm01577","sampleImages":[{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/preview/1.jpg"}]}}}"#.into())
+        })
+        .unwrap();
+        assert_eq!(retry[0], "2");
+        assert_eq!(
+            fetch_image_with(
+                &state,
+                &FanzaImageRequest {
+                    item,
+                    preview_generation: Some(retry[0].clone()),
+                    image_authority_id: retry[2].clone(),
+                },
+                |_| Ok(raster_bytes()),
+            ),
+            Ok(raster_bytes())
+        );
+    }
+
+    #[test]
+    fn provider_and_invalid_preview_failures_clear_their_exact_authority() {
+        for (document, expected) in [
+            ("", VR_PROVIDER_ERROR),
+            (r#"{"data":{}}"#, VR_FANZA_MALFORMED),
+            (
+                r#"{"data":{"ppvContent":{"id":"ovvr616","sampleImages":[]}}}"#,
+                VR_FANZA_CONFLICTING,
+            ),
+        ] {
+            let state = FanzaCatalogState::default();
+            let (item, detail_generation) = current_vr_item_with_detail(&state);
+            let result = if document.is_empty() {
+                fetch_preview_with(&state, &item, &detail_generation, |_| {
+                    Err(ProviderRequestError::Provider)
+                })
+            } else {
+                fetch_preview_with(&state, &item, &detail_generation, |_| {
+                    Ok(document.to_owned())
+                })
+            };
+            assert_eq!(result, Err(expected));
+            assert!(preview(&state.0.lock().unwrap(), Category::Vr).is_none());
+
+            let dispatched = std::cell::Cell::new(false);
+            assert_eq!(
+                fetch_image_with(
+                    &state,
+                    &FanzaImageRequest {
+                        item,
+                        preview_generation: Some("1".into()),
+                        image_authority_id: "fanza-preview-1-1".into(),
+                    },
+                    |_| {
+                        dispatched.set(true);
+                        Ok(raster_bytes())
+                    },
+                ),
+                Err(VR_FANZA_STALE)
+            );
+            assert!(!dispatched.get());
+        }
+    }
+
+    #[test]
+    fn close_and_context_change_clear_only_their_provisional_preview() {
+        let state = FanzaCatalogState::default();
+        let (item, detail_generation) = current_vr_item_with_detail(&state);
+        assert_eq!(
+            fetch_preview_with(&state, &item, &detail_generation, |_| {
+                invalidate_detail(&state, "vr", &detail_generation).unwrap();
+                Ok(r#"{"data":{"ppvContent":{"id":"vrkm01577","sampleImages":[]}}}"#.into())
+            }),
+            Err(VR_FANZA_STALE)
+        );
+        assert!(preview(&state.0.lock().unwrap(), Category::Vr).is_none());
+
+        let detail_generation = detail(&state, &item).unwrap()[0].clone();
+        assert_eq!(
+            fetch_preview_with(&state, &item, &detail_generation, |_| {
+                invalidate_catalog(&state, "vr", "2").unwrap();
+                Ok(r#"{"data":{"ppvContent":{"id":"vrkm01577","sampleImages":[]}}}"#.into())
+            }),
+            Err(VR_FANZA_STALE)
+        );
+        assert!(preview(&state.0.lock().unwrap(), Category::Vr).is_none());
+    }
+
+    #[test]
+    fn failed_older_preview_does_not_clear_a_newer_generation() {
+        let state = FanzaCatalogState::default();
+        let (item, detail_generation) = current_vr_item_with_detail(&state);
+        let newer = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            fetch_preview_with(&state, &item, &detail_generation, |_| {
+                newer.replace(
+                    fetch_preview_with(&state, &item, &detail_generation, |_| {
+                        Ok(r#"{"data":{"ppvContent":{"id":"vrkm01577","sampleImages":[{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/preview/2.jpg"}]}}}"#.into())
+                    })
+                    .unwrap(),
+                );
+                Err(ProviderRequestError::Network)
+            }),
+            Err(VR_NETWORK_ERROR)
+        );
+        let newer = newer.into_inner();
+        assert_eq!(newer[0], "2");
+        assert_eq!(
+            fetch_image_with(
+                &state,
+                &FanzaImageRequest {
+                    item,
+                    preview_generation: Some(newer[0].clone()),
+                    image_authority_id: newer[2].clone(),
+                },
+                |_| Ok(raster_bytes()),
+            ),
+            Ok(raster_bytes())
         );
     }
 
@@ -1281,7 +1718,8 @@ mod tests {
             Err(VR_FANZA_STALE)
         );
         assert!(!dispatched.get());
-        let preview = fetch_preview_with(&state, &item, |_| Ok(r#"{"data":{"ppvContent":{"id":"vrkm01577","sampleImages":[{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/preview/1.jpg"},{"largeImageUrl":"https://evil.example/2.jpg"}]}}}"#.into())).unwrap();
+        let detail = detail(&state, &item).unwrap();
+        let preview = fetch_preview_with(&state, &item, &detail[0], |_| Ok(r#"{"data":{"ppvContent":{"id":"vrkm01577","sampleImages":[{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/preview/1.jpg"},{"largeImageUrl":"https://evil.example/2.jpg"}]}}}"#.into())).unwrap();
         assert_eq!(preview.len(), 3);
         let preview_request = FanzaImageRequest {
             item,
