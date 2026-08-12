@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod adult_library;
+mod fanza_catalog;
 mod javdb_catalog;
 mod library_scan;
 mod tv_library;
@@ -29,6 +30,12 @@ use adult_library::{
     set_adult_folder, trash_adult_file_with, AdultLibraryState, ADULT_FILE_OPEN_FAILED,
     ADULT_FILE_REVEAL_FAILED, ADULT_FILE_TRASH_FAILED, ADULT_FOLDER_STORAGE_FAILED,
     ADULT_FOLDER_UNAVAILABLE, ADULT_LIBRARY_SCAN_FAILED,
+};
+use fanza_catalog::{
+    fetch_catalog_with as fetch_fanza_catalog_with, fetch_cover_bytes as fetch_fanza_cover_bytes,
+    fetch_cover_with as fetch_fanza_cover_with,
+    fetch_graphql_document as fetch_fanza_graphql_document,
+    invalidate_catalog as invalidate_fanza_catalog_with, FanzaCatalogRequest, FanzaCatalogState,
 };
 use javdb_catalog::{
     fetch_api_document as fetch_javdb_api_document, fetch_catalog_with as fetch_javdb_catalog_with,
@@ -3270,6 +3277,78 @@ async fn fetch_javdb_catalog(
 }
 
 #[tauri::command]
+async fn fetch_fanza_catalog(
+    category: String,
+    context_generation: String,
+    feed: String,
+    count: u16,
+    state: tauri::State<'_, FanzaCatalogState>,
+) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    let request = FanzaCatalogRequest {
+        category,
+        context_generation,
+        feed,
+        count,
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_fanza_catalog_with(&state, &request, fetch_fanza_graphql_document)
+            .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
+fn invalidate_fanza_catalog(
+    category: String,
+    context_generation: String,
+    state: tauri::State<'_, FanzaCatalogState>,
+) -> Result<(), String> {
+    invalidate_fanza_catalog_with(state.inner(), &category, &context_generation)
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn fetch_fanza_cover(
+    category: String,
+    context_generation: String,
+    request_generation: String,
+    content_id: String,
+    display_code: String,
+    cover_authority_id: String,
+    state: tauri::State<'_, FanzaCatalogState>,
+) -> Result<Vec<u8>, String> {
+    let state = state.inner().clone();
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_fanza_cover_with(
+            &state,
+            &category,
+            &context_generation,
+            &request_generation,
+            &content_id,
+            &display_code,
+            &cover_authority_id,
+            fetch_fanza_cover_bytes,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
 fn invalidate_javdb_catalog(
     category: String,
     context_generation: String,
@@ -4144,6 +4223,7 @@ fn main() {
         .manage(MovieTorrentState::default())
         .manage(AdultLibraryState::default())
         .manage(AdultTorrentState::default())
+        .manage(FanzaCatalogState::default())
         .manage(JavdbCatalogState::default())
         .manage(TvLibraryState::default())
         .manage(TvReleaseState::default())
@@ -4215,6 +4295,9 @@ fn main() {
             dismiss_vr_organization,
             fetch_javdb_vr_catalog,
             fetch_javdb_adult_catalog,
+            fetch_fanza_catalog,
+            invalidate_fanza_catalog,
+            fetch_fanza_cover,
             fetch_javdb_catalog,
             invalidate_javdb_catalog,
             fetch_javdb_cover,
