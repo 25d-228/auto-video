@@ -516,6 +516,31 @@ describe("native-owned JavDB details and preview boundary", () => {
     }
   });
 
+  it("invalidates the exact native generation after renderer response validation fails", async () => {
+    invokeMock
+      .mockResolvedValueOnce(
+        response.map((value, index) =>
+          index === 4 ? "AnotherProviderItem" : value,
+        ),
+      )
+      .mockResolvedValueOnce(undefined);
+
+    await expect(fetchJavdbDetail(item)).resolves.toEqual({
+      status: "malformed-provider",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "fetch_javdb_detail", {
+      category: "vr",
+      contextGeneration: "3",
+      requestGeneration: "7",
+      providerItemId: "VrA",
+      code: "MDVR-419",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "invalidate_javdb_detail", {
+      category: "vr",
+      detailGeneration: "11",
+    });
+  });
+
   it("fetches and invalidates only opaque exact detail image authority", async () => {
     const parsed = parseJavdbDetailResponse(response, item);
     expect(parsed.status).toBe("ready");

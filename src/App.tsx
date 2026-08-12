@@ -2331,17 +2331,15 @@ function DiscoverJavdbBrowseCard({
       className="javdb-browse-card"
       data-cover-ratio={coverRatio}
       data-narrow-cover={coverRatio < 0.9}
-      id={detailsTriggerId}
-      onClick={() => onDetails(item, detailsTriggerId)}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          onDetails(item, detailsTriggerId);
-        }
-      }}
       style={{ width: `${Math.round(javdbCoverHeight * coverRatio)}px` }}
-      tabIndex={0}
     >
+      <button
+        aria-label={`View details: ${item.code}`}
+        className="javdb-browse-card__details-control"
+        id={detailsTriggerId}
+        onClick={() => onDetails(item, detailsTriggerId)}
+        type="button"
+      />
       <div className="javdb-browse-card__cover">
         <JavdbCover
           item={item}

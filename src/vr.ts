@@ -905,7 +905,20 @@ export async function fetchJavdbDetail(
       "fetch_javdb_detail",
       javdbItemAuthority(item),
     );
-    return parseJavdbDetailResponse(response, item);
+    const result = parseJavdbDetailResponse(response, item);
+    if (
+      result.status === "malformed-provider" &&
+      Array.isArray(response) &&
+      typeof response[0] === "string" &&
+      unsignedU64Pattern.test(response[0]) &&
+      BigInt(response[0]) > 0n &&
+      BigInt(response[0]) <= maximumU64
+    ) {
+      await invalidateJavdbDetailGeneration(item.category, response[0]).catch(
+        () => undefined,
+      );
+    }
+    return result;
   } catch (error: unknown) {
     return { status: javdbDetailErrorStatus(item.category, error) };
   }
@@ -961,9 +974,19 @@ export async function fetchJavdbDetailImageObjectUrl(
 }
 
 export async function invalidateJavdbDetail(detail: JavdbDetail) {
+  await invalidateJavdbDetailGeneration(
+    detail.category,
+    detail.detailGeneration,
+  );
+}
+
+async function invalidateJavdbDetailGeneration(
+  category: JavdbBrowseCategory,
+  detailGeneration: string,
+) {
   await window.__TAURI__.core.invoke("invalidate_javdb_detail", {
-    category: detail.category,
-    detailGeneration: detail.detailGeneration,
+    category,
+    detailGeneration,
   });
 }
 

@@ -347,6 +347,10 @@ fn preview_urls(movie: &BTreeMap<String, JsonValue>) -> Vec<String> {
     urls
 }
 
+fn valid_detail_tag_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|character| character.is_ascii_digit())
+}
+
 fn parse_detail(
     document: &str,
     category: CatalogCategory,
@@ -384,24 +388,43 @@ fn parse_detail(
         return Err(CatalogDocumentError::Conflicting);
     }
 
+    let Some(JsonValue::Array(tags)) = movie.get("tags") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
     let mut valid_tag_ids = Vec::new();
-    if let Some(JsonValue::Array(tags)) = movie.get("tags") {
-        for tag in tags {
-            let JsonValue::Object(tag) = tag else {
-                continue;
-            };
-            if let Some(JsonValue::String(tag_id)) = tag.get("id") {
-                if !tag_id.is_empty() && !valid_tag_ids.contains(tag_id) {
-                    valid_tag_ids.push(tag_id.clone());
-                }
+    let mut valid_tag_names = Vec::new();
+    for tag in tags {
+        let JsonValue::Object(tag) = tag else {
+            continue;
+        };
+        let Some(JsonValue::String(tag_id)) = tag.get("id") else {
+            continue;
+        };
+        if !valid_detail_tag_id(tag_id) {
+            continue;
+        }
+        if !valid_tag_ids.contains(tag_id) {
+            valid_tag_ids.push(tag_id.clone());
+        }
+        if let Some(name) = optional_text(tag, "name") {
+            if !valid_tag_names.contains(&name) {
+                valid_tag_names.push(name);
             }
         }
     }
+    if !tags.is_empty() && valid_tag_ids.is_empty() {
+        return Err(CatalogDocumentError::Malformed);
+    }
     let has_vr_tag = valid_tag_ids.iter().any(|tag_id| tag_id == "212");
-    if (category == CatalogCategory::Adult && has_vr_tag)
-        || (category == CatalogCategory::Vr && !valid_tag_ids.is_empty() && !has_vr_tag)
-    {
+    if category == CatalogCategory::Adult && has_vr_tag {
         return Err(CatalogDocumentError::Conflicting);
+    }
+    if category == CatalogCategory::Vr && !has_vr_tag {
+        return Err(if valid_tag_ids.is_empty() {
+            CatalogDocumentError::Malformed
+        } else {
+            CatalogDocumentError::Conflicting
+        });
     }
 
     Ok(ParsedDetail {
@@ -411,7 +434,7 @@ fn parse_detail(
         duration: optional_number_text(movie, "duration"),
         summary: optional_text(movie, "summary"),
         actors: optional_names(movie, "actors"),
-        tags: optional_names(movie, "tags"),
+        tags: valid_tag_names,
         cover_url: cover_url(movie),
         preview_urls: preview_urls(movie),
     })
@@ -1024,25 +1047,43 @@ fn finish_detail(
     Ok(response)
 }
 
+fn clear_detail_generation(
+    state: &JavdbCatalogState,
+    category: CatalogCategory,
+    generation: u64,
+) -> Result<(), &'static str> {
+    let mut context = state.0.lock().map_err(|_| category.stale_error())?;
+    if detail_authority(&context, category).is_some_and(|detail| detail.generation == generation) {
+        set_detail_authority(&mut context, category, None);
+    }
+    Ok(())
+}
+
 pub(crate) fn fetch_detail_with(
     state: &JavdbCatalogState,
     request: &JavdbDetailRequest,
     fetch: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
 ) -> Result<Vec<String>, &'static str> {
     let (category, generation) = begin_detail(state, request)?;
-    let url = format!(
-        "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
-        request.provider_item_id
-    );
-    let document = fetch(&url).map_err(|error| category.provider_error(error))?;
-    let detail = parse_detail(
-        &document,
-        category,
-        &request.provider_item_id,
-        &request.code,
-    )
-    .map_err(|error| parse_error(category, error))?;
-    finish_detail(state, request, category, generation, detail)
+    let result = (|| {
+        let url = format!(
+            "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
+            request.provider_item_id
+        );
+        let document = fetch(&url).map_err(|error| category.provider_error(error))?;
+        let detail = parse_detail(
+            &document,
+            category,
+            &request.provider_item_id,
+            &request.code,
+        )
+        .map_err(|error| parse_error(category, error))?;
+        finish_detail(state, request, category, generation, detail)
+    })();
+    if result.is_err() {
+        clear_detail_generation(state, category, generation)?;
+    }
+    result
 }
 
 fn authorized_detail_image_url(
@@ -1156,13 +1197,7 @@ pub(crate) fn invalidate_detail(
         .ok()
         .filter(|generation| *generation > 0)
         .ok_or_else(|| category.stale_error())?;
-    let mut context = state.0.lock().map_err(|_| category.stale_error())?;
-    if detail_authority(&context, category)
-        .is_some_and(|detail| detail.generation == detail_generation)
-    {
-        set_detail_authority(&mut context, category, None);
-    }
-    Ok(())
+    clear_detail_generation(state, category, detail_generation)
 }
 
 pub(crate) fn invalidate_catalog(
@@ -2121,15 +2156,15 @@ mod tests {
             assert!(response[11].starts_with("javdb-detail-cover-"));
             assert_eq!(response[12], "2");
             assert_eq!(&response[13..15], ["Actor A", "Actor B"]);
-            assert_eq!(response[15], "2");
-            assert_eq!(&response[16..18], ["Category", "Tag"]);
-            assert_eq!(response[18], "24");
-            assert_eq!(response.len(), 43);
-            assert!(response[19].starts_with("javdb-preview-"));
+            assert_eq!(response[15], "1");
+            assert_eq!(response[16], "Category");
+            assert_eq!(response[17], "24");
+            assert_eq!(response.len(), 42);
+            assert!(response[18].starts_with("javdb-preview-"));
 
             let image_dispatched = Cell::new(false);
             assert_eq!(
-                fetch_detail_image_with(&state, &request, &response[0], &response[19], |url| {
+                fetch_detail_image_with(&state, &request, &response[0], &response[18], |url| {
                     image_dispatched.set(true);
                     assert_eq!(url, "https://tp.rotating-0.com/0.jpg");
                     Ok(jpeg())
@@ -2152,35 +2187,241 @@ mod tests {
     }
 
     #[test]
-    fn exact_details_accept_missing_optional_fields_and_reject_conflicting_identity() {
+    fn exact_details_require_present_category_tags_and_keep_tag_names_optional() {
+        for (category, item_id, code, malformed_error) in [
+            ("adult", "AdultA", "ADLT-123", ADULT_JAVDB_MALFORMED),
+            ("vr", "VrA", "MDVR-419", VR_JAVDB_MALFORMED),
+        ] {
+            for tags in [
+                None,
+                Some("null"),
+                Some(r#"[null,{"name":"Presentation only"},{"id":null},{"id":" "}]"#),
+            ] {
+                let state = JavdbCatalogState::default();
+                let request = established_detail_request(&state, category, item_id, code);
+                let tags = tags
+                    .map(|tags| format!(r#","tags":{tags}"#))
+                    .unwrap_or_default();
+                let document = format!(
+                    r#"{{"success":1,"data":{{"movie":{{"id":"{item_id}","number":"{code}"{tags}}}}}}}"#
+                );
+                assert_eq!(
+                    fetch_detail_with(&state, &request, |_| Ok(document)),
+                    Err(malformed_error)
+                );
+            }
+        }
+
+        let vr_state = JavdbCatalogState::default();
+        let vr_request = established_detail_request(&vr_state, "vr", "VrA", "MDVR-419");
+        let empty_presentation = fetch_detail_with(&vr_state, &vr_request, |_| {
+            Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","title":null,"origin_title":null,"release_date":null,"duration":null,"summary":null,"actors":null,"tags":[{"id":"212"}],"cover_url":null,"preview_images":null}}}"#.to_owned())
+        })
+        .expect("optional presentation fields may remain absent or null");
+        assert_eq!(&empty_presentation[6..13], ["", "", "", "", "", "", "0"]);
+        assert_eq!(&empty_presentation[13..], ["0", "0"]);
+
+        let adult_state = JavdbCatalogState::default();
+        let adult_request = established_detail_request(&adult_state, "adult", "AdultA", "ADLT-123");
+        let empty_adult = fetch_detail_with(&adult_state, &adult_request, |_| {
+            Ok(
+                r#"{"success":1,"data":{"movie":{"id":"AdultA","number":"ADLT-123","tags":[]}}}"#
+                    .to_owned(),
+            )
+        })
+        .expect("an exact empty Adult tag collection proves that tag 212 is absent");
+        assert_eq!(&empty_adult[12..], ["0", "0", "0"]);
+
+        for (category, item_id, code, tags, expected_names) in [
+            (
+                "adult",
+                "AdultA",
+                "ADLT-123",
+                r#"[null,{"id":"28","name":"Adult"},{"name":"Optional"}]"#,
+                vec!["Adult"],
+            ),
+            (
+                "vr",
+                "VrA",
+                "MDVR-419",
+                r#"[false,{"id":"212"},{"name":"Optional"}]"#,
+                vec![],
+            ),
+        ] {
+            let state = JavdbCatalogState::default();
+            let request = established_detail_request(&state, category, item_id, code);
+            let document = format!(
+                r#"{{"success":1,"data":{{"movie":{{"id":"{item_id}","number":"{code}","tags":{tags}}}}}}}"#
+            );
+            let response = fetch_detail_with(&state, &request, |_| Ok(document))
+                .expect("malformed presentation tags must not hide valid category proof");
+            let tag_count = response[13].parse::<usize>().expect("tag count must parse");
+            assert_eq!(&response[14..14 + tag_count], expected_names);
+        }
+    }
+
+    #[test]
+    fn empty_and_opposite_tag_sets_cannot_establish_the_requested_category() {
+        for (category, item_id, code, tags, expected_error) in [
+            ("vr", "VrA", "MDVR-419", "[]", VR_JAVDB_MALFORMED),
+            (
+                "vr",
+                "VrA",
+                "MDVR-419",
+                r#"[{"id":"28"}]"#,
+                VR_JAVDB_CONFLICTING,
+            ),
+            (
+                "adult",
+                "AdultA",
+                "ADLT-123",
+                r#"[{"id":"212"}]"#,
+                ADULT_JAVDB_CONFLICTING,
+            ),
+        ] {
+            let state = JavdbCatalogState::default();
+            let request = established_detail_request(&state, category, item_id, code);
+            let document = format!(
+                r#"{{"success":1,"data":{{"movie":{{"id":"{item_id}","number":"{code}","tags":{tags}}}}}}}"#
+            );
+            assert_eq!(
+                fetch_detail_with(&state, &request, |_| Ok(document)),
+                Err(expected_error)
+            );
+        }
+
         let state = JavdbCatalogState::default();
         let request = established_detail_request(&state, "vr", "VrA", "MDVR-419");
-        let response = fetch_detail_with(&state, &request, |_| {
-            Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","title":null,"origin_title":null,"release_date":null,"duration":null,"summary":null,"actors":null,"tags":null,"cover_url":null,"preview_images":null}}}"#.to_owned())
-        })
-        .expect("optional fields may be absent or null");
-        assert_eq!(&response[6..13], ["", "", "", "", "", "", "0"]);
-        assert_eq!(&response[13..], ["0", "0"]);
-
         for document in [
-            r#"{"success":1,"data":{"movie":{"id":"VrB","number":"MDVR-419"}}}"#,
-            r#"{"success":1,"data":{"movie":{"id":"VrA","number":"ADLT-123"}}}"#,
-            r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"28"}]}}}"#,
+            r#"{"success":1,"data":{"movie":{"id":"VrB","number":"MDVR-419","tags":[{"id":"212"}]}}}"#,
+            r#"{"success":1,"data":{"movie":{"id":"VrA","number":"ADLT-123","tags":[{"id":"212"}]}}}"#,
         ] {
             assert_eq!(
                 fetch_detail_with(&state, &request, |_| Ok(document.to_owned())),
                 Err(VR_JAVDB_CONFLICTING)
             );
         }
+    }
 
-        let adult_state = JavdbCatalogState::default();
-        let adult_request = established_detail_request(&adult_state, "adult", "AdultA", "ADLT-123");
-        assert_eq!(
-            fetch_detail_with(&adult_state, &adult_request, |_| {
-                Ok(r#"{"success":1,"data":{"movie":{"id":"AdultA","number":"ADLT-123","tags":[{"id":"212"}]}}}"#.to_owned())
-            }),
-            Err(ADULT_JAVDB_CONFLICTING)
-        );
+    #[test]
+    fn failed_detail_attempts_clear_only_their_exact_provisional_authority() {
+        #[derive(Clone, Copy)]
+        enum Failure {
+            Network,
+            Provider,
+            Malformed,
+            Conflicting,
+        }
+
+        for (failure, expected_error) in [
+            (Failure::Network, VR_NETWORK_ERROR),
+            (Failure::Provider, VR_PROVIDER_ERROR),
+            (Failure::Malformed, VR_JAVDB_MALFORMED),
+            (Failure::Conflicting, VR_JAVDB_CONFLICTING),
+        ] {
+            let state = JavdbCatalogState::default();
+            let request = established_detail_request(&state, "vr", "VrA", "MDVR-419");
+            let provisional_generation = Cell::new(0);
+            let result = fetch_detail_with(&state, &request, |_| {
+                let generation = state
+                    .0
+                    .lock()
+                    .expect("detail state must lock")
+                    .vr_detail
+                    .as_ref()
+                    .expect("the provisional authority must exist")
+                    .generation;
+                provisional_generation.set(generation);
+                match failure {
+                    Failure::Network => Err(ProviderRequestError::Network),
+                    Failure::Provider => Ok(r#"{"success":0,"data":{}}"#.to_owned()),
+                    Failure::Malformed => Ok("{".to_owned()),
+                    Failure::Conflicting => Ok(r#"{"success":1,"data":{"movie":{"id":"VrB","number":"MDVR-419","tags":[{"id":"212"}]}}}"#.to_owned()),
+                }
+            });
+            assert_eq!(result, Err(expected_error));
+            assert!(state
+                .0
+                .lock()
+                .expect("detail state must lock")
+                .vr_detail
+                .is_none());
+
+            let source_dispatched = Cell::new(false);
+            assert!(open_detail_source_with(
+                &state,
+                &request,
+                &provisional_generation.get().to_string(),
+                |_| {
+                    source_dispatched.set(true);
+                    Ok(())
+                },
+            )
+            .is_err());
+            assert!(!source_dispatched.get());
+            let image_dispatched = Cell::new(false);
+            assert!(fetch_detail_image_with(
+                &state,
+                &request,
+                &provisional_generation.get().to_string(),
+                "javdb-preview-stale",
+                |_| {
+                    image_dispatched.set(true);
+                    Ok(jpeg())
+                },
+            )
+            .is_err());
+            assert!(!image_dispatched.get());
+
+            fetch_detail_with(&state, &request, |_| {
+                Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"212"}]}}}"#.to_owned())
+            })
+            .expect("the same exact current item must remain retryable");
+        }
+    }
+
+    #[test]
+    fn closing_during_failed_detail_attempts_keeps_stale_authority_revoked() {
+        for (document, expected_error) in [
+            (None, VR_NETWORK_ERROR),
+            (Some("{"), VR_JAVDB_MALFORMED),
+            (
+                Some(
+                    r#"{"success":1,"data":{"movie":{"id":"VrB","number":"MDVR-419","tags":[{"id":"212"}]}}}"#,
+                ),
+                VR_JAVDB_CONFLICTING,
+            ),
+        ] {
+            let state = JavdbCatalogState::default();
+            let request = established_detail_request(&state, "vr", "VrA", "MDVR-419");
+            let result = fetch_detail_with(&state, &request, |_| {
+                let generation = state
+                    .0
+                    .lock()
+                    .expect("detail state must lock")
+                    .vr_detail
+                    .as_ref()
+                    .expect("the provisional authority must exist")
+                    .generation;
+                invalidate_detail(&state, "vr", &generation.to_string())
+                    .expect("closing must invalidate the pending generation");
+                document
+                    .map(str::to_owned)
+                    .ok_or(ProviderRequestError::Network)
+            });
+            assert_eq!(result, Err(expected_error));
+            assert!(state
+                .0
+                .lock()
+                .expect("detail state must lock")
+                .vr_detail
+                .is_none());
+
+            fetch_detail_with(&state, &request, |_| {
+                Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"212"}]}}}"#.to_owned())
+            })
+            .expect("closing a failed attempt must not block an exact retry");
+        }
     }
 
     #[test]
@@ -2301,28 +2542,112 @@ mod tests {
     fn late_detail_and_image_results_cannot_replace_newer_authority() {
         let state = JavdbCatalogState::default();
         let first = established_detail_request(&state, "vr", "VrA", "MDVR-419");
+        let late_generation = Cell::new(0);
+        let current_response = RefCell::new(None);
         let late_result = fetch_detail_with(&state, &first, |_| {
+            late_generation.set(
+                state
+                    .0
+                    .lock()
+                    .expect("detail state must lock")
+                    .vr_detail
+                    .as_ref()
+                    .expect("the provisional authority must exist")
+                    .generation,
+            );
             let current = fetch_detail_with(&state, &first, |_| {
                 Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"212"}],"preview_images":[{"large_url":"https://tp.cmastd.com/current.jpg"}]}}}"#.to_owned())
             })
             .expect("newer detail must finish");
             assert_eq!(current[6], "");
+            current_response.replace(Some(current));
             Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"212"}],"title":"Late"}}}"#.to_owned())
         });
         assert_eq!(late_result, Err(VR_JAVDB_STALE));
 
-        let current = fetch_detail_with(&state, &first, |_| {
-            Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"212"}],"preview_images":[{"large_url":"https://tp.cmastd.com/current.jpg"}]}}}"#.to_owned())
-        })
-        .expect("current detail must finish");
+        let current = current_response
+            .into_inner()
+            .expect("the newer detail must remain current");
         let image = current
             .last()
             .expect("preview authority must be present")
             .clone();
+        let current_dispatched = Cell::new(false);
+        assert_eq!(
+            fetch_detail_image_with(&state, &first, &current[0], &image, |_| {
+                current_dispatched.set(true);
+                Ok(jpeg())
+            }),
+            Ok(jpeg())
+        );
+        assert!(current_dispatched.get());
+
+        let stale_source_dispatched = Cell::new(false);
+        assert!(open_detail_source_with(
+            &state,
+            &first,
+            &late_generation.get().to_string(),
+            |_| {
+                stale_source_dispatched.set(true);
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(!stale_source_dispatched.get());
+
         let result = fetch_detail_image_with(&state, &first, &current[0], &image, |_| {
             invalidate_detail(&state, "vr", &current[0]).expect("detail must invalidate");
             Ok(jpeg())
         });
         assert_eq!(result, Err(VR_JAVDB_STALE));
+    }
+
+    #[test]
+    fn context_change_during_detail_fetch_leaves_no_stale_authority() {
+        let state = JavdbCatalogState::default();
+        let request = established_detail_request(&state, "vr", "VrA", "MDVR-419");
+        let provisional_generation = Cell::new(0);
+        let result = fetch_detail_with(&state, &request, |_| {
+            provisional_generation.set(
+                state
+                    .0
+                    .lock()
+                    .expect("detail state must lock")
+                    .vr_detail
+                    .as_ref()
+                    .expect("the provisional authority must exist")
+                    .generation,
+            );
+            invalidate_catalog(&state, "vr", &request.context_generation)
+                .expect("the context change must invalidate its detail authority");
+            Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"212"}]}}}"#.to_owned())
+        });
+        assert_eq!(result, Err(VR_JAVDB_STALE));
+
+        let source_dispatched = Cell::new(false);
+        assert!(open_detail_source_with(
+            &state,
+            &request,
+            &provisional_generation.get().to_string(),
+            |_| {
+                source_dispatched.set(true);
+                Ok(())
+            },
+        )
+        .is_err());
+        assert!(!source_dispatched.get());
+        let image_dispatched = Cell::new(false);
+        assert!(fetch_detail_image_with(
+            &state,
+            &request,
+            &provisional_generation.get().to_string(),
+            "javdb-preview-stale",
+            |_| {
+                image_dispatched.set(true);
+                Ok(jpeg())
+            },
+        )
+        .is_err());
+        assert!(!image_dispatched.get());
     }
 }
