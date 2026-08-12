@@ -42,12 +42,40 @@ export type JavdbBrowseRequest = {
 
 export type JavdbBrowseItem = JavdbCatalogItem & {
   category: JavdbBrowseCategory;
+  contextGeneration: string;
   providerItemId: string;
   requestGeneration: string;
   releaseDate: string | null;
   coverAuthorityId: string | null;
   sourceAspectRatio: number;
 };
+
+export type JavdbDetail = {
+  category: JavdbBrowseCategory;
+  contextGeneration: string;
+  requestGeneration: string;
+  providerItemId: string;
+  code: string;
+  detailGeneration: string;
+  title: string | null;
+  originalTitle: string | null;
+  releaseDate: string | null;
+  duration: string | null;
+  summary: string | null;
+  actors: string[];
+  tags: string[];
+  coverAuthorityId: string | null;
+  previewAuthorityIds: string[];
+};
+
+export type JavdbDetailResult =
+  | { status: "ready"; detail: JavdbDetail }
+  | { status: "source-unavailable" }
+  | { status: "network-error" }
+  | { status: "malformed-provider" }
+  | { status: "conflicting-provider" }
+  | { status: "provider-error" }
+  | { status: "stale" };
 
 export type JavdbBrowseResult =
   | { status: "ready"; items: JavdbBrowseItem[] }
@@ -195,6 +223,10 @@ const javdbBaseUrl = "https://javdb.com";
 const javdbProviderItemPattern = /^[A-Za-z0-9]{1,64}$/;
 const javdbCoverAuthorityPattern =
   /^javdb-cover-[1-9][0-9]*-[1-9][0-9]*-[a-f0-9]{8}$/;
+const javdbDetailCoverAuthorityPattern =
+  /^javdb-detail-cover-[1-9][0-9]*-1-[a-f0-9]{8}$/;
+const javdbPreviewAuthorityPattern =
+  /^javdb-preview-[1-9][0-9]*-[1-9][0-9]*-[a-f0-9]{8}$/;
 const javdbSourceAspectRatio = 1.48;
 const javdbResultCounts = new Set([10, 25, 50, 100]);
 const javdbBrowseModes = new Set(["category", "ranking"]);
@@ -506,9 +538,13 @@ function javdbBrowseErrorStatus(
 export function parseJavdbBrowseResponse(
   value: unknown,
   request: JavdbBrowseRequest,
+  contextGeneration: string,
 ): JavdbBrowseResult {
   if (
     !validJavdbBrowseRequest(request) ||
+    !unsignedU64Pattern.test(contextGeneration) ||
+    BigInt(contextGeneration) === 0n ||
+    BigInt(contextGeneration) > maximumU64 ||
     !Array.isArray(value) ||
     value.length < 2 ||
     !value.every((entry) => typeof entry === "string")
@@ -556,6 +592,7 @@ export function parseJavdbBrowseResponse(
     providerItemIds.add(providerItemId);
     items.push({
       category,
+      contextGeneration,
       providerItemId,
       requestGeneration,
       code,
@@ -593,7 +630,7 @@ export async function fetchJavdbBrowse(
         month: request.month,
       },
     );
-    return parseJavdbBrowseResponse(response, request);
+    return parseJavdbBrowseResponse(response, request, contextGeneration);
   } catch (error: unknown) {
     return { status: javdbBrowseErrorStatus(request.category, error) };
   }
@@ -689,6 +726,252 @@ export async function invalidateJavdbBrowse(
     category,
     contextGeneration,
   });
+}
+
+export function javdbDetailErrorStatus(
+  category: JavdbBrowseCategory,
+  error: unknown,
+): Exclude<JavdbDetailResult["status"], "ready"> {
+  const errorCode =
+    typeof error === "string"
+      ? error
+      : error instanceof Error
+        ? error.message
+        : "";
+  if (errorCode === `${category}_source_unavailable`) {
+    return "source-unavailable";
+  }
+  if (errorCode === `${category}_network_error`) {
+    return "network-error";
+  }
+  if (errorCode === `${category}_javdb_malformed_provider`) {
+    return "malformed-provider";
+  }
+  if (errorCode === `${category}_javdb_conflicting_provider`) {
+    return "conflicting-provider";
+  }
+  if (errorCode === `${category}_javdb_stale`) {
+    return "stale";
+  }
+  return "provider-error";
+}
+
+function javdbItemAuthority(item: JavdbBrowseItem) {
+  return {
+    category: item.category,
+    contextGeneration: item.contextGeneration,
+    requestGeneration: item.requestGeneration,
+    providerItemId: item.providerItemId,
+    code: item.code,
+  };
+}
+
+function validJavdbItemAuthority(item: JavdbBrowseItem) {
+  return (
+    (item.category === "adult" || item.category === "vr") &&
+    unsignedU64Pattern.test(item.contextGeneration) &&
+    BigInt(item.contextGeneration) > 0n &&
+    BigInt(item.contextGeneration) <= maximumU64 &&
+    unsignedU64Pattern.test(item.requestGeneration) &&
+    BigInt(item.requestGeneration) > 0n &&
+    BigInt(item.requestGeneration) <= maximumU64 &&
+    javdbProviderItemPattern.test(item.providerItemId) &&
+    canonicalizeProductCode(item.code) === item.code
+  );
+}
+
+export function parseJavdbDetailResponse(
+  value: unknown,
+  item: JavdbBrowseItem,
+): JavdbDetailResult {
+  if (
+    !validJavdbItemAuthority(item) ||
+    !Array.isArray(value) ||
+    value.length < 15 ||
+    !value.every((entry) => typeof entry === "string")
+  ) {
+    return { status: "malformed-provider" };
+  }
+  const fields = value as string[];
+  const [
+    detailGeneration,
+    category,
+    contextGeneration,
+    requestGeneration,
+    providerItemId,
+    code,
+    title,
+    originalTitle,
+    releaseDate,
+    duration,
+    summary,
+    coverAuthorityId,
+    actorCountText,
+  ] = fields;
+  const actorCount = Number(actorCountText);
+  if (
+    !unsignedU64Pattern.test(detailGeneration) ||
+    BigInt(detailGeneration) === 0n ||
+    BigInt(detailGeneration) > maximumU64 ||
+    category !== item.category ||
+    contextGeneration !== item.contextGeneration ||
+    requestGeneration !== item.requestGeneration ||
+    providerItemId !== item.providerItemId ||
+    code !== item.code ||
+    (coverAuthorityId !== "" &&
+      (!javdbDetailCoverAuthorityPattern.test(coverAuthorityId) ||
+        !coverAuthorityId.startsWith(
+          `javdb-detail-cover-${detailGeneration}-1-`,
+        ))) ||
+    !/^\d{1,6}$/.test(actorCountText) ||
+    !Number.isSafeInteger(actorCount)
+  ) {
+    return { status: "malformed-provider" };
+  }
+  let cursor = 13;
+  const actors = fields.slice(cursor, cursor + actorCount);
+  cursor += actorCount;
+  const tagCountText = fields[cursor];
+  const tagCount = Number(tagCountText);
+  cursor += 1;
+  if (
+    tagCountText === undefined ||
+    !/^\d{1,6}$/.test(tagCountText) ||
+    !Number.isSafeInteger(tagCount)
+  ) {
+    return { status: "malformed-provider" };
+  }
+  const tags = fields.slice(cursor, cursor + tagCount);
+  cursor += tagCount;
+  const previewCountText = fields[cursor];
+  const previewCount = Number(previewCountText);
+  cursor += 1;
+  if (
+    previewCountText === undefined ||
+    !/^\d{1,2}$/.test(previewCountText) ||
+    !Number.isSafeInteger(previewCount) ||
+    previewCount > 24 ||
+    fields.length !== cursor + previewCount ||
+    actors.length !== actorCount ||
+    tags.length !== tagCount ||
+    actors.some((actor) => actor.trim() === "") ||
+    tags.some((tag) => tag.trim() === "")
+  ) {
+    return { status: "malformed-provider" };
+  }
+  const previewAuthorityIds = fields.slice(cursor);
+  if (
+    new Set(previewAuthorityIds).size !== previewAuthorityIds.length ||
+    previewAuthorityIds.some(
+      (authorityId, index) =>
+        !javdbPreviewAuthorityPattern.test(authorityId) ||
+        !authorityId.startsWith(
+          `javdb-preview-${detailGeneration}-${index + 1}-`,
+        ),
+    )
+  ) {
+    return { status: "malformed-provider" };
+  }
+  return {
+    status: "ready",
+    detail: {
+      category: item.category,
+      contextGeneration: item.contextGeneration,
+      requestGeneration: item.requestGeneration,
+      providerItemId: item.providerItemId,
+      code: item.code,
+      detailGeneration,
+      title: title === "" ? null : title,
+      originalTitle: originalTitle === "" ? null : originalTitle,
+      releaseDate: releaseDate === "" ? null : releaseDate,
+      duration: duration === "" ? null : duration,
+      summary: summary === "" ? null : summary,
+      actors,
+      tags,
+      coverAuthorityId: coverAuthorityId === "" ? null : coverAuthorityId,
+      previewAuthorityIds,
+    },
+  };
+}
+
+export async function fetchJavdbDetail(
+  item: JavdbBrowseItem,
+): Promise<JavdbDetailResult> {
+  if (!validJavdbItemAuthority(item)) {
+    throw new Error("A current JavDB catalog item is required.");
+  }
+  try {
+    const response = await window.__TAURI__.core.invoke<unknown>(
+      "fetch_javdb_detail",
+      javdbItemAuthority(item),
+    );
+    return parseJavdbDetailResponse(response, item);
+  } catch (error: unknown) {
+    return { status: javdbDetailErrorStatus(item.category, error) };
+  }
+}
+
+function javdbDetailAuthority(detail: JavdbDetail) {
+  return {
+    category: detail.category,
+    contextGeneration: detail.contextGeneration,
+    requestGeneration: detail.requestGeneration,
+    providerItemId: detail.providerItemId,
+    code: detail.code,
+    detailGeneration: detail.detailGeneration,
+  };
+}
+
+export async function fetchJavdbDetailImageObjectUrl(
+  detail: JavdbDetail,
+  imageAuthorityId: string,
+) {
+  const isCover = imageAuthorityId === detail.coverAuthorityId;
+  const isPreview = detail.previewAuthorityIds.includes(imageAuthorityId);
+  if (
+    (!isCover && !isPreview) ||
+    (!javdbDetailCoverAuthorityPattern.test(imageAuthorityId) &&
+      !javdbPreviewAuthorityPattern.test(imageAuthorityId))
+  ) {
+    throw new Error("A current JavDB detail image authority is required.");
+  }
+  const value = await window.__TAURI__.core.invoke<unknown>(
+    "fetch_javdb_detail_image",
+    {
+      ...javdbDetailAuthority(detail),
+      imageAuthorityId,
+    },
+  );
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > 16 * 1024 * 1024 ||
+    !value.every(
+      (byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255,
+    )
+  ) {
+    throw new Error("The native JavDB image response was invalid.");
+  }
+  const bytes = Uint8Array.from(value as number[]);
+  const mimeType = javdbCoverMimeType(bytes);
+  if (mimeType === null) {
+    throw new Error("The native JavDB image response was invalid.");
+  }
+  return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+}
+
+export async function invalidateJavdbDetail(detail: JavdbDetail) {
+  await window.__TAURI__.core.invoke("invalidate_javdb_detail", {
+    category: detail.category,
+    detailGeneration: detail.detailGeneration,
+  });
+}
+
+export async function openJavdbDetailSource(detail: JavdbDetail) {
+  await window.__TAURI__.core.invoke(
+    "open_javdb_detail_source",
+    javdbDetailAuthority(detail),
+  );
 }
 
 export async function fetchExactJavdbVrItem(

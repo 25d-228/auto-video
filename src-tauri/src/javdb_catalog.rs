@@ -21,6 +21,7 @@ const JAVDB_SIGNATURE_MIDDLE: &str = "lpw6vgqzsp";
 const JAVDB_SIGNATURE_SECRET: &str = "71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa";
 const JAVDB_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const JAVDB_COVER_MAX_BYTES: usize = 16 * 1024 * 1024;
+const JAVDB_PREVIEW_LIMIT: usize = 24;
 const JAVDB_HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
 #[cfg(target_os = "macos")]
 const JAVDB_HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_code}";
@@ -100,6 +101,15 @@ pub(crate) struct JavdbCatalogRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JavdbDetailRequest {
+    pub category: String,
+    pub context_generation: String,
+    pub request_generation: String,
+    pub provider_item_id: String,
+    pub code: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CatalogItem {
     provider_item_id: String,
     code: String,
@@ -125,13 +135,40 @@ struct CatalogAuthority {
     items: Vec<AuthorizedCatalogItem>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DetailImageAuthority {
+    authority_id: String,
+    url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DetailAuthority {
+    generation: u64,
+    catalog_context_generation: u64,
+    catalog_request_generation: u64,
+    provider_item_id: String,
+    code: String,
+    title: Option<String>,
+    original_title: Option<String>,
+    release_date: Option<String>,
+    duration: Option<String>,
+    summary: Option<String>,
+    actors: Vec<String>,
+    tags: Vec<String>,
+    cover: Option<DetailImageAuthority>,
+    previews: Vec<DetailImageAuthority>,
+}
+
 #[derive(Default)]
 struct CatalogContext {
     generation: u64,
+    detail_generation: u64,
     adult_context_generation: u64,
     vr_context_generation: u64,
     adult: Option<CatalogAuthority>,
     vr: Option<CatalogAuthority>,
+    adult_detail: Option<DetailAuthority>,
+    vr_detail: Option<DetailAuthority>,
 }
 
 #[derive(Clone, Default)]
@@ -156,6 +193,19 @@ enum AdultCategoryCheck {
 struct ParsedListing {
     items: Vec<CatalogItem>,
     provider_empty: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedDetail {
+    title: Option<String>,
+    original_title: Option<String>,
+    release_date: Option<String>,
+    duration: Option<String>,
+    summary: Option<String>,
+    actors: Vec<String>,
+    tags: Vec<String>,
+    cover_url: Option<String>,
+    preview_urls: Vec<String>,
 }
 
 fn valid_provider_item_id(value: &str) -> bool {
@@ -194,6 +244,36 @@ fn optional_text(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<Stri
         }
         _ => None,
     }
+}
+
+fn optional_number_text(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {
+    match object.get(key) {
+        Some(JsonValue::Number(value)) => Some(value.clone()),
+        Some(JsonValue::String(value)) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn optional_names(object: &BTreeMap<String, JsonValue>, key: &str) -> Vec<String> {
+    let Some(JsonValue::Array(values)) = object.get(key) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for value in values {
+        let JsonValue::Object(value) = value else {
+            continue;
+        };
+        let Some(name) = optional_text(value, "name") else {
+            continue;
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 fn valid_cover_url(value: &str) -> bool {
@@ -237,6 +317,103 @@ fn cover_url(movie: &BTreeMap<String, JsonValue>) -> Option<String> {
             return None;
         };
         valid_cover_url(value).then(|| value.clone())
+    })
+}
+
+fn preview_urls(movie: &BTreeMap<String, JsonValue>) -> Vec<String> {
+    let Some(JsonValue::Array(previews)) = movie.get("preview_images") else {
+        return Vec::new();
+    };
+    let mut urls = Vec::new();
+    for preview in previews {
+        let JsonValue::Object(preview) = preview else {
+            continue;
+        };
+        let url = ["large_url", "thumb_url"].into_iter().find_map(|key| {
+            let JsonValue::String(value) = preview.get(key)? else {
+                return None;
+            };
+            valid_cover_url(value).then(|| value.clone())
+        });
+        if let Some(url) = url {
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+            if urls.len() == JAVDB_PREVIEW_LIMIT {
+                break;
+            }
+        }
+    }
+    urls
+}
+
+fn parse_detail(
+    document: &str,
+    category: CatalogCategory,
+    provider_item_id: &str,
+    code: &str,
+) -> Result<ParsedDetail, CatalogDocumentError> {
+    let JsonValue::Object(envelope) = JsonParser::new(document)
+        .parse()
+        .ok_or(CatalogDocumentError::Malformed)?
+    else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::Number(success)) = envelope.get("success") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    if success != "1" {
+        return Err(CatalogDocumentError::Provider);
+    }
+    let Some(JsonValue::Object(data)) = envelope.get("data") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::Object(movie)) = data.get("movie") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::String(response_item_id)) = movie.get("id") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    if !valid_provider_item_id(response_item_id) || response_item_id != provider_item_id {
+        return Err(CatalogDocumentError::Conflicting);
+    }
+    let Some(JsonValue::String(number)) = movie.get("number") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    if canonical_product_code(number).as_deref() != Some(code) {
+        return Err(CatalogDocumentError::Conflicting);
+    }
+
+    let mut valid_tag_ids = Vec::new();
+    if let Some(JsonValue::Array(tags)) = movie.get("tags") {
+        for tag in tags {
+            let JsonValue::Object(tag) = tag else {
+                continue;
+            };
+            if let Some(JsonValue::String(tag_id)) = tag.get("id") {
+                if !tag_id.is_empty() && !valid_tag_ids.contains(tag_id) {
+                    valid_tag_ids.push(tag_id.clone());
+                }
+            }
+        }
+    }
+    let has_vr_tag = valid_tag_ids.iter().any(|tag_id| tag_id == "212");
+    if (category == CatalogCategory::Adult && has_vr_tag)
+        || (category == CatalogCategory::Vr && !valid_tag_ids.is_empty() && !has_vr_tag)
+    {
+        return Err(CatalogDocumentError::Conflicting);
+    }
+
+    Ok(ParsedDetail {
+        title: optional_text(movie, "title"),
+        original_title: optional_text(movie, "origin_title"),
+        release_date: optional_text(movie, "release_date"),
+        duration: optional_number_text(movie, "duration"),
+        summary: optional_text(movie, "summary"),
+        actors: optional_names(movie, "actors"),
+        tags: optional_names(movie, "tags"),
+        cover_url: cover_url(movie),
+        preview_urls: preview_urls(movie),
     })
 }
 
@@ -468,8 +645,14 @@ fn begin_request(
         items: Vec::new(),
     };
     match category {
-        CatalogCategory::Adult => context.adult = Some(authority),
-        CatalogCategory::Vr => context.vr = Some(authority),
+        CatalogCategory::Adult => {
+            context.adult = Some(authority);
+            context.adult_detail = None;
+        }
+        CatalogCategory::Vr => {
+            context.vr = Some(authority);
+            context.vr_detail = None;
+        }
     }
     Ok(context.generation)
 }
@@ -488,6 +671,27 @@ fn authority_mut(
     match category {
         CatalogCategory::Adult => context.adult.as_mut(),
         CatalogCategory::Vr => context.vr.as_mut(),
+    }
+}
+
+fn detail_authority(
+    context: &CatalogContext,
+    category: CatalogCategory,
+) -> Option<&DetailAuthority> {
+    match category {
+        CatalogCategory::Adult => context.adult_detail.as_ref(),
+        CatalogCategory::Vr => context.vr_detail.as_ref(),
+    }
+}
+
+fn set_detail_authority(
+    context: &mut CatalogContext,
+    category: CatalogCategory,
+    detail: Option<DetailAuthority>,
+) {
+    match category {
+        CatalogCategory::Adult => context.adult_detail = detail,
+        CatalogCategory::Vr => context.vr_detail = detail,
     }
 }
 
@@ -614,6 +818,353 @@ pub(crate) fn fetch_catalog_with(
     finish_request(state, category, generation, items)
 }
 
+fn parsed_detail_request(
+    request: &JavdbDetailRequest,
+) -> Result<(CatalogCategory, u64, u64), &'static str> {
+    let category = CatalogCategory::parse(&request.category).ok_or(VR_PROVIDER_ERROR)?;
+    let context_generation = request
+        .context_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| category.stale_error())?;
+    let request_generation = request
+        .request_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| category.stale_error())?;
+    if !valid_provider_item_id(&request.provider_item_id)
+        || canonical_product_code(&request.code).as_deref() != Some(&request.code)
+    {
+        return Err(category.stale_error());
+    }
+    Ok((category, context_generation, request_generation))
+}
+
+fn catalog_contains_detail_request(
+    context: &CatalogContext,
+    category: CatalogCategory,
+    context_generation: u64,
+    request_generation: u64,
+    provider_item_id: &str,
+    code: &str,
+) -> bool {
+    authority(context, category)
+        .filter(|authority| {
+            authority.context_generation == context_generation
+                && authority.generation == request_generation
+        })
+        .is_some_and(|authority| {
+            authority
+                .items
+                .iter()
+                .any(|item| item.provider_item_id == provider_item_id && item.code == code)
+        })
+}
+
+fn begin_detail(
+    state: &JavdbCatalogState,
+    request: &JavdbDetailRequest,
+) -> Result<(CatalogCategory, u64), &'static str> {
+    let (category, context_generation, request_generation) = parsed_detail_request(request)?;
+    let mut context = state.0.lock().map_err(|_| category.stale_error())?;
+    if !catalog_contains_detail_request(
+        &context,
+        category,
+        context_generation,
+        request_generation,
+        &request.provider_item_id,
+        &request.code,
+    ) {
+        return Err(category.stale_error());
+    }
+    context.detail_generation = context
+        .detail_generation
+        .checked_add(1)
+        .ok_or_else(|| category.provider_error(ProviderRequestError::Provider))?;
+    let generation = context.detail_generation;
+    set_detail_authority(
+        &mut context,
+        category,
+        Some(DetailAuthority {
+            generation,
+            catalog_context_generation: context_generation,
+            catalog_request_generation: request_generation,
+            provider_item_id: request.provider_item_id.clone(),
+            code: request.code.clone(),
+            title: None,
+            original_title: None,
+            release_date: None,
+            duration: None,
+            summary: None,
+            actors: Vec::new(),
+            tags: Vec::new(),
+            cover: None,
+            previews: Vec::new(),
+        }),
+    );
+    Ok((category, generation))
+}
+
+fn detail_matches_request(
+    detail: &DetailAuthority,
+    request: &JavdbDetailRequest,
+    context_generation: u64,
+    request_generation: u64,
+    detail_generation: u64,
+) -> bool {
+    detail.generation == detail_generation
+        && detail.catalog_context_generation == context_generation
+        && detail.catalog_request_generation == request_generation
+        && detail.provider_item_id == request.provider_item_id
+        && detail.code == request.code
+}
+
+fn detail_image_authority(
+    generation: u64,
+    position: usize,
+    kind: &str,
+    url: String,
+) -> DetailImageAuthority {
+    DetailImageAuthority {
+        authority_id: format!(
+            "javdb-{kind}-{generation}-{position}-{}",
+            &md5_hex(url.as_bytes())[..8]
+        ),
+        url,
+    }
+}
+
+fn encode_detail(category: CatalogCategory, detail: &DetailAuthority) -> Vec<String> {
+    let mut response = vec![
+        detail.generation.to_string(),
+        category.value().to_owned(),
+        detail.catalog_context_generation.to_string(),
+        detail.catalog_request_generation.to_string(),
+        detail.provider_item_id.clone(),
+        detail.code.clone(),
+        detail.title.clone().unwrap_or_default(),
+        detail.original_title.clone().unwrap_or_default(),
+        detail.release_date.clone().unwrap_or_default(),
+        detail.duration.clone().unwrap_or_default(),
+        detail.summary.clone().unwrap_or_default(),
+        detail
+            .cover
+            .as_ref()
+            .map(|cover| cover.authority_id.clone())
+            .unwrap_or_default(),
+        detail.actors.len().to_string(),
+    ];
+    response.extend(detail.actors.iter().cloned());
+    response.push(detail.tags.len().to_string());
+    response.extend(detail.tags.iter().cloned());
+    response.push(detail.previews.len().to_string());
+    response.extend(
+        detail
+            .previews
+            .iter()
+            .map(|preview| preview.authority_id.clone()),
+    );
+    response
+}
+
+fn finish_detail(
+    state: &JavdbCatalogState,
+    request: &JavdbDetailRequest,
+    category: CatalogCategory,
+    generation: u64,
+    detail: ParsedDetail,
+) -> Result<Vec<String>, &'static str> {
+    let (_, context_generation, request_generation) = parsed_detail_request(request)?;
+    let mut context = state.0.lock().map_err(|_| category.stale_error())?;
+    if !catalog_contains_detail_request(
+        &context,
+        category,
+        context_generation,
+        request_generation,
+        &request.provider_item_id,
+        &request.code,
+    ) || !detail_authority(&context, category).is_some_and(|detail| {
+        detail_matches_request(
+            detail,
+            request,
+            context_generation,
+            request_generation,
+            generation,
+        )
+    }) {
+        return Err(category.stale_error());
+    }
+    let authority = DetailAuthority {
+        generation,
+        catalog_context_generation: context_generation,
+        catalog_request_generation: request_generation,
+        provider_item_id: request.provider_item_id.clone(),
+        code: request.code.clone(),
+        title: detail.title,
+        original_title: detail.original_title,
+        release_date: detail.release_date,
+        duration: detail.duration,
+        summary: detail.summary,
+        actors: detail.actors,
+        tags: detail.tags,
+        cover: detail
+            .cover_url
+            .map(|url| detail_image_authority(generation, 1, "detail-cover", url)),
+        previews: detail
+            .preview_urls
+            .into_iter()
+            .enumerate()
+            .map(|(index, url)| detail_image_authority(generation, index + 1, "preview", url))
+            .collect(),
+    };
+    let response = encode_detail(category, &authority);
+    set_detail_authority(&mut context, category, Some(authority));
+    Ok(response)
+}
+
+pub(crate) fn fetch_detail_with(
+    state: &JavdbCatalogState,
+    request: &JavdbDetailRequest,
+    fetch: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+) -> Result<Vec<String>, &'static str> {
+    let (category, generation) = begin_detail(state, request)?;
+    let url = format!(
+        "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
+        request.provider_item_id
+    );
+    let document = fetch(&url).map_err(|error| category.provider_error(error))?;
+    let detail = parse_detail(
+        &document,
+        category,
+        &request.provider_item_id,
+        &request.code,
+    )
+    .map_err(|error| parse_error(category, error))?;
+    finish_detail(state, request, category, generation, detail)
+}
+
+fn authorized_detail_image_url(
+    state: &JavdbCatalogState,
+    request: &JavdbDetailRequest,
+    detail_generation: u64,
+    image_authority_id: &str,
+) -> Result<String, &'static str> {
+    let (category, context_generation, request_generation) = parsed_detail_request(request)?;
+    let context = state.0.lock().map_err(|_| category.stale_error())?;
+    if !catalog_contains_detail_request(
+        &context,
+        category,
+        context_generation,
+        request_generation,
+        &request.provider_item_id,
+        &request.code,
+    ) {
+        return Err(category.stale_error());
+    }
+    let detail = detail_authority(&context, category)
+        .filter(|detail| {
+            detail_matches_request(
+                detail,
+                request,
+                context_generation,
+                request_generation,
+                detail_generation,
+            )
+        })
+        .ok_or_else(|| category.stale_error())?;
+    detail
+        .cover
+        .iter()
+        .chain(detail.previews.iter())
+        .find(|image| image.authority_id == image_authority_id)
+        .map(|image| image.url.clone())
+        .ok_or_else(|| category.stale_error())
+}
+
+pub(crate) fn fetch_detail_image_with(
+    state: &JavdbCatalogState,
+    request: &JavdbDetailRequest,
+    detail_generation: &str,
+    image_authority_id: &str,
+    fetch: impl FnOnce(&str) -> Result<Vec<u8>, ProviderRequestError>,
+) -> Result<Vec<u8>, &'static str> {
+    let (category, _, _) = parsed_detail_request(request)?;
+    let detail_generation = detail_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| category.stale_error())?;
+    if image_authority_id.is_empty() || image_authority_id.contains("://") {
+        return Err(category.stale_error());
+    }
+    let url = authorized_detail_image_url(state, request, detail_generation, image_authority_id)?;
+    let bytes = fetch(&url).map_err(|error| category.provider_error(error))?;
+    if !accepted_raster(&bytes) {
+        return Err(category.provider_error(ProviderRequestError::Provider));
+    }
+    authorized_detail_image_url(state, request, detail_generation, image_authority_id)?;
+    Ok(bytes)
+}
+
+pub(crate) fn open_detail_source_with(
+    state: &JavdbCatalogState,
+    request: &JavdbDetailRequest,
+    detail_generation: &str,
+    open: impl FnOnce(&str) -> Result<(), ()>,
+) -> Result<(), &'static str> {
+    let (category, context_generation, request_generation) = parsed_detail_request(request)?;
+    let detail_generation = detail_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| category.stale_error())?;
+    let context = state.0.lock().map_err(|_| category.stale_error())?;
+    if !catalog_contains_detail_request(
+        &context,
+        category,
+        context_generation,
+        request_generation,
+        &request.provider_item_id,
+        &request.code,
+    ) || !detail_authority(&context, category).is_some_and(|detail| {
+        detail_matches_request(
+            detail,
+            request,
+            context_generation,
+            request_generation,
+            detail_generation,
+        )
+    }) {
+        return Err(category.stale_error());
+    }
+    let url = format!("https://javdb.com/v/{}", request.provider_item_id);
+    let result = open(&url).map_err(|()| category.provider_error(ProviderRequestError::Provider));
+    drop(context);
+    result
+}
+
+pub(crate) fn invalidate_detail(
+    state: &JavdbCatalogState,
+    category: &str,
+    detail_generation: &str,
+) -> Result<(), &'static str> {
+    let category = CatalogCategory::parse(category).ok_or(VR_PROVIDER_ERROR)?;
+    let detail_generation = detail_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| category.stale_error())?;
+    let mut context = state.0.lock().map_err(|_| category.stale_error())?;
+    if detail_authority(&context, category)
+        .is_some_and(|detail| detail.generation == detail_generation)
+    {
+        set_detail_authority(&mut context, category, None);
+    }
+    Ok(())
+}
+
 pub(crate) fn invalidate_catalog(
     state: &JavdbCatalogState,
     category: &str,
@@ -645,6 +1196,7 @@ pub(crate) fn invalidate_catalog(
                 .is_some_and(|authority| authority.context_generation <= context_generation)
             {
                 context.adult = None;
+                context.adult_detail = None;
             }
         }
         CatalogCategory::Vr => {
@@ -654,6 +1206,7 @@ pub(crate) fn invalidate_catalog(
                 .is_some_and(|authority| authority.context_generation <= context_generation)
             {
                 context.vr = None;
+                context.vr_detail = None;
             }
         }
     }
@@ -1089,6 +1642,44 @@ mod tests {
         vec![0xff, 0xd8, 0xff, 0xe0, 0, 16, 0, 0, 0, 0, 0, 0]
     }
 
+    fn detail_request(
+        category: &str,
+        catalog: &[String],
+        provider_item_id: &str,
+        code: &str,
+    ) -> JavdbDetailRequest {
+        JavdbDetailRequest {
+            category: category.to_owned(),
+            context_generation: String::new(),
+            request_generation: catalog[0].clone(),
+            provider_item_id: provider_item_id.to_owned(),
+            code: code.to_owned(),
+        }
+    }
+
+    fn established_detail_request(
+        state: &JavdbCatalogState,
+        category: &str,
+        provider_item_id: &str,
+        code: &str,
+    ) -> JavdbDetailRequest {
+        let request = request(category);
+        let context_generation = request.context_generation.clone();
+        let catalog = fetch_catalog_with(state, &request, |url| {
+            Ok(if category == "adult" && url.contains("/api/v4/") {
+                detail_with_number(provider_item_id, code, r#"[{"id":"28"}]"#)
+            } else {
+                format!(
+                    r#"{{"success":1,"data":{{"movies":[{{"id":"{provider_item_id}","number":"{code}"}}]}}}}"#
+                )
+            })
+        })
+        .expect("catalog authority must be established");
+        let mut detail = detail_request(category, &catalog, provider_item_id, code);
+        detail.context_generation = context_generation;
+        detail
+    }
+
     #[test]
     fn signs_requests_with_the_captured_mobile_identity() {
         assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
@@ -1476,5 +2067,262 @@ mod tests {
             Ok(jpeg())
         );
         assert!(dispatched.get());
+    }
+
+    #[test]
+    fn exact_adult_and_vr_details_preserve_optional_fields_and_bound_preview_authorities() {
+        for (category, item_id, code, category_tag) in [
+            ("adult", "AdultA", "ADLT-123", "28"),
+            ("vr", "VrA", "MDVR-419", "212"),
+        ] {
+            let state = JavdbCatalogState::default();
+            let request = established_detail_request(&state, category, item_id, code);
+            let previews = (0..30)
+                .map(|index| {
+                    if index == 1 {
+                        r#"{"large_url":"https://tp.cmastd.com/0.jpg"}"#.to_owned()
+                    } else if index == 2 {
+                        r#"{"large_url":"https://tp.evil.example/forged.jpg"}"#.to_owned()
+                    } else {
+                        format!(r#"{{"large_url":"https://tp.rotating-{index}.com/{index}.jpg"}}"#)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let document = format!(
+                r#"{{"success":1,"data":{{"movie":{{"id":"{item_id}","number":"{code}","title":" Provider title ","origin_title":"Original","release_date":"2026-08-12","duration":123,"summary":"Summary","cover_url":"https://tp.spfcas.com/cover.jpg","actors":[{{"name":"Actor A"}},null,{{"name":" "}},{{"name":"Actor B"}}],"tags":[{{"id":"{category_tag}","name":"Category"}},{{"name":"Tag"}},false],"preview_images":[{previews}]}}}}}}"#
+            );
+            let dispatched_url = RefCell::new(String::new());
+            let response = fetch_detail_with(&state, &request, |url| {
+                dispatched_url.replace(url.to_owned());
+                Ok(document)
+            })
+            .expect("exact detail must be accepted");
+            assert_eq!(
+                dispatched_url.into_inner(),
+                format!("{JAVDB_API_URL}/api/v4/movies/{item_id}?from_rankings=false")
+            );
+            assert_eq!(
+                &response[1..12],
+                [
+                    category,
+                    &request.context_generation,
+                    &request.request_generation,
+                    item_id,
+                    code,
+                    "Provider title",
+                    "Original",
+                    "2026-08-12",
+                    "123",
+                    "Summary",
+                    response[11].as_str()
+                ]
+            );
+            assert!(response[11].starts_with("javdb-detail-cover-"));
+            assert_eq!(response[12], "2");
+            assert_eq!(&response[13..15], ["Actor A", "Actor B"]);
+            assert_eq!(response[15], "2");
+            assert_eq!(&response[16..18], ["Category", "Tag"]);
+            assert_eq!(response[18], "24");
+            assert_eq!(response.len(), 43);
+            assert!(response[19].starts_with("javdb-preview-"));
+
+            let image_dispatched = Cell::new(false);
+            assert_eq!(
+                fetch_detail_image_with(&state, &request, &response[0], &response[19], |url| {
+                    image_dispatched.set(true);
+                    assert_eq!(url, "https://tp.rotating-0.com/0.jpg");
+                    Ok(jpeg())
+                },),
+                Ok(jpeg())
+            );
+            assert!(image_dispatched.get());
+
+            let opened = RefCell::new(String::new());
+            open_detail_source_with(&state, &request, &response[0], |url| {
+                opened.replace(url.to_owned());
+                Ok(())
+            })
+            .expect("the exact provider source must open");
+            assert_eq!(
+                opened.into_inner(),
+                format!("https://javdb.com/v/{item_id}")
+            );
+        }
+    }
+
+    #[test]
+    fn exact_details_accept_missing_optional_fields_and_reject_conflicting_identity() {
+        let state = JavdbCatalogState::default();
+        let request = established_detail_request(&state, "vr", "VrA", "MDVR-419");
+        let response = fetch_detail_with(&state, &request, |_| {
+            Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","title":null,"origin_title":null,"release_date":null,"duration":null,"summary":null,"actors":null,"tags":null,"cover_url":null,"preview_images":null}}}"#.to_owned())
+        })
+        .expect("optional fields may be absent or null");
+        assert_eq!(&response[6..13], ["", "", "", "", "", "", "0"]);
+        assert_eq!(&response[13..], ["0", "0"]);
+
+        for document in [
+            r#"{"success":1,"data":{"movie":{"id":"VrB","number":"MDVR-419"}}}"#,
+            r#"{"success":1,"data":{"movie":{"id":"VrA","number":"ADLT-123"}}}"#,
+            r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"28"}]}}}"#,
+        ] {
+            assert_eq!(
+                fetch_detail_with(&state, &request, |_| Ok(document.to_owned())),
+                Err(VR_JAVDB_CONFLICTING)
+            );
+        }
+
+        let adult_state = JavdbCatalogState::default();
+        let adult_request = established_detail_request(&adult_state, "adult", "AdultA", "ADLT-123");
+        assert_eq!(
+            fetch_detail_with(&adult_state, &adult_request, |_| {
+                Ok(r#"{"success":1,"data":{"movie":{"id":"AdultA","number":"ADLT-123","tags":[{"id":"212"}]}}}"#.to_owned())
+            }),
+            Err(ADULT_JAVDB_CONFLICTING)
+        );
+    }
+
+    #[test]
+    fn stale_forged_cross_item_and_cross_category_details_cause_no_dispatch() {
+        let state = JavdbCatalogState::default();
+        let request = established_detail_request(&state, "vr", "VrA", "MDVR-419");
+        for invalid in [
+            JavdbDetailRequest {
+                category: "adult".to_owned(),
+                ..request.clone()
+            },
+            JavdbDetailRequest {
+                provider_item_id: "VrB".to_owned(),
+                ..request.clone()
+            },
+            JavdbDetailRequest {
+                code: "MDVR-422".to_owned(),
+                ..request.clone()
+            },
+            JavdbDetailRequest {
+                request_generation: "999".to_owned(),
+                ..request.clone()
+            },
+            JavdbDetailRequest {
+                context_generation: "999".to_owned(),
+                ..request.clone()
+            },
+        ] {
+            let dispatched = Cell::new(false);
+            assert!(fetch_detail_with(&state, &invalid, |_| {
+                dispatched.set(true);
+                unreachable!()
+            })
+            .is_err());
+            assert!(!dispatched.get());
+        }
+
+        invalidate_catalog(
+            &state,
+            "vr",
+            &NEXT_CONTEXT_GENERATION
+                .fetch_add(1, Ordering::Relaxed)
+                .to_string(),
+        )
+        .expect("catalog invalidation must succeed");
+        let dispatched = Cell::new(false);
+        assert!(fetch_detail_with(&state, &request, |_| {
+            dispatched.set(true);
+            unreachable!()
+        })
+        .is_err());
+        assert!(!dispatched.get());
+    }
+
+    #[test]
+    fn detail_images_reject_unretained_stale_cross_context_and_invalid_payloads() {
+        let state = JavdbCatalogState::default();
+        let request = established_detail_request(&state, "vr", "VrA", "MDVR-419");
+        let response = fetch_detail_with(&state, &request, |_| {
+            Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"212"}],"preview_images":[{"large_url":"https://tp.cmastd.com/a.jpg"},{"large_url":"https://tp.spfcas.com/b.jpg"}]}}}"#.to_owned())
+        })
+        .expect("detail authority must be established");
+        for (authority, detail_request) in [
+            ("javdb-preview-forged".to_owned(), request.clone()),
+            (
+                response[16].clone(),
+                JavdbDetailRequest {
+                    category: "adult".to_owned(),
+                    ..request.clone()
+                },
+            ),
+            (
+                response[16].clone(),
+                JavdbDetailRequest {
+                    provider_item_id: "VrB".to_owned(),
+                    ..request.clone()
+                },
+            ),
+        ] {
+            let dispatched = Cell::new(false);
+            assert!(fetch_detail_image_with(
+                &state,
+                &detail_request,
+                &response[0],
+                &authority,
+                |_| {
+                    dispatched.set(true);
+                    Ok(jpeg())
+                },
+            )
+            .is_err());
+            assert!(!dispatched.get());
+        }
+
+        let dispatched = Cell::new(false);
+        assert_eq!(
+            fetch_detail_image_with(&state, &request, &response[0], &response[16], |_| {
+                dispatched.set(true);
+                Ok(vec![0; 12])
+            },),
+            Err(VR_PROVIDER_ERROR)
+        );
+        assert!(dispatched.get());
+
+        invalidate_detail(&state, "vr", &response[0]).expect("detail invalidation must succeed");
+        let dispatched = Cell::new(false);
+        assert!(
+            fetch_detail_image_with(&state, &request, &response[0], &response[16], |_| {
+                dispatched.set(true);
+                Ok(jpeg())
+            },)
+            .is_err()
+        );
+        assert!(!dispatched.get());
+    }
+
+    #[test]
+    fn late_detail_and_image_results_cannot_replace_newer_authority() {
+        let state = JavdbCatalogState::default();
+        let first = established_detail_request(&state, "vr", "VrA", "MDVR-419");
+        let late_result = fetch_detail_with(&state, &first, |_| {
+            let current = fetch_detail_with(&state, &first, |_| {
+                Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"212"}],"preview_images":[{"large_url":"https://tp.cmastd.com/current.jpg"}]}}}"#.to_owned())
+            })
+            .expect("newer detail must finish");
+            assert_eq!(current[6], "");
+            Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"212"}],"title":"Late"}}}"#.to_owned())
+        });
+        assert_eq!(late_result, Err(VR_JAVDB_STALE));
+
+        let current = fetch_detail_with(&state, &first, |_| {
+            Ok(r#"{"success":1,"data":{"movie":{"id":"VrA","number":"MDVR-419","tags":[{"id":"212"}],"preview_images":[{"large_url":"https://tp.cmastd.com/current.jpg"}]}}}"#.to_owned())
+        })
+        .expect("current detail must finish");
+        let image = current
+            .last()
+            .expect("preview authority must be present")
+            .clone();
+        let result = fetch_detail_image_with(&state, &first, &current[0], &image, |_| {
+            invalidate_detail(&state, "vr", &current[0]).expect("detail must invalidate");
+            Ok(jpeg())
+        });
+        assert_eq!(result, Err(VR_JAVDB_STALE));
     }
 }

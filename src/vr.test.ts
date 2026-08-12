@@ -9,15 +9,20 @@ import {
   fetchExactJavdbVrItem,
   fetchJavdbBrowse,
   fetchJavdbCoverObjectUrl,
+  fetchJavdbDetail,
+  fetchJavdbDetailImageObjectUrl,
   fetchVerifiedAdultSukebeiReleases,
   fetchVerifiedSukebeiReleases,
   inspectVerifiedAdultSukebeiTorrent,
   inspectVerifiedSukebeiTorrent,
   invalidateVerifiedAdultTorrent,
+  invalidateJavdbDetail,
   loadVrDownloadLimit,
   loadVrDownloads,
   loadVrFolder,
+  openJavdbDetailSource,
   parseJavdbBrowseResponse,
+  parseJavdbDetailResponse,
   previewVrOrganization,
   queryVrStorage,
   scanVrLibrary,
@@ -27,7 +32,11 @@ import {
   startVerifiedVrDownload,
   trashVrFile,
 } from "./vr";
-import type { JavdbBrowseItem, JavdbBrowseRequest } from "./vr";
+import type {
+  JavdbBrowseItem,
+  JavdbBrowseRequest,
+  JavdbDetail,
+} from "./vr";
 
 const catalogFixture = `
   <!doctype html>
@@ -270,12 +279,14 @@ describe("native-owned JavDB browse boundary", () => {
           "1.48",
         ],
         request,
+        "3",
       ),
     ).toEqual({
       status: "ready",
       items: [
         {
           category: "vr",
+          contextGeneration: "3",
           providerItemId: "VrA",
           requestGeneration: "7",
           code: "MDVR-419",
@@ -288,6 +299,7 @@ describe("native-owned JavDB browse boundary", () => {
         },
         {
           category: "vr",
+          contextGeneration: "3",
           providerItemId: "VrB",
           requestGeneration: "7",
           code: "MDVR-422",
@@ -306,7 +318,7 @@ describe("native-owned JavDB browse boundary", () => {
       ["7", "1", "vr", "VrA", "MDVR-0419", "", "", "", "1.48"],
       ["7", "1", "vr", "VrA", "MDVR-419", "", "", "https://tp.evil.com/a.jpg", "1.48"],
     ]) {
-      expect(parseJavdbBrowseResponse(response, request)).toEqual({
+      expect(parseJavdbBrowseResponse(response, request, "3")).toEqual({
         status: "malformed-provider",
       });
     }
@@ -351,6 +363,7 @@ describe("native-owned JavDB browse boundary", () => {
     ]);
     const item: JavdbBrowseItem = {
       category: "vr",
+      contextGeneration: "3",
       providerItemId: "VrA",
       requestGeneration: "7",
       code: "MDVR-419",
@@ -377,6 +390,188 @@ describe("native-owned JavDB browse boundary", () => {
     invokeMock.mockResolvedValueOnce([0xff, 0xd8, 0xff, 0xe0]);
     await expect(fetchJavdbCoverObjectUrl(item)).rejects.toThrow("invalid");
     expect(createObjectURL).toHaveBeenCalledOnce();
+  });
+});
+
+describe("native-owned JavDB details and preview boundary", () => {
+  const item: JavdbBrowseItem = {
+    category: "vr",
+    contextGeneration: "3",
+    providerItemId: "VrA",
+    requestGeneration: "7",
+    code: "MDVR-419",
+    title: "Listing title",
+    releaseDate: null,
+    coverAuthorityId: null,
+    coverUrl: null,
+    source: "JavDB",
+    sourceAspectRatio: 1.48,
+  };
+  const response = [
+    "11",
+    "vr",
+    "3",
+    "7",
+    "VrA",
+    "MDVR-419",
+    "Provider title",
+    "Original title",
+    "2026-08-12",
+    "123",
+    "Summary",
+    "javdb-detail-cover-11-1-0123abcd",
+    "2",
+    "Actor A",
+    "Actor B",
+    "2",
+    "VR",
+    "Featured",
+    "2",
+    "javdb-preview-11-1-1111aaaa",
+    "javdb-preview-11-2-2222bbbb",
+  ];
+
+  it("parses structured exact details while preserving optional presentation fields", () => {
+    expect(parseJavdbDetailResponse(response, item)).toEqual({
+      status: "ready",
+      detail: {
+        category: "vr",
+        contextGeneration: "3",
+        requestGeneration: "7",
+        providerItemId: "VrA",
+        code: "MDVR-419",
+        detailGeneration: "11",
+        title: "Provider title",
+        originalTitle: "Original title",
+        releaseDate: "2026-08-12",
+        duration: "123",
+        summary: "Summary",
+        actors: ["Actor A", "Actor B"],
+        tags: ["VR", "Featured"],
+        coverAuthorityId: "javdb-detail-cover-11-1-0123abcd",
+        previewAuthorityIds: [
+          "javdb-preview-11-1-1111aaaa",
+          "javdb-preview-11-2-2222bbbb",
+        ],
+      },
+    });
+    expect(
+      parseJavdbDetailResponse(
+        ["11", "vr", "3", "7", "VrA", "MDVR-419", "", "", "", "", "", "", "0", "0", "0"],
+        item,
+      ),
+    ).toEqual({
+      status: "ready",
+      detail: expect.objectContaining({
+        title: null,
+        originalTitle: null,
+        actors: [],
+        tags: [],
+        coverAuthorityId: null,
+        previewAuthorityIds: [],
+      }),
+    });
+    for (const invalid of [
+      response.map((value, index) => (index === 1 ? "adult" : value)),
+      response.map((value, index) => (index === 3 ? "8" : value)),
+      response.map((value, index) => (index === 4 ? "VrB" : value)),
+      response.map((value, index) =>
+        index === 5 ? "MDVR-422" : value,
+      ),
+      response.map((value, index) =>
+        index === 19 ? "https://tp.cmastd.com/raw.jpg" : value,
+      ),
+      [...response.slice(0, 18), "25", ...Array(25).fill("javdb-preview-11-1-1111aaaa")],
+    ]) {
+      expect(parseJavdbDetailResponse(invalid, item)).toEqual({
+        status: "malformed-provider",
+      });
+    }
+  });
+
+  it("submits only the complete retained item authority and maps native detail errors", async () => {
+    invokeMock.mockResolvedValueOnce(response);
+    await expect(fetchJavdbDetail(item)).resolves.toEqual(
+      parseJavdbDetailResponse(response, item),
+    );
+    expect(invokeMock).toHaveBeenLastCalledWith("fetch_javdb_detail", {
+      category: "vr",
+      contextGeneration: "3",
+      requestGeneration: "7",
+      providerItemId: "VrA",
+      code: "MDVR-419",
+    });
+    expect(invokeMock.mock.calls[0]?.[1]).not.toHaveProperty("providerUrl");
+
+    for (const [error, status] of [
+      ["vr_source_unavailable", "source-unavailable"],
+      ["vr_network_error", "network-error"],
+      ["vr_javdb_malformed_provider", "malformed-provider"],
+      ["vr_javdb_conflicting_provider", "conflicting-provider"],
+      ["vr_javdb_stale", "stale"],
+      ["vr_provider_error", "provider-error"],
+    ]) {
+      invokeMock.mockRejectedValueOnce(error);
+      await expect(fetchJavdbDetail(item)).resolves.toEqual({ status });
+    }
+  });
+
+  it("fetches and invalidates only opaque exact detail image authority", async () => {
+    const parsed = parseJavdbDetailResponse(response, item);
+    expect(parsed.status).toBe("ready");
+    const detail = (parsed as { status: "ready"; detail: JavdbDetail }).detail;
+    const createObjectURL = vi.fn().mockReturnValue("blob:preview");
+    vi.stubGlobal("URL", { createObjectURL });
+    invokeMock.mockResolvedValueOnce([
+      0xff, 0xd8, 0xff, 0xe0, 0, 16, 0, 0, 0, 0, 0, 0,
+    ]);
+    await expect(
+      fetchJavdbDetailImageObjectUrl(
+        detail,
+        "javdb-preview-11-1-1111aaaa",
+      ),
+    ).resolves.toBe("blob:preview");
+    expect(invokeMock).toHaveBeenLastCalledWith(
+      "fetch_javdb_detail_image",
+      {
+        category: "vr",
+        contextGeneration: "3",
+        requestGeneration: "7",
+        providerItemId: "VrA",
+        code: "MDVR-419",
+        detailGeneration: "11",
+        imageAuthorityId: "javdb-preview-11-1-1111aaaa",
+      },
+    );
+    expect(invokeMock.mock.calls[0]?.[1]).not.toHaveProperty("imageUrl");
+
+    invokeMock.mockResolvedValueOnce(undefined);
+    await invalidateJavdbDetail(detail);
+    expect(invokeMock).toHaveBeenLastCalledWith("invalidate_javdb_detail", {
+      category: "vr",
+      detailGeneration: "11",
+    });
+    invokeMock.mockResolvedValueOnce(undefined);
+    await openJavdbDetailSource(detail);
+    expect(invokeMock).toHaveBeenLastCalledWith(
+      "open_javdb_detail_source",
+      {
+        category: "vr",
+        contextGeneration: "3",
+        requestGeneration: "7",
+        providerItemId: "VrA",
+        code: "MDVR-419",
+        detailGeneration: "11",
+      },
+    );
+    expect(invokeMock.mock.calls.at(-1)?.[1]).not.toHaveProperty("sourceUrl");
+
+    await expect(
+      fetchJavdbDetailImageObjectUrl(
+        detail,
+        "javdb-preview-11-3-3333cccc",
+      ),
+    ).rejects.toThrow("current");
   });
 });
 
