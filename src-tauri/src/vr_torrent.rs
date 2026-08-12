@@ -1667,11 +1667,15 @@ fn product_code_candidates(name: &str) -> Vec<(String, String)> {
         {
             separated_number_start += 1;
         }
+        let mut separated_number_end = separated_number_start;
+        while separated_number_end < bytes.len() && bytes[separated_number_end].is_ascii_digit() {
+            separated_number_end += 1;
+        }
         let (prefix_end, number_start) = if compact_number_start < token_end {
             if separated_number_start > token_end
-                && bytes
-                    .get(separated_number_start)
-                    .is_some_and(u8::is_ascii_digit)
+                && separated_number_end > separated_number_start
+                && (separated_number_end == bytes.len()
+                    || !bytes[separated_number_end].is_ascii_alphanumeric())
             {
                 index = prefix_start + 1;
                 continue;
@@ -2998,6 +3002,11 @@ mod tests {
         ));
         assert!(release_matches_product_code(
             "Compact 3DSVR1947 release",
+            "3DSVR-1947"
+        ));
+        assert!(release_matches_product_code("MDVR419 1080p", "MDVR-419"));
+        assert!(release_matches_product_code(
+            "3DSVR1947 1080p",
             "3DSVR-1947"
         ));
         assert!(product_code_candidates("AB1-2 unsupported").is_empty());

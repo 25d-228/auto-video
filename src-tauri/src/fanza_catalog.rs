@@ -30,19 +30,20 @@ Add-Type -AssemblyName System.Net.Http
 $handler = [System.Net.Http.HttpClientHandler]::new()
 $handler.AllowAutoRedirect = $false
 $client = [System.Net.Http.HttpClient]::new($handler)
-$client.Timeout = [TimeSpan]::FromSeconds(20)
+$deadline = [System.Threading.CancellationTokenSource]::new()
+$deadline.CancelAfter(20000)
 try {
   $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $env:FANZA_URL)
   $request.Content = [System.Net.Http.StringContent]::new($env:FANZA_BODY, [System.Text.Encoding]::UTF8, 'application/json')
   $request.Headers.Accept.ParseAdd('application/json')
   $request.Headers.Referrer = [Uri]$env:FANZA_REFERER
   $request.Headers.TryAddWithoutValidation('Origin', $env:FANZA_ORIGIN) | Out-Null
-  $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+  $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $deadline.Token).GetAwaiter().GetResult()
   $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
   $memory = [System.IO.MemoryStream]::new()
   $buffer = [byte[]]::new(65536)
   $tooLarge = $false
-  while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+  while (($read = $stream.ReadAsync($buffer, 0, $buffer.Length, $deadline.Token).GetAwaiter().GetResult()) -gt 0) {
     if ($memory.Length + $read -gt 4194304) { $tooLarge = $true; break }
     $memory.Write($buffer, 0, $read)
   }
@@ -57,6 +58,7 @@ try {
 } catch {
   [Environment]::Exit(28)
 } finally {
+  $deadline.Dispose()
   $client.Dispose()
   $handler.Dispose()
 }"#;
@@ -69,16 +71,17 @@ Add-Type -AssemblyName System.Net.Http
 $handler = [System.Net.Http.HttpClientHandler]::new()
 $handler.AllowAutoRedirect = $false
 $client = [System.Net.Http.HttpClient]::new($handler)
-$client.Timeout = [TimeSpan]::FromSeconds(20)
+$deadline = [System.Threading.CancellationTokenSource]::new()
+$deadline.CancelAfter(20000)
 try {
   $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $env:FANZA_IMAGE)
   $request.Headers.Referrer = [Uri]$env:FANZA_REFERER
-  $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+  $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $deadline.Token).GetAwaiter().GetResult()
   $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
   $memory = [System.IO.MemoryStream]::new()
   $buffer = [byte[]]::new(65536)
   $tooLarge = $false
-  while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+  while (($read = $stream.ReadAsync($buffer, 0, $buffer.Length, $deadline.Token).GetAwaiter().GetResult()) -gt 0) {
     if ($memory.Length + $read -gt 16777216) { $tooLarge = $true; break }
     $memory.Write($buffer, 0, $read)
   }
@@ -91,6 +94,7 @@ try {
 } catch {
   [Environment]::Exit(28)
 } finally {
+  $deadline.Dispose()
   $client.Dispose()
   $handler.Dispose()
 }"#;
@@ -1166,6 +1170,20 @@ mod tests {
             Ok(catalog_document("popular", r#"{"id":"ovvr616"}"#))
         })
         .is_ok());
+    }
+
+    #[test]
+    fn windows_transport_uses_one_deadline_for_headers_and_stalled_body_reads() {
+        for script in [WINDOWS_FANZA_GRAPHQL_SCRIPT, WINDOWS_FANZA_IMAGE_SCRIPT] {
+            assert_eq!(script.matches("CancellationTokenSource]::new()").count(), 1);
+            assert_eq!(script.matches("$deadline.CancelAfter(20000)").count(), 1);
+            assert_eq!(script.matches("$deadline.Token").count(), 2);
+            assert!(script.contains("ResponseHeadersRead, $deadline.Token"));
+            assert!(
+                script.contains("$stream.ReadAsync($buffer, 0, $buffer.Length, $deadline.Token)")
+            );
+            assert!(!script.contains("$stream.Read($buffer"));
+        }
     }
 
     #[test]

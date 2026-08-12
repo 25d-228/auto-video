@@ -2410,6 +2410,7 @@ function JavdbCover({
 }
 
 function DiscoverJavdbBrowseCard({
+  coverRatio,
   inLibrary,
   item,
   onDetails,
@@ -2418,6 +2419,7 @@ function DiscoverJavdbBrowseCard({
   onRatioChange,
   transferState,
 }: {
+  coverRatio: number;
   inLibrary: boolean;
   item: JavdbBrowseItem;
   onDetails: (item: JavdbBrowseItem, triggerId: string) => void;
@@ -2426,7 +2428,6 @@ function DiscoverJavdbBrowseCard({
   onRatioChange: (item: JavdbBrowseItem, ratio: number) => void;
   transferState: VrDownload["state"] | null;
 }) {
-  const [coverRatio, setCoverRatio] = useState(item.sourceAspectRatio);
   const cardId = `javdb-card-${item.category}-${item.requestGeneration}-${item.providerItemId}`;
   const detailsTriggerId = `${cardId}-details`;
   const previewTriggerId = `${cardId}-preview`;
@@ -2436,7 +2437,6 @@ function DiscoverJavdbBrowseCard({
     <article
       aria-labelledby={`${cardId}-title`}
       className="provider-browse-card"
-      data-actions-only="true"
       data-cover-ratio={coverRatio}
       data-narrow-cover={coverRatio < 0.9}
       style={{ width: `${Math.round(naturalWidthCoverHeight * coverRatio)}px` }}
@@ -2452,7 +2452,6 @@ function DiscoverJavdbBrowseCard({
         <JavdbCover
           item={item}
           onRatio={(ratio) => {
-            setCoverRatio(ratio);
             onRatioChange(item, ratio);
           }}
         />
@@ -2517,9 +2516,22 @@ function javdbBrowseItemKey(item: JavdbBrowseItem) {
   return `${item.category}:${item.requestGeneration}:${item.providerItemId}`;
 }
 
+function updatedNaturalWidthRatios(
+  current: Map<string, number>,
+  itemKey: string,
+  ratio: number,
+) {
+  if (current.get(itemKey) === ratio) {
+    return current;
+  }
+  const next = new Map(current);
+  next.set(itemKey, ratio);
+  return next;
+}
+
 function naturalWidthBrowsePages<Item>(
   items: Item[],
-  ratios: Map<string, number>,
+  ratios: ReadonlyMap<string, number>,
   width: number,
   height: number,
   getItemKey: (item: Item) => string,
@@ -2579,7 +2591,9 @@ function NaturalWidthBrowseGallery<Item>({
   getItemKey,
   getSourceAspectRatio,
   items,
+  onRatioChange,
   onSelectedPageChange,
+  ratios,
   renderItem,
   selectedPage,
 }: {
@@ -2587,13 +2601,18 @@ function NaturalWidthBrowseGallery<Item>({
   getItemKey: (item: Item) => string;
   getSourceAspectRatio: (item: Item) => number;
   items: Item[];
+  onRatioChange: (itemKey: string, ratio: number) => void;
   onSelectedPageChange: (page: number) => void;
-  renderItem: (item: Item, onRatioChange: (ratio: number) => void) => ReactNode;
+  ratios: ReadonlyMap<string, number>;
+  renderItem: (
+    item: Item,
+    ratio: number,
+    onRatioChange: (ratio: number) => void,
+  ) => ReactNode;
   selectedPage: number;
 }) {
   const viewport = useRef<HTMLDivElement | null>(null);
   const [bounds, setBounds] = useState({ width: 0, height: 0 });
-  const [ratios, setRatios] = useState<Map<string, number>>(() => new Map());
 
   useLayoutEffect(() => {
     const element = viewport.current;
@@ -2651,17 +2670,11 @@ function NaturalWidthBrowseGallery<Item>({
         <ul aria-label={ariaLabel} className="provider-browse-grid">
           {visibleItems.map((item) => (
             <li key={getItemKey(item)}>
-              {renderItem(item, (ratio) => {
-                setRatios((current) => {
-                  const itemKey = getItemKey(item);
-                  if (current.get(itemKey) === ratio) {
-                    return current;
-                  }
-                  const next = new Map(current);
-                  next.set(itemKey, ratio);
-                  return next;
-                });
-              })}
+              {renderItem(
+                item,
+                ratios.get(getItemKey(item)) ?? getSourceAspectRatio(item),
+                (ratio) => onRatioChange(getItemKey(item), ratio),
+              )}
             </li>
           ))}
         </ul>
@@ -2703,7 +2716,9 @@ function JavdbBrowseGallery({
   onDetails,
   onFindReleases,
   onPreview,
+  onRatioChange,
   onSelectedPageChange,
+  ratios,
   selectedPage,
 }: {
   ariaLabel: string;
@@ -2713,7 +2728,9 @@ function JavdbBrowseGallery({
   onDetails: (item: JavdbBrowseItem, triggerId: string) => void;
   onFindReleases: (item: JavdbBrowseItem, triggerId: string) => void;
   onPreview: (item: JavdbBrowseItem, triggerId: string) => void;
+  onRatioChange: (itemKey: string, ratio: number) => void;
   onSelectedPageChange: (page: number) => void;
+  ratios: ReadonlyMap<string, number>;
   selectedPage: number;
 }) {
   return (
@@ -2722,9 +2739,12 @@ function JavdbBrowseGallery({
       getItemKey={javdbBrowseItemKey}
       getSourceAspectRatio={(item) => item.sourceAspectRatio}
       items={items}
+      onRatioChange={onRatioChange}
       onSelectedPageChange={onSelectedPageChange}
-      renderItem={(item, onRatioChange) => (
+      ratios={ratios}
+      renderItem={(item, coverRatio, onRatioChange) => (
         <DiscoverJavdbBrowseCard
+          coverRatio={coverRatio}
           inLibrary={getInLibrary(item)}
           item={item}
           onDetails={onDetails}
@@ -2812,25 +2832,27 @@ function FanzaCover({
 }
 
 function DiscoverFanzaCard({
+  coverRatio,
   inLibrary,
   item,
   onFindReleases,
   onRatioChange,
   transferState,
 }: {
+  coverRatio: number;
   inLibrary: boolean;
   item: FanzaCatalogItem;
   onFindReleases: (item: FanzaCatalogItem, triggerId: string) => void;
   onRatioChange: (ratio: number) => void;
   transferState: VrDownload["state"] | null;
 }) {
-  const [coverRatio, setCoverRatio] = useState(item.sourceAspectRatio);
   const cardId = `fanza-card-${item.category}-${item.contextGeneration}-${item.requestGeneration}-${item.providerItemId}`;
   const releasesTriggerId = `${cardId}-releases`;
   return (
     <article
       aria-labelledby={`${cardId}-title`}
       className="provider-browse-card"
+      data-actions-only="true"
       data-cover-ratio={coverRatio}
       data-narrow-cover={coverRatio < 0.9}
       style={{ width: `${Math.round(naturalWidthCoverHeight * coverRatio)}px` }}
@@ -2839,7 +2861,6 @@ function DiscoverFanzaCard({
         <FanzaCover
           item={item}
           onRatio={(ratio) => {
-            setCoverRatio(ratio);
             onRatioChange(ratio);
           }}
         />
@@ -2892,8 +2913,10 @@ function FanzaBrowseSurface({
   items,
   message,
   onFindReleases,
+  onRatioChange,
   onRetry,
   onSelectedPageChange,
+  ratios,
   selectedPage,
   state,
 }: {
@@ -2904,8 +2927,10 @@ function FanzaBrowseSurface({
   items: FanzaCatalogItem[];
   message: (typeof fanzaCatalogMessages)[keyof typeof fanzaCatalogMessages] | null;
   onFindReleases: (item: FanzaCatalogItem, triggerId: string) => void;
+  onRatioChange: (itemKey: string, ratio: number) => void;
   onRetry: () => void;
   onSelectedPageChange: (page: number) => void;
+  ratios: ReadonlyMap<string, number>;
   selectedPage: number;
   state: FanzaCatalogState;
 }) {
@@ -2920,9 +2945,12 @@ function FanzaBrowseSurface({
           getItemKey={fanzaItemKey}
           getSourceAspectRatio={(item) => item.sourceAspectRatio}
           items={items}
+          onRatioChange={onRatioChange}
           onSelectedPageChange={onSelectedPageChange}
-          renderItem={(item, onRatioChange) => (
+          ratios={ratios}
+          renderItem={(item, coverRatio, onRatioChange) => (
             <DiscoverFanzaCard
+              coverRatio={coverRatio}
               inLibrary={getInLibrary(item)}
               item={item}
               onFindReleases={onFindReleases}
@@ -8879,6 +8907,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   });
   const [adultBrowseRequestVersion, setAdultBrowseRequestVersion] = useState(0);
   const [adultBrowseSelectedPage, setAdultBrowseSelectedPage] = useState(1);
+  const [adultBrowseRatios, setAdultBrowseRatios] = useState<Map<string, number>>(
+    () => new Map(),
+  );
   const [adultFanzaActivated, setAdultFanzaActivated] = useState(false);
   const [adultFanzaFeed, setAdultFanzaFeed] =
     useState<FanzaFeed>("popular");
@@ -8889,6 +8920,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   });
   const [adultFanzaRequestVersion, setAdultFanzaRequestVersion] = useState(0);
   const [adultFanzaSelectedPage, setAdultFanzaSelectedPage] = useState(1);
+  const [adultFanzaRatios, setAdultFanzaRatios] = useState<Map<string, number>>(
+    () => new Map(),
+  );
   const [adultSearchInputError, setAdultSearchInputError] = useState<
     string | null
   >(null);
@@ -8941,6 +8975,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   });
   const [vrBrowseRequestVersion, setVrBrowseRequestVersion] = useState(0);
   const [vrBrowseSelectedPage, setVrBrowseSelectedPage] = useState(1);
+  const [vrBrowseRatios, setVrBrowseRatios] = useState<Map<string, number>>(
+    () => new Map(),
+  );
   const [vrFanzaActivated, setVrFanzaActivated] = useState(false);
   const [vrFanzaFeed, setVrFanzaFeed] = useState<FanzaFeed>("popular");
   const [vrFanzaCount, setVrFanzaCount] = useState<FanzaResultCount>(25);
@@ -8949,6 +8986,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   });
   const [vrFanzaRequestVersion, setVrFanzaRequestVersion] = useState(0);
   const [vrFanzaSelectedPage, setVrFanzaSelectedPage] = useState(1);
+  const [vrFanzaRatios, setVrFanzaRatios] = useState<Map<string, number>>(
+    () => new Map(),
+  );
   const [javdbDetailContext, setJavdbDetailContext] =
     useState<JavdbDetailContext | null>(null);
   const [javdbDetailState, setJavdbDetailState] =
@@ -10231,6 +10271,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       count: adultBrowseCount,
     };
     setAdultBrowseState({ status: "loading" });
+    setAdultBrowseRatios(new Map());
     const contextGeneration = String(++adultBrowseContextGeneration.current);
     void fetchJavdbBrowse(request, contextGeneration).then((result) => {
       if (requestId === adultBrowseRequestId.current) {
@@ -10263,6 +10304,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     };
     const contextGeneration = String(++adultFanzaContextGeneration.current);
     setAdultFanzaState({ status: "loading" });
+    setAdultFanzaRatios(new Map());
     void fetchFanzaCatalog(request, contextGeneration).then((result) => {
       if (requestId === adultFanzaRequestId.current) {
         setAdultFanzaState(result);
@@ -10354,6 +10396,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       count: vrBrowseCount,
     };
     setVrBrowseState({ status: "loading" });
+    setVrBrowseRatios(new Map());
     const contextGeneration = String(++vrBrowseContextGeneration.current);
     void fetchJavdbBrowse(request, contextGeneration).then((result) => {
       if (requestId === vrBrowseRequestId.current) {
@@ -10384,6 +10427,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     };
     const contextGeneration = String(++vrFanzaContextGeneration.current);
     setVrFanzaState({ status: "loading" });
+    setVrFanzaRatios(new Map());
     void fetchFanzaCatalog(request, contextGeneration).then((result) => {
       if (requestId === vrFanzaRequestId.current) {
         setVrFanzaState(result);
@@ -13130,24 +13174,26 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           ? { status: "idle" }
           : currentState,
       );
-      adultBrowseRequestId.current += 1;
       setAdultBrowseActivated(false);
-      setAdultBrowseState({ status: "idle" });
-      setAdultBrowseSelectedPage(1);
-      const javdbGeneration = String(
-        ++adultBrowseContextGeneration.current,
-      );
-      void invalidateJavdbBrowse("adult", javdbGeneration).catch(
-        () => undefined,
-      );
-      adultFanzaRequestId.current += 1;
+      if (adultBrowseState.status === "loading") {
+        adultBrowseRequestId.current += 1;
+        setAdultBrowseState({ status: "idle" });
+        const javdbGeneration = String(
+          ++adultBrowseContextGeneration.current,
+        );
+        void invalidateJavdbBrowse("adult", javdbGeneration).catch(
+          () => undefined,
+        );
+      }
       setAdultFanzaActivated(false);
-      setAdultFanzaState({ status: "idle" });
-      setAdultFanzaSelectedPage(1);
-      const fanzaGeneration = String(++adultFanzaContextGeneration.current);
-      void invalidateFanzaCatalog("adult", fanzaGeneration).catch(
-        () => undefined,
-      );
+      if (adultFanzaState.status === "loading") {
+        adultFanzaRequestId.current += 1;
+        setAdultFanzaState({ status: "idle" });
+        const fanzaGeneration = String(++adultFanzaContextGeneration.current);
+        void invalidateFanzaCatalog("adult", fanzaGeneration).catch(
+          () => undefined,
+        );
+      }
     }
     if (discoverCategory === "vr") {
       vrCatalogRequestId.current += 1;
@@ -13156,18 +13202,24 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           ? { status: "idle" }
           : currentState,
       );
-      vrBrowseRequestId.current += 1;
       setVrBrowseActivated(false);
-      setVrBrowseState({ status: "idle" });
-      setVrBrowseSelectedPage(1);
-      const javdbGeneration = String(++vrBrowseContextGeneration.current);
-      void invalidateJavdbBrowse("vr", javdbGeneration).catch(() => undefined);
-      vrFanzaRequestId.current += 1;
+      if (vrBrowseState.status === "loading") {
+        vrBrowseRequestId.current += 1;
+        setVrBrowseState({ status: "idle" });
+        const javdbGeneration = String(++vrBrowseContextGeneration.current);
+        void invalidateJavdbBrowse("vr", javdbGeneration).catch(
+          () => undefined,
+        );
+      }
       setVrFanzaActivated(false);
-      setVrFanzaState({ status: "idle" });
-      setVrFanzaSelectedPage(1);
-      const fanzaGeneration = String(++vrFanzaContextGeneration.current);
-      void invalidateFanzaCatalog("vr", fanzaGeneration).catch(() => undefined);
+      if (vrFanzaState.status === "loading") {
+        vrFanzaRequestId.current += 1;
+        setVrFanzaState({ status: "idle" });
+        const fanzaGeneration = String(++vrFanzaContextGeneration.current);
+        void invalidateFanzaCatalog("vr", fanzaGeneration).catch(
+          () => undefined,
+        );
+      }
     }
     if (category === "tv") {
       setIsTvDiscoverActivated(true);
@@ -15520,8 +15572,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       items={vrFanzaItems}
                       message={currentVrFanzaMessage}
                       onFindReleases={openVrReleaseComparison}
+                      onRatioChange={(itemKey, ratio) =>
+                        setVrFanzaRatios((current) =>
+                          updatedNaturalWidthRatios(current, itemKey, ratio),
+                        )
+                      }
                       onRetry={restartVrFanza}
                       onSelectedPageChange={setVrFanzaSelectedPage}
+                      ratios={vrFanzaRatios}
                       selectedPage={vrFanzaSelectedPage}
                       state={vrFanzaState}
                     />
@@ -15539,7 +15597,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         onDetails={openJavdbDetails}
                         onFindReleases={openVrReleaseComparison}
                         onPreview={openJavdbPreview}
+                        onRatioChange={(itemKey, ratio) =>
+                          setVrBrowseRatios((current) =>
+                            updatedNaturalWidthRatios(current, itemKey, ratio),
+                          )
+                        }
                         onSelectedPageChange={setVrBrowseSelectedPage}
+                        ratios={vrBrowseRatios}
                         selectedPage={vrBrowseSelectedPage}
                       />
                     </>
@@ -15623,8 +15687,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       items={adultFanzaItems}
                       message={currentAdultFanzaMessage}
                       onFindReleases={openAdultReleaseComparison}
+                      onRatioChange={(itemKey, ratio) =>
+                        setAdultFanzaRatios((current) =>
+                          updatedNaturalWidthRatios(current, itemKey, ratio),
+                        )
+                      }
                       onRetry={restartAdultFanza}
                       onSelectedPageChange={setAdultFanzaSelectedPage}
+                      ratios={adultFanzaRatios}
                       selectedPage={adultFanzaSelectedPage}
                       state={adultFanzaState}
                     />
@@ -15642,7 +15712,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         onDetails={openJavdbDetails}
                         onFindReleases={openAdultReleaseComparison}
                         onPreview={openJavdbPreview}
+                        onRatioChange={(itemKey, ratio) =>
+                          setAdultBrowseRatios((current) =>
+                            updatedNaturalWidthRatios(current, itemKey, ratio),
+                          )
+                        }
                         onSelectedPageChange={setAdultBrowseSelectedPage}
+                        ratios={adultBrowseRatios}
                         selectedPage={adultBrowseSelectedPage}
                       />
                     </>
