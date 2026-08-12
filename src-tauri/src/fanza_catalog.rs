@@ -733,7 +733,7 @@ fn parse_process_response(
     parse_framed_response(output, maximum)
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn macos_process_error(exit_code: Option<i32>) -> ProviderRequestError {
     if exit_code == Some(63) {
         ProviderRequestError::Provider
