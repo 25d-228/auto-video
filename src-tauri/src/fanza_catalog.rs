@@ -22,6 +22,42 @@ const FANZA_PREVIEW_LIMIT: usize = 24;
 const FANZA_HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
 #[cfg(target_os = "macos")]
 const FANZA_HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_code}";
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_FANZA_GRAPHQL_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  $headers = @{ Accept = 'application/json'; Origin = $env:FANZA_ORIGIN; Referer = $env:FANZA_REFERER }
+  $response = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 20 -Method Post -Uri $env:FANZA_URL -ContentType 'application/json' -Headers $headers -Body $env:FANZA_BODY
+  [Console]::Out.Write($response.Content)
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + [int]$response.StatusCode)
+} catch {
+  $status = if ($null -eq $_.Exception.Response) { 0 } else { [int]$_.Exception.Response.StatusCode }
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + $status)
+}"#;
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_FANZA_IMAGE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  $response = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 20 -Uri $env:FANZA_IMAGE -Headers @{ Referer = $env:FANZA_REFERER }
+  $memory = [System.IO.MemoryStream]::new()
+  $buffer = [byte[]]::new(65536)
+  $tooLarge = $false
+  while (($read = $response.RawContentStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+    if ($memory.Length + $read -gt 16777216) { $tooLarge = $true; break }
+    $memory.Write($buffer, 0, $read)
+  }
+  if ($tooLarge) {
+    [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:413")
+  } else {
+    [Console]::Out.Write([Convert]::ToBase64String($memory.ToArray()))
+    [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + [int]$response.StatusCode)
+  }
+} catch {
+  $status = if ($null -eq $_.Exception.Response) { 0 } else { [int]$_.Exception.Response.StatusCode }
+  [Console]::Out.Write("`nAUTO_VIDEO_HTTP_STATUS:" + $status)
+}"#;
 
 pub(crate) const ADULT_FANZA_MALFORMED: &str = "adult_fanza_malformed_provider";
 pub(crate) const ADULT_FANZA_CONFLICTING: &str = "adult_fanza_conflicting_provider";
@@ -968,9 +1004,9 @@ pub(crate) fn fetch_graphql_document(body: &str) -> Result<String, ProviderReque
 
 #[cfg(target_os = "windows")]
 pub(crate) fn fetch_graphql_document(body: &str) -> Result<String, ProviderRequestError> {
-    let script = "$ProgressPreference='SilentlyContinue';try{$r=Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 20 -Method Post -Uri $env:FANZA_URL -ContentType 'application/json' -Headers @{Accept='application/json';Origin=$env:FANZA_ORIGIN;Referer=$env:FANZA_REFERER} -Body $env:FANZA_BODY;[Console]::Out.Write($r.Content);[Console]::Out.Write('`nAUTO_VIDEO_HTTP_STATUS:'+[int]$r.StatusCode)}catch{if($_.Exception.Response){[Console]::Out.Write('`nAUTO_VIDEO_HTTP_STATUS:'+[int]$_.Exception.Response.StatusCode.value__)}else{[Console]::Out.Write('`nAUTO_VIDEO_HTTP_STATUS:0')}}";
     let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(WINDOWS_FANZA_GRAPHQL_SCRIPT)
         .env("FANZA_URL", FANZA_GRAPHQL_URL)
         .env("FANZA_ORIGIN", FANZA_ORIGIN)
         .env("FANZA_REFERER", FANZA_REFERER)
@@ -1023,18 +1059,27 @@ pub(crate) fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, ProviderRequestErr
     if !valid_https_image_url(url) {
         return Err(ProviderRequestError::Provider);
     }
-    let script = "$ProgressPreference='SilentlyContinue';try{$r=Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 20 -Uri $env:FANZA_IMAGE -Headers @{Referer=$env:FANZA_REFERER};[Console]::Out.Write([Convert]::ToBase64String($r.Content));[Console]::Out.Write('`nAUTO_VIDEO_HTTP_STATUS:'+[int]$r.StatusCode)}catch{if($_.Exception.Response){[Console]::Out.Write('`nAUTO_VIDEO_HTTP_STATUS:'+[int]$_.Exception.Response.StatusCode.value__)}else{[Console]::Out.Write('`nAUTO_VIDEO_HTTP_STATUS:0')}}";
     let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(WINDOWS_FANZA_IMAGE_SCRIPT)
         .env("FANZA_IMAGE", url)
         .env("FANZA_REFERER", FANZA_REFERER)
         .output()
         .map_err(|_| ProviderRequestError::Network)?;
-    let encoded = parse_text_response(&output.stdout, FANZA_IMAGE_MAX_BYTES * 2)?;
-    crate::javdb_catalog::decode_base64(
+    parse_windows_image_response(&output.stdout)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn parse_windows_image_response(output: &[u8]) -> Result<Vec<u8>, ProviderRequestError> {
+    let encoded = parse_text_response(output, FANZA_IMAGE_MAX_BYTES * 2)?;
+    let bytes = crate::javdb_catalog::decode_base64(
         std::str::from_utf8(&encoded).map_err(|_| ProviderRequestError::Provider)?,
     )
-    .ok_or(ProviderRequestError::Provider)
+    .ok_or(ProviderRequestError::Provider)?;
+    if bytes.len() > FANZA_IMAGE_MAX_BYTES {
+        return Err(ProviderRequestError::Provider);
+    }
+    Ok(bytes)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1110,6 +1155,63 @@ mod tests {
         ] {
             assert!(!valid_https_image_url(url), "accepted {url}");
         }
+    }
+
+    #[test]
+    fn windows_transport_uses_utf8_real_newlines_and_bounded_raw_image_bytes() {
+        for script in [WINDOWS_FANZA_GRAPHQL_SCRIPT, WINDOWS_FANZA_IMAGE_SCRIPT] {
+            assert!(script.contains("$ErrorActionPreference = 'Stop'"));
+            assert!(script.contains("$ProgressPreference = 'SilentlyContinue'"));
+            assert!(script.contains("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8"));
+            assert!(script.contains("[Console]::Out.Write(\"`nAUTO_VIDEO_HTTP_STATUS:"));
+            assert!(!script.contains("Write('`nAUTO_VIDEO_HTTP_STATUS:"));
+            assert!(script.contains("-MaximumRedirection 0"));
+            assert!(script.contains("-TimeoutSec 20"));
+        }
+        assert!(WINDOWS_FANZA_GRAPHQL_SCRIPT.contains("Origin = $env:FANZA_ORIGIN"));
+        assert!(WINDOWS_FANZA_GRAPHQL_SCRIPT.contains("Referer = $env:FANZA_REFERER"));
+        assert!(WINDOWS_FANZA_IMAGE_SCRIPT.contains("$response.RawContentStream.Read"));
+        assert!(WINDOWS_FANZA_IMAGE_SCRIPT.contains("[System.IO.MemoryStream]::new()"));
+        assert!(WINDOWS_FANZA_IMAGE_SCRIPT.contains("-gt 16777216"));
+        assert!(WINDOWS_FANZA_IMAGE_SCRIPT.contains("[Convert]::ToBase64String($memory.ToArray())"));
+        assert!(!WINDOWS_FANZA_IMAGE_SCRIPT.contains("ToBase64String($response.Content)"));
+    }
+
+    #[test]
+    fn framed_transport_preserves_unicode_statuses_binary_bytes_and_limits() {
+        let unicode = "{\"data\":{\"title\":\"日本語の作品\"}}";
+        let framed = format!("{unicode}\nAUTO_VIDEO_HTTP_STATUS:200");
+        assert_eq!(
+            String::from_utf8(parse_text_response(framed.as_bytes(), 1024).unwrap()).unwrap(),
+            unicode
+        );
+        for (status, expected) in [
+            ("404", ProviderRequestError::SourceUnavailable),
+            ("410", ProviderRequestError::SourceUnavailable),
+            ("451", ProviderRequestError::SourceUnavailable),
+            ("0", ProviderRequestError::Network),
+            ("500", ProviderRequestError::Provider),
+        ] {
+            assert_eq!(
+                parse_text_response(
+                    format!("body\nAUTO_VIDEO_HTTP_STATUS:{status}").as_bytes(),
+                    1024,
+                ),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            parse_text_response(b"four\nAUTO_VIDEO_HTTP_STATUS:200", 3),
+            Err(ProviderRequestError::Provider)
+        );
+        assert_eq!(
+            parse_windows_image_response(b"AP8QgA==\nAUTO_VIDEO_HTTP_STATUS:200"),
+            Ok(vec![0x00, 0xff, 0x10, 0x80])
+        );
+        assert_eq!(
+            parse_windows_image_response(b"AP8QgA==\nAUTO_VIDEO_HTTP_STATUS:413"),
+            Err(ProviderRequestError::Provider)
+        );
     }
 
     #[test]

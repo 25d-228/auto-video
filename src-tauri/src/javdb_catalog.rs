@@ -1507,7 +1507,7 @@ fn parse_binary_response(output: &[u8]) -> Result<Vec<u8>, ProviderRequestError>
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(test, target_os = "windows"))]
 pub(crate) fn decode_base64(value: &str) -> Option<Vec<u8>> {
     fn digit(character: u8) -> Option<u8> {
         match character {

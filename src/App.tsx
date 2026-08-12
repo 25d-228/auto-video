@@ -48,6 +48,7 @@ import {
   fetchFanzaCatalog,
   fetchFanzaCoverObjectUrl,
   fetchFanzaDetail,
+  fanzaErrorStatus,
   fetchFanzaPreview,
   fetchFanzaPreviewImageObjectUrl,
   invalidateFanzaCatalog,
@@ -1350,6 +1351,39 @@ const fanzaMessages = {
   },
 } as const;
 
+const fanzaPreviewMessages = {
+  "source-unavailable": {
+    heading: "FANZA previews are unavailable",
+    message: "The retained preview source is unavailable. Retry this exact item later.",
+    role: "alert",
+  },
+  "network-error": {
+    heading: "FANZA previews could not be reached",
+    message: "Check the network connection and retry this exact item.",
+    role: "alert",
+  },
+  "malformed-provider": {
+    heading: "FANZA returned invalid preview data",
+    message: "The exact item or retained preview response was invalid.",
+    role: "alert",
+  },
+  "conflicting-provider": {
+    heading: "FANZA returned a conflicting preview identity",
+    message: "The preview no longer belongs to this exact item.",
+    role: "alert",
+  },
+  "provider-error": {
+    heading: "FANZA previews could not be loaded",
+    message: "The provider returned an unexpected preview error. Retry this exact item.",
+    role: "alert",
+  },
+  stale: {
+    heading: "These FANZA previews are no longer current",
+    message: "Return to the current catalog and open Preview again.",
+    role: "alert",
+  },
+} as const;
+
 const vrReleaseMessages = {
   loading: {
     heading: "Finding verified releases",
@@ -2192,6 +2226,7 @@ function JavdbBrowseControls({
             <span>Provider</span>
             <select
               aria-label={`${category === "vr" ? "VR" : "Adult"} provider`}
+              id={`${category}-provider`}
               onChange={(event) =>
                 onProviderChange(event.target.value as DiscoverBrowseProvider)
               }
@@ -3075,7 +3110,17 @@ function FanzaBrowseSurface({
 }
 
 function fanzaFocusTarget(category: "adult" | "vr", triggerId: string) {
-  return document.getElementById(triggerId) ?? document.getElementById(`${category}-fanza-refresh`);
+  return (
+    document.getElementById(triggerId) ??
+    document.getElementById(`${category}-fanza-refresh`) ??
+    document.getElementById(`${category}-provider`) ??
+    document.querySelector<HTMLInputElement>(
+      'input[name="discover-category"]:checked',
+    ) ??
+    document.querySelector<HTMLButtonElement>(
+      '.navigation-item[aria-current="page"]',
+    )
+  );
 }
 
 function FanzaDetailsDialog({
@@ -3160,11 +3205,13 @@ function FanzaPreviewDialog({
   detailState,
   item,
   onBack,
+  onRetryDetail,
   triggerId,
 }: {
   detailState: FanzaDetailState;
   item: FanzaCatalogItem;
   onBack: () => void;
+  onRetryDetail: () => void;
   triggerId: string;
 }) {
   const [state, setState] = useState<FanzaPreviewState>({ status: "loading" });
@@ -3191,15 +3238,52 @@ function FanzaPreviewDialog({
         setState({ status: "no-preview" });
         return;
       }
-      const images = (await Promise.all(result.authorityIds.map(async (authorityId) => {
-        try {
-          const url = await fetchFanzaPreviewImageObjectUrl(item, result.previewGeneration, authorityId);
-          if (!current) URL.revokeObjectURL(url);
-          else objectUrls.add(url);
-          return current ? url : null;
-        } catch { return null; }
-      }))).filter((url): url is string => url !== null);
-      if (current) setState(images.length === 0 ? { status: "provider-error" } : { status: "ready", previewGeneration: result.previewGeneration, images });
+      const imageResults = await Promise.all(
+        result.authorityIds.map(async (authorityId) => {
+          try {
+            const url = await fetchFanzaPreviewImageObjectUrl(
+              item,
+              result.previewGeneration,
+              authorityId,
+            );
+            if (!current) URL.revokeObjectURL(url);
+            else objectUrls.add(url);
+            return current
+              ? ({ status: "ready", url } as const)
+              : ({ status: "stale" } as const);
+          } catch (error: unknown) {
+            return {
+              status: fanzaErrorStatus(item.category, error),
+            } as const;
+          }
+        }),
+      );
+      if (!current) return;
+      const images = imageResults.flatMap((imageResult) =>
+        imageResult.status === "ready" ? [imageResult.url] : [],
+      );
+      const firstFailure = imageResults.find(
+        (imageResult) => imageResult.status !== "ready",
+      );
+      const hasStaleFailure = imageResults.some(
+        (imageResult) => imageResult.status === "stale",
+      );
+      setState(
+        images.length > 0
+          ? {
+              status: "ready",
+              previewGeneration: result.previewGeneration,
+              images,
+            }
+          : {
+              status:
+                hasStaleFailure
+                  ? "stale"
+                  : firstFailure === undefined
+                  ? "provider-error"
+                  : firstFailure.status,
+            },
+      );
     });
     return () => {
       current = false;
@@ -3222,25 +3306,52 @@ function FanzaPreviewDialog({
         : { ...state, images },
     );
   };
-  const message = state.status === "ready" || state.status === "loading" || state.status === "no-preview" ? null : fanzaMessages[state.status];
+  const visibleState: FanzaPreviewState =
+    detailState.status === "ready"
+      ? state
+      : detailState.status === "loading"
+        ? { status: "loading" }
+        : { status: detailState.status };
+  const message =
+    visibleState.status === "ready" ||
+    visibleState.status === "loading" ||
+    visibleState.status === "no-preview"
+      ? null
+      : fanzaPreviewMessages[visibleState.status];
+  const retryPreview = () => {
+    if (detailState.status === "ready") {
+      setRequestVersion((version) => version + 1);
+    } else {
+      onRetryDetail();
+    }
+  };
   return (
     <Dialog.Portal>
       <Dialog.Backdrop className="vr-torrent__backdrop" />
       <Dialog.Viewport className="vr-torrent__viewport">
         <Dialog.Popup
-          aria-busy={state.status === "loading"}
+          aria-busy={visibleState.status === "loading"}
           className="vr-torrent__popup javdb-preview__popup"
           finalFocus={() => fanzaFocusTarget(item.category, triggerId)}
-          onKeyDown={(event) => { if (event.key === "ArrowLeft") move(-1); else if (event.key === "ArrowRight") move(1); }}
+          onKeyDown={(event) => {
+            if (visibleState.status !== "ready") return;
+            if (event.key === "ArrowLeft") {
+              event.preventDefault();
+              move(-1);
+            } else if (event.key === "ArrowRight") {
+              event.preventDefault();
+              move(1);
+            }
+          }}
         >
           <div className="vr-torrent__heading"><div><p className="card-eyebrow">FANZA preview</p><Dialog.Title>{item.code}</Dialog.Title></div><Dialog.Close render={<Button type="button" variant="ghost"><AppIcon name="close" />Close</Button>} /></div>
           <Dialog.Description className="vr-torrent__description">Exact preview images retained for this accepted FANZA item.</Dialog.Description>
-          {detailState.status !== "ready" || state.status === "loading" ? (
+          {visibleState.status === "loading" ? (
             <div className="vr-releases__state" role="status"><h3>Loading FANZA preview</h3><p>Verifying the current exact item and retained preview images.</p></div>
-          ) : state.status === "ready" ? (
-            <div className="javdb-preview__content"><span aria-live="polite" className="sr-only" role="status">{state.images.length} FANZA preview images loaded.</span><img alt={`${item.code} preview ${currentIndex + 1} of ${state.images.length}`} onError={removeCurrentImage} src={state.images[currentIndex]} /><p aria-live="polite">Image {currentIndex + 1} of {state.images.length}</p>{state.images.length > 1 ? <div className="javdb-preview__navigation"><Button aria-label={`Previous preview for ${item.code}`} onClick={() => move(-1)} type="button" variant="outline">Previous</Button><Button aria-label={`Next preview for ${item.code}`} onClick={() => move(1)} type="button" variant="outline">Next</Button></div> : null}</div>
+          ) : visibleState.status === "ready" ? (
+            <div className="javdb-preview__content"><span aria-live="polite" className="sr-only" role="status">{visibleState.images.length} FANZA preview images loaded.</span><img alt={`${item.code} preview ${currentIndex + 1} of ${visibleState.images.length}`} onError={removeCurrentImage} src={visibleState.images[currentIndex]} /><p aria-live="polite">Image {currentIndex + 1} of {visibleState.images.length}</p>{visibleState.images.length > 1 ? <div className="javdb-preview__navigation"><Button aria-label={`Previous preview for ${item.code}`} onClick={() => move(-1)} type="button" variant="outline">Previous</Button><Button aria-label={`Next preview for ${item.code}`} onClick={() => move(1)} type="button" variant="outline">Next</Button></div> : null}</div>
           ) : (
-            <div className="vr-releases__state" role={message?.role}><div><h3>{state.status === "no-preview" ? "No preview images available" : message?.heading}</h3><p>{state.status === "no-preview" ? "FANZA did not provide an accepted preview for this item." : message?.message}</p>{state.status === "no-preview" || state.status === "stale" ? null : <Button onClick={() => setRequestVersion((version) => version + 1)} type="button" variant="outline">Retry preview</Button>}</div></div>
+            <div className="vr-releases__state" role={message?.role}><div><h3>{visibleState.status === "no-preview" ? "No preview images available" : message?.heading}</h3><p>{visibleState.status === "no-preview" ? "FANZA did not provide an accepted preview for this item." : message?.message}</p>{visibleState.status === "no-preview" || visibleState.status === "stale" ? null : <Button onClick={retryPreview} type="button" variant="outline">Retry preview</Button>}</div></div>
           )}
           <Button onClick={onBack} type="button" variant="outline">Back to details</Button>
         </Dialog.Popup>
@@ -17744,6 +17855,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
             detailState={fanzaDetailState}
             item={fanzaDetailContext.item}
             onBack={() => setFanzaDetailContext((current) => current === null ? null : { ...current, surface: "details" })}
+            onRetryDetail={retryFanzaDetail}
             triggerId={fanzaDetailContext.triggerId}
           />
         )}
