@@ -10905,6 +10905,191 @@ describe("native-owned FANZA Adult and VR catalogs", () => {
     );
   });
 
+  it.each([
+    {
+      category: "adult" as const,
+      code: "MARAA-244",
+      contentId: "maraa244",
+      label: "Adult",
+    },
+    {
+      category: "vr" as const,
+      code: "VRKM-1577",
+      contentId: "vrkm01577",
+      label: "VR",
+    },
+  ])(
+    "keeps $label Retry focused in the current FANZA request and completes once",
+    async ({ category, code, contentId, label }) => {
+      const retry = createDeferred<string[]>();
+      fetchFanzaCatalogMock
+        .mockRejectedValueOnce(`${category}_network_error`)
+        .mockReturnValueOnce(retry.promise);
+      render(<App />);
+      selectDiscover();
+      fireEvent.click(screen.getByRole("radio", { name: label }));
+      if (category === "adult") {
+        fireEvent.change(
+          screen.getByRole("combobox", { name: "Adult provider" }),
+          { target: { value: "fanza" } },
+        );
+      }
+
+      expect(
+        await screen.findByRole("heading", {
+          name: "FANZA could not be reached",
+        }),
+      ).toBeTruthy();
+      const retryButton = screen.getByRole("button", { name: "Retry" });
+      retryButton.focus();
+      fireEvent.click(retryButton);
+
+      await waitFor(() => expect(fetchFanzaCatalogMock).toHaveBeenCalledTimes(2));
+      const refresh = document.getElementById(`${category}-fanza-refresh`);
+      expect(document.activeElement).toBe(refresh);
+      expect(
+        screen
+          .getByRole("region", { name: `FANZA ${label} catalog` })
+          .getAttribute("aria-busy"),
+      ).toBe("true");
+      expect(fetchFanzaCatalogMock).toHaveBeenLastCalledWith({
+        category,
+        contextGeneration: expect.any(String),
+        feed: "popular",
+        count: 25,
+      });
+      expect(
+        (screen.getByRole("radio", { name: label }) as HTMLInputElement).checked,
+      ).toBe(true);
+      expect(
+        (screen.getByRole("combobox", {
+          name: `${label} provider`,
+        }) as HTMLSelectElement).value,
+      ).toBe("fanza");
+      expect(
+        (screen.getByRole("combobox", {
+          name: `${label} FANZA feed`,
+        }) as HTMLSelectElement).value,
+      ).toBe("popular");
+      expect(
+        (screen.getByRole("combobox", {
+          name: `${label} FANZA result count`,
+        }) as HTMLSelectElement).value,
+      ).toBe("25");
+
+      await act(async () => {
+        retry.resolve(
+          fanzaCatalogFixture(category, [
+            { code, contentId, cover: false },
+          ]),
+        );
+        await retry.promise;
+      });
+      expect(await screen.findByRole("heading", { name: code })).toBeTruthy();
+      expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+      expect(fetchFanzaCatalogMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([
+    {
+      category: "adult" as const,
+      freshCode: "MARAA-244",
+      freshContentId: "maraa244",
+      label: "Adult",
+      lateCode: "ADLT-123",
+      lateContentId: "adlt123",
+    },
+    {
+      category: "vr" as const,
+      freshCode: "OVVR-616",
+      freshContentId: "ovvr616",
+      label: "VR",
+      lateCode: "VRKM-1577",
+      lateContentId: "vrkm01577",
+    },
+  ])(
+    "starts one safe current $label request from stale and rejects a superseded result",
+    async ({
+      category,
+      freshCode,
+      freshContentId,
+      label,
+      lateCode,
+      lateContentId,
+    }) => {
+      const superseded = createDeferred<string[]>();
+      fetchFanzaCatalogMock
+        .mockRejectedValueOnce(`${category}_fanza_stale`)
+        .mockReturnValueOnce(superseded.promise)
+        .mockResolvedValueOnce(
+          fanzaCatalogFixture(
+            category,
+            [{ code: freshCode, contentId: freshContentId, cover: false }],
+            "10",
+          ),
+        );
+      render(<App />);
+      selectDiscover();
+      fireEvent.click(screen.getByRole("radio", { name: label }));
+      if (category === "adult") {
+        fireEvent.change(
+          screen.getByRole("combobox", { name: "Adult provider" }),
+          { target: { value: "fanza" } },
+        );
+      }
+
+      expect(
+        await screen.findByRole("heading", { name: "FANZA request changed" }),
+      ).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await waitFor(() => expect(fetchFanzaCatalogMock).toHaveBeenCalledTimes(2));
+      expect(fetchFanzaCatalogMock).toHaveBeenLastCalledWith({
+        category,
+        contextGeneration: expect.any(String),
+        feed: "popular",
+        count: 25,
+      });
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Refresh" }),
+      );
+      expect(await screen.findByRole("heading", { name: freshCode })).toBeTruthy();
+      expect(fetchFanzaCatalogMock).toHaveBeenCalledTimes(3);
+      await act(async () => {
+        superseded.resolve(
+          fanzaCatalogFixture(category, [
+            { code: lateCode, contentId: lateContentId },
+          ]),
+        );
+        await superseded.promise;
+      });
+
+      expect(screen.getByRole("heading", { name: freshCode })).toBeTruthy();
+      expect(screen.queryByRole("heading", { name: lateCode })).toBeNull();
+      expect(fetchFanzaCoverMock).not.toHaveBeenCalled();
+      expect(
+        (screen.getByRole("radio", { name: label }) as HTMLInputElement).checked,
+      ).toBe(true);
+      expect(
+        (screen.getByRole("combobox", {
+          name: `${label} provider`,
+        }) as HTMLSelectElement).value,
+      ).toBe("fanza");
+      expect(
+        (screen.getByRole("combobox", {
+          name: `${label} FANZA feed`,
+        }) as HTMLSelectElement).value,
+      ).toBe("popular");
+      expect(
+        (screen.getByRole("combobox", {
+          name: `${label} FANZA result count`,
+        }) as HTMLSelectElement).value,
+      ).toBe("25");
+      expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+    },
+  );
+
   it("keeps cover failures local and exposes honest retryable catalog states", async () => {
     fetchFanzaCatalogMock
       .mockRejectedValueOnce("vr_source_unavailable")

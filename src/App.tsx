@@ -13304,6 +13304,26 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     setVrFanzaRequestVersion((version) => version + 1);
   };
 
+  const retryAdultFanza = () => {
+    closeAdultReleaseComparison();
+    closeJavdbDetail();
+    adultFanzaRequestId.current += 1;
+    setAdultFanzaState({ status: "loading" });
+    setAdultFanzaActivated(true);
+    setAdultFanzaRequestVersion((version) => version + 1);
+    document.getElementById("adult-fanza-refresh")?.focus();
+  };
+
+  const retryVrFanza = () => {
+    closeVrReleaseComparison();
+    closeJavdbDetail();
+    vrFanzaRequestId.current += 1;
+    setVrFanzaState({ status: "loading" });
+    setVrFanzaActivated(true);
+    setVrFanzaRequestVersion((version) => version + 1);
+    document.getElementById("vr-fanza-refresh")?.focus();
+  };
+
   const changeAdultBrowseProvider = (provider: DiscoverBrowseProvider) => {
     if (provider === adultBrowseProvider) return;
     closeAdultReleaseComparison();
@@ -15564,10 +15584,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         vrFanzaState.status === "network-error" ||
                         vrFanzaState.status === "malformed-provider" ||
                         vrFanzaState.status === "conflicting-provider" ||
-                        vrFanzaState.status === "provider-error" ? (
+                        vrFanzaState.status === "provider-error" ||
+                        vrFanzaState.status === "stale" ? (
                           <Button
                             className="empty-state__action"
-                            onClick={restartVrFanza}
+                            onClick={retryVrFanza}
                             type="button"
                             variant="outline"
                           >
@@ -15714,10 +15735,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         adultFanzaState.status === "network-error" ||
                         adultFanzaState.status === "malformed-provider" ||
                         adultFanzaState.status === "conflicting-provider" ||
-                        adultFanzaState.status === "provider-error" ? (
+                        adultFanzaState.status === "provider-error" ||
+                        adultFanzaState.status === "stale" ? (
                           <Button
                             className="empty-state__action"
-                            onClick={restartAdultFanza}
+                            onClick={retryAdultFanza}
                             type="button"
                             variant="outline"
                           >
