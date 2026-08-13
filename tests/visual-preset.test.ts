@@ -12,11 +12,27 @@ const presetConfiguration = JSON.parse(
   menuAccent: string;
 };
 const applicationStyles = readFileSync(resolve("src/index.css"), "utf8");
+const packageJson = JSON.parse(
+  readFileSync(resolve("package.json"), "utf8"),
+) as { dependencies: Record<string, string> };
+const buttonSource = readFileSync(
+  resolve("src/components/ui/button.tsx"),
+  "utf8",
+);
 
-describe("Mira preset contract", () => {
-  it("records the Base UI Mira configuration with Neutral and Phosphor", () => {
+function ruleBody(selector: string) {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = applicationStyles.match(
+    new RegExp(`${escapedSelector}\\s*\\{([^}]+)\\}`, "s"),
+  );
+  expect(match, `Expected a CSS rule for ${selector}`).not.toBeNull();
+  return match?.[1] ?? "";
+}
+
+describe("Sera preset contract", () => {
+  it("records the Base UI Sera configuration with Neutral and Phosphor", () => {
     expect(presetConfiguration).toMatchObject({
-      style: "base-mira",
+      style: "base-sera",
       tailwind: {
         baseColor: "neutral",
         cssVariables: true,
@@ -27,18 +43,28 @@ describe("Mira preset contract", () => {
     });
   });
 
-  it("defines the approved fonts, Red theme, Rose charts, and zero radius", () => {
+  it("defines the approved Sera fonts, Red theme, Rose charts, and square surfaces", () => {
     expect(applicationStyles).toContain(
-      '@import "@fontsource-variable/inter";',
+      '@import "@fontsource-variable/noto-sans";',
     );
     expect(applicationStyles).toContain(
-      '@import "@fontsource-variable/geist-mono";',
+      '@import "@fontsource-variable/playfair-display";',
     );
     expect(applicationStyles).toContain(
-      '--font-sans: "Inter Variable", sans-serif;',
+      '--font-sans: "Noto Sans Variable", sans-serif;',
     );
     expect(applicationStyles).toContain(
-      '--font-heading: "Geist Mono Variable", monospace;',
+      '--font-heading: "Playfair Display Variable", serif;',
+    );
+    expect(packageJson.dependencies).toMatchObject({
+      "@fontsource-variable/noto-sans": "5.3.0",
+      "@fontsource-variable/playfair-display": "5.3.0",
+    });
+    expect(packageJson.dependencies).not.toHaveProperty(
+      "@fontsource-variable/inter",
+    );
+    expect(packageJson.dependencies).not.toHaveProperty(
+      "@fontsource-variable/geist-mono",
     );
     expect(applicationStyles).toContain(
       "--primary: oklch(0.505 0.213 27.518);",
@@ -53,7 +79,51 @@ describe("Mira preset contract", () => {
       applicationStyles.matchAll(/border-radius:\s*([^;]+);/g),
       (match) => match[1],
     );
-    expect(new Set(surfaceRadii)).toEqual(new Set(["var(--radius)"]));
+    expect(new Set(surfaceRadii)).toEqual(new Set(["0", "var(--radius)"]));
+  });
+
+  it("keeps the shared Button on the current Sera contract", () => {
+    expect(buttonSource).toContain(
+      "rounded-none border border-transparent bg-clip-padding text-xs font-semibold tracking-widest whitespace-nowrap uppercase",
+    );
+    expect(buttonSource).toContain(
+      '"border-border bg-transparent hover:bg-muted hover:text-foreground',
+    );
+    expect(buttonSource).toContain(
+      'default:\n          "h-10 gap-1.5 px-6',
+    );
+    expect(buttonSource).toContain('xs: "h-7 gap-1 px-3');
+    expect(buttonSource).not.toContain("rounded-md");
+    expect(buttonSource).not.toContain("text-xs/relaxed font-medium");
+  });
+
+  it("uses responsive ordered toolbar tracks without a fixed request block", () => {
+    const controls = ruleBody(".provider-browse-controls");
+    const request = ruleBody(".provider-browse-controls__request");
+    expect(controls).toContain("display: grid;");
+    expect(controls).toContain("width: 100%;");
+    expect(controls).toContain("min-width: 0;");
+    expect(controls).toContain(
+      "grid-template-columns: max-content minmax(0, 1fr);",
+    );
+    expect(request).toContain(
+      "repeat(auto-fit, minmax(min(100%, 7.5rem), 1fr))",
+    );
+    expect(request).toContain("min-width: 0;");
+    expect(ruleBody(".provider-select-label")).toContain("min-width: 0;");
+    expect(ruleBody(".provider-select-label select")).toContain("width: 100%;");
+    expect(applicationStyles).not.toContain("flex: 1 1 24rem;");
+  });
+
+  it("places cover actions on one opaque semantic surface for hover and focus", () => {
+    const actions = ruleBody(".provider-browse-card__actions");
+    expect(actions).toContain("background: var(--card);");
+    expect(actions).toContain("color: var(--card-foreground);");
+    expect(actions).toContain("border: 1px solid var(--border);");
+    expect(actions).not.toContain("background: transparent;");
+    expect(applicationStyles).toContain(
+      ".provider-browse-card:hover .provider-browse-card__actions,\n.provider-browse-card:focus-within .provider-browse-card__actions",
+    );
   });
 
   it("reserves a stable title action column and reveals it for hover and focus", () => {

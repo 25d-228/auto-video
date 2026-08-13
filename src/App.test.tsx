@@ -10491,6 +10491,78 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
 });
 
 describe("native-owned FANZA Adult and VR catalogs", () => {
+  it("keeps the complete Adult and VR browse toolbar in logical responsive order", () => {
+    Object.defineProperties(window, {
+      innerHeight: { configurable: true, value: 520 },
+      innerWidth: { configurable: true, value: 720 },
+    });
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "Adult browse mode" }),
+      { target: { value: "category" } },
+    );
+
+    const expectLogicalOrder = (controls: HTMLElement[]) => {
+      for (let index = 1; index < controls.length; index += 1) {
+        expect(
+          controls[index - 1].compareDocumentPosition(controls[index]),
+        ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      }
+    };
+    const adultControls = () => [
+      screen.getByRole("group", { name: "Discover category" }),
+      screen.getByRole("group", { name: "Adult workflow" }),
+      screen.getByRole("combobox", { name: "Adult provider" }),
+      screen.getByRole("combobox", { name: "Adult browse mode" }),
+      screen.getByRole("combobox", { name: "Adult year" }),
+      screen.getByRole("combobox", { name: "Adult month" }),
+      screen.getByRole("combobox", { name: "Adult sort" }),
+      screen.getByRole("combobox", { name: "Adult result count" }),
+      screen.getByRole("button", { name: "Refresh" }),
+    ];
+    expectLogicalOrder(adultControls());
+
+    Object.defineProperties(window, {
+      innerHeight: { configurable: true, value: 900 },
+      innerWidth: { configurable: true, value: 1440 },
+    });
+    fireEvent(window, new Event("resize"));
+    expectLogicalOrder(adultControls());
+
+    Object.defineProperties(window, {
+      innerHeight: { configurable: true, value: 520 },
+      innerWidth: { configurable: true, value: 720 },
+    });
+    fireEvent(window, new Event("resize"));
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const vrControls = () => [
+      screen.getByRole("group", { name: "Discover category" }),
+      screen.getByRole("group", { name: "VR workflow" }),
+      screen.getByRole("combobox", { name: "VR provider" }),
+      screen.getByRole("combobox", { name: "VR FANZA feed" }),
+      screen.getByRole("combobox", { name: "VR FANZA result count" }),
+      screen.getByRole("button", { name: "Refresh" }),
+    ];
+    expectLogicalOrder(vrControls());
+
+    Object.defineProperties(window, {
+      innerHeight: { configurable: true, value: 900 },
+      innerWidth: { configurable: true, value: 1440 },
+    });
+    fireEvent(window, new Event("resize"));
+    expectLogicalOrder(vrControls());
+
+    const toolbar = screen
+      .getByRole("group", { name: "Discover category" })
+      .closest(".library-toolbar");
+    expect(toolbar?.querySelector(".provider-browse-controls")).toBeTruthy();
+    expect(
+      toolbar?.querySelector(".provider-browse-controls__request"),
+    ).toBeTruthy();
+  });
+
   it("keeps Adult on JavDB Daily and starts VR on FANZA Popular", async () => {
     fetchFanzaCatalogMock.mockResolvedValue(
       fanzaCatalogFixture("vr", [
