@@ -10339,6 +10339,76 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     ).toBeTruthy();
   });
 
+  it("uses every observed shell width and height immediately without a three-card cap", async () => {
+    gallerySizes.discover = { width: 446, height: 260 };
+    fetchJavdbBrowseMock.mockResolvedValue(
+      javdbBrowseFixture(
+        "vr",
+        Array.from({ length: 12 }, (_, index) => ({
+          code: `MDVR-${419 + index}`,
+          id: `Responsive${index + 1}`,
+        })),
+      ),
+    );
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectVrBrowseProvider("JavDB");
+    await screen.findByRole("heading", { level: 3, name: "MDVR-419" });
+
+    const gallery = document.querySelector('[data-gallery="discover"]');
+    const sidebarWidth = 13.5 * 16;
+    const galleryWidthForWindow = (windowWidth: number) => {
+      const outerPadding = Math.min(48, Math.max(24, windowWidth * 0.04));
+      return Math.floor(windowWidth - sidebarWidth - outerPadding * 2);
+    };
+    const widths = [
+      { capacity: "1", pages: "12", window: 720 },
+      { capacity: "2", pages: "6", window: 1024 },
+      { capacity: "4", pages: "3", window: 1440 },
+      { capacity: "4", pages: "3", window: 1600 },
+    ];
+
+    for (const size of widths) {
+      const galleryWidth = galleryWidthForWindow(size.window);
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: size.window,
+      });
+      fireEvent(window, new Event("resize"));
+      resizeGallery("discover", galleryWidth, 260);
+      expect(gallery?.getAttribute("data-viewport-width")).toBe(
+        String(galleryWidth),
+      );
+      expect(gallery?.getAttribute("data-page-capacity")).toBe(size.capacity);
+      expect(gallery?.getAttribute("data-page-count")).toBe(size.pages);
+    }
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Next JavDB VR catalog page" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Next JavDB VR catalog page" }),
+    );
+    expect(gallery?.getAttribute("data-current-page")).toBe("3");
+
+    resizeGallery("discover", 1288, 552);
+    expect(gallery?.getAttribute("data-viewport-height")).toBe("552");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("4");
+    expect(gallery?.getAttribute("data-page-count")).toBe("2");
+    expect(gallery?.getAttribute("data-current-page")).toBe("2");
+
+    resizeGallery("discover", 1288, 828);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("12");
+    expect(gallery?.getAttribute("data-page-count")).toBe("1");
+    expect(gallery?.getAttribute("data-current-page")).toBe("1");
+
+    resizeGallery("discover", 726, 552);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("4");
+    expect(gallery?.getAttribute("data-page-count")).toBe("3");
+    expect(gallery?.getAttribute("data-current-page")).toBe("1");
+  });
+
   it("does not reuse a decoded cover ratio for the same provider item in a newer generation", async () => {
     fetchJavdbBrowseMock
       .mockResolvedValueOnce(
@@ -10389,10 +10459,13 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     expect(fetchJavdbCoverMock).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps all three actions visible, focusable, and layout-stable on a narrow 720 by 520 card", async () => {
+  it("keeps the vertical action stack inside a narrow 720 by 520 cover without changing layout", async () => {
     gallerySizes.discover = { width: 720, height: 520 };
     fetchJavdbBrowseMock.mockResolvedValue(
-      javdbBrowseFixture("vr", [{ code: "MDVR-419", id: "Portrait" }]),
+      javdbBrowseFixture("vr", [
+        { code: "MDVR-419", id: "Portrait" },
+        { code: "MDVR-420", id: "Wide" },
+      ]),
     );
     render(<App />);
     selectDiscover();
@@ -10408,7 +10481,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     });
     Object.defineProperties(cover, {
       naturalHeight: { configurable: true, value: 180 },
-      naturalWidth: { configurable: true, value: 80 },
+      naturalWidth: { configurable: true, value: 20 },
     });
     fireEvent.load(cover);
 
@@ -10424,8 +10497,14 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     const details = within(card).getByRole("button", {
       name: "View details: MDVR-419",
     });
+    const actions = copy.closest(".provider-browse-card__actions");
+    const coverElement = card.querySelector(".provider-browse-card__cover");
+    const gallery = document.querySelector('[data-gallery="discover"]');
     const cardStyle = card.getAttribute("style");
-    expect(card.dataset.narrowCover).toBe("true");
+    const pageCapacity = gallery?.getAttribute("data-page-capacity");
+    expect(actions?.parentElement).toBe(coverElement);
+    expect(actions?.children).toHaveLength(3);
+    expect(card.hasAttribute("data-narrow-cover")).toBe(false);
     expect(copy.textContent).toContain("Copy");
     expect(preview.textContent).toBe("Preview");
     expect(releases.textContent).toBe("Find releases");
@@ -10441,6 +10520,19 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     expect(document.activeElement).toBe(releases);
     expect(card.getAttribute("style")).toBe(cardStyle);
     expect(card.style.width).toBe("80px");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe(pageCapacity);
+
+    const wideCard = screen
+      .getByRole("heading", { level: 3, name: "MDVR-420" })
+      .closest("article") as HTMLElement;
+    const wideActions = within(wideCard)
+      .getByRole("button", { name: "Copy title: MDVR-420" })
+      .closest(".provider-browse-card__actions");
+    expect(wideActions?.parentElement).toBe(
+      wideCard.querySelector(".provider-browse-card__cover"),
+    );
+    expect(wideActions?.children).toHaveLength(3);
+    expect(wideCard.style.width).toBe("266px");
   });
 
   it("keeps a conflicting Adult detail identity out of cards and release lookup", async () => {
@@ -10513,7 +10605,7 @@ describe("native-owned FANZA Adult and VR catalogs", () => {
     };
     const adultControls = () => [
       screen.getByRole("group", { name: "Discover category" }),
-      screen.getByRole("group", { name: "Adult workflow" }),
+      screen.getByRole("group", { name: "Adult Mode" }),
       screen.getByRole("combobox", { name: "Adult provider" }),
       screen.getByRole("combobox", { name: "Adult browse mode" }),
       screen.getByRole("combobox", { name: "Adult year" }),
@@ -10522,6 +10614,11 @@ describe("native-owned FANZA Adult and VR catalogs", () => {
       screen.getByRole("combobox", { name: "Adult result count" }),
       screen.getByRole("button", { name: "Refresh" }),
     ];
+    expect(
+      within(screen.getByRole("group", { name: "Adult Mode" })).getByText(
+        "Mode",
+      ),
+    ).toBeTruthy();
     expectLogicalOrder(adultControls());
 
     Object.defineProperties(window, {
@@ -10539,12 +10636,17 @@ describe("native-owned FANZA Adult and VR catalogs", () => {
     fireEvent.click(screen.getByRole("radio", { name: "VR" }));
     const vrControls = () => [
       screen.getByRole("group", { name: "Discover category" }),
-      screen.getByRole("group", { name: "VR workflow" }),
+      screen.getByRole("group", { name: "VR Mode" }),
       screen.getByRole("combobox", { name: "VR provider" }),
       screen.getByRole("combobox", { name: "VR FANZA feed" }),
       screen.getByRole("combobox", { name: "VR FANZA result count" }),
       screen.getByRole("button", { name: "Refresh" }),
     ];
+    expect(
+      within(screen.getByRole("group", { name: "VR Mode" })).getByText(
+        "Mode",
+      ),
+    ).toBeTruthy();
     expectLogicalOrder(vrControls());
 
     Object.defineProperties(window, {
@@ -10860,6 +10962,9 @@ describe("native-owned FANZA Adult and VR catalogs", () => {
     const copy = within(card).getByRole("button", {
       name: "Copy title: 3DSVR-1947",
     });
+    expect(copy.closest(".provider-browse-card__actions")?.parentElement).toBe(
+      card.querySelector(".provider-browse-card__cover"),
+    );
     copy.focus();
     fireEvent.click(copy);
     expect(clipboardWriteMock).toHaveBeenCalledWith("3DSVR-1947");

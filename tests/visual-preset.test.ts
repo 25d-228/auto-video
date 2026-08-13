@@ -167,33 +167,97 @@ describe("Sera preset contract", () => {
     );
   });
 
-  it("uses responsive ordered toolbar tracks without a fixed request block", () => {
-    const controls = ruleBody(".provider-browse-controls");
-    const request = ruleBody(".provider-browse-controls__request");
-    expect(controls).toContain("display: grid;");
-    expect(controls).toContain("width: 100%;");
-    expect(controls).toContain("min-width: 0;");
-    expect(controls).toContain(
-      "grid-template-columns: max-content minmax(0, 1fr);",
+  it("uses the complete workspace width while keeping descriptions readable", () => {
+    const shell = ruleBody(".app-shell");
+    const workspace = ruleBody(".workspace__content");
+    expect(shell).toContain(
+      "grid-template-columns: 13.5rem minmax(0, 1fr);",
     );
-    expect(request).toContain(
-      "repeat(auto-fit, minmax(min(100%, 7.5rem), 1fr))",
+    expect(workspace).toContain("width: 100%;");
+    expect(workspace).toContain("margin: 0;");
+    expect(workspace).toContain(
+      "padding: 1.5rem clamp(1.5rem, 4vw, 3rem);",
     );
-    expect(request).toContain("min-width: 0;");
-    expect(ruleBody(".provider-select-label")).toContain("min-width: 0;");
-    expect(ruleBody(".provider-select-label select")).toContain("width: 100%;");
-    expect(applicationStyles).not.toContain("flex: 1 1 24rem;");
+    expect(workspace).not.toContain("max-width:");
+    expect(workspace).not.toContain("62rem");
+    expect(ruleBody(".page-header")).toContain("max-width: 42rem;");
+    expect(applicationStyles).not.toContain("width: min(100%, 62rem);");
   });
 
-  it("places cover actions on one opaque semantic surface for hover and focus", () => {
+  it("uses responsive ordered toolbar rows without a fixed request block", () => {
+    const controls = ruleBody(".provider-browse-controls");
+    const request = ruleBody(".provider-browse-controls__request");
+    expect(controls).toContain("display: flex;");
+    expect(controls).toContain("flex-wrap: wrap;");
+    expect(controls).toContain("min-width: 0;");
+    expect(request).toContain("display: flex;");
+    expect(request).toContain("flex-wrap: wrap;");
+    expect(request).toContain("min-width: 0;");
+    expect(ruleBody(".provider-select-label")).toContain(
+      "flex: 0 1 9rem;",
+    );
+    expect(ruleBody(".provider-select-label select")).toContain("width: 100%;");
+    expect(controls).not.toContain("grid-template-columns:");
+    expect(request).not.toContain("grid-template-columns:");
+  });
+
+  it("keeps provider cards on a fixed cover height and natural-width wrapped gallery", () => {
+    const viewport = ruleBody(
+      ".media-gallery--provider-browse .media-gallery__viewport",
+    );
+    const grid = ruleBody(".provider-browse-grid");
+    const cover = ruleBody(".provider-browse-card__cover");
+    expect(viewport).toContain("min-height: 16.25rem;");
+    expect(viewport).toContain("flex: 1;");
+    expect(viewport).not.toContain("clamp(");
+    expect(viewport).not.toContain("overflow:");
+    expect(ruleBody(".media-gallery__viewport")).toContain("overflow: hidden;");
+    expect(grid).toContain("display: flex;");
+    expect(grid).toContain("flex-wrap: wrap;");
+    expect(grid).toContain("align-content: flex-start;");
+    expect(cover).toContain("height: 180px;");
+    expect(applicationStyles).not.toContain(
+      ".media-gallery--provider-browse .media-grid",
+    );
+  });
+
+  it("places cover actions in one vertical opaque semantic stack", () => {
     const actions = ruleBody(".provider-browse-card__actions");
+    const actionButton = ruleBody(
+      '.provider-browse-card__actions [data-slot="button"]',
+    );
+    expect(actions).toContain("flex-direction: column;");
+    expect(actions).toContain("right: 0.375rem;");
+    expect(actions).toContain("bottom: 0.375rem;");
+    expect(actions).toContain("left: 0.375rem;");
+    expect(actions).toContain("max-height: calc(100% - 0.75rem);");
     expect(actions).toContain("background: var(--card);");
     expect(actions).toContain("color: var(--card-foreground);");
     expect(actions).toContain("border: 1px solid var(--border);");
     expect(actions).not.toContain("background: transparent;");
+    expect(actionButton).toContain("width: 100%;");
+    expect(actionButton).toContain("text-transform: none;");
+    expect(actionButton).toContain("letter-spacing: normal;");
+    expect(actionButton).toContain("white-space: normal;");
     expect(applicationStyles).toContain(
       ".provider-browse-card:hover .provider-browse-card__actions,\n.provider-browse-card:focus-within .provider-browse-card__actions",
     );
+    expect(applicationStyles).not.toContain("data-narrow-cover");
+  });
+
+  it("uses stable selected surfaces instead of underlined navigation or segments", () => {
+    const navigation = ruleBody('.navigation-item[aria-current="page"]');
+    const option = ruleBody(".discover-category label span");
+    const selectedOption = ruleBody(
+      ".discover-category input:checked + span",
+    );
+    expect(navigation).toContain("background: var(--sidebar-accent);");
+    expect(navigation).not.toContain("border-bottom-color:");
+    expect(option).toContain("border: 1px solid var(--border);");
+    expect(option).not.toContain("border-bottom:");
+    expect(selectedOption).toContain("background: var(--primary);");
+    expect(selectedOption).toContain("color: var(--primary-foreground);");
+    expect(selectedOption).not.toContain("border-bottom-color:");
   });
 
   it("reserves a stable title action column and reveals it for hover and focus", () => {
