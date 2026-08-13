@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { buttonVariants } from "../src/components/ui/button";
+
 const presetConfiguration = JSON.parse(
   readFileSync(resolve("components.json"), "utf8"),
 ) as {
@@ -83,6 +85,49 @@ describe("Sera preset contract", () => {
   });
 
   it("keeps the shared Button on the current Sera contract", () => {
+    const defaultButton = buttonVariants({ variant: "default" }).split(/\s+/);
+    const outlineButton = buttonVariants({ variant: "outline" }).split(/\s+/);
+    const destructiveButton = buttonVariants({
+      variant: "destructive",
+    }).split(/\s+/);
+
+    expect(defaultButton).toEqual(
+      expect.arrayContaining([
+        "text-xs",
+        "font-semibold",
+        "tracking-widest",
+        "uppercase",
+        "bg-primary",
+        "text-primary-foreground",
+        "hover:bg-primary/80",
+        "disabled:pointer-events-none",
+        "disabled:opacity-50",
+        "focus-visible:border-ring",
+        "focus-visible:ring-2",
+        "focus-visible:ring-ring/30",
+      ]),
+    );
+    expect(outlineButton).toEqual(
+      expect.arrayContaining([
+        "border-border",
+        "bg-transparent",
+        "hover:bg-muted",
+        "hover:text-foreground",
+        "dark:hover:bg-input/30",
+      ]),
+    );
+    expect(destructiveButton).toEqual(
+      expect.arrayContaining([
+        "bg-destructive/10",
+        "text-destructive",
+        "hover:bg-destructive/20",
+        "focus-visible:border-destructive/40",
+        "focus-visible:ring-destructive/20",
+        "dark:bg-destructive/20",
+        "dark:hover:bg-destructive/30",
+        "dark:focus-visible:ring-destructive/40",
+      ]),
+    );
     expect(buttonSource).toContain(
       "rounded-none border border-transparent bg-clip-padding text-xs font-semibold tracking-widest whitespace-nowrap uppercase",
     );
@@ -95,6 +140,31 @@ describe("Sera preset contract", () => {
     expect(buttonSource).toContain('xs: "h-7 gap-1 px-3');
     expect(buttonSource).not.toContain("rounded-md");
     expect(buttonSource).not.toContain("text-xs/relaxed font-medium");
+  });
+
+  it("keeps native-control inheritance in the base layer below Sera utilities", () => {
+    const baseLayerStart = applicationStyles.indexOf("@layer base {");
+    const baseLayerEnd = applicationStyles.indexOf(
+      "\n}\n\n* {",
+      baseLayerStart,
+    );
+    expect(baseLayerStart).toBeGreaterThanOrEqual(0);
+    expect(baseLayerEnd).toBeGreaterThan(baseLayerStart);
+
+    const baseLayer = applicationStyles.slice(baseLayerStart, baseLayerEnd);
+    const unlayeredStyles =
+      applicationStyles.slice(0, baseLayerStart) +
+      applicationStyles.slice(baseLayerEnd + 2);
+    expect(baseLayer).toMatch(
+      /button,\s*input,\s*select\s*{\s*font:\s*inherit;/s,
+    );
+    expect(baseLayer).toMatch(/button\s*{\s*color:\s*inherit;/s);
+    expect(unlayeredStyles).not.toMatch(
+      /(^|\n)\s*button,\s*input,\s*select\s*{\s*font:\s*inherit;/s,
+    );
+    expect(unlayeredStyles).not.toMatch(
+      /(^|\n)\s*button\s*{\s*color:\s*inherit;/s,
+    );
   });
 
   it("uses responsive ordered toolbar tracks without a fixed request block", () => {
