@@ -2169,8 +2169,11 @@ function DiscoverBrowseControls({
 
   return (
     <div className="provider-browse-controls">
-      <fieldset className="discover-category provider-workflow">
-        <legend>{category === "vr" ? "VR" : "Adult"} workflow</legend>
+      <fieldset
+        aria-label={`${category === "vr" ? "VR" : "Adult"} Mode`}
+        className="discover-category provider-workflow"
+      >
+        <legend>Mode</legend>
         <div>
           {(["browse", "exact"] as const).map((value) => (
             <label key={value}>
@@ -2468,16 +2471,8 @@ function DiscoverJavdbBrowseCard({
       aria-labelledby={`${cardId}-title`}
       className="provider-browse-card"
       data-cover-ratio={ratio}
-      data-narrow-cover={ratio < 0.9}
       style={{ width: `${Math.round(providerCoverHeight * ratio)}px` }}
     >
-      <button
-        aria-label={`View details: ${item.code}`}
-        className="provider-browse-card__details-control"
-        id={detailsTriggerId}
-        onClick={() => onDetails(item, detailsTriggerId)}
-        type="button"
-      />
       <div className="provider-browse-card__cover">
         <JavdbCover
           item={item}
@@ -2489,49 +2484,64 @@ function DiscoverJavdbBrowseCard({
           {inLibrary ? <span>In library</span> : null}
           {transferState === null ? null : <span>{transferState}</span>}
         </div>
+        <div
+          className="provider-browse-card__actions"
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <Button
+            aria-label={`View details: ${item.code}`}
+            id={detailsTriggerId}
+            onClick={(event) => {
+              event.stopPropagation();
+              onDetails(item, detailsTriggerId);
+            }}
+            onKeyDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+            size="xs"
+            type="button"
+            variant="ghost"
+          >
+            Details
+          </Button>
+          <CopyTitleAction title={item.code} />
+          <Button
+            aria-label={`Preview: ${item.code}`}
+            id={previewTriggerId}
+            onClick={(event) => {
+              event.stopPropagation();
+              onPreview(item, previewTriggerId);
+            }}
+            onKeyDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+            size="xs"
+            type="button"
+            variant="ghost"
+          >
+            Preview
+          </Button>
+          <Button
+            aria-label={`Find releases: ${item.code}`}
+            id={releasesTriggerId}
+            onClick={(event) => {
+              event.stopPropagation();
+              onFindReleases(item, releasesTriggerId);
+            }}
+            onKeyDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+            size="xs"
+            type="button"
+            variant="ghost"
+          >
+            Find releases
+          </Button>
+        </div>
       </div>
       <div className="provider-browse-card__body">
         <h3 id={`${cardId}-title`}>{item.code}</h3>
         <p>{item.title ?? item.releaseDate ?? "Title unavailable"}</p>
         <span>JavDB</span>
-      </div>
-      <div
-        className="provider-browse-card__actions"
-        onClick={(event) => event.stopPropagation()}
-        onKeyDown={(event) => event.stopPropagation()}
-        onPointerDown={(event) => event.stopPropagation()}
-      >
-        <CopyTitleAction title={item.code} />
-        <Button
-          aria-label={`Preview: ${item.code}`}
-          id={previewTriggerId}
-          onClick={(event) => {
-            event.stopPropagation();
-            onPreview(item, previewTriggerId);
-          }}
-          onKeyDown={(event) => event.stopPropagation()}
-          onPointerDown={(event) => event.stopPropagation()}
-          size="xs"
-          type="button"
-          variant="outline"
-        >
-          Preview
-        </Button>
-        <Button
-          aria-label={`Find releases: ${item.code}`}
-          id={releasesTriggerId}
-          onClick={(event) => {
-            event.stopPropagation();
-            onFindReleases(item, releasesTriggerId);
-          }}
-          onKeyDown={(event) => event.stopPropagation()}
-          onPointerDown={(event) => event.stopPropagation()}
-          size="xs"
-          type="button"
-          variant="outline"
-        >
-          Find releases
-        </Button>
       </div>
     </article>
   );
@@ -2616,21 +2626,19 @@ function DiscoverFanzaCard({
     <article
       aria-labelledby={`${titleId}-title`}
       className="provider-browse-card"
-      data-actions-only="true"
       data-cover-ratio={ratio}
-      data-narrow-cover={ratio < 0.9}
       style={{ width: `${Math.round(providerCoverHeight * ratio)}px` }}
     >
       <div className="provider-browse-card__cover">
         <FanzaCover item={item} onRatio={onRatioChange} />
+        <div className="provider-browse-card__actions">
+          <CopyTitleAction title={item.displayCode} />
+        </div>
       </div>
       <div className="provider-browse-card__body">
         <h3 id={`${titleId}-title`}>{item.displayCode}</h3>
         <p>{item.title ?? "Title unavailable"}</p>
         <span>FANZA</span>
-      </div>
-      <div className="provider-browse-card__actions">
-        <CopyTitleAction title={item.displayCode} />
       </div>
     </article>
   );
@@ -2775,6 +2783,8 @@ function NaturalWidthBrowseGallery<Item>({
       data-gallery="discover"
       data-page-capacity={visibleItems.length}
       data-page-count={pageCount}
+      data-viewport-height={bounds.height}
+      data-viewport-width={bounds.width}
     >
       <div className="media-gallery__viewport" ref={viewport}>
         <ul aria-label={ariaLabel} className="provider-browse-grid">

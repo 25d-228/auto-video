@@ -1,8 +1,8 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/inter";
-@import "@fontsource-variable/geist-mono";
+@import "@fontsource-variable/noto-sans";
+@import "@fontsource-variable/playfair-display";
 
 @custom-variant dark (&:is([data-theme="dark"] *));
 
@@ -10,8 +10,8 @@
   color: var(--foreground);
   background: var(--background);
   font-family:
-    "Inter Variable", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", sans-serif;
+    "Noto Sans Variable", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   color-scheme: light;
@@ -85,8 +85,8 @@
 }
 
 @theme inline {
-  --font-sans: "Inter Variable", sans-serif;
-  --font-heading: "Geist Mono Variable", monospace;
+  --font-sans: "Noto Sans Variable", sans-serif;
+  --font-heading: "Playfair Display Variable", serif;
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -139,6 +139,25 @@
   html {
     @apply font-sans;
   }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    @apply font-heading tracking-wider uppercase;
+  }
+
+  button,
+  input,
+  select {
+    font: inherit;
+  }
+
+  button {
+    color: inherit;
+  }
 }
 
 * {
@@ -150,15 +169,6 @@ body {
   min-height: 100vh;
   margin: 0;
   background: var(--background);
-}
-
-button,
-input {
-  font: inherit;
-}
-
-button {
-  color: inherit;
 }
 
 #root {
@@ -218,9 +228,9 @@ button {
 }
 
 .brand strong {
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.8125rem;
-  letter-spacing: -0.01em;
+  letter-spacing: 0.06em;
 }
 
 .brand small {
@@ -270,13 +280,15 @@ button {
   gap: 0.5rem;
   padding: 0.375rem 0.5rem;
   border: 1px solid transparent;
-  border-radius: var(--radius);
+  border-radius: 0;
   background: transparent;
   color: var(--muted-foreground);
   cursor: pointer;
   font-size: 0.8125rem;
   font-weight: 600;
+  letter-spacing: 0.08em;
   text-align: left;
+  text-transform: uppercase;
 }
 
 .navigation-item:hover {
@@ -285,9 +297,10 @@ button {
 }
 
 .navigation-item[aria-current="page"] {
+  border-color: var(--sidebar-border);
   background: var(--sidebar-accent);
   color: var(--sidebar-accent-foreground);
-  box-shadow: none;
+  box-shadow: inset 2px 0 0 var(--sidebar-primary);
 }
 
 .navigation-item:focus-visible,
@@ -317,10 +330,10 @@ button {
 
 .workspace__content {
   display: flex;
-  width: min(100%, 62rem);
+  width: 100%;
   min-height: 100%;
   flex-direction: column;
-  margin: 0 auto;
+  margin: 0;
   padding: 1.5rem clamp(1.5rem, 4vw, 3rem);
 }
 
@@ -331,10 +344,10 @@ button {
 .page-header h1 {
   margin: 0.375rem 0 0;
   color: var(--foreground);
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: clamp(1.5rem, 3vw, 2rem);
   line-height: 1.15;
-  letter-spacing: -0.025em;
+  letter-spacing: 0.06em;
 }
 
 .page-header > p:last-child {
@@ -352,11 +365,13 @@ button {
 .discover-card,
 .vr-download-card,
 .tmdb-attribution {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 0;
+  border-radius: 0;
   background: var(--card);
   color: var(--card-foreground);
-  box-shadow: none;
+  box-shadow:
+    0 1px 2px color-mix(in oklch, var(--foreground) 8%, transparent),
+    0 0 0 1px color-mix(in oklch, var(--foreground) 5%, transparent);
 }
 
 .dashboard-library-summary {
@@ -387,9 +402,9 @@ button {
 .dashboard-library-summary h2,
 .dashboard-library-summary h3 {
   margin: 0.25rem 0 0;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.875rem;
-  letter-spacing: -0.01em;
+  letter-spacing: 0.06em;
 }
 
 .dashboard-library-summary__folder,
@@ -428,7 +443,7 @@ button {
 .dashboard-library-summary__storage dd {
   margin: 0.25rem 0 0;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
   font-weight: 600;
   line-height: 1.4;
@@ -468,9 +483,9 @@ button {
 .settings-card h2 {
   margin: 0;
   color: var(--card-foreground);
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.875rem;
-  letter-spacing: -0.01em;
+  letter-spacing: 0.06em;
 }
 
 .empty-state p,
@@ -608,10 +623,11 @@ button {
   width: 100%;
   min-height: 2rem;
   margin-top: 0.375rem;
-  padding: 0.375rem 0.5rem;
-  border: 1px solid var(--input);
-  border-radius: var(--radius);
-  background: var(--background);
+  padding: 0.375rem 0;
+  border: 0;
+  border-bottom: 1px solid var(--input);
+  border-radius: 0;
+  background: transparent;
   color: var(--foreground);
 }
 
@@ -678,7 +694,7 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
-  padding: 0.75rem 1rem;
+  padding: 1rem;
 }
 
 .library-toolbar__heading {
@@ -696,9 +712,9 @@ button {
 
 .library-toolbar h2 {
   margin: 0.25rem 0 0;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.875rem;
-  letter-spacing: -0.01em;
+  letter-spacing: 0.06em;
 }
 
 .vr-downloads {
@@ -742,7 +758,7 @@ button {
 .vr-downloads__summary dd {
   margin: 0.25rem 0 0;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
   font-weight: 600;
 }
@@ -767,7 +783,7 @@ button {
 .vr-download-card h2 {
   margin: 0.25rem 0 0;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.875rem;
   line-height: 1.45;
   white-space: pre-wrap;
@@ -835,7 +851,7 @@ button {
 
 .vr-download-card__metadata dd {
   margin: 0;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
 }
 
 .vr-download-card__actions {
@@ -850,27 +866,31 @@ button {
 }
 
 .library-toolbar--discover {
-  align-items: flex-end;
+  align-items: stretch;
   flex-wrap: wrap;
+}
+
+.library-toolbar--discover .library-toolbar__heading,
+.library-toolbar--discover .discover-toolbar__controls {
+  flex: 1 1 100%;
 }
 
 .discover-toolbar__controls {
   display: flex;
   min-width: 0;
-  flex: 1 1 20rem;
+  flex: 1 1 100%;
   flex-wrap: wrap;
   align-items: flex-end;
-  justify-content: flex-end;
+  justify-content: stretch;
   gap: 0.5rem;
 }
 
 .provider-browse-controls {
   display: flex;
   min-width: 0;
-  flex: 1 1 24rem;
+  flex: 1 1 auto;
   flex-wrap: wrap;
   align-items: flex-end;
-  justify-content: flex-end;
   gap: 0.5rem;
 }
 
@@ -881,27 +901,36 @@ button {
 .provider-browse-controls__request {
   display: flex;
   min-width: 0;
-  flex: 1 1 24rem;
+  flex: 1 1 auto;
   flex-wrap: wrap;
   align-items: flex-end;
-  justify-content: flex-end;
   gap: 0.5rem;
+}
+
+.provider-browse-controls__request > [data-slot="button"] {
+  flex: 0 0 auto;
 }
 
 .provider-select-label {
   display: grid;
+  min-width: 7.5rem;
+  flex: 0 1 9rem;
   gap: 0.25rem;
   color: var(--foreground);
   font-size: 0.6875rem;
   font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .provider-select-label select {
-  min-height: 1.75rem;
-  padding: 0.25rem 0.5rem;
-  border: 1px solid var(--input);
-  border-radius: var(--radius);
-  background: var(--background);
+  width: 100%;
+  min-height: 2.25rem;
+  padding: 0.375rem 1.5rem 0.375rem 0;
+  border: 0;
+  border-bottom: 1px solid var(--input);
+  border-radius: 0;
+  background: transparent;
   color: var(--foreground);
   font-size: 0.75rem;
   font-weight: 500;
@@ -918,6 +947,8 @@ button {
   color: var(--foreground);
   font-size: 0.6875rem;
   font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .discover-category > div {
@@ -947,14 +978,17 @@ button {
   color: var(--muted-foreground);
   font-size: 0.75rem;
   font-weight: 600;
+  letter-spacing: 0.08em;
   place-items: center;
+  text-transform: uppercase;
 }
 
 .discover-category label + label span {
-  border-left: 0;
+  border-left-width: 0;
 }
 
 .discover-category input:checked + span {
+  border-color: var(--primary);
   background: var(--primary);
   color: var(--primary-foreground);
 }
@@ -970,6 +1004,8 @@ button {
   color: var(--foreground);
   font-size: 0.6875rem;
   font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .discover-search__field {
@@ -982,11 +1018,12 @@ button {
   display: block;
   width: 100%;
   min-width: 0;
-  min-height: 1.75rem;
-  padding: 0.25rem 0.5rem;
-  border: 1px solid var(--input);
-  border-radius: var(--radius);
-  background: var(--background);
+  min-height: 2.25rem;
+  padding: 0.375rem 0;
+  border: 0;
+  border-bottom: 1px solid var(--input);
+  border-radius: 0;
+  background: transparent;
   color: var(--foreground);
   font-size: 0.75rem;
 }
@@ -1030,6 +1067,8 @@ button {
   color: var(--foreground);
   font-size: 0.6875rem;
   font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .movie-search__field {
@@ -1050,11 +1089,12 @@ button {
 .movie-search__input {
   display: block;
   width: 100%;
-  min-height: 1.75rem;
-  padding: 0.25rem 2rem;
-  border: 1px solid var(--input);
-  border-radius: var(--radius);
-  background: var(--background);
+  min-height: 2.25rem;
+  padding: 0.375rem 2rem;
+  border: 0;
+  border-bottom: 1px solid var(--input);
+  border-radius: 0;
+  background: transparent;
   color: var(--foreground);
   font-size: 0.75rem;
 }
@@ -1079,11 +1119,12 @@ button {
 
 .movie-sort__select {
   width: 100%;
-  min-height: 1.75rem;
-  padding: 0.25rem 0.5rem;
-  border: 1px solid var(--input);
-  border-radius: var(--radius);
-  background: var(--background);
+  min-height: 2.25rem;
+  padding: 0.375rem 1.5rem 0.375rem 0;
+  border: 0;
+  border-bottom: 1px solid var(--input);
+  border-radius: 0;
+  background: transparent;
   color: var(--foreground);
   font-size: 0.75rem;
 }
@@ -1114,8 +1155,9 @@ button {
   margin: 0.75rem 0 0;
   padding: 0.625rem 0.75rem;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--muted);
+  border-left: 2px solid var(--foreground);
+  border-radius: 0;
+  background: var(--card);
   font-size: 0.75rem;
   line-height: 1.4;
 }
@@ -1167,9 +1209,8 @@ button {
 }
 
 .media-gallery--provider-browse .media-gallery__viewport {
-  height: clamp(16.25rem, 52vh, 31rem);
   min-height: 16.25rem;
-  flex: 0 0 auto;
+  flex: 1;
 }
 
 .provider-browse-grid {
@@ -1192,35 +1233,17 @@ button {
   max-width: 100%;
   height: 16.25rem;
   overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border: 0;
+  border-radius: 0;
   background: var(--card);
   color: var(--card-foreground);
-  cursor: pointer;
-}
-
-.provider-browse-card[data-actions-only="true"] {
-  cursor: default;
+  box-shadow:
+    0 1px 2px color-mix(in oklch, var(--foreground) 8%, transparent),
+    0 0 0 1px color-mix(in oklch, var(--foreground) 5%, transparent);
 }
 
 .provider-browse-card:focus-within {
   box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 45%, transparent);
-}
-
-.provider-browse-card__details-control {
-  position: absolute;
-  z-index: 1;
-  inset: 0;
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius);
-  background: transparent;
-  cursor: pointer;
-}
-
-.provider-browse-card__details-control:focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: -3px;
 }
 
 .provider-browse-card__cover {
@@ -1245,7 +1268,7 @@ button {
   height: 100%;
   padding: 0.75rem;
   color: var(--muted-foreground);
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   font-size: 0.75rem;
   overflow-wrap: anywhere;
   place-items: center;
@@ -1284,7 +1307,7 @@ button {
 }
 
 .provider-browse-card__body h3 {
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.8125rem;
 }
 
@@ -1307,47 +1330,75 @@ button {
 .provider-browse-card__actions {
   position: absolute;
   z-index: 2;
-  top: 8.5rem;
   right: 0.375rem;
+  bottom: 0.375rem;
   left: 0.375rem;
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
   gap: 0.25rem;
+  max-height: calc(100% - 0.75rem);
+  padding: 0;
+  border: 0;
+  background: transparent;
   opacity: 0;
-  transition: opacity 120ms ease;
+  transform: translateY(0.25rem);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
   pointer-events: none;
 }
 
 .provider-browse-card__actions [data-slot="button"] {
-  width: auto;
+  width: fit-content;
+  max-width: 100%;
   min-width: 0;
-  padding-inline: 0.375rem;
+  min-height: 1.375rem;
+  height: auto;
+  justify-content: center;
+  padding: 0.125rem 0.25rem;
+  border-color: transparent;
+  background: transparent;
+  color: white;
+  font-size: 0.625rem;
+  line-height: 1.15;
+  letter-spacing: normal;
+  overflow-wrap: anywhere;
+  text-shadow:
+    0 1px 2px black,
+    0 0 3px rgb(0 0 0 / 0.9);
+  text-transform: none;
+  white-space: normal;
 }
 
-.provider-browse-card[data-narrow-cover="true"] .provider-browse-card__actions {
-  top: 8rem;
-  flex-direction: column;
-  align-items: stretch;
+.provider-browse-card__actions [data-slot="button"]:hover,
+.provider-browse-card__actions [data-slot="button"]:focus-visible {
+  border-color: transparent;
+  background: transparent;
+  color: white;
 }
 
-.provider-browse-card[data-narrow-cover="true"] .provider-browse-card__actions [data-slot="button"] {
-  width: 100%;
-  padding-inline: 0.125rem;
-  font-size: 0.5625rem;
+.provider-browse-card__actions [data-slot="button"]:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.125rem;
+}
+
+.provider-browse-card__actions [data-slot="button"]:focus-visible {
+  outline: 2px solid white;
+  outline-offset: 0;
+  box-shadow: 0 0 0 1px black;
+}
+
+.provider-browse-card__actions .title-copy-button {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .provider-browse-card:hover .provider-browse-card__actions,
 .provider-browse-card:focus-within .provider-browse-card__actions,
 .provider-browse-card__actions:focus-within {
   opacity: 1;
-  pointer-events: auto;
-}
-
-.provider-browse-card:hover .title-copy-button,
-.provider-browse-card:focus-within .title-copy-button,
-.provider-browse-card .title-copy-button[data-copy-state="success"],
-.provider-browse-card .title-copy-button[data-copy-state="error"] {
-  opacity: 1;
+  transform: translateY(0);
   pointer-events: auto;
 }
 
@@ -1492,10 +1543,10 @@ button {
   margin: 0;
   overflow: hidden;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.8125rem;
   line-height: 1.45;
-  letter-spacing: -0.01em;
+  letter-spacing: 0.06em;
   white-space: pre-wrap;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 4;
@@ -1544,7 +1595,6 @@ button {
   position: fixed;
   z-index: 60;
   inset: 0;
-  background: color-mix(in oklch, var(--foreground) 45%, transparent);
 }
 
 .movie-details__viewport {
@@ -1562,12 +1612,7 @@ button {
   max-height: 100%;
   padding: 1rem;
   overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
   outline: none;
-  background: var(--popover);
-  color: var(--popover-foreground);
-  box-shadow: 0 1rem 3rem color-mix(in oklch, var(--foreground) 20%, transparent);
   pointer-events: auto;
 }
 
@@ -1586,7 +1631,7 @@ button {
 .movie-details__heading h2 {
   margin: 0.25rem 0 0;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 1rem;
   line-height: 1.35;
   white-space: pre-wrap;
@@ -1623,7 +1668,7 @@ button {
 
 .movie-details__state h3,
 .movie-details__overview h3 {
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.8125rem;
 }
 
@@ -1716,7 +1761,7 @@ button {
   gap: 0.5rem;
   padding: 0.75rem;
   color: var(--muted-foreground);
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   font-size: 0.75rem;
   overflow-wrap: anywhere;
   place-items: center;
@@ -1813,7 +1858,7 @@ button {
 .tv-season-guide__heading h3,
 .tv-season-guide__empty h4,
 .tv-season-guide__episode-heading h4 {
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.8125rem;
 }
 
@@ -1885,7 +1930,7 @@ button {
 .tv-season-guide__episode-information h5 {
   margin: 0;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.75rem;
   line-height: 1.4;
   white-space: pre-wrap;
@@ -1956,7 +2001,7 @@ button {
 }
 
 .tv-season-guide__state h4 {
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.75rem;
 }
 
@@ -1974,7 +2019,6 @@ button {
   position: fixed;
   z-index: 70;
   inset: 0;
-  background: color-mix(in oklch, var(--foreground) 45%, transparent);
 }
 
 .vr-releases__viewport {
@@ -1992,12 +2036,7 @@ button {
   max-height: 100%;
   padding: 1rem;
   overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
   outline: none;
-  background: var(--popover);
-  color: var(--popover-foreground);
-  box-shadow: 0 1rem 3rem color-mix(in oklch, var(--foreground) 20%, transparent);
   pointer-events: auto;
 }
 
@@ -2016,7 +2055,7 @@ button {
 .vr-releases__heading h2 {
   margin: 0.25rem 0 0;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 1rem;
   line-height: 1.35;
 }
@@ -2046,7 +2085,7 @@ button {
 
 .vr-releases__state h3,
 .vr-releases__selection h3 {
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.8125rem;
 }
 
@@ -2121,7 +2160,7 @@ button {
 
 .vr-releases__release-name {
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   font-size: 0.75rem;
   line-height: 1.4;
   white-space: pre-wrap;
@@ -2198,7 +2237,6 @@ button {
   position: fixed;
   z-index: 80;
   inset: 0;
-  background: color-mix(in oklch, var(--foreground) 55%, transparent);
 }
 
 .vr-torrent__viewport {
@@ -2216,12 +2254,7 @@ button {
   max-height: 100%;
   padding: 1rem;
   overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
   outline: none;
-  background: var(--popover);
-  color: var(--popover-foreground);
-  box-shadow: 0 1rem 3rem color-mix(in oklch, var(--foreground) 20%, transparent);
   pointer-events: auto;
 }
 
@@ -2240,7 +2273,7 @@ button {
 .vr-torrent__heading h2 {
   margin: 0.25rem 0 0;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 1rem;
   line-height: 1.35;
 }
@@ -2257,7 +2290,7 @@ button {
   margin-top: 0.5rem;
   overflow-wrap: anywhere;
   color: var(--popover-foreground);
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   white-space: pre-wrap;
 }
 
@@ -2279,7 +2312,7 @@ button {
 
 .vr-torrent__state h3,
 .vr-torrent__content h3 {
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.8125rem;
 }
 
@@ -2332,7 +2365,7 @@ button {
 
 .vr-torrent__metadata dd {
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   white-space: pre-wrap;
 }
 
@@ -2386,7 +2419,7 @@ button {
 .vr-torrent__file-selection li span:nth-child(2) {
   min-width: 0;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   white-space: pre-wrap;
 }
 
@@ -2419,7 +2452,7 @@ button {
 .tv-torrent__files li span:first-child {
   min-width: 0;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   white-space: pre-wrap;
 }
 
@@ -2560,10 +2593,10 @@ button {
   margin: 0;
   overflow: hidden;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 0.8125rem;
   line-height: 1.45;
-  letter-spacing: -0.01em;
+  letter-spacing: 0.06em;
   white-space: pre-wrap;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
@@ -2607,7 +2640,6 @@ button {
 .movie-metadata__backdrop {
   position: fixed;
   z-index: 60;
-  background: rgb(15 23 42 / 0.58);
   inset: 0;
 }
 
@@ -2626,10 +2658,6 @@ button {
   max-height: calc(100vh - 1.5rem);
   overflow: auto;
   padding: 1rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--background);
-  box-shadow: 0 1.25rem 4rem rgb(15 23 42 / 0.28);
 }
 
 .movie-metadata__heading {
@@ -2668,6 +2696,8 @@ button {
 .movie-metadata__search > label {
   font-size: 0.6875rem;
   font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .movie-metadata__search > div {
@@ -2679,11 +2709,12 @@ button {
 .movie-metadata__search input {
   width: 100%;
   min-width: 0;
-  min-height: 2rem;
-  padding: 0.375rem 0.5rem;
-  border: 1px solid var(--input);
-  border-radius: var(--radius);
-  background: var(--background);
+  min-height: 2.25rem;
+  padding: 0.375rem 0;
+  border: 0;
+  border-bottom: 1px solid var(--input);
+  border-radius: 0;
+  background: transparent;
   color: var(--foreground);
 }
 
@@ -2907,7 +2938,7 @@ button {
 .vr-library-file__identity span {
   overflow: hidden;
   text-overflow: ellipsis;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   font-size: 0.625rem;
   white-space: nowrap;
 }
@@ -2934,7 +2965,6 @@ button {
   position: fixed;
   z-index: 50;
   inset: 0;
-  background: color-mix(in oklch, var(--foreground) 45%, transparent);
 }
 
 .trash-dialog__viewport {
@@ -2951,12 +2981,7 @@ button {
   width: min(26rem, 100%);
   max-height: 100%;
   overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
   outline: none;
-  background: var(--popover);
-  color: var(--popover-foreground);
-  box-shadow: 0 1rem 3rem color-mix(in oklch, var(--foreground) 20%, transparent);
   padding: 1rem;
   pointer-events: auto;
 }
@@ -2971,7 +2996,7 @@ button {
 .trash-dialog__heading h2 {
   margin: 0;
   overflow-wrap: anywhere;
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-heading);
   font-size: 1rem;
   line-height: 1.35;
 }
@@ -3004,7 +3029,7 @@ button {
   gap: 0.25rem;
   padding: 0.625rem;
   border: 1px solid var(--border);
-  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-family: var(--font-sans);
   font-size: 0.6875rem;
   overflow-wrap: anywhere;
 }
@@ -3018,6 +3043,30 @@ button {
   justify-content: flex-end;
   gap: 0.5rem;
   margin-top: 1rem;
+}
+
+.movie-details__backdrop,
+.vr-releases__backdrop,
+.vr-torrent__backdrop,
+.movie-metadata__backdrop,
+.trash-dialog__backdrop {
+  background: color-mix(in oklch, black 20%, transparent);
+  backdrop-filter: blur(4px);
+}
+
+.movie-details__popup,
+.javdb-detail__popup,
+.vr-releases__popup,
+.vr-torrent__popup,
+.movie-metadata__popup,
+.trash-dialog__popup {
+  border: 0;
+  border-radius: 0;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow:
+    0 1rem 3rem color-mix(in oklch, var(--foreground) 18%, transparent),
+    0 0 0 1px color-mix(in oklch, var(--foreground) 10%, transparent);
 }
 
 @media (hover: none) {
