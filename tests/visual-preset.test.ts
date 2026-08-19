@@ -226,8 +226,17 @@ describe("Sera preset contract", () => {
     const actionButton = ruleBody(
       '.provider-browse-card__actions [data-slot="button"]',
     );
+    const actionIcon = ruleBody(
+      '.provider-browse-card__actions [data-slot="button"] svg',
+    );
+    const copyAction = ruleBody(
+      ".provider-browse-card__actions .title-copy-button",
+    );
     const revealedActions = ruleBody(
       ".provider-browse-card:hover .provider-browse-card__actions,\n.provider-browse-card:focus-within .provider-browse-card__actions,\n.provider-browse-card__actions:focus-within",
+    );
+    const revealedCopyAction = ruleBody(
+      ".provider-browse-card:hover .provider-browse-card__actions .title-copy-button,\n.provider-browse-card:focus-within .provider-browse-card__actions .title-copy-button,\n.provider-browse-card__actions:focus-within .title-copy-button",
     );
     expect(actions).toContain("flex-direction: column;");
     expect(actions).toContain("right: 0.375rem;");
@@ -248,9 +257,16 @@ describe("Sera preset contract", () => {
     expect(actionButton).toContain("text-transform: none;");
     expect(actionButton).toContain("letter-spacing: normal;");
     expect(actionButton).toContain("white-space: normal;");
+    expect(actionIcon).toContain("filter: drop-shadow(");
+    expect(copyAction).not.toContain("pointer-events: auto;");
+    expect(copyAction).toContain("pointer-events: none;");
+    expect(applicationStyles).not.toContain(
+      '.title-copy-button[data-copy-state="success"],\n.title-copy-button[data-copy-state="error"]',
+    );
     expect(revealedActions).toContain("opacity: 1;");
     expect(revealedActions).toContain("transform: translateY(0);");
     expect(revealedActions).toContain("pointer-events: auto;");
+    expect(revealedCopyAction).toContain("pointer-events: auto;");
     expect(applicationStyles).toContain(
       '.provider-browse-card__actions [data-slot="button"]:focus-visible {\n  outline: 2px solid white;\n  outline-offset: 0;\n  box-shadow: 0 0 0 1px black;',
     );
@@ -267,6 +283,39 @@ describe("Sera preset contract", () => {
     );
     expect(hoverlessMedia).not.toContain("provider-browse-card__actions");
   });
+
+  it.each([80, 266])(
+    "keeps disclosed action rectangles inside a %ipx cover",
+    (coverWidth) => {
+      const actions = ruleBody(".provider-browse-card__actions");
+      const actionButton = ruleBody(
+        '.provider-browse-card__actions [data-slot="button"]',
+      );
+      const inset = Number(
+        actions.match(/left:\s*([\d.]+)rem;/)?.[1] ?? Number.NaN,
+      );
+      const pixelsPerRem = 16;
+      const coverHeight = 180;
+      const actionRectangle = {
+        bottom: coverHeight - inset * pixelsPerRem,
+        left: inset * pixelsPerRem,
+        right: coverWidth - inset * pixelsPerRem,
+        top: inset * pixelsPerRem,
+      };
+
+      expect(Number.isFinite(inset)).toBe(true);
+      expect(actionRectangle.left).toBeGreaterThanOrEqual(0);
+      expect(actionRectangle.top).toBeGreaterThanOrEqual(0);
+      expect(actionRectangle.right).toBeLessThanOrEqual(coverWidth);
+      expect(actionRectangle.bottom).toBeLessThanOrEqual(coverHeight);
+      expect(actionRectangle.right).toBeGreaterThan(actionRectangle.left);
+      expect(actionRectangle.bottom).toBeGreaterThan(actionRectangle.top);
+      expect(actions).toContain("bottom: 0.375rem;");
+      expect(actions).toContain("max-height: calc(100% - 0.75rem);");
+      expect(actionButton).toContain("max-width: 100%;");
+      expect(actionButton).toContain("overflow-wrap: anywhere;");
+    },
+  );
 
   it("uses stable selected surfaces instead of underlined navigation or segments", () => {
     const navigation = ruleBody('.navigation-item[aria-current="page"]');

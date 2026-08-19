@@ -1389,9 +1389,14 @@ body {
   box-shadow: 0 0 0 1px black;
 }
 
+.provider-browse-card__actions [data-slot="button"] svg {
+  filter: drop-shadow(0 1px 1px rgb(0 0 0 / 0.95))
+    drop-shadow(0 0 2px rgb(0 0 0 / 0.9));
+}
+
 .provider-browse-card__actions .title-copy-button {
   opacity: 1;
-  pointer-events: auto;
+  pointer-events: none;
 }
 
 .provider-browse-card:hover .provider-browse-card__actions,
@@ -1399,6 +1404,12 @@ body {
 .provider-browse-card__actions:focus-within {
   opacity: 1;
   transform: translateY(0);
+  pointer-events: auto;
+}
+
+.provider-browse-card:hover .provider-browse-card__actions .title-copy-button,
+.provider-browse-card:focus-within .provider-browse-card__actions .title-copy-button,
+.provider-browse-card__actions:focus-within .title-copy-button {
   pointer-events: auto;
 }
 
@@ -1522,8 +1533,8 @@ body {
 
 .media-title-row:hover .title-copy-button,
 .media-title-row:focus-within .title-copy-button,
-.title-copy-button[data-copy-state="success"],
-.title-copy-button[data-copy-state="error"] {
+.media-title-row .title-copy-button[data-copy-state="success"],
+.media-title-row .title-copy-button[data-copy-state="error"] {
   opacity: 1;
   pointer-events: auto;
 }
@@ -3070,7 +3081,7 @@ body {
 }
 
 @media (hover: none) {
-  .title-copy-button {
+  .media-title-row .title-copy-button {
     opacity: 1;
     pointer-events: auto;
   }
