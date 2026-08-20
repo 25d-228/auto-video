@@ -223,6 +223,7 @@ describe("Sera preset contract", () => {
 
   it("keeps cover actions compact, vertical, transparent, and hidden until hover or focus", () => {
     const actions = ruleBody(".provider-browse-card__actions");
+    const coverContrast = ruleBody(".provider-browse-card__cover::after");
     const actionButton = ruleBody(
       '.provider-browse-card__actions [data-slot="button"]',
     );
@@ -237,6 +238,9 @@ describe("Sera preset contract", () => {
     );
     const revealedCopyAction = ruleBody(
       ".provider-browse-card:hover .provider-browse-card__actions .title-copy-button,\n.provider-browse-card:focus-within .provider-browse-card__actions .title-copy-button,\n.provider-browse-card__actions:focus-within .title-copy-button",
+    );
+    const revealedCoverContrast = ruleBody(
+      ".provider-browse-card:hover .provider-browse-card__cover::after,\n.provider-browse-card:focus-within .provider-browse-card__cover::after",
     );
     expect(actions).toContain("flex-direction: column;");
     expect(actions).toContain("right: 0.375rem;");
@@ -253,11 +257,17 @@ describe("Sera preset contract", () => {
     expect(actionButton).toContain("max-width: 100%;");
     expect(actionButton).toContain("background: transparent;");
     expect(actionButton).toContain("color: white;");
+    expect(actionButton).toContain("font-size: 0.75rem;");
     expect(actionButton).toContain("text-shadow:");
     expect(actionButton).toContain("text-transform: none;");
     expect(actionButton).toContain("letter-spacing: normal;");
     expect(actionButton).toContain("white-space: normal;");
     expect(actionIcon).toContain("filter: drop-shadow(");
+    expect(coverContrast).toContain("height: 5.5rem;");
+    expect(coverContrast).toContain("background: linear-gradient(");
+    expect(coverContrast).toContain("opacity: 0;");
+    expect(coverContrast).toContain("pointer-events: none;");
+    expect(coverContrast).not.toContain("height: 100%;");
     expect(copyAction).not.toContain("pointer-events: auto;");
     expect(copyAction).toContain("pointer-events: none;");
     expect(applicationStyles).not.toContain(
@@ -267,6 +277,7 @@ describe("Sera preset contract", () => {
     expect(revealedActions).toContain("transform: translateY(0);");
     expect(revealedActions).toContain("pointer-events: auto;");
     expect(revealedCopyAction).toContain("pointer-events: auto;");
+    expect(revealedCoverContrast).toContain("opacity: 1;");
     expect(applicationStyles).toContain(
       '.provider-browse-card__actions [data-slot="button"]:focus-visible {\n  outline: 2px solid white;\n  outline-offset: 0;\n  box-shadow: 0 0 0 1px black;',
     );

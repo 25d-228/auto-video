@@ -1256,6 +1256,20 @@ body {
   place-items: center;
 }
 
+.provider-browse-card__cover::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 5.5rem;
+  background: linear-gradient(to top, rgb(0 0 0 / 0.82), transparent);
+  opacity: 0;
+  transition: opacity 120ms ease;
+  pointer-events: none;
+}
+
 .provider-browse-card__cover > img {
   width: 100%;
   height: 100%;
@@ -1277,6 +1291,7 @@ body {
 
 .provider-browse-card__badges {
   position: absolute;
+  z-index: 2;
   top: 0.375rem;
   left: 0.375rem;
   display: flex;
@@ -1353,14 +1368,14 @@ body {
   width: fit-content;
   max-width: 100%;
   min-width: 0;
-  min-height: 1.375rem;
+  min-height: 1.5rem;
   height: auto;
   justify-content: center;
   padding: 0.125rem 0.25rem;
   border-color: transparent;
   background: transparent;
   color: white;
-  font-size: 0.625rem;
+  font-size: 0.75rem;
   line-height: 1.15;
   letter-spacing: normal;
   overflow-wrap: anywhere;
@@ -1405,6 +1420,11 @@ body {
   opacity: 1;
   transform: translateY(0);
   pointer-events: auto;
+}
+
+.provider-browse-card:hover .provider-browse-card__cover::after,
+.provider-browse-card:focus-within .provider-browse-card__cover::after {
+  opacity: 1;
 }
 
 .provider-browse-card:hover .provider-browse-card__actions .title-copy-button,
@@ -1754,65 +1774,6 @@ body {
 .movie-details__overview h3,
 .movie-details__overview p {
   margin: 0;
-}
-
-.javdb-detail__popup {
-  width: min(44rem, 100%);
-}
-
-.javdb-detail__content .movie-details__poster {
-  position: relative;
-  align-self: start;
-}
-
-.javdb-detail__placeholder {
-  display: grid;
-  width: 100%;
-  height: 100%;
-  gap: 0.5rem;
-  padding: 0.75rem;
-  color: var(--muted-foreground);
-  font-family: var(--font-sans);
-  font-size: 0.75rem;
-  overflow-wrap: anywhere;
-  place-items: center;
-  text-align: center;
-}
-
-.javdb-detail__badges {
-  position: absolute;
-  top: 0.375rem;
-  left: 0.375rem;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-}
-
-.javdb-detail__badges span {
-  padding: 0.125rem 0.375rem;
-  border-radius: var(--radius);
-  background: rgb(15 23 42 / 0.78);
-  color: white;
-  font-size: 0.625rem;
-  text-transform: capitalize;
-}
-
-.javdb-detail__content .movie-details__information > h3,
-.javdb-detail__original-title {
-  margin: 0 0 0.5rem;
-  overflow-wrap: anywhere;
-}
-
-.javdb-detail__original-title {
-  color: var(--muted-foreground);
-  font-size: 0.75rem;
-}
-
-.javdb-detail__actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-top: 1rem;
 }
 
 .javdb-preview__content {
@@ -3066,7 +3027,6 @@ body {
 }
 
 .movie-details__popup,
-.javdb-detail__popup,
 .vr-releases__popup,
 .vr-torrent__popup,
 .movie-metadata__popup,
