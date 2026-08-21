@@ -26,7 +26,7 @@ const JAVDB_SIGNATURE_SECRET: &str = "71cf27bb3c0bcdf207b64abecddc970098c7421ee7
 const JAVDB_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const JAVDB_COVER_MAX_BYTES: usize = 16 * 1024 * 1024;
 const JAVDB_PREVIEW_LIMIT: usize = 24;
-// Four simultaneous detail checks reduce serial latency without overloading the provider or host.
+// Four global worker slots reduce serial latency while bounding provider processes and native threads.
 const ADULT_CATEGORY_CHECK_CONCURRENCY: usize = 4;
 const JAVDB_HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
 #[cfg(target_os = "macos")]
@@ -171,50 +171,31 @@ struct CatalogContext {
     detail_generation: u64,
     adult_context_generation: u64,
     vr_context_generation: u64,
+    adult_checks_in_progress: usize,
+    #[cfg(test)]
+    adult_check_waiters: Vec<u64>,
     adult: Option<CatalogAuthority>,
     vr: Option<CatalogAuthority>,
     adult_detail: Option<DetailAuthority>,
     vr_detail: Option<DetailAuthority>,
 }
 
-struct AdultCategoryCheckLimiter {
-    active: Mutex<usize>,
-    available: Condvar,
-}
-
-impl Default for AdultCategoryCheckLimiter {
-    fn default() -> Self {
-        Self {
-            active: Mutex::new(0),
-            available: Condvar::new(),
-        }
-    }
-}
-
-struct AdultCategoryCheckPermit<'a>(&'a AdultCategoryCheckLimiter);
-
-impl AdultCategoryCheckLimiter {
-    fn acquire(&self) -> Result<AdultCategoryCheckPermit<'_>, ()> {
-        let mut active = self.active.lock().map_err(|_| ())?;
-        while *active >= ADULT_CATEGORY_CHECK_CONCURRENCY {
-            active = self.available.wait(active).map_err(|_| ())?;
-        }
-        *active += 1;
-        Ok(AdultCategoryCheckPermit(self))
-    }
+struct AdultCategoryCheckPermit<'a> {
+    state: &'a JavdbCatalogState,
 }
 
 impl Drop for AdultCategoryCheckPermit<'_> {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.0.active.lock() {
-            *active = active.saturating_sub(1);
-            self.0.available.notify_one();
+        if let Ok(mut context) = self.state.0.lock() {
+            context.adult_checks_in_progress = context.adult_checks_in_progress.saturating_sub(1);
+            drop(context);
+            self.state.1.notify_all();
         }
     }
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct JavdbCatalogState(Arc<Mutex<CatalogContext>>, Arc<AdultCategoryCheckLimiter>);
+pub(crate) struct JavdbCatalogState(Arc<Mutex<CatalogContext>>, Arc<Condvar>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CatalogDocumentError {
@@ -719,7 +700,12 @@ fn begin_request(
             context.vr_detail = None;
         }
     }
-    Ok(context.generation)
+    let generation = context.generation;
+    drop(context);
+    if category == CatalogCategory::Adult {
+        state.1.notify_all();
+    }
+    Ok(generation)
 }
 
 fn authority(context: &CatalogContext, category: CatalogCategory) -> Option<&CatalogAuthority> {
@@ -848,30 +834,44 @@ fn require_current_request(
     }
 }
 
-fn claim_adult_item(
+fn reserve_adult_category_check(
     state: &JavdbCatalogState,
     generation: u64,
-    next_index: &Mutex<usize>,
-    item_count: usize,
-) -> Result<Option<usize>, &'static str> {
-    let context = state
+) -> Result<AdultCategoryCheckPermit<'_>, &'static str> {
+    let mut context = state
         .0
         .lock()
         .map_err(|_| CatalogCategory::Adult.provider_error(ProviderRequestError::Provider))?;
-    if authority(&context, CatalogCategory::Adult)
-        .is_none_or(|authority| authority.generation != generation)
-    {
-        return Err(CatalogCategory::Adult.stale_error());
+    loop {
+        if authority(&context, CatalogCategory::Adult)
+            .is_none_or(|authority| authority.generation != generation)
+        {
+            return Err(CatalogCategory::Adult.stale_error());
+        }
+        if context.adult_checks_in_progress < ADULT_CATEGORY_CHECK_CONCURRENCY {
+            context.adult_checks_in_progress += 1;
+            return Ok(AdultCategoryCheckPermit { state });
+        }
+        #[cfg(test)]
+        {
+            context.adult_check_waiters.push(generation);
+            state.1.notify_all();
+        }
+        context = state
+            .1
+            .wait(context)
+            .map_err(|_| CatalogCategory::Adult.provider_error(ProviderRequestError::Provider))?;
+        #[cfg(test)]
+        {
+            let waiter = context
+                .adult_check_waiters
+                .iter()
+                .position(|waiter| *waiter == generation)
+                .expect("the waiting Adult request must remain registered");
+            context.adult_check_waiters.remove(waiter);
+            state.1.notify_all();
+        }
     }
-    let mut next_index = next_index
-        .lock()
-        .map_err(|_| CatalogCategory::Adult.provider_error(ProviderRequestError::Provider))?;
-    if *next_index >= item_count {
-        return Ok(None);
-    }
-    let index = *next_index;
-    *next_index += 1;
-    Ok(Some(index))
 }
 
 fn verify_adult_items<F>(
@@ -887,7 +887,6 @@ where
         return Ok(items);
     }
 
-    let next_index = Mutex::new(0usize);
     let results = Mutex::new(vec![None; items.len()]);
     let stale = AtomicBool::new(false);
     let failed = AtomicBool::new(false);
@@ -895,40 +894,31 @@ where
 
     thread::scope(|scope| {
         let mut workers = Vec::new();
-        for _ in 0..ADULT_CATEGORY_CHECK_CONCURRENCY.min(items.len()) {
-            workers.push(scope.spawn(|| loop {
-                if stale.load(Ordering::Acquire)
-                    || failed.load(Ordering::Acquire)
-                    || conflicting.load(Ordering::Acquire)
-                {
-                    return;
+        for (index, item) in items.iter().enumerate() {
+            if stale.load(Ordering::Acquire)
+                || failed.load(Ordering::Acquire)
+                || conflicting.load(Ordering::Acquire)
+            {
+                break;
+            }
+            let permit = match reserve_adult_category_check(state, generation) {
+                Ok(permit) => permit,
+                Err(error) if error == CatalogCategory::Adult.stale_error() => {
+                    stale.store(true, Ordering::Release);
+                    break;
                 }
-                let permit = match state.1.acquire() {
-                    Ok(permit) => permit,
-                    Err(()) => {
-                        failed.store(true, Ordering::Release);
-                        return;
-                    }
-                };
-                if stale.load(Ordering::Acquire)
-                    || failed.load(Ordering::Acquire)
-                    || conflicting.load(Ordering::Acquire)
-                {
-                    return;
+                Err(_) => {
+                    failed.store(true, Ordering::Release);
+                    break;
                 }
-                let index = match claim_adult_item(state, generation, &next_index, items.len()) {
-                    Ok(Some(index)) => index,
-                    Ok(None) => return,
-                    Err(error) if error == CatalogCategory::Adult.stale_error() => {
-                        stale.store(true, Ordering::Release);
-                        return;
-                    }
-                    Err(_) => {
-                        failed.store(true, Ordering::Release);
-                        return;
-                    }
-                };
-                let item = &items[index];
+            };
+            if failed.load(Ordering::Acquire) || conflicting.load(Ordering::Acquire) {
+                break;
+            }
+            let results = &results;
+            let failed = &failed;
+            let conflicting = &conflicting;
+            workers.push(scope.spawn(move || {
                 let url = format!(
                     "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
                     item.provider_item_id
@@ -939,7 +929,6 @@ where
                         adult_item_category(&document, &item.provider_item_id, &item.code)
                     })
                     .unwrap_or(AdultCategoryCheck::Inconclusive);
-                drop(permit);
                 if let Ok(mut results) = results.lock() {
                     results[index] = Some(category_check);
                 } else {
@@ -949,6 +938,7 @@ where
                 if category_check == AdultCategoryCheck::Conflicting {
                     conflicting.store(true, Ordering::Release);
                 }
+                drop(permit);
             }));
         }
         for worker in workers {
@@ -1434,6 +1424,10 @@ pub(crate) fn invalidate_catalog(
             }
         }
     }
+    drop(context);
+    if category == CatalogCategory::Adult {
+        state.1.notify_all();
+    }
     Ok(())
 }
 
@@ -1855,6 +1849,24 @@ mod tests {
         }
     }
 
+    fn wait_for_only_current_adult_waiter(state: &JavdbCatalogState) {
+        let mut context = state.0.lock().expect("catalog state must remain available");
+        loop {
+            let current_generation = context
+                .adult
+                .as_ref()
+                .expect("a current Adult request must exist")
+                .generation;
+            if context.adult_check_waiters.as_slice() == [current_generation] {
+                return;
+            }
+            context = state
+                .1
+                .wait(context)
+                .expect("catalog state must remain available");
+        }
+    }
+
     fn detail(item_id: &str, tags: &str) -> String {
         format!(r#"{{"success":1,"data":{{"movie":{{"id":"{item_id}","tags":{tags}}}}}}}"#)
     }
@@ -2154,6 +2166,224 @@ mod tests {
             maximum_active.load(Ordering::SeqCst),
             ADULT_CATEGORY_CHECK_CONCURRENCY
         );
+    }
+
+    #[test]
+    fn overlapping_adult_requests_cancel_stale_waiters_before_latest_work_starts() {
+        let state = JavdbCatalogState::default();
+        let first_request = request("adult");
+        let second_request = request("adult");
+        let latest_request = request("adult");
+        let (started_sender, started_receiver) = mpsc::channel::<String>();
+        let (listed_sender, listed_receiver) = mpsc::channel::<&'static str>();
+        let release = (Mutex::new((false, Vec::<String>::new())), Condvar::new());
+        let active = AtomicUsize::new(0);
+        let maximum_active = AtomicUsize::new(0);
+        let first_listing = (1..=8)
+            .map(|index| format!(r#"{{"id":"First{index}","number":"ADLT-{index}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let second_listing = (1..=8)
+            .map(|index| format!(r#"{{"id":"Second{index}","number":"ADLT-1{index}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let latest_listing =
+            r#"{"id":"Latest1","number":"ADLT-21"},{"id":"Latest2","number":"ADLT-22"}"#;
+        let fetch_detail = |url: &str| {
+            let item_id = url
+                .split("/api/v4/movies/")
+                .nth(1)
+                .and_then(|value| value.split('?').next())
+                .expect("detail URL must contain the provider item");
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum_active.fetch_max(current, Ordering::SeqCst);
+            started_sender
+                .send(item_id.to_owned())
+                .expect("the test must observe every started check");
+            let (release_state, available) = &release;
+            let mut release_state = release_state
+                .lock()
+                .expect("release state must remain available");
+            while !release_state.0 && !release_state.1.iter().any(|id| id == item_id) {
+                release_state = available
+                    .wait(release_state)
+                    .expect("release state must remain available");
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            let number = if let Some(index) = item_id.strip_prefix("First") {
+                format!("ADLT-{index}")
+            } else if let Some(index) = item_id.strip_prefix("Second") {
+                format!("ADLT-1{index}")
+            } else if let Some(index) = item_id.strip_prefix("Latest") {
+                format!("ADLT-2{index}")
+            } else {
+                unreachable!()
+            };
+            Ok(detail_with_number(item_id, &number, r#"[{"id":"28"}]"#))
+        };
+
+        thread::scope(|scope| {
+            let first_result = scope.spawn(|| {
+                fetch_catalog_with(&state, &first_request, |url| {
+                    if url.contains("movies/tags") {
+                        Ok(format!(
+                            r#"{{"success":1,"data":{{"movies":[{first_listing}]}}}}"#
+                        ))
+                    } else {
+                        fetch_detail(url)
+                    }
+                })
+            });
+
+            let first_started = (0..ADULT_CATEGORY_CHECK_CONCURRENCY)
+                .map(|_| {
+                    started_receiver
+                        .recv()
+                        .expect("the first request must fill every global worker slot")
+                })
+                .collect::<Vec<_>>();
+            assert!(first_started.iter().all(|item| item.starts_with("First")));
+            assert_eq!(
+                state
+                    .0
+                    .lock()
+                    .expect("catalog state must remain available")
+                    .adult_checks_in_progress,
+                ADULT_CATEGORY_CHECK_CONCURRENCY
+            );
+
+            let second_result = scope.spawn(|| {
+                fetch_catalog_with(&state, &second_request, |url| {
+                    if url.contains("movies/tags") {
+                        listed_sender
+                            .send("second")
+                            .expect("the second listing must be observed");
+                        Ok(format!(
+                            r#"{{"success":1,"data":{{"movies":[{second_listing}]}}}}"#
+                        ))
+                    } else {
+                        fetch_detail(url)
+                    }
+                })
+            });
+            assert_eq!(
+                listed_receiver
+                    .recv()
+                    .expect("the second request must reach verification"),
+                "second"
+            );
+            wait_for_only_current_adult_waiter(&state);
+
+            let latest_result = scope.spawn(|| {
+                fetch_catalog_with(&state, &latest_request, |url| {
+                    if url.contains("movies/tags") {
+                        listed_sender
+                            .send("latest")
+                            .expect("the latest listing must be observed");
+                        Ok(format!(
+                            r#"{{"success":1,"data":{{"movies":[{latest_listing}]}}}}"#
+                        ))
+                    } else {
+                        fetch_detail(url)
+                    }
+                })
+            });
+            assert_eq!(
+                listed_receiver
+                    .recv()
+                    .expect("the latest request must reach verification"),
+                "latest"
+            );
+            wait_for_only_current_adult_waiter(&state);
+
+            {
+                let (release_state, available) = &release;
+                release_state
+                    .lock()
+                    .expect("release state must remain available")
+                    .1
+                    .push(first_started[0].clone());
+                available.notify_all();
+            }
+            let first_replacement = started_receiver
+                .recv()
+                .expect("the latest request must receive the released worker slot");
+            assert!(first_replacement.starts_with("Latest"));
+            assert_eq!(
+                state
+                    .0
+                    .lock()
+                    .expect("catalog state must remain available")
+                    .adult_checks_in_progress,
+                ADULT_CATEGORY_CHECK_CONCURRENCY
+            );
+            wait_for_only_current_adult_waiter(&state);
+
+            {
+                let (release_state, available) = &release;
+                release_state
+                    .lock()
+                    .expect("release state must remain available")
+                    .0 = true;
+                available.notify_all();
+            }
+
+            let latest = latest_result
+                .join()
+                .expect("latest catalog worker must not panic")
+                .expect("the latest request must complete");
+            assert_eq!(latest[1], "2");
+            assert_eq!(latest[4], "ADLT-21");
+            assert_eq!(latest[11], "ADLT-22");
+            assert_eq!(
+                second_result
+                    .join()
+                    .expect("second catalog worker must not panic"),
+                Err(ADULT_JAVDB_STALE)
+            );
+            assert_eq!(
+                first_result
+                    .join()
+                    .expect("first catalog worker must not panic"),
+                Err(ADULT_JAVDB_STALE)
+            );
+
+            let mut all_started = first_started;
+            all_started.push(first_replacement);
+            all_started.extend(started_receiver.try_iter());
+            assert_eq!(
+                all_started
+                    .iter()
+                    .filter(|item| item.starts_with("First"))
+                    .count(),
+                ADULT_CATEGORY_CHECK_CONCURRENCY
+            );
+            assert!(!all_started.iter().any(|item| item.starts_with("Second")));
+            assert_eq!(
+                all_started
+                    .iter()
+                    .filter(|item| item.starts_with("Latest"))
+                    .count(),
+                2
+            );
+        });
+
+        assert_eq!(maximum_active.load(Ordering::SeqCst), 4);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .0
+                .lock()
+                .expect("catalog state must remain available")
+                .adult_checks_in_progress,
+            0
+        );
+        assert!(state
+            .0
+            .lock()
+            .expect("catalog state must remain available")
+            .adult_check_waiters
+            .is_empty());
     }
 
     #[test]
