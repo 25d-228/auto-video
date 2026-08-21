@@ -1,6 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +26,8 @@ const JAVDB_SIGNATURE_SECRET: &str = "71cf27bb3c0bcdf207b64abecddc970098c7421ee7
 const JAVDB_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const JAVDB_COVER_MAX_BYTES: usize = 16 * 1024 * 1024;
 const JAVDB_PREVIEW_LIMIT: usize = 24;
+// Four simultaneous detail checks reduce serial latency without overloading the provider or host.
+const ADULT_CATEGORY_CHECK_CONCURRENCY: usize = 4;
 const JAVDB_HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
 #[cfg(target_os = "macos")]
 const JAVDB_HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_code}";
@@ -171,8 +177,44 @@ struct CatalogContext {
     vr_detail: Option<DetailAuthority>,
 }
 
+struct AdultCategoryCheckLimiter {
+    active: Mutex<usize>,
+    available: Condvar,
+}
+
+impl Default for AdultCategoryCheckLimiter {
+    fn default() -> Self {
+        Self {
+            active: Mutex::new(0),
+            available: Condvar::new(),
+        }
+    }
+}
+
+struct AdultCategoryCheckPermit<'a>(&'a AdultCategoryCheckLimiter);
+
+impl AdultCategoryCheckLimiter {
+    fn acquire(&self) -> Result<AdultCategoryCheckPermit<'_>, ()> {
+        let mut active = self.active.lock().map_err(|_| ())?;
+        while *active >= ADULT_CATEGORY_CHECK_CONCURRENCY {
+            active = self.available.wait(active).map_err(|_| ())?;
+        }
+        *active += 1;
+        Ok(AdultCategoryCheckPermit(self))
+    }
+}
+
+impl Drop for AdultCategoryCheckPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.0.active.lock() {
+            *active = active.saturating_sub(1);
+            self.0.available.notify_one();
+        }
+    }
+}
+
 #[derive(Clone, Default)]
-pub(crate) struct JavdbCatalogState(Arc<Mutex<CatalogContext>>);
+pub(crate) struct JavdbCatalogState(Arc<Mutex<CatalogContext>>, Arc<AdultCategoryCheckLimiter>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CatalogDocumentError {
@@ -782,11 +824,173 @@ fn parse_error(category: CatalogCategory, error: CatalogDocumentError) -> &'stat
     }
 }
 
-pub(crate) fn fetch_catalog_with(
+fn request_is_current(
+    state: &JavdbCatalogState,
+    category: CatalogCategory,
+    generation: u64,
+) -> Result<bool, &'static str> {
+    let context = state
+        .0
+        .lock()
+        .map_err(|_| category.provider_error(ProviderRequestError::Provider))?;
+    Ok(authority(&context, category).is_some_and(|authority| authority.generation == generation))
+}
+
+fn require_current_request(
+    state: &JavdbCatalogState,
+    category: CatalogCategory,
+    generation: u64,
+) -> Result<(), &'static str> {
+    if request_is_current(state, category, generation)? {
+        Ok(())
+    } else {
+        Err(category.stale_error())
+    }
+}
+
+fn claim_adult_item(
+    state: &JavdbCatalogState,
+    generation: u64,
+    next_index: &Mutex<usize>,
+    item_count: usize,
+) -> Result<Option<usize>, &'static str> {
+    let context = state
+        .0
+        .lock()
+        .map_err(|_| CatalogCategory::Adult.provider_error(ProviderRequestError::Provider))?;
+    if authority(&context, CatalogCategory::Adult)
+        .is_none_or(|authority| authority.generation != generation)
+    {
+        return Err(CatalogCategory::Adult.stale_error());
+    }
+    let mut next_index = next_index
+        .lock()
+        .map_err(|_| CatalogCategory::Adult.provider_error(ProviderRequestError::Provider))?;
+    if *next_index >= item_count {
+        return Ok(None);
+    }
+    let index = *next_index;
+    *next_index += 1;
+    Ok(Some(index))
+}
+
+fn verify_adult_items<F>(
+    state: &JavdbCatalogState,
+    generation: u64,
+    items: Vec<CatalogItem>,
+    fetch: &F,
+) -> Result<Vec<CatalogItem>, &'static str>
+where
+    F: Fn(&str) -> Result<String, ProviderRequestError> + Sync,
+{
+    if items.is_empty() {
+        return Ok(items);
+    }
+
+    let next_index = Mutex::new(0usize);
+    let results = Mutex::new(vec![None; items.len()]);
+    let stale = AtomicBool::new(false);
+    let failed = AtomicBool::new(false);
+    let conflicting = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for _ in 0..ADULT_CATEGORY_CHECK_CONCURRENCY.min(items.len()) {
+            workers.push(scope.spawn(|| loop {
+                if stale.load(Ordering::Acquire)
+                    || failed.load(Ordering::Acquire)
+                    || conflicting.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                let permit = match state.1.acquire() {
+                    Ok(permit) => permit,
+                    Err(()) => {
+                        failed.store(true, Ordering::Release);
+                        return;
+                    }
+                };
+                if stale.load(Ordering::Acquire)
+                    || failed.load(Ordering::Acquire)
+                    || conflicting.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                let index = match claim_adult_item(state, generation, &next_index, items.len()) {
+                    Ok(Some(index)) => index,
+                    Ok(None) => return,
+                    Err(error) if error == CatalogCategory::Adult.stale_error() => {
+                        stale.store(true, Ordering::Release);
+                        return;
+                    }
+                    Err(_) => {
+                        failed.store(true, Ordering::Release);
+                        return;
+                    }
+                };
+                let item = &items[index];
+                let url = format!(
+                    "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
+                    item.provider_item_id
+                );
+                let category_check = fetch(&url)
+                    .ok()
+                    .map(|document| {
+                        adult_item_category(&document, &item.provider_item_id, &item.code)
+                    })
+                    .unwrap_or(AdultCategoryCheck::Inconclusive);
+                drop(permit);
+                if let Ok(mut results) = results.lock() {
+                    results[index] = Some(category_check);
+                } else {
+                    failed.store(true, Ordering::Release);
+                    return;
+                }
+                if category_check == AdultCategoryCheck::Conflicting {
+                    conflicting.store(true, Ordering::Release);
+                }
+            }));
+        }
+        for worker in workers {
+            if worker.join().is_err() {
+                failed.store(true, Ordering::Release);
+            }
+        }
+    });
+
+    require_current_request(state, CatalogCategory::Adult, generation)?;
+    if failed.load(Ordering::Acquire) {
+        return Err(CatalogCategory::Adult.provider_error(ProviderRequestError::Provider));
+    }
+    let results = results
+        .into_inner()
+        .map_err(|_| CatalogCategory::Adult.provider_error(ProviderRequestError::Provider))?;
+    if conflicting.load(Ordering::Acquire)
+        || results.contains(&Some(AdultCategoryCheck::Conflicting))
+    {
+        return Err(CatalogCategory::Adult.conflicting_error());
+    }
+    if stale.load(Ordering::Acquire) || results.iter().any(Option::is_none) {
+        return Err(CatalogCategory::Adult.stale_error());
+    }
+
+    Ok(items
+        .into_iter()
+        .zip(results)
+        .filter_map(|(item, category)| {
+            (category == Some(AdultCategoryCheck::Adult)).then_some(item)
+        })
+        .collect())
+}
+
+pub(crate) fn fetch_catalog_with<F>(
     state: &JavdbCatalogState,
     request: &JavdbCatalogRequest,
-    mut fetch: impl FnMut(&str) -> Result<String, ProviderRequestError>,
-) -> Result<Vec<String>, &'static str> {
+    fetch: F,
+) -> Result<Vec<String>, &'static str>
+where
+    F: Fn(&str) -> Result<String, ProviderRequestError> + Sync,
+{
     let category = CatalogCategory::parse(&request.category).ok_or(VR_PROVIDER_ERROR)?;
     if validated_request(request) != Some(category) {
         return Err(category.provider_error(ProviderRequestError::Provider));
@@ -799,7 +1003,10 @@ pub(crate) fn fetch_catalog_with(
     let mut items = Vec::new();
     let mut accepted_codes = HashMap::<String, String>::new();
     for url in listing_urls(request, category) {
-        let document = fetch(&url).map_err(|error| category.provider_error(error))?;
+        require_current_request(state, category, generation)?;
+        let document = fetch(&url);
+        require_current_request(state, category, generation)?;
+        let document = document.map_err(|error| category.provider_error(error))?;
         let page = parse_listing(&document).map_err(|error| parse_error(category, error))?;
         for item in page.items {
             if let Some(previous_code) = accepted_codes.get(&item.provider_item_id) {
@@ -817,25 +1024,7 @@ pub(crate) fn fetch_catalog_with(
     }
 
     if category == CatalogCategory::Adult {
-        let mut accepted_adult_items = Vec::new();
-        for item in items {
-            let url = format!(
-                "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
-                item.provider_item_id
-            );
-            let category_check = fetch(&url)
-                .ok()
-                .map(|document| adult_item_category(&document, &item.provider_item_id, &item.code))
-                .unwrap_or(AdultCategoryCheck::Inconclusive);
-            match category_check {
-                AdultCategoryCheck::Adult => accepted_adult_items.push(item),
-                AdultCategoryCheck::Conflicting => {
-                    return Err(category.conflicting_error());
-                }
-                AdultCategoryCheck::NotAdult | AdultCategoryCheck::Inconclusive => {}
-            }
-        }
-        items = accepted_adult_items;
+        items = verify_adult_items(state, generation, items, &fetch)?;
     }
     items.truncate(request.count as usize);
     finish_request(state, category, generation, items)
@@ -1642,7 +1831,10 @@ pub(crate) fn fetch_cover_bytes(_url: &str) -> Result<Vec<u8>, ProviderRequestEr
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    };
 
     use super::*;
 
@@ -1727,7 +1919,7 @@ mod tests {
     #[test]
     fn constructs_adult_period_category_sort_count_and_exact_vr_tag_requests() {
         let state = JavdbCatalogState::default();
-        let urls = RefCell::new(Vec::new());
+        let urls = Mutex::new(Vec::new());
         for period in ["daily", "weekly", "monthly"] {
             let ranking = JavdbCatalogRequest {
                 category: "adult".to_owned(),
@@ -1742,7 +1934,9 @@ mod tests {
                 count: 25,
             };
             fetch_catalog_with(&state, &ranking, |url| {
-                urls.borrow_mut().push(url.to_owned());
+                urls.lock()
+                    .expect("request list must remain available")
+                    .push(url.to_owned());
                 Ok(if url.contains("rankings") {
                     r#"{"success":1,"data":{"movies":[]}}"#.to_owned()
                 } else {
@@ -1752,7 +1946,9 @@ mod tests {
             .expect("Adult ranking period must be accepted");
         }
         assert_eq!(
-            urls.borrow().as_slice(),
+            urls.lock()
+                .expect("request list must remain available")
+                .as_slice(),
             [
                 "https://apidd.spthgb.com/api/v1/rankings?type=0&period=daily",
                 "https://apidd.spthgb.com/api/v1/rankings?type=0&period=weekly",
@@ -1775,14 +1971,14 @@ mod tests {
             adult.month = Some(6);
             adult.sort = sort.to_owned();
             adult.count = 10;
-            let url = RefCell::new(String::new());
+            let url = Mutex::new(String::new());
             fetch_catalog_with(&state, &adult, |value| {
-                url.replace(value.to_owned());
+                *url.lock().expect("request URL must remain available") = value.to_owned();
                 Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
             })
             .expect("Adult category request must be accepted");
             assert_eq!(
-                url.into_inner(),
+                url.into_inner().expect("request URL must remain available"),
                 format!("https://apidd.spthgb.com/api/v1/movies/tags?filter_by=0%3At%3Am%3A%3A{current_year}%3A%3A6&filter_by_tags=&sort_by={provider_sort}&order_by={order}&page=1&limit=10")
             );
         }
@@ -1793,25 +1989,28 @@ mod tests {
         ] {
             let mut invalid = request("adult");
             invalid.year = Some(invalid_year);
-            let dispatched = Cell::new(false);
+            let dispatched = AtomicBool::new(false);
             assert!(fetch_catalog_with(&state, &invalid, |_| {
-                dispatched.set(true);
+                dispatched.store(true, Ordering::Relaxed);
                 unreachable!()
             })
             .is_err());
-            assert!(!dispatched.get());
+            assert!(!dispatched.load(Ordering::Relaxed));
         }
 
         let mut vr = request("vr");
         vr.count = 100;
-        let urls = RefCell::new(Vec::new());
+        let urls = Mutex::new(Vec::new());
         fetch_catalog_with(&state, &vr, |url| {
-            urls.borrow_mut().push(url.to_owned());
+            urls.lock()
+                .expect("request list must remain available")
+                .push(url.to_owned());
             Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
         })
         .expect("VR request must be accepted");
-        assert_eq!(urls.borrow().len(), 1);
-        assert!(urls.borrow()[0].contains("filter_by=0%3At%3Am%3A212%3A%3A%3A"));
+        let urls = urls.lock().expect("request list must remain available");
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].contains("filter_by=0%3At%3Am%3A212%3A%3A%3A"));
     }
 
     #[test]
@@ -1878,11 +2077,272 @@ mod tests {
     }
 
     #[test]
+    fn adult_category_checks_overlap_without_exceeding_the_fixed_bound() {
+        let state = JavdbCatalogState::default();
+        let request = request("adult");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let release = (Mutex::new(false), Condvar::new());
+        let active = AtomicUsize::new(0);
+        let maximum_active = AtomicUsize::new(0);
+        let listing = (1..=8)
+            .map(|index| format!(r#"{{"id":"Adult{index}","number":"ADLT-{index}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        thread::scope(|scope| {
+            let request = &request;
+            let result = scope.spawn(|| {
+                fetch_catalog_with(&state, request, |url| {
+                    if url.contains("movies/tags") {
+                        return Ok(format!(
+                            r#"{{"success":1,"data":{{"movies":[{listing}]}}}}"#
+                        ));
+                    }
+                    let item_id = url
+                        .split("/api/v4/movies/")
+                        .nth(1)
+                        .and_then(|value| value.split('?').next())
+                        .expect("detail URL must contain the provider item");
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum_active.fetch_max(current, Ordering::SeqCst);
+                    started_sender
+                        .send(item_id.to_owned())
+                        .expect("the test must observe each started check");
+                    let (released, available) = &release;
+                    let mut released = released.lock().expect("release gate must remain available");
+                    while !*released {
+                        released = available
+                            .wait(released)
+                            .expect("release gate must remain available");
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(detail_with_number(
+                        item_id,
+                        &format!("ADLT-{}", &item_id[5..]),
+                        r#"[{"id":"28"}]"#,
+                    ))
+                })
+            });
+
+            let started = (0..ADULT_CATEGORY_CHECK_CONCURRENCY)
+                .map(|_| {
+                    started_receiver
+                        .recv()
+                        .expect("the configured checks must start")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(started.len(), ADULT_CATEGORY_CHECK_CONCURRENCY);
+            assert_eq!(
+                active.load(Ordering::SeqCst),
+                ADULT_CATEGORY_CHECK_CONCURRENCY
+            );
+            assert!(started_receiver.try_recv().is_err());
+            {
+                let (released, available) = &release;
+                *released.lock().expect("release gate must remain available") = true;
+                available.notify_all();
+            }
+            let response = result
+                .join()
+                .expect("catalog worker must not panic")
+                .expect("every exact Adult row must be accepted");
+            assert_eq!(response[1], "8");
+        });
+
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            maximum_active.load(Ordering::SeqCst),
+            ADULT_CATEGORY_CHECK_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn adult_category_completion_order_cannot_change_provider_source_order() {
+        let state = JavdbCatalogState::default();
+        let request = request("adult");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (completed_sender, completed_receiver) = mpsc::channel();
+        let released = (Mutex::new(Vec::<String>::new()), Condvar::new());
+
+        thread::scope(|scope| {
+            let result = scope.spawn(|| {
+                fetch_catalog_with(&state, &request, |url| {
+                    if url.contains("movies/tags") {
+                        return Ok(r#"{"success":1,"data":{"movies":[{"id":"First","number":"ADLT-1"},{"id":"Second","number":"ADLT-2"},{"id":"Third","number":"ADLT-3"},{"id":"Fourth","number":"ADLT-4"}]}}"#.to_owned());
+                    }
+                    let item_id = url
+                        .split("/api/v4/movies/")
+                        .nth(1)
+                        .and_then(|value| value.split('?').next())
+                        .expect("detail URL must contain the provider item");
+                    started_sender
+                        .send(item_id.to_owned())
+                        .expect("the test must observe each started check");
+                    let (released_items, available) = &released;
+                    let mut released_items = released_items
+                        .lock()
+                        .expect("completion gate must remain available");
+                    while !released_items.iter().any(|released| released == item_id) {
+                        released_items = available
+                            .wait(released_items)
+                            .expect("completion gate must remain available");
+                    }
+                    completed_sender
+                        .send(item_id.to_owned())
+                        .expect("the test must observe completion order");
+                    let number = match item_id {
+                        "First" => "ADLT-1",
+                        "Second" => "ADLT-2",
+                        "Third" => "ADLT-3",
+                        "Fourth" => "ADLT-4",
+                        _ => unreachable!(),
+                    };
+                    Ok(detail_with_number(item_id, number, r#"[{"id":"28"}]"#))
+                })
+            });
+
+            let mut started = (0..4)
+                .map(|_| started_receiver.recv().expect("all four checks must start"))
+                .collect::<Vec<_>>();
+            started.sort();
+            assert_eq!(started, ["First", "Fourth", "Second", "Third"]);
+            for item_id in ["Fourth", "Third", "Second", "First"] {
+                let (released_items, available) = &released;
+                released_items
+                    .lock()
+                    .expect("completion gate must remain available")
+                    .push(item_id.to_owned());
+                available.notify_all();
+                assert_eq!(
+                    completed_receiver
+                        .recv()
+                        .expect("the released check must finish"),
+                    item_id
+                );
+            }
+
+            let response = result
+                .join()
+                .expect("catalog worker must not panic")
+                .expect("every exact Adult row must be accepted");
+            assert_eq!(response[1], "4");
+            assert_eq!(response[4], "ADLT-1");
+            assert_eq!(response[11], "ADLT-2");
+            assert_eq!(response[18], "ADLT-3");
+            assert_eq!(response[25], "ADLT-4");
+        });
+    }
+
+    #[test]
+    fn newer_adult_request_stops_obsolete_detail_scheduling_and_rejects_late_results() {
+        let state = JavdbCatalogState::default();
+        let old_request = request("adult");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let release = (Mutex::new(false), Condvar::new());
+        let detail_starts = AtomicUsize::new(0);
+        let listing = (1..=8)
+            .map(|index| format!(r#"{{"id":"Old{index}","number":"ADLT-{index}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        thread::scope(|scope| {
+            let old_result = scope.spawn(|| {
+                fetch_catalog_with(&state, &old_request, |url| {
+                    if url.contains("movies/tags") {
+                        return Ok(format!(
+                            r#"{{"success":1,"data":{{"movies":[{listing}]}}}}"#
+                        ));
+                    }
+                    detail_starts.fetch_add(1, Ordering::SeqCst);
+                    started_sender
+                        .send(())
+                        .expect("the test must observe each started check");
+                    let (released, available) = &release;
+                    let mut released = released.lock().expect("release gate must remain available");
+                    while !*released {
+                        released = available
+                            .wait(released)
+                            .expect("release gate must remain available");
+                    }
+                    let item_id = url
+                        .split("/api/v4/movies/")
+                        .nth(1)
+                        .and_then(|value| value.split('?').next())
+                        .expect("detail URL must contain the provider item");
+                    Ok(detail(item_id, r#"[{"id":"28"}]"#))
+                })
+            });
+
+            for _ in 0..ADULT_CATEGORY_CHECK_CONCURRENCY {
+                started_receiver
+                    .recv()
+                    .expect("the initial bounded checks must start");
+            }
+            let current = fetch_catalog_with(&state, &request("adult"), |_| {
+                Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
+            })
+            .expect("the newer request must become current");
+            assert_eq!(current[1], "0");
+            {
+                let (released, available) = &release;
+                *released.lock().expect("release gate must remain available") = true;
+                available.notify_all();
+            }
+            assert_eq!(
+                old_result.join().expect("catalog worker must not panic"),
+                Err(ADULT_JAVDB_STALE)
+            );
+            assert_eq!(
+                detail_starts.load(Ordering::SeqCst),
+                ADULT_CATEGORY_CHECK_CONCURRENCY
+            );
+            let context = state.0.lock().expect("catalog state must remain available");
+            assert!(context.adult.as_ref().is_some_and(|authority| {
+                authority.generation.to_string() == current[0] && authority.items.is_empty()
+            }));
+        });
+    }
+
+    #[test]
+    fn obsolete_two_page_request_stops_before_the_next_listing_dispatch() {
+        let state = JavdbCatalogState::default();
+        let mut obsolete = request("vr");
+        obsolete.count = 100;
+        let newer_context = NEXT_CONTEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let calls = AtomicUsize::new(0);
+
+        let result = fetch_catalog_with(&state, &obsolete, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            invalidate_catalog(&state, "vr", &newer_context.to_string())
+                .expect("newer context must invalidate the request");
+            Ok(r#"{"success":1,"data":{"movies":[{"id":"Late","number":"MDVR-419"}]}}"#.to_owned())
+        });
+
+        assert_eq!(result, Err(VR_JAVDB_STALE));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn vr_browse_never_dispatches_adult_per_item_verification() {
+        let state = JavdbCatalogState::default();
+        let calls = AtomicUsize::new(0);
+        let response = fetch_catalog_with(&state, &request("vr"), |url| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert!(!url.contains("/api/v4/"));
+            Ok(r#"{"success":1,"data":{"movies":[{"id":"VrA","number":"MDVR-419"}]}}"#.to_owned())
+        })
+        .expect("VR category listing must not need Adult verification");
+
+        assert_eq!(response[1], "1");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn drops_only_adult_rows_with_vr_failed_or_inconclusive_category_checks() {
         let state = JavdbCatalogState::default();
-        let calls = RefCell::new(Vec::new());
+        let calls = Mutex::new(Vec::new());
         let response = fetch_catalog_with(&state, &request("adult"), |url| {
-            calls.borrow_mut().push(url.to_owned());
+            calls.lock().expect("request list must remain available").push(url.to_owned());
             if url.contains("movies/tags") {
                 return Ok(r#"{"success":1,"data":{"movies":[{"id":"AdultA","number":"ADLT-123"},{"id":"VrA","number":"MDVR-419"},{"id":"Failed","number":"ADLT-124"},{"id":"Unknown","number":"ADLT-125"},{"id":"AdultB","number":"ADLT-126"}]}}"#.to_owned());
             }
@@ -1902,15 +2362,24 @@ mod tests {
         assert_eq!(response[1], "2");
         assert_eq!(response[4], "ADLT-123");
         assert_eq!(response[11], "ADLT-126");
-        assert_eq!(calls.borrow().len(), 6);
+        assert_eq!(
+            calls
+                .lock()
+                .expect("request list must remain available")
+                .len(),
+            6
+        );
     }
 
     #[test]
     fn rejects_the_complete_adult_request_when_detail_reuses_an_item_for_another_code() {
         let state = JavdbCatalogState::default();
-        let dispatched_urls = RefCell::new(Vec::new());
+        let dispatched_urls = Mutex::new(Vec::new());
         let result = fetch_catalog_with(&state, &request("adult"), |url| {
-            dispatched_urls.borrow_mut().push(url.to_owned());
+            dispatched_urls
+                .lock()
+                .expect("request list must remain available")
+                .push(url.to_owned());
             if url.contains("movies/tags") {
                 Ok(r#"{"success":1,"data":{"movies":[{"id":"AdultA","number":"ADLT-123"},{"id":"AdultB","number":"ADLT-124"}]}}"#.to_owned())
             } else if url.contains("AdultA") {
@@ -1921,7 +2390,13 @@ mod tests {
         });
 
         assert_eq!(result, Err(ADULT_JAVDB_CONFLICTING));
-        assert_eq!(dispatched_urls.borrow().len(), 2);
+        let dispatched_urls = dispatched_urls
+            .lock()
+            .expect("request list must remain available");
+        assert!(dispatched_urls
+            .iter()
+            .any(|url| url.contains("movies/tags")));
+        assert!(dispatched_urls.iter().any(|url| url.contains("AdultA")));
         let context = state.0.lock().expect("catalog state must remain available");
         assert!(context
             .adult
