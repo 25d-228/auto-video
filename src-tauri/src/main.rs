@@ -3,6 +3,7 @@
 mod adult_library;
 mod fanza_catalog;
 mod javdb_catalog;
+mod library_enrichment;
 mod library_scan;
 mod tv_library;
 mod tv_release;
@@ -25,11 +26,11 @@ use std::fs::File;
 use std::process::{Command, Stdio};
 
 use adult_library::{
-    clear_adult_folder as clear_trusted_adult_folder, configured_adult_folder,
-    load_adult_folder_with, open_adult_file_with, reveal_adult_file_with, scan_adult_library_with,
-    set_adult_folder, trash_adult_file_with, AdultLibraryState, ADULT_FILE_OPEN_FAILED,
-    ADULT_FILE_REVEAL_FAILED, ADULT_FILE_TRASH_FAILED, ADULT_FOLDER_STORAGE_FAILED,
-    ADULT_FOLDER_UNAVAILABLE, ADULT_LIBRARY_SCAN_FAILED,
+    adult_library_enrichment_authority, clear_adult_folder as clear_trusted_adult_folder,
+    configured_adult_folder, load_adult_folder_with, open_adult_file_with, reveal_adult_file_with,
+    scan_adult_library_with, set_adult_folder, trash_adult_file_with, AdultLibraryState,
+    ADULT_FILE_OPEN_FAILED, ADULT_FILE_REVEAL_FAILED, ADULT_FILE_TRASH_FAILED,
+    ADULT_FOLDER_STORAGE_FAILED, ADULT_FOLDER_UNAVAILABLE, ADULT_LIBRARY_SCAN_FAILED,
 };
 use fanza_catalog::{
     fetch_catalog_with as fetch_fanza_catalog_with, fetch_cover_bytes as fetch_fanza_cover_bytes,
@@ -47,6 +48,13 @@ use javdb_catalog::{
     open_detail_source_with as open_javdb_detail_source_with, JavdbCatalogRequest,
     JavdbCatalogState, JavdbDetailRequest,
 };
+use library_enrichment::{
+    fetch_cover_with as fetch_library_cover_with,
+    fetch_image_request as fetch_library_image_request,
+    fetch_presentation_with as fetch_library_presentation_with,
+    fetch_text_request as fetch_library_text_request, LibraryCategory, LibraryEnrichmentState,
+    LibraryItemAuthority, LIBRARY_COVER_STALE, LIBRARY_ENRICHMENT_FAILED, LIBRARY_ENRICHMENT_STALE,
+};
 use library_scan::{is_supported_library_media, scan_library_files};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
@@ -58,9 +66,10 @@ use tv_library::{
     load_tv_folder_with, open_tv_file_with, parse_tv_metadata_candidates,
     parse_verified_tv_metadata, percent_encode_tv_metadata_query, reveal_tv_file_with,
     save_tv_metadata_match_with, scan_tv_library_with_metadata, set_tv_folder,
-    trash_tv_file_with_download_ownership_and_metadata, TvLibraryState, TV_FILE_OPEN_FAILED,
-    TV_FILE_REVEAL_FAILED, TV_FILE_TRASH_FAILED, TV_FOLDER_STORAGE_FAILED, TV_FOLDER_UNAVAILABLE,
-    TV_LIBRARY_SCAN_FAILED, TV_METADATA_CONTEXT_INVALID, TV_METADATA_PERSISTENCE_FAILED,
+    trash_tv_file_with_download_ownership_and_metadata, tv_library_enrichment_authority,
+    TvLibraryState, TV_FILE_OPEN_FAILED, TV_FILE_REVEAL_FAILED, TV_FILE_TRASH_FAILED,
+    TV_FOLDER_STORAGE_FAILED, TV_FOLDER_UNAVAILABLE, TV_LIBRARY_SCAN_FAILED,
+    TV_METADATA_CONTEXT_INVALID, TV_METADATA_PERSISTENCE_FAILED,
 };
 use tv_release::{
     fetch_apibay_tv_releases_for_state_with, TvReleaseState, TV_APIBAY_PROVIDER_ERROR,
@@ -79,8 +88,8 @@ use vr_download::{
 };
 use vr_library::{
     invalidate_vr_library, open_vr_file_with, reveal_vr_file_with, scan_vr_library_with,
-    trash_vr_file_with, VrLibraryState, VR_FILE_OPEN_FAILED, VR_FILE_REVEAL_FAILED,
-    VR_FILE_TRASH_FAILED, VR_LIBRARY_SCAN_FAILED,
+    trash_vr_file_with, vr_library_enrichment_authority, VrLibraryState, VR_FILE_OPEN_FAILED,
+    VR_FILE_REVEAL_FAILED, VR_FILE_TRASH_FAILED, VR_LIBRARY_SCAN_FAILED,
 };
 use vr_torrent::{
     canonical_imdb_id, fetch_artifact_response, hex_sha1, inspect_sukebei_adult_torrent_with,
@@ -140,6 +149,7 @@ const MOVIE_METADATA_PERSISTENCE_FAILED: &str = "movie_metadata_persistence_fail
 const MOVIE_METADATA_STALE: &str = "movie_metadata_stale";
 const MOVIE_METADATA_UNAVAILABLE: &str = "movie_metadata_unavailable";
 const TMDB_TOKEN_FILE_NAME: &str = ".tmdb-api-read-access-token";
+const LIBRARY_ENRICHMENT_CACHE_FILE_NAME: &str = ".library-enrichment-cache-v1";
 const TMDB_TOKEN_INVALID: &str = "tmdb_token_invalid";
 const TMDB_TOKEN_STORAGE_FAILED: &str = "tmdb_token_storage_failed";
 const MOVIE_TMDB_NETWORK_ERROR: &str = "movie_tmdb_network_error";
@@ -273,6 +283,65 @@ struct MoviesLibraryContext {
 
 #[derive(Clone, Default)]
 struct MoviesLibraryState(Arc<Mutex<MoviesLibraryContext>>);
+
+fn filename_title_and_year(relative_path: &str) -> Option<(String, Option<String>)> {
+    let filename = Path::new(relative_path).file_name()?.to_str()?;
+    if filename.starts_with('.') {
+        return None;
+    }
+    let title = Path::new(filename).file_stem()?.to_str()?.to_owned();
+    if title.trim().is_empty() {
+        return None;
+    }
+    let bytes = title.as_bytes();
+    let year = bytes.windows(4).enumerate().find_map(|(index, window)| {
+        let value = std::str::from_utf8(window).ok()?;
+        ((index == 0 || !bytes[index - 1].is_ascii_digit())
+            && (index + 4 == bytes.len() || !bytes[index + 4].is_ascii_digit())
+            && (value.starts_with("19") || value.starts_with("20"))
+            && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.to_owned())
+    });
+    Some((title, year))
+}
+
+fn movie_library_enrichment_authority(
+    state: &MoviesLibraryState,
+    file_id: &str,
+) -> Result<LibraryItemAuthority, &'static str> {
+    let context = state.0.lock().map_err(|_| LIBRARY_ENRICHMENT_STALE)?;
+    let scan = context
+        .completed_scan
+        .as_ref()
+        .ok_or(LIBRARY_ENRICHMENT_STALE)?;
+    let file = scan
+        .files
+        .iter()
+        .find(|file| file.file_id == file_id)
+        .filter(|file| file.association.is_none())
+        .ok_or(LIBRARY_ENRICHMENT_STALE)?;
+    let (local_title, year) =
+        filename_title_and_year(&file.relative_path).ok_or(LIBRARY_ENRICHMENT_STALE)?;
+    let identity = hex_sha1(
+        format!(
+            "movie\0{}\0{}\0{}\0{}\0{}\0{}",
+            scan.folder_identity,
+            file.relative_path,
+            file.file_identity,
+            file.fingerprint,
+            file.size,
+            scan.generation
+        )
+        .as_bytes(),
+    );
+    Ok(LibraryItemAuthority {
+        category: LibraryCategory::Movie,
+        identity,
+        local_title,
+        year,
+        code: None,
+    })
+}
 
 struct TrashMovieRequest {
     path: String,
@@ -2222,6 +2291,13 @@ fn tmdb_token_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map(|directory| directory.join(TMDB_TOKEN_FILE_NAME))
         .map_err(|_| TMDB_TOKEN_STORAGE_FAILED.to_owned())
+}
+
+fn library_enrichment_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(LIBRARY_ENRICHMENT_CACHE_FILE_NAME))
+        .map_err(|_| LIBRARY_ENRICHMENT_FAILED.to_owned())
 }
 
 fn movies_folder_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -4216,6 +4292,216 @@ async fn save_verified_tv_torrent(
     .map_err(|_| TV_TORRENT_SAVE_FAILED.to_owned())?
 }
 
+#[allow(clippy::too_many_arguments)]
+fn trusted_library_enrichment_authority(
+    category: &str,
+    item_id: &str,
+    scan_generation: &str,
+    code: Option<&str>,
+    app: &tauri::AppHandle,
+    movies: &MoviesLibraryState,
+    tv: &TvLibraryState,
+    adult: &AdultLibraryState,
+    vr: &VrLibraryState,
+    downloads: &VrDownloadState,
+) -> Result<(LibraryItemAuthority, Option<String>), &'static str> {
+    let category = LibraryCategory::parse(category).ok_or(LIBRARY_ENRICHMENT_STALE)?;
+    let mut authority = match category {
+        LibraryCategory::Movie => {
+            if code.is_some() || scan_generation != item_id {
+                return Err(LIBRARY_ENRICHMENT_STALE);
+            }
+            movie_library_enrichment_authority(movies, item_id)?
+        }
+        LibraryCategory::Tv => {
+            if code.is_some() {
+                return Err(LIBRARY_ENRICHMENT_STALE);
+            }
+            let generation = scan_generation
+                .parse::<u64>()
+                .ok()
+                .filter(|generation| *generation > 0)
+                .ok_or(LIBRARY_ENRICHMENT_STALE)?;
+            tv_library_enrichment_authority(tv, generation, item_id)?
+        }
+        LibraryCategory::Adult => {
+            let code = code.ok_or(LIBRARY_ENRICHMENT_STALE)?;
+            if item_id != format!("code:{code}") {
+                return Err(LIBRARY_ENRICHMENT_STALE);
+            }
+            let generation = scan_generation
+                .parse::<u64>()
+                .ok()
+                .filter(|generation| *generation > 0)
+                .ok_or(LIBRARY_ENRICHMENT_STALE)?;
+            adult_library_enrichment_authority(adult, generation, code)?
+        }
+        LibraryCategory::Vr => {
+            let code = code.ok_or(LIBRARY_ENRICHMENT_STALE)?;
+            if item_id != format!("code:{code}") {
+                return Err(LIBRARY_ENRICHMENT_STALE);
+            }
+            let generation = scan_generation
+                .parse::<u64>()
+                .ok()
+                .filter(|generation| *generation > 0)
+                .ok_or(LIBRARY_ENRICHMENT_STALE)?;
+            let folder = configured_vr_folder(downloads)
+                .map_err(|_| LIBRARY_ENRICHMENT_STALE)?
+                .ok_or(LIBRARY_ENRICHMENT_STALE)?;
+            vr_library_enrichment_authority(vr, generation, &folder, code)?
+        }
+    };
+    let token = if matches!(category, LibraryCategory::Movie | LibraryCategory::Tv) {
+        load_tmdb_token_file(&tmdb_token_path(app).map_err(|_| LIBRARY_ENRICHMENT_FAILED)?)
+            .map_err(|_| LIBRARY_ENRICHMENT_FAILED)?
+    } else {
+        None
+    };
+    if matches!(category, LibraryCategory::Movie | LibraryCategory::Tv) {
+        let token_identity = token
+            .as_deref()
+            .map(|token| hex_sha1(token.as_bytes()))
+            .unwrap_or_else(|| "missing-token".to_owned());
+        authority.identity =
+            hex_sha1(format!("{}\0{token_identity}", authority.identity).as_bytes());
+    }
+    Ok((authority, token))
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn fetch_library_presentation(
+    app: tauri::AppHandle,
+    category: String,
+    item_id: String,
+    scan_generation: String,
+    code: Option<String>,
+    enrichment: tauri::State<'_, LibraryEnrichmentState>,
+    movies: tauri::State<'_, MoviesLibraryState>,
+    tv: tauri::State<'_, TvLibraryState>,
+    adult: tauri::State<'_, AdultLibraryState>,
+    vr: tauri::State<'_, VrLibraryState>,
+    downloads: tauri::State<'_, VrDownloadState>,
+) -> Result<Vec<String>, String> {
+    let enrichment = enrichment.inner().clone();
+    let movies = movies.inner().clone();
+    let tv = tv.inner().clone();
+    let adult = adult.inner().clone();
+    let vr = vr.inner().clone();
+    let downloads = downloads.inner().clone();
+    let cache_path = library_enrichment_cache_path(&app)?;
+    let (authority, token) = trusted_library_enrichment_authority(
+        &category,
+        &item_id,
+        &scan_generation,
+        code.as_deref(),
+        &app,
+        &movies,
+        &tv,
+        &adult,
+        &vr,
+        &downloads,
+    )
+    .map_err(str::to_owned)?;
+    let expected_identity = authority.identity.clone();
+    let app_for_validation = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = fetch_library_presentation_with(
+            &enrichment,
+            &cache_path,
+            &authority,
+            token.as_deref(),
+            |request| fetch_library_text_request(request, token.as_deref()),
+            fetch_library_image_request,
+            fetch_javdb_api_document,
+        )?;
+        let (current, _) = trusted_library_enrichment_authority(
+            &category,
+            &item_id,
+            &scan_generation,
+            code.as_deref(),
+            &app_for_validation,
+            &movies,
+            &tv,
+            &adult,
+            &vr,
+            &downloads,
+        )?;
+        (current.identity == expected_identity)
+            .then_some(result)
+            .ok_or(LIBRARY_ENRICHMENT_STALE)
+    })
+    .await
+    .map_err(|_| LIBRARY_ENRICHMENT_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn fetch_library_cover(
+    app: tauri::AppHandle,
+    category: String,
+    item_id: String,
+    scan_generation: String,
+    code: Option<String>,
+    cover_authority_id: String,
+    enrichment: tauri::State<'_, LibraryEnrichmentState>,
+    movies: tauri::State<'_, MoviesLibraryState>,
+    tv: tauri::State<'_, TvLibraryState>,
+    adult: tauri::State<'_, AdultLibraryState>,
+    vr: tauri::State<'_, VrLibraryState>,
+    downloads: tauri::State<'_, VrDownloadState>,
+) -> Result<Vec<u8>, String> {
+    let enrichment = enrichment.inner().clone();
+    let movies = movies.inner().clone();
+    let tv = tv.inner().clone();
+    let adult = adult.inner().clone();
+    let vr = vr.inner().clone();
+    let downloads = downloads.inner().clone();
+    let (authority, _) = trusted_library_enrichment_authority(
+        &category,
+        &item_id,
+        &scan_generation,
+        code.as_deref(),
+        &app,
+        &movies,
+        &tv,
+        &adult,
+        &vr,
+        &downloads,
+    )
+    .map_err(str::to_owned)?;
+    let expected_identity = authority.identity.clone();
+    let app_for_validation = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = fetch_library_cover_with(
+            &enrichment,
+            &authority,
+            &cover_authority_id,
+            fetch_library_image_request,
+        )?;
+        let (current, _) = trusted_library_enrichment_authority(
+            &category,
+            &item_id,
+            &scan_generation,
+            code.as_deref(),
+            &app_for_validation,
+            &movies,
+            &tv,
+            &adult,
+            &vr,
+            &downloads,
+        )?;
+        (current.identity == expected_identity)
+            .then_some(bytes)
+            .ok_or(LIBRARY_COVER_STALE)
+    })
+    .await
+    .map_err(|_| LIBRARY_ENRICHMENT_FAILED.to_owned())?
+    .map_err(str::to_owned)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -4231,6 +4517,7 @@ fn main() {
         .manage(VrTorrentState::default())
         .manage(VrDownloadState::default())
         .manage(VrLibraryState::default())
+        .manage(LibraryEnrichmentState::default())
         .invoke_handler(tauri::generate_handler![
             load_movies_folder,
             choose_movies_folder,
@@ -4277,6 +4564,8 @@ fn main() {
             open_vr_file,
             reveal_vr_file,
             trash_vr_file,
+            fetch_library_presentation,
+            fetch_library_cover,
             load_vr_download_limit,
             save_vr_download_limit,
             load_vr_downloads,
@@ -4347,7 +4636,7 @@ mod tests {
         begin_movie_metadata_verification, clear_movie_metadata_match_with,
         clear_movies_folder_file, clear_tmdb_token_file, fetch_javdb_adult_catalog_with,
         fetch_javdb_vr_catalog_with, fetch_sukebei_adult_releases_with,
-        fetch_sukebei_vr_releases_with, fetch_yts_movie_releases_with,
+        fetch_sukebei_vr_releases_with, fetch_yts_movie_releases_with, filename_title_and_year,
         finish_movie_metadata_search, finish_movie_metadata_verification,
         invalidate_movie_metadata_client_context, load_movies_folder_file, load_tmdb_token_file,
         movie_metadata_error, open_movie_path_with, open_movie_request_with,
@@ -4399,6 +4688,22 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.path).expect("failed to remove filesystem fixture");
         }
+    }
+
+    #[test]
+    fn movie_enrichment_uses_the_exact_filename_title_and_one_bounded_year() {
+        assert_eq!(
+            filename_title_and_year("Nested/映画  — Exact Movie (2024).MKV"),
+            Some((
+                "映画  — Exact Movie (2024)".to_owned(),
+                Some("2024".to_owned())
+            ))
+        );
+        assert_eq!(
+            filename_title_and_year("Version12024.mp4"),
+            Some(("Version12024".to_owned(), None))
+        );
+        assert_eq!(filename_title_and_year("blank/.mkv"), None);
     }
 
     fn path_string(path: PathBuf) -> String {

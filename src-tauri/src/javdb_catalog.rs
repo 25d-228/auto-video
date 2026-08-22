@@ -231,6 +231,15 @@ struct ParsedDetail {
     preview_urls: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LibraryJavdbMetadata {
+    pub provider_item_id: String,
+    pub title: Option<String>,
+    pub release_date: Option<String>,
+    pub duration: Option<String>,
+    pub actors: Vec<String>,
+}
+
 fn valid_provider_item_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -460,6 +469,56 @@ fn parse_detail(
         tags: valid_tag_names,
         cover_url: cover_url(movie),
         preview_urls: preview_urls(movie),
+    })
+}
+
+pub(crate) fn fetch_exact_library_metadata_with(
+    category: &str,
+    code: &str,
+    fetch: &mut impl FnMut(&str) -> Result<String, ProviderRequestError>,
+) -> Result<LibraryJavdbMetadata, ProviderRequestError> {
+    let category = CatalogCategory::parse(category).ok_or(ProviderRequestError::Provider)?;
+    if canonical_product_code(code).as_deref() != Some(code) {
+        return Err(ProviderRequestError::Provider);
+    }
+    let search_url = format!("{JAVDB_API_URL}/api/v2/search?q={code}&type=movie");
+    let listing = fetch(&search_url)?;
+    let listing = parse_listing(&listing).map_err(|_| ProviderRequestError::Provider)?;
+    let mut exact_items = listing
+        .items
+        .into_iter()
+        .filter(|item| item.code == code)
+        .collect::<Vec<_>>();
+    exact_items.sort_by(|left, right| left.provider_item_id.cmp(&right.provider_item_id));
+    exact_items.dedup_by(|left, right| left.provider_item_id == right.provider_item_id);
+    if exact_items.is_empty() {
+        return Err(ProviderRequestError::SourceUnavailable);
+    }
+    if exact_items.len() != 1 {
+        return Err(ProviderRequestError::Provider);
+    }
+    let item = exact_items
+        .pop()
+        .expect("one exact JavDB item was established");
+    let detail_url = format!(
+        "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
+        item.provider_item_id
+    );
+    let detail = fetch(&detail_url)?;
+    let detail = parse_detail(&detail, category, &item.provider_item_id, code)
+        .map_err(|_| ProviderRequestError::Provider)?;
+    Ok(LibraryJavdbMetadata {
+        provider_item_id: item.provider_item_id,
+        title: detail.title,
+        release_date: detail.release_date,
+        duration: detail.duration.map(|duration| {
+            if duration.ends_with(" min") {
+                duration
+            } else {
+                format!("{duration} min")
+            }
+        }),
+        actors: detail.actors,
     })
 }
 
@@ -2086,6 +2145,18 @@ mod tests {
             }),
             Err(VR_JAVDB_CONFLICTING)
         );
+    }
+
+    #[test]
+    fn exact_library_lookup_treats_a_valid_empty_listing_as_source_unavailable() {
+        let mut dispatches = 0;
+        let result = fetch_exact_library_metadata_with("adult", "ADLT-123", &mut |_| {
+            dispatches += 1;
+            Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
+        });
+
+        assert_eq!(result, Err(ProviderRequestError::SourceUnavailable));
+        assert_eq!(dispatches, 1);
     }
 
     #[test]
