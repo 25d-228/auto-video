@@ -1559,6 +1559,75 @@ function automaticLibraryPresentation(
 }
 
 describe("automatic Library presentation", () => {
+  it.each([
+    ["movies", "Movies", "Exact local movie", "/Movies/Exact local movie.mp4"],
+    ["tv", "TV", "Exact Local Show", "/TV/Exact Local Show.S01E01.mp4"],
+    ["adult", "Adult", "ADLT-123", "/Adult/ADLT-123.mp4"],
+    ["vr", "VR", "MDVR-419", "/VR/MDVR-419.mp4"],
+  ] as const)(
+    "shows truthful automatic descriptive facts without replacing the %s card title",
+    async (category, categoryLabel, localTitle, path) => {
+      Object.defineProperties(window, {
+        innerHeight: { configurable: true, value: 520 },
+        innerWidth: { configurable: true, value: 720 },
+      });
+      gallerySizes.library = { width: 446, height: 284 };
+      if (category === "movies") {
+        savedMoviesFolder = "/Movies";
+        scanMoviesMock.mockResolvedValue([path]);
+      } else if (category === "tv") {
+        savedTvFolder = "/TV";
+        scanTvLibraryMock.mockResolvedValue(
+          fixtureTvMetadataScan({
+            members: [
+              {
+                path,
+                relativePath: "Exact Local Show.S01E01.mp4",
+              },
+            ],
+            showTitle: localTitle,
+          }),
+        );
+      } else if (category === "adult") {
+        savedAdultFolder = "/Adult";
+        scanAdultLibraryMock.mockResolvedValue([path, "ADLT-123.mp4", "5"]);
+      } else {
+        savedVrFolder = "/VR";
+        scanVrLibraryMock.mockResolvedValue([path, "5"]);
+      }
+      fetchLibraryPresentationMock.mockResolvedValue(
+        automaticLibraryPresentation(
+          category === "movies" ? "movie" : category,
+          `Provider ${categoryLabel} title`,
+        ),
+      );
+
+      render(<App />);
+      selectLibrary();
+      if (category !== "movies") {
+        fireEvent.click(screen.getByRole("radio", { name: categoryLabel }));
+      }
+
+      const facts = await screen.findByLabelText(
+        `Automatic presentation facts for ${localTitle}`,
+      );
+      expect(
+        within(facts).getByText(`Provider ${categoryLabel} title`),
+      ).toBeTruthy();
+      expect(
+        within(facts).getByText(
+          category === "adult" || category === "vr"
+            ? "1999-04-19 · 120 min · Exact actor"
+            : "1999-04-19 · 120 min · Drama",
+        ),
+      ).toBeTruthy();
+      expect(facts.parentElement?.classList.contains("library-card__details-trigger")).toBe(
+        true,
+      );
+      expect(screen.getByRole("heading", { name: localTitle })).toBeTruthy();
+    },
+  );
+
   it("starts work only for the visible natural-width page and reuses unchanged identities", async () => {
     savedMoviesFolder = "/Movies";
     scanMoviesMock.mockResolvedValue(

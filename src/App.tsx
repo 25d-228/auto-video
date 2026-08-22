@@ -6151,6 +6151,24 @@ function LibraryPresentationSurface({
       : automaticState.status === "ready"
         ? automaticState.retryCover
         : null;
+  const automaticFacts =
+    presentationState === "automatic"
+      ? [
+          resolved.presentation.title !== null &&
+          resolved.presentation.title !== localTitle
+            ? resolved.presentation.title
+            : null,
+          [
+            resolved.presentation.date,
+            resolved.presentation.runtime,
+            category === "movies" || category === "tv"
+              ? resolved.presentation.genres[0]
+              : resolved.presentation.cast[0],
+          ]
+            .filter((value): value is string => value !== undefined && value !== null)
+            .join(" · ") || null,
+        ].filter((value): value is string => value !== null)
+      : [];
 
   useEffect(() => {
     setImageFailed(false);
@@ -6197,6 +6215,16 @@ function LibraryPresentationSurface({
             }}
             src={coverUrl}
           />
+        )}
+        {automaticFacts.length === 0 ? null : (
+          <span
+            aria-label={`Automatic presentation facts for ${localTitle}`}
+            className="library-card__presentation-facts"
+          >
+            {automaticFacts.map((fact, index) => (
+              <span key={`${index}:${fact}`}>{fact}</span>
+            ))}
+          </span>
         )}
         <span className="library-card__presentation-state">{stateLabel}</span>
       </button>

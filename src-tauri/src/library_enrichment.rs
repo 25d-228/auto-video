@@ -639,6 +639,48 @@ fn year_matches(requested: Option<&str>, date: Option<&str>) -> bool {
         .is_some_and(|(requested, candidate)| (requested - candidate).abs() <= 1)
 }
 
+#[derive(Clone)]
+struct TmdbSearchCandidate {
+    id: u64,
+    date: Option<String>,
+    titles: Vec<String>,
+}
+
+fn tmdb_titles(object: &BTreeMap<String, JsonValue>, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .filter_map(|key| optional_text(object, key))
+        .collect()
+}
+
+fn tmdb_candidate_matches_details(
+    candidate: &TmdbSearchCandidate,
+    detail_titles: &[String],
+    detail_date: Option<&str>,
+    requested_year: Option<&str>,
+) -> bool {
+    let titles_match = candidate.titles.iter().any(|search_title| {
+        let normalized_search_title = normalized_title(search_title);
+        detail_titles
+            .iter()
+            .any(|detail_title| normalized_search_title == normalized_title(detail_title))
+    });
+    let dates_match = match (candidate.date.as_deref(), detail_date) {
+        (Some(search_date), Some(detail_date)) => search_date.get(..4) == detail_date.get(..4),
+        (None, None) => true,
+        _ => requested_year.is_none(),
+    };
+    titles_match && dates_match
+}
+
+fn has_descriptive_metadata(presentation: &LibraryPresentation) -> bool {
+    presentation.title.is_some()
+        || presentation.date.is_some()
+        || presentation.runtime.is_some()
+        || !presentation.genres.is_empty()
+        || !presentation.cast.is_empty()
+        || presentation.overview.is_some()
+}
+
 fn percent_encode(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(value.len());
@@ -722,7 +764,7 @@ fn tmdb_presentation(
     } else {
         "first_air_date"
     };
-    let mut accepted = Vec::new();
+    let mut candidates = Vec::new();
     for result in results {
         let Some(result) = json_object(result) else {
             continue;
@@ -731,22 +773,47 @@ fn tmdb_presentation(
             continue;
         };
         let date = optional_date(result, date_key);
-        if !year_matches(authority.year.as_deref(), date.as_deref())
-            || !title_keys.iter().any(|key| {
-                json_string(result, key)
-                    .is_some_and(|title| title_matches(&authority.local_title, title))
-            })
-        {
+        let titles = tmdb_titles(result, &title_keys);
+        if titles.is_empty() || !year_matches(authority.year.as_deref(), date.as_deref()) {
             continue;
         }
-        accepted.push(id);
+        candidates.push(TmdbSearchCandidate { id, date, titles });
     }
-    accepted.sort_unstable();
-    accepted.dedup();
-    if accepted.len() != 1 {
+    let mut matching_ids = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .titles
+                .iter()
+                .any(|title| title_matches(&authority.local_title, title))
+        })
+        .map(|candidate| candidate.id)
+        .collect::<Vec<_>>();
+    matching_ids.sort_unstable();
+    matching_ids.dedup();
+    let provider_id = if matching_ids.len() == 1 {
+        matching_ids[0]
+    } else if matching_ids.is_empty()
+        && authority.category == LibraryCategory::Movie
+        && authority.year.is_some()
+    {
+        let mut year_matches = candidates
+            .iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        year_matches.sort_unstable();
+        year_matches.dedup();
+        if year_matches.len() != 1 {
+            return Ok(LibraryPresentation::local_only("missing"));
+        }
+        year_matches[0]
+    } else {
         return Ok(LibraryPresentation::local_only("missing"));
-    }
-    let provider_id = accepted[0];
+    };
+    let accepted_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.id == provider_id)
+        .collect::<Vec<_>>();
     let detail_url = format!(
         "https://api.themoviedb.org/3/{kind}/{provider_id}?append_to_response=credits%2Cexternal_ids"
     );
@@ -764,8 +831,10 @@ fn tmdb_presentation(
     let details = JsonParser::new(&details)
         .parse()
         .and_then(|value| json_object(&value).cloned())
-        .filter(|details| json_u64(details, "id") == Some(provider_id))
         .ok_or(ProviderRequestError::Provider)?;
+    if json_u64(&details, "id") != Some(provider_id) {
+        return Ok(LibraryPresentation::local_only("missing"));
+    }
     let title_key = if kind == "movie" { "title" } else { "name" };
     let original_title_key = if kind == "movie" {
         "original_title"
@@ -774,10 +843,15 @@ fn tmdb_presentation(
     };
     let title = optional_text(&details, title_key).ok_or(ProviderRequestError::Provider)?;
     let detail_date = optional_date(&details, date_key);
+    let detail_titles = tmdb_titles(&details, &[title_key, original_title_key]);
     if !year_matches(authority.year.as_deref(), detail_date.as_deref())
-        || ![title_key, original_title_key].into_iter().any(|key| {
-            optional_text(&details, key)
-                .is_some_and(|candidate| title_matches(&authority.local_title, &candidate))
+        || !accepted_candidates.iter().any(|candidate| {
+            tmdb_candidate_matches_details(
+                candidate,
+                &detail_titles,
+                detail_date.as_deref(),
+                authority.year.as_deref(),
+            )
         })
     {
         return Ok(LibraryPresentation::local_only("missing"));
@@ -1232,16 +1306,34 @@ fn exact_product_code_in(value: &str, code: &str) -> bool {
     codes.as_slice() == [code]
 }
 
-fn javdatabase_document_matches(document: &str, code: &str) -> bool {
+fn javdatabase_title(document: &str) -> Option<&str> {
     let lower = document.to_ascii_lowercase();
-    let Some(start) = lower.find("<title>") else {
-        return false;
-    };
+    let start = lower.find("<title>")?;
     let title = &document[start + "<title>".len()..];
-    let Some(end) = title.to_ascii_lowercase().find("</title>") else {
-        return false;
-    };
-    exact_product_code_in(&title[..end], code)
+    let end = title.to_ascii_lowercase().find("</title>")?;
+    Some(title[..end].trim())
+}
+
+fn javdatabase_document_matches(document: &str, code: &str) -> bool {
+    javdatabase_title(document).is_some_and(|title| exact_product_code_in(title, code))
+}
+
+fn javdatabase_romanized_cast(document: &str, code: &str) -> Option<String> {
+    let title = javdatabase_title(document)?;
+    let suffix = " - jav database";
+    let lower = title.to_ascii_lowercase();
+    if !lower.ends_with(suffix) {
+        return None;
+    }
+    let identity_and_cast = &title[..title.len() - suffix.len()];
+    let (title_code, cast) = identity_and_cast.split_once(" - ")?;
+    let cast = cast.trim();
+    (title_code.trim().eq_ignore_ascii_case(code)
+        && !cast.is_empty()
+        && cast.len() <= 16 * 1024
+        && !cast.bytes().any(|byte| byte.is_ascii_control())
+        && !cast.to_ascii_lowercase().contains("jav"))
+    .then(|| cast.to_owned())
 }
 
 fn exact_code_presentation(
@@ -1308,6 +1400,7 @@ fn exact_code_presentation(
     );
     let mut metadata = LibraryPresentation::local_only("unavailable");
     let mut accepted_metadata = false;
+    let mut romanized_cast = None;
     if let Ok(document) = &r18 {
         if let Some(root) = JsonParser::new(document)
             .parse()
@@ -1317,7 +1410,6 @@ fn exact_code_presentation(
                     .is_some_and(|content_id| exact_product_code_in(&content_id, code))
             })
         {
-            accepted_metadata = true;
             sources.push("r18.dev");
             metadata.title =
                 optional_text(&root, "title_ja").or_else(|| optional_text(&root, "title"));
@@ -1337,6 +1429,7 @@ fn exact_code_presentation(
                     _ => None,
                 });
             metadata.cast = r18_actresses(&root);
+            accepted_metadata = has_descriptive_metadata(&metadata);
             if cover.is_none() {
                 let jacket = root
                     .get("images")
@@ -1444,7 +1537,6 @@ fn exact_code_presentation(
         if !javdatabase_document_matches(document, code) {
             return Err(ProviderRequestError::Provider);
         }
-        accepted_metadata = true;
         sources.push("JavDatabase");
         if metadata.date.is_none() {
             metadata.date = find_date(document);
@@ -1452,6 +1544,11 @@ fn exact_code_presentation(
         if metadata.runtime.is_none() {
             metadata.runtime = find_runtime(document);
         }
+        romanized_cast = javdatabase_romanized_cast(document, code);
+        accepted_metadata = accepted_metadata
+            || metadata.date.is_some()
+            || metadata.runtime.is_some()
+            || romanized_cast.is_some();
     } else if !matches!(&database, Err(ProviderRequestError::SourceUnavailable)) {
         transient_failure = true;
     }
@@ -1523,8 +1620,12 @@ fn exact_code_presentation(
     if metadata.title.is_none() || metadata.cast.is_empty() {
         match fetch_exact_library_metadata_with(authority.category.value(), code, fetch_javdb) {
             Ok(javdb) => {
-                accepted_metadata = true;
                 sources.push("JavDB");
+                accepted_metadata = accepted_metadata
+                    || javdb.title.is_some()
+                    || javdb.release_date.is_some()
+                    || javdb.duration.is_some()
+                    || !javdb.actors.is_empty();
                 metadata.title = metadata.title.or(javdb.title);
                 if metadata.cast.is_empty() {
                     metadata.cast = javdb.actors;
@@ -1535,6 +1636,11 @@ fn exact_code_presentation(
             }
             Err(ProviderRequestError::SourceUnavailable) => {}
             Err(_) => transient_failure = true,
+        }
+    }
+    if metadata.cast.is_empty() {
+        if let Some(cast) = romanized_cast {
+            metadata.cast.push(cast);
         }
     }
     if cover.is_none() && !accepted_metadata {
@@ -1891,7 +1997,17 @@ pub(crate) fn fetch_presentation_with(
     } else {
         now
     };
-    if presentation.is_automatic() {
+    let confirmed_exact_code_miss = matches!(
+        authority.category,
+        LibraryCategory::Adult | LibraryCategory::Vr
+    ) && authority
+        .code
+        .as_deref()
+        .is_some_and(|code| !code.starts_with("FC2-"))
+        && presentation.cover_state == "missing"
+        && !presentation.is_automatic()
+        && cache_cover;
+    if presentation.is_automatic() || confirmed_exact_code_miss {
         let _cache_guard = state.0.lock().map_err(|_| LIBRARY_ENRICHMENT_FAILED)?;
         let mut cache = read_cache(cache_path).unwrap_or_default();
         cache.retain(|entry| entry.identity != authority.identity);
@@ -1948,7 +2064,7 @@ pub(crate) fn fetch_cover_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2111,6 +2227,76 @@ mod tests {
         assert_eq!(result.imdb_id.as_deref(), Some("tt0099685"));
         assert_eq!(result.runtime.as_deref(), Some("145 min"));
         assert_eq!(result.genres, ["Drama"]);
+    }
+
+    #[test]
+    fn movie_year_anchor_accepts_one_consistent_romanized_result_and_preserves_its_title() {
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Movie,
+            identity: "romanized-movie".to_owned(),
+            local_title: "パーフェクトブルー".to_owned(),
+            year: Some("1998".to_owned()),
+            code: None,
+        };
+        let mut responses = vec![
+            r#"{"results":[{"id":10494,"title":"Perfect Blue","original_title":"PERFECT BLUE","release_date":"1998-02-28"}]}"#.to_owned(),
+            r#"{"id":10494,"title":"Perfect Blue","original_title":"PERFECT BLUE","release_date":"1998-02-28","runtime":81,"genres":[{"name":"Animation"}],"credits":{"cast":[]},"external_ids":{"imdb_id":"tt0156887"},"poster_path":null}"#.to_owned(),
+        ]
+        .into_iter();
+
+        let presentation = tmdb_presentation(&authority, Some("token"), &mut |_| {
+            Ok(responses.next().expect("fixture response"))
+        })
+        .expect("one year-anchored result must resolve");
+
+        assert!(presentation.is_automatic());
+        assert_eq!(presentation.provider_id.as_deref(), Some("10494"));
+        assert_eq!(presentation.title.as_deref(), Some("Perfect Blue"));
+        assert_ne!(
+            presentation.title.as_deref(),
+            Some(authority.local_title.as_str())
+        );
+    }
+
+    #[test]
+    fn movie_year_anchor_keeps_ambiguous_and_conflicting_results_local_only() {
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Movie,
+            identity: "ambiguous-romanized-movie".to_owned(),
+            local_title: "日本語題名".to_owned(),
+            year: Some("1998".to_owned()),
+            code: None,
+        };
+        let mut calls = 0;
+        let ambiguous = tmdb_presentation(&authority, Some("token"), &mut |_| {
+            calls += 1;
+            Ok(r#"{"results":[{"id":1,"title":"First Romanization","release_date":"1998-01-01"},{"id":2,"title":"Second Romanization","release_date":"1998-02-01"}]}"#.to_owned())
+        })
+        .expect("ambiguous year matches must remain local");
+        assert_eq!(calls, 1);
+        assert!(!ambiguous.is_automatic());
+
+        let mut conflicting_year = vec![
+            r#"{"results":[{"id":3,"title":"Romanized Title","release_date":"1998-01-01"}]}"#.to_owned(),
+            r#"{"id":3,"title":"Romanized Title","release_date":"2001-01-01","genres":[],"credits":{"cast":[]},"external_ids":{},"poster_path":null}"#.to_owned(),
+        ]
+        .into_iter();
+        let year_conflict = tmdb_presentation(&authority, Some("token"), &mut |_| {
+            Ok(conflicting_year.next().expect("fixture response"))
+        })
+        .expect("a conflicting detail year must remain local");
+        assert!(!year_conflict.is_automatic());
+
+        let mut conflicting_id = vec![
+            r#"{"results":[{"id":4,"title":"Romanized Title","release_date":"1998-01-01"}]}"#.to_owned(),
+            r#"{"id":5,"title":"Romanized Title","release_date":"1998-01-01","genres":[],"credits":{"cast":[]},"external_ids":{},"poster_path":null}"#.to_owned(),
+        ]
+        .into_iter();
+        let identity_conflict = tmdb_presentation(&authority, Some("token"), &mut |_| {
+            Ok(conflicting_id.next().expect("fixture response"))
+        })
+        .expect("a conflicting detail identity must remain local");
+        assert!(!identity_conflict.is_automatic());
     }
 
     #[test]
@@ -2443,6 +2629,161 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_exact_code_miss_survives_restart_and_refreshes_after_expiry() {
+        let fixture = CacheFixture::new();
+        let state = LibraryEnrichmentState::default();
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Adult,
+            identity: "adult-confirmed-miss".to_owned(),
+            local_title: "ADLT-123".to_owned(),
+            year: None,
+            code: Some("ADLT-123".to_owned()),
+        };
+        let provider_calls = Cell::new(0);
+        let first = fetch_presentation_with(
+            &state,
+            &fixture.path,
+            &authority,
+            None,
+            |_| {
+                provider_calls.set(provider_calls.get() + 1);
+                Err(ProviderRequestError::SourceUnavailable)
+            },
+            |_| {
+                provider_calls.set(provider_calls.get() + 1);
+                Err(ProviderRequestError::SourceUnavailable)
+            },
+            |_| {
+                provider_calls.set(provider_calls.get() + 1);
+                Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
+            },
+        )
+        .expect("a complete exact-code miss must resolve");
+        assert_eq!(first[2], "local-only");
+        assert_eq!(first[12], "missing");
+        assert!(provider_calls.get() > 0);
+
+        fetch_presentation_with(
+            &state,
+            &fixture.path,
+            &authority,
+            None,
+            |_| panic!("a repeated view must suppress text provider work"),
+            |_| panic!("a repeated view must suppress image provider work"),
+            |_| panic!("a repeated view must suppress JavDB work"),
+        )
+        .expect("a repeated view must use the confirmed miss");
+        fetch_presentation_with(
+            &LibraryEnrichmentState::default(),
+            &fixture.path,
+            &authority,
+            None,
+            |_| panic!("a fresh miss must suppress text provider work after restart"),
+            |_| panic!("a fresh miss must suppress image provider work after restart"),
+            |_| panic!("a fresh miss must suppress JavDB work after restart"),
+        )
+        .expect("a fresh confirmed miss must load after restart");
+
+        let replaced_authority = LibraryItemAuthority {
+            identity: "adult-replaced-item".to_owned(),
+            ..authority.clone()
+        };
+        let replacement_calls = Cell::new(0);
+        fetch_presentation_with(
+            &LibraryEnrichmentState::default(),
+            &fixture.path,
+            &replaced_authority,
+            None,
+            |_| {
+                replacement_calls.set(replacement_calls.get() + 1);
+                Err(ProviderRequestError::SourceUnavailable)
+            },
+            |_| {
+                replacement_calls.set(replacement_calls.get() + 1);
+                Err(ProviderRequestError::SourceUnavailable)
+            },
+            |_| {
+                replacement_calls.set(replacement_calls.get() + 1);
+                Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
+            },
+        )
+        .expect("a different exact item may establish its own miss");
+        assert!(replacement_calls.get() > 0);
+
+        let mut entries = read_cache(&fixture.path).expect("miss cache must parse");
+        assert_eq!(entries.len(), 2);
+        let original = entries
+            .iter_mut()
+            .find(|entry| entry.identity == authority.identity)
+            .expect("the exact original miss must remain cached");
+        original.cover_saved_at = 0;
+        write_cache(&fixture.path, &entries).expect("expired miss must persist");
+
+        let refreshed_calls = Cell::new(0);
+        fetch_presentation_with(
+            &LibraryEnrichmentState::default(),
+            &fixture.path,
+            &authority,
+            None,
+            |_| {
+                refreshed_calls.set(refreshed_calls.get() + 1);
+                Err(ProviderRequestError::SourceUnavailable)
+            },
+            |_| {
+                refreshed_calls.set(refreshed_calls.get() + 1);
+                Err(ProviderRequestError::SourceUnavailable)
+            },
+            |_| {
+                refreshed_calls.set(refreshed_calls.get() + 1);
+                Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
+            },
+        )
+        .expect("an expired miss may be confirmed again");
+        assert!(refreshed_calls.get() > 0);
+
+        fetch_presentation_with(
+            &LibraryEnrichmentState::default(),
+            &fixture.path,
+            &authority,
+            None,
+            |_| panic!("the refreshed miss must suppress text provider work"),
+            |_| panic!("the refreshed miss must suppress image provider work"),
+            |_| panic!("the refreshed miss must suppress JavDB work"),
+        )
+        .expect("the refreshed miss must remain durable");
+    }
+
+    #[test]
+    fn transient_exact_code_failure_is_not_persisted_as_a_confirmed_miss() {
+        let fixture = CacheFixture::new();
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Vr,
+            identity: "vr-transient-miss".to_owned(),
+            local_title: "MDVR-419".to_owned(),
+            year: None,
+            code: Some("MDVR-419".to_owned()),
+        };
+        let attempts = Cell::new(0);
+        for _ in 0..2 {
+            let result = fetch_presentation_with(
+                &LibraryEnrichmentState::default(),
+                &fixture.path,
+                &authority,
+                None,
+                |_| Err(ProviderRequestError::SourceUnavailable),
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    Err(ProviderRequestError::Network)
+                },
+                |_| Err(ProviderRequestError::SourceUnavailable),
+            );
+            assert_eq!(result, Err(LIBRARY_ENRICHMENT_FAILED));
+            assert!(!fixture.path.exists());
+        }
+        assert!(attempts.get() > 1);
+    }
+
+    #[test]
     fn expired_cover_refresh_preserves_fresh_metadata_and_expired_metadata_is_replaced() {
         let fixture = CacheFixture::new();
         let authority = LibraryItemAuthority {
@@ -2643,5 +2984,61 @@ mod tests {
         assert!(r18_position < r18_cover_position);
         assert!(r18_cover_position < database_position);
         assert!(!events.iter().any(|event| event.contains("mgstage.com")));
+    }
+
+    #[test]
+    fn exact_code_uses_validated_javdatabase_cast_only_after_japanese_cast_is_unavailable() {
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Adult,
+            identity: "adult-romanized-cast".to_owned(),
+            local_title: "ADLT-123".to_owned(),
+            year: None,
+            code: Some("ADLT-123".to_owned()),
+        };
+        let (presentation, bytes, cache_cover) = exact_code_presentation(
+            &authority,
+            &mut |request| {
+                if request.url.contains("r18.dev") {
+                    Ok(r#"{"content_id":"adlt00123","title_ja":"日本語題名","actresses":[]}"#.to_owned())
+                } else if request.url.contains("javdatabase.com") {
+                    Ok("<title>ADLT-123 - Romanized Actor - JAV Database</title>".to_owned())
+                } else {
+                    Err(ProviderRequestError::SourceUnavailable)
+                }
+            },
+            &mut |_| Err(ProviderRequestError::SourceUnavailable),
+            &mut |url| {
+                if url.contains("/search?") {
+                    Ok(r#"{"success":1,"data":{"movies":[{"id":"AdultA","number":"ADLT-123"}]}}"#.to_owned())
+                } else {
+                    Ok(r#"{"success":1,"data":{"movie":{"id":"AdultA","number":"ADLT-123","title":"日本語題名","actors":[],"tags":[{"id":"1","name":"Drama"}]}}}"#.to_owned())
+                }
+            },
+        )
+        .expect("the exact provider chain must resolve");
+
+        assert!(presentation.is_automatic());
+        assert_eq!(presentation.title.as_deref(), Some("日本語題名"));
+        assert_eq!(presentation.cast, ["Romanized Actor"]);
+        assert!(bytes.is_none());
+        assert!(cache_cover);
+        assert_eq!(
+            javdatabase_romanized_cast(
+                "<title>OTHER-123 - Wrong Actor - JAV Database</title>",
+                "ADLT-123"
+            ),
+            None
+        );
+        assert_eq!(
+            javdatabase_romanized_cast("<title>ADLT-123 - JAV Database</title>", "ADLT-123"),
+            None
+        );
+        assert_eq!(
+            javdatabase_romanized_cast(
+                "<title>ADLT-123 - JAV Movie - JAV Database</title>",
+                "ADLT-123"
+            ),
+            None
+        );
     }
 }

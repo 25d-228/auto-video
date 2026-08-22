@@ -491,6 +491,9 @@ pub(crate) fn fetch_exact_library_metadata_with(
         .collect::<Vec<_>>();
     exact_items.sort_by(|left, right| left.provider_item_id.cmp(&right.provider_item_id));
     exact_items.dedup_by(|left, right| left.provider_item_id == right.provider_item_id);
+    if exact_items.is_empty() {
+        return Err(ProviderRequestError::SourceUnavailable);
+    }
     if exact_items.len() != 1 {
         return Err(ProviderRequestError::Provider);
     }
@@ -2142,6 +2145,18 @@ mod tests {
             }),
             Err(VR_JAVDB_CONFLICTING)
         );
+    }
+
+    #[test]
+    fn exact_library_lookup_treats_a_valid_empty_listing_as_source_unavailable() {
+        let mut dispatches = 0;
+        let result = fetch_exact_library_metadata_with("adult", "ADLT-123", &mut |_| {
+            dispatches += 1;
+            Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
+        });
+
+        assert_eq!(result, Err(ProviderRequestError::SourceUnavailable));
+        assert_eq!(dispatches, 1);
     }
 
     #[test]
