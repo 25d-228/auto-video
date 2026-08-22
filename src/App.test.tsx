@@ -9267,6 +9267,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
       sort: "newest",
       count: 25,
     });
+    expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(1);
     expect(
       (screen.getByRole("combobox", {
         name: "Adult ranking period",
@@ -10246,7 +10247,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     expect(fetchSukebeiAdultReleasesMock).toHaveBeenCalledTimes(1);
   });
 
-  it("isolates late catalog and cover results after request and category changes", async () => {
+  it("replaces default Adult verification once and rejects its late catalog and cover", async () => {
     const oldCatalog = createDeferred<string[]>();
     const oldCover = createDeferred<number[]>();
     fetchJavdbBrowseMock
@@ -10261,10 +10262,34 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     selectDiscover();
     fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
     await waitFor(() => expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(1));
+    expect(
+      screen.getByRole("heading", { name: "Loading JavDB catalog" }),
+    ).toBeTruthy();
+    expect(fetchJavdbBrowseMock).toHaveBeenNthCalledWith(1, {
+      category: "adult",
+      contextGeneration: "1",
+      mode: "ranking",
+      period: "daily",
+      year: null,
+      month: null,
+      sort: "newest",
+      count: 25,
+    });
     fireEvent.change(
       screen.getByRole("combobox", { name: "Adult ranking period" }),
       { target: { value: "weekly" } },
     );
+    await waitFor(() => expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(2));
+    expect(fetchJavdbBrowseMock).toHaveBeenNthCalledWith(2, {
+      category: "adult",
+      contextGeneration: "2",
+      mode: "ranking",
+      period: "weekly",
+      year: null,
+      month: null,
+      sort: "newest",
+      count: 25,
+    });
     expect(
       await screen.findByRole("heading", { level: 3, name: "ADLT-124" }),
     ).toBeTruthy();
@@ -10277,6 +10302,7 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
       await oldCatalog.promise;
     });
     expect(screen.queryByRole("heading", { name: "ADLT-123" })).toBeNull();
+    expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(2);
 
     fireEvent.click(screen.getByRole("radio", { name: "Movies" }));
     await act(async () => {
