@@ -1628,6 +1628,63 @@ describe("automatic Library presentation", () => {
     },
   );
 
+  it.each([
+    [
+      "movie",
+      "Movies",
+      "\u{30ab}\u{3099}\u{30f3}\u{30c0}\u{30e0}",
+      "ガンダム",
+      "/Movies/ガンダム.mp4",
+    ],
+    [
+      "tv",
+      "TV",
+      "\u{30cf}\u{309a}\u{30d2}\u{309a}\u{30e8}\u{30f3}",
+      "パピヨン",
+      "/TV/パピヨン.S01E01.mp4",
+    ],
+  ] as const)(
+    "keeps the exact decomposed %s Library title after NFC-equivalent enrichment",
+    async (category, categoryLabel, localTitle, providerTitle, path) => {
+      if (category === "movie") {
+        savedMoviesFolder = "/Movies";
+        scanMoviesMock.mockResolvedValue([path]);
+      } else {
+        savedTvFolder = "/TV";
+        scanTvLibraryMock.mockResolvedValue(
+          fixtureTvMetadataScan({
+            members: [
+              {
+                path,
+                relativePath: "パピヨン.S01E01.mp4",
+              },
+            ],
+            showTitle: localTitle,
+          }),
+        );
+      }
+      fetchLibraryPresentationMock.mockResolvedValue(
+        automaticLibraryPresentation(category, providerTitle),
+      );
+
+      render(<App />);
+      selectLibrary();
+      if (category === "tv") {
+        fireEvent.click(screen.getByRole("radio", { name: categoryLabel }));
+      }
+
+      const facts = await screen.findByLabelText(
+        `Automatic presentation facts for ${localTitle}`,
+      );
+      expect(within(facts).getByText(providerTitle)).toBeTruthy();
+      const localHeading = screen
+        .getAllByRole("heading")
+        .find((heading) => heading.textContent === localTitle);
+      expect(localHeading?.textContent).toBe(localTitle);
+      expect(localHeading?.textContent).not.toBe(providerTitle);
+    },
+  );
+
   it("starts work only for the visible natural-width page and reuses unchanged identities", async () => {
     savedMoviesFolder = "/Movies";
     scanMoviesMock.mockResolvedValue(

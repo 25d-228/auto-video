@@ -15,6 +15,7 @@ use crate::{
     vr_torrent::{hex_sha1, json_array, json_object, json_string, json_u64, JsonParser, JsonValue},
     ProviderRequestError,
 };
+use unicode_normalization::UnicodeNormalization;
 
 pub(crate) const LIBRARY_ENRICHMENT_FAILED: &str = "library_enrichment_failed";
 pub(crate) const LIBRARY_ENRICHMENT_STALE: &str = "library_enrichment_stale";
@@ -608,7 +609,7 @@ fn r18_actresses(object: &BTreeMap<String, JsonValue>) -> Vec<String> {
 
 fn normalized_title(value: &str) -> String {
     value
-        .chars()
+        .nfc()
         .flat_map(char::to_lowercase)
         .filter(|character| character.is_alphanumeric())
         .collect()
@@ -644,6 +645,15 @@ struct TmdbSearchCandidate {
     id: u64,
     date: Option<String>,
     titles: Vec<String>,
+}
+
+enum TmdbSearchOutcome {
+    Missing,
+    Rejected,
+    Accepted {
+        provider_id: u64,
+        candidates: Vec<TmdbSearchCandidate>,
+    },
 }
 
 fn tmdb_titles(object: &BTreeMap<String, JsonValue>, keys: &[&str]) -> Vec<String> {
@@ -707,33 +717,28 @@ fn validated_document(
     Ok(document)
 }
 
-fn tmdb_presentation(
+fn tmdb_search(
     authority: &LibraryItemAuthority,
-    token: Option<&str>,
+    kind: &str,
+    include_year: bool,
     fetch: &mut impl FnMut(&ProviderTextRequest) -> Result<String, ProviderRequestError>,
-) -> Result<LibraryPresentation, ProviderRequestError> {
-    let Some(_token) = token.filter(|token| !token.is_empty()) else {
-        return Ok(LibraryPresentation::local_only("unavailable"));
-    };
-    let kind = if authority.category == LibraryCategory::Movie {
-        "movie"
-    } else {
-        "tv"
-    };
-    let year_parameter = if kind == "movie" {
-        "year"
-    } else {
-        "first_air_date_year"
-    };
+) -> Result<TmdbSearchOutcome, ProviderRequestError> {
     let mut search_url = format!(
         "https://api.themoviedb.org/3/search/{kind}?query={}&include_adult=false",
         percent_encode(&authority.local_title)
     );
-    if let Some(year) = authority.year.as_deref() {
-        search_url.push('&');
-        search_url.push_str(year_parameter);
-        search_url.push('=');
-        search_url.push_str(year);
+    if include_year {
+        let year_parameter = if kind == "movie" {
+            "year"
+        } else {
+            "first_air_date_year"
+        };
+        if let Some(year) = authority.year.as_deref() {
+            search_url.push('&');
+            search_url.push_str(year_parameter);
+            search_url.push('=');
+            search_url.push_str(year);
+        }
     }
     let search = validated_document(
         &ProviderTextRequest {
@@ -754,6 +759,9 @@ fn tmdb_presentation(
         .get("results")
         .and_then(json_array)
         .ok_or(ProviderRequestError::Provider)?;
+    if results.is_empty() {
+        return Ok(TmdbSearchOutcome::Missing);
+    }
     let title_keys = if kind == "movie" {
         ["title", "original_title"]
     } else {
@@ -778,6 +786,9 @@ fn tmdb_presentation(
             continue;
         }
         candidates.push(TmdbSearchCandidate { id, date, titles });
+    }
+    if candidates.is_empty() {
+        return Ok(TmdbSearchOutcome::Rejected);
     }
     let mut matching_ids = candidates
         .iter()
@@ -804,11 +815,53 @@ fn tmdb_presentation(
         year_matches.sort_unstable();
         year_matches.dedup();
         if year_matches.len() != 1 {
-            return Ok(LibraryPresentation::local_only("missing"));
+            return Ok(TmdbSearchOutcome::Rejected);
         }
         year_matches[0]
     } else {
-        return Ok(LibraryPresentation::local_only("missing"));
+        return Ok(TmdbSearchOutcome::Rejected);
+    };
+    Ok(TmdbSearchOutcome::Accepted {
+        provider_id,
+        candidates,
+    })
+}
+
+fn tmdb_presentation(
+    authority: &LibraryItemAuthority,
+    token: Option<&str>,
+    fetch: &mut impl FnMut(&ProviderTextRequest) -> Result<String, ProviderRequestError>,
+) -> Result<LibraryPresentation, ProviderRequestError> {
+    let Some(_token) = token.filter(|token| !token.is_empty()) else {
+        return Ok(LibraryPresentation::local_only("unavailable"));
+    };
+    let kind = if authority.category == LibraryCategory::Movie {
+        "movie"
+    } else {
+        "tv"
+    };
+    let date_key = if kind == "movie" {
+        "release_date"
+    } else {
+        "first_air_date"
+    };
+    let search = tmdb_search(authority, kind, authority.year.is_some(), fetch)?;
+    let search = if matches!(&search, TmdbSearchOutcome::Missing)
+        && authority.category == LibraryCategory::Movie
+        && authority.year.is_some()
+    {
+        tmdb_search(authority, kind, false, fetch)?
+    } else {
+        search
+    };
+    let (provider_id, candidates) = match search {
+        TmdbSearchOutcome::Accepted {
+            provider_id,
+            candidates,
+        } => (provider_id, candidates),
+        TmdbSearchOutcome::Missing | TmdbSearchOutcome::Rejected => {
+            return Ok(LibraryPresentation::local_only("missing"));
+        }
     };
     let accepted_candidates = candidates
         .iter()
@@ -2201,6 +2254,165 @@ mod tests {
         assert!(WINDOWS_TEXT_SCRIPT.contains("4194304"));
         assert!(WINDOWS_IMAGE_SCRIPT.contains("16777216"));
         assert!(WINDOWS_IMAGE_SCRIPT.contains("ToBase64String($memory.ToArray())"));
+    }
+
+    #[test]
+    fn movie_title_matching_composes_nfd_without_changing_the_local_identity_or_query() {
+        let local_title = "\u{30ab}\u{3099}\u{30f3}\u{30c0}\u{30e0}";
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Movie,
+            identity: "nfd-movie".to_owned(),
+            local_title: local_title.to_owned(),
+            year: Some("1990".to_owned()),
+            code: None,
+        };
+        let mut requests = Vec::new();
+        let presentation = tmdb_presentation(&authority, Some("token"), &mut |request| {
+            requests.push(request.url.clone());
+            if request.url.contains("search/movie") {
+                Ok(r#"{"results":[{"id":11,"title":"ガンダム","release_date":"1990-01-01"}]}"#.to_owned())
+            } else {
+                Ok(r#"{"id":11,"title":"ガンダム","original_title":"ガンダム","release_date":"1990-01-01","genres":[],"credits":{"cast":[]},"external_ids":{},"poster_path":null}"#.to_owned())
+            }
+        })
+        .expect("canonically equivalent movie titles must match");
+
+        assert!(presentation.is_automatic());
+        assert_eq!(presentation.title.as_deref(), Some("ガンダム"));
+        assert_eq!(authority.local_title, local_title);
+        assert!(requests[0].contains("query=%E3%82%AB%E3%82%99"));
+    }
+
+    #[test]
+    fn grouped_tv_title_matching_composes_nfd_without_changing_the_local_identity_or_query() {
+        let local_title = "\u{30cf}\u{309a}\u{30d2}\u{309a}\u{30e8}\u{30f3}";
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Tv,
+            identity: "nfd-tv-group".to_owned(),
+            local_title: local_title.to_owned(),
+            year: None,
+            code: None,
+        };
+        let mut requests = Vec::new();
+        let presentation = tmdb_presentation(&authority, Some("token"), &mut |request| {
+            requests.push(request.url.clone());
+            if request.url.contains("search/tv") {
+                Ok(r#"{"results":[{"id":12,"name":"パピヨン","first_air_date":"2003-01-01"}]}"#.to_owned())
+            } else {
+                Ok(r#"{"id":12,"name":"パピヨン","original_name":"パピヨン","first_air_date":"2003-01-01","genres":[],"credits":{"cast":[]},"external_ids":{},"poster_path":null}"#.to_owned())
+            }
+        })
+        .expect("canonically equivalent grouped TV titles must match");
+
+        assert!(presentation.is_automatic());
+        assert_eq!(presentation.title.as_deref(), Some("パピヨン"));
+        assert_eq!(authority.local_title, local_title);
+        assert!(requests[0].contains("query=%E3%83%8F%E3%82%9A"));
+    }
+
+    #[test]
+    fn movie_search_retries_once_without_year_after_a_confirmed_empty_result() {
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Movie,
+            identity: "bare-title-fallback".to_owned(),
+            local_title: "パーフェクトブルー".to_owned(),
+            year: Some("1998".to_owned()),
+            code: None,
+        };
+        let mut requests = Vec::new();
+        let presentation = tmdb_presentation(&authority, Some("token"), &mut |request| {
+            requests.push(request.url.clone());
+            match requests.len() {
+                1 => Ok(r#"{"results":[]}"#.to_owned()),
+                2 => Ok(r#"{"results":[{"id":10494,"title":"Perfect Blue","release_date":"1998-02-28"}]}"#.to_owned()),
+                3 => Ok(r#"{"id":10494,"title":"Perfect Blue","original_title":"PERFECT BLUE","release_date":"1998-02-28","genres":[],"credits":{"cast":[]},"external_ids":{"imdb_id":"tt0156887"},"poster_path":null}"#.to_owned()),
+                _ => panic!("the bounded fallback must not dispatch again"),
+            }
+        })
+        .expect("the bare-title fallback must resolve one exact result");
+
+        assert!(presentation.is_automatic());
+        assert_eq!(presentation.provider_id.as_deref(), Some("10494"));
+        assert!(requests[0].contains("&year=1998"));
+        assert!(requests[1].contains("search/movie"));
+        assert!(!requests[1].contains("&year="));
+        assert!(requests[2].contains("/movie/10494?"));
+    }
+
+    #[test]
+    fn movie_search_does_not_fallback_after_a_first_attempt_acceptance_or_conflict() {
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Movie,
+            identity: "bounded-movie-search".to_owned(),
+            local_title: "Exact Movie".to_owned(),
+            year: Some("1999".to_owned()),
+            code: None,
+        };
+        let mut accepted_requests = Vec::new();
+        let accepted = tmdb_presentation(&authority, Some("token"), &mut |request| {
+            accepted_requests.push(request.url.clone());
+            if request.url.contains("search/movie") {
+                Ok(r#"{"results":[{"id":1,"title":"Exact Movie","release_date":"1999-01-01"}]}"#.to_owned())
+            } else {
+                Ok(r#"{"id":1,"title":"Exact Movie","release_date":"1999-01-01","genres":[],"credits":{"cast":[]},"external_ids":{},"poster_path":null}"#.to_owned())
+            }
+        })
+        .expect("the first accepted result must resolve");
+        assert!(accepted.is_automatic());
+        assert_eq!(
+            accepted_requests
+                .iter()
+                .filter(|url| url.contains("search/movie"))
+                .count(),
+            1
+        );
+
+        let mut conflict_requests = Vec::new();
+        let conflict = tmdb_presentation(&authority, Some("token"), &mut |request| {
+            conflict_requests.push(request.url.clone());
+            Ok(
+                r#"{"results":[{"id":2,"title":"Exact Movie","release_date":"2005-01-01"}]}"#
+                    .to_owned(),
+            )
+        })
+        .expect("a conflicting first result must remain local");
+        assert!(!conflict.is_automatic());
+        assert_eq!(conflict_requests.len(), 1);
+    }
+
+    #[test]
+    fn movie_search_two_confirmed_misses_are_local_only_and_provider_failures_remain_errors() {
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Movie,
+            identity: "missing-movie".to_owned(),
+            local_title: "Missing Movie".to_owned(),
+            year: Some("1999".to_owned()),
+            code: None,
+        };
+        let mut calls = 0;
+        let missing = tmdb_presentation(&authority, Some("token"), &mut |_| {
+            calls += 1;
+            Ok(r#"{"results":[]}"#.to_owned())
+        })
+        .expect("two confirmed misses must be an honest local-only result");
+        assert_eq!(calls, 2);
+        assert!(!missing.is_automatic());
+
+        let mut failure_calls = 0;
+        let failure = tmdb_presentation(&authority, Some("token"), &mut |_| {
+            failure_calls += 1;
+            Err(ProviderRequestError::Network)
+        });
+        assert_eq!(failure_calls, 1);
+        assert_eq!(failure, Err(ProviderRequestError::Network));
+
+        let mut malformed_calls = 0;
+        let malformed = tmdb_presentation(&authority, Some("token"), &mut |_| {
+            malformed_calls += 1;
+            Ok("{}".to_owned())
+        });
+        assert_eq!(malformed_calls, 1);
+        assert_eq!(malformed, Err(ProviderRequestError::Provider));
     }
 
     #[test]
