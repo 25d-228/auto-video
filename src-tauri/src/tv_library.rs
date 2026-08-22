@@ -10,6 +10,7 @@ use std::{
 #[cfg(unix)]
 use std::fs::File;
 
+use crate::library_enrichment::{LibraryCategory, LibraryItemAuthority};
 use crate::library_scan::{is_supported_library_media, scan_library_files};
 use crate::vr_download::{
     with_unowned_tv_library_path, VrDownloadState, VrLibraryTrashOwnershipError,
@@ -175,6 +176,50 @@ struct TvLibraryContext {
 
 #[derive(Clone, Default)]
 pub struct TvLibraryState(Arc<Mutex<TvLibraryContext>>);
+
+pub(crate) fn tv_library_enrichment_authority(
+    state: &TvLibraryState,
+    scan_generation: u64,
+    group_id: &str,
+) -> Result<LibraryItemAuthority, &'static str> {
+    let context = state.0.lock().map_err(|_| TV_LIBRARY_SCAN_FAILED)?;
+    let scan = context.completed_scan.as_ref().ok_or(TV_LIBRARY_STALE)?;
+    if scan.generation != scan_generation || context.folder.as_ref() != Some(&scan.folder) {
+        return Err(TV_LIBRARY_STALE);
+    }
+    let group = scan
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .filter(|group| group.association.is_none() && !group.metadata_attention)
+        .ok_or(TV_LIBRARY_STALE)?;
+    let mut members = group.member_paths.clone();
+    members.sort();
+    let mut identity = format!(
+        "tv\0{}\0{}\0{scan_generation}\0{group_id}\0{}",
+        scan.folder.display(),
+        scan.folder_identity,
+        group.show_title
+    );
+    for member in members {
+        let file = scan
+            .files
+            .iter()
+            .find(|file| file.path == member)
+            .ok_or(TV_LIBRARY_STALE)?;
+        identity.push_str(&format!(
+            "\0{}\0{}\0{}\0{}",
+            file.relative_path, file.file_identity, file.fingerprint, file.size
+        ));
+    }
+    Ok(LibraryItemAuthority {
+        category: LibraryCategory::Tv,
+        identity: hex_sha1(identity.as_bytes()),
+        local_title: group.show_title.clone(),
+        year: None,
+        code: None,
+    })
+}
 
 #[derive(Clone, Copy)]
 enum TvFileValidationError {
@@ -2074,6 +2119,39 @@ mod tests {
                 "1".to_owned(),
                 "3".to_owned(),
             ])
+        );
+    }
+
+    #[test]
+    fn enrichment_authority_requires_one_current_unmatched_group() {
+        let fixture = Fixture::new("enrichment-authority");
+        fs::write(fixture.path.join("Exact Show.S01E02.mp4"), b"episode")
+            .expect("episode must be written");
+        fs::write(fixture.path.join("Unassociated feature.mp4"), b"feature")
+            .expect("unassociated file must be written");
+        let state = TvLibraryState::default();
+        set_tv_folder(&state, &fixture.path.join("config"), fixture.path.clone())
+            .expect("TV folder must be configured");
+        scan_tv_library_with(&state).expect("scan must complete");
+        let (generation, group_id) = {
+            let context = state.0.lock().expect("TV state must lock");
+            let scan = context.completed_scan.as_ref().expect("scan must exist");
+            (scan.generation, scan.groups[0].group_id.clone())
+        };
+
+        let authority = tv_library_enrichment_authority(&state, generation, &group_id)
+            .expect("the current parsed group must authorize presentation");
+        assert_eq!(authority.category, LibraryCategory::Tv);
+        assert_eq!(authority.local_title, "Exact Show");
+        assert_eq!(
+            tv_library_enrichment_authority(&state, generation, "fabricated-group"),
+            Err(TV_LIBRARY_STALE)
+        );
+
+        scan_tv_library_with(&state).expect("refresh must complete");
+        assert_eq!(
+            tv_library_enrichment_authority(&state, generation, &group_id),
+            Err(TV_LIBRARY_STALE)
         );
     }
 

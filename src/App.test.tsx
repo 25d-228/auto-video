@@ -18,6 +18,7 @@ import {
 } from "vitest";
 
 import App from "./App";
+import { invalidateLibraryEnrichment } from "./library-enrichment";
 
 const systemDarkModeQuery = "(prefers-color-scheme: dark)";
 
@@ -165,6 +166,12 @@ let fetchFanzaCoverMock: Mock<
 >;
 let invalidateFanzaCatalogMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
+>;
+let fetchLibraryPresentationMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let fetchLibraryCoverMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<number[]>
 >;
 let fetchSukebeiAdultReleasesMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string>
@@ -1095,6 +1102,29 @@ beforeEach(() => {
       0xff, 0xd8, 0xff, 0xe0, 0, 16, 0, 0, 0, 0, 0, 0,
     ]);
   invalidateFanzaCatalogMock = vi.fn().mockResolvedValue(undefined);
+  fetchLibraryPresentationMock = vi.fn().mockImplementation((parameters) =>
+    Promise.resolve([
+      "library-enrichment-v1",
+      String(parameters?.category ?? ""),
+      "local-only",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "missing",
+      "0.72",
+      "0",
+      "0",
+    ]),
+  );
+  fetchLibraryCoverMock = vi.fn().mockResolvedValue([
+    0xff, 0xd8, 0xff, 0xe0, 0, 16, 0, 0, 0, 0, 0, 0,
+  ]);
   fetchJavdbDetailMock = vi.fn().mockResolvedValue([
     "1",
     "vr",
@@ -1388,6 +1418,10 @@ beforeEach(() => {
           return fetchFanzaCoverMock(parameters);
         case "invalidate_fanza_catalog":
           return invalidateFanzaCatalogMock(parameters);
+        case "fetch_library_presentation":
+          return fetchLibraryPresentationMock(parameters);
+        case "fetch_library_cover":
+          return fetchLibraryCoverMock(parameters);
         case "fetch_sukebei_adult_releases":
           return fetchSukebeiAdultReleasesMock(parameters);
         case "fetch_sukebei_vr_releases":
@@ -1489,12 +1523,648 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  invalidateLibraryEnrichment();
   window.localStorage.clear();
   delete document.documentElement.dataset.appearance;
   delete document.documentElement.dataset.theme;
   Reflect.deleteProperty(navigator, "clipboard");
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+function automaticLibraryPresentation(
+  category: "movie" | "tv" | "adult" | "vr",
+  title = "Exact provider title",
+) {
+  return [
+    "library-enrichment-v1",
+    category,
+    "automatic",
+    "Fixture provider",
+    "provider-419",
+    "tt0123456",
+    title,
+    "Exact original title",
+    "1999-04-19",
+    "120 min",
+    "Exact descriptive overview.",
+    "library-cover-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "ready",
+    "0.5",
+    "1",
+    "Drama",
+    "1",
+    "Exact actor",
+  ];
+}
+
+describe("automatic Library presentation", () => {
+  it.each([
+    ["movies", "Movies", "Exact local movie", "/Movies/Exact local movie.mp4"],
+    ["tv", "TV", "Exact Local Show", "/TV/Exact Local Show.S01E01.mp4"],
+    ["adult", "Adult", "ADLT-123", "/Adult/ADLT-123.mp4"],
+    ["vr", "VR", "MDVR-419", "/VR/MDVR-419.mp4"],
+  ] as const)(
+    "shows truthful automatic descriptive facts without replacing the %s card title",
+    async (category, categoryLabel, localTitle, path) => {
+      Object.defineProperties(window, {
+        innerHeight: { configurable: true, value: 520 },
+        innerWidth: { configurable: true, value: 720 },
+      });
+      gallerySizes.library = { width: 446, height: 284 };
+      if (category === "movies") {
+        savedMoviesFolder = "/Movies";
+        scanMoviesMock.mockResolvedValue([path]);
+      } else if (category === "tv") {
+        savedTvFolder = "/TV";
+        scanTvLibraryMock.mockResolvedValue(
+          fixtureTvMetadataScan({
+            members: [
+              {
+                path,
+                relativePath: "Exact Local Show.S01E01.mp4",
+              },
+            ],
+            showTitle: localTitle,
+          }),
+        );
+      } else if (category === "adult") {
+        savedAdultFolder = "/Adult";
+        scanAdultLibraryMock.mockResolvedValue([path, "ADLT-123.mp4", "5"]);
+      } else {
+        savedVrFolder = "/VR";
+        scanVrLibraryMock.mockResolvedValue([path, "5"]);
+      }
+      fetchLibraryPresentationMock.mockResolvedValue(
+        automaticLibraryPresentation(
+          category === "movies" ? "movie" : category,
+          `Provider ${categoryLabel} title`,
+        ),
+      );
+
+      render(<App />);
+      selectLibrary();
+      if (category !== "movies") {
+        fireEvent.click(screen.getByRole("radio", { name: categoryLabel }));
+      }
+
+      const facts = await screen.findByLabelText(
+        `Automatic presentation facts for ${localTitle}`,
+      );
+      expect(
+        within(facts).getByText(`Provider ${categoryLabel} title`),
+      ).toBeTruthy();
+      expect(
+        within(facts).getByText(
+          category === "adult" || category === "vr"
+            ? "1999-04-19 · 120 min · Exact actor"
+            : "1999-04-19 · 120 min · Drama",
+        ),
+      ).toBeTruthy();
+      expect(facts.parentElement?.classList.contains("library-card__details-trigger")).toBe(
+        true,
+      );
+      expect(screen.getByRole("heading", { name: localTitle })).toBeTruthy();
+    },
+  );
+
+  it.each([
+    [
+      "movie",
+      "Movies",
+      "\u{30ab}\u{3099}\u{30f3}\u{30c0}\u{30e0}",
+      "ガンダム",
+      "/Movies/ガンダム.mp4",
+    ],
+    [
+      "tv",
+      "TV",
+      "\u{30cf}\u{309a}\u{30d2}\u{309a}\u{30e8}\u{30f3}",
+      "パピヨン",
+      "/TV/パピヨン.S01E01.mp4",
+    ],
+  ] as const)(
+    "keeps the exact decomposed %s Library title after NFC-equivalent enrichment",
+    async (category, categoryLabel, localTitle, providerTitle, path) => {
+      if (category === "movie") {
+        savedMoviesFolder = "/Movies";
+        scanMoviesMock.mockResolvedValue([path]);
+      } else {
+        savedTvFolder = "/TV";
+        scanTvLibraryMock.mockResolvedValue(
+          fixtureTvMetadataScan({
+            members: [
+              {
+                path,
+                relativePath: "パピヨン.S01E01.mp4",
+              },
+            ],
+            showTitle: localTitle,
+          }),
+        );
+      }
+      fetchLibraryPresentationMock.mockResolvedValue(
+        automaticLibraryPresentation(category, providerTitle),
+      );
+
+      render(<App />);
+      selectLibrary();
+      if (category === "tv") {
+        fireEvent.click(screen.getByRole("radio", { name: categoryLabel }));
+      }
+
+      const facts = await screen.findByLabelText(
+        `Automatic presentation facts for ${localTitle}`,
+      );
+      expect(within(facts).getByText(providerTitle)).toBeTruthy();
+      const localHeading = screen
+        .getAllByRole("heading")
+        .find((heading) => heading.textContent === localTitle);
+      expect(localHeading?.textContent).toBe(localTitle);
+      expect(localHeading?.textContent).not.toBe(providerTitle);
+    },
+  );
+
+  it("starts work only for the visible natural-width page and reuses unchanged identities", async () => {
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(
+      Array.from(
+        { length: 20 },
+        (_, index) => `/Movies/Visible ${String(index + 1).padStart(2, "0")}.mp4`,
+      ),
+    );
+    gallerySizes.library = { width: 1088, height: 284 };
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByRole("heading", { name: "Visible 01" });
+    await waitFor(() => expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(7));
+    expect(
+      fetchLibraryPresentationMock.mock.calls.map(([request]) => request?.itemId),
+    ).toEqual(Array.from({ length: 7 }, (_, index) => fixtureMovieFileId(`/Movies/Visible ${String(index + 1).padStart(2, "0")}.mp4`)));
+
+    fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
+    await waitFor(() => expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(14));
+
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectLibrary();
+    fireEvent(window, new Event("resize"));
+    expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(14);
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the available Library shell width at 720, 1024, 1440, and 1600 pixels", async () => {
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(
+      Array.from(
+        { length: 20 },
+        (_, index) => `/Movies/Shell ${String(index + 1).padStart(2, "0")}.mp4`,
+      ),
+    );
+    gallerySizes.library = { width: 446, height: 284 };
+    render(<App />);
+    selectLibrary();
+    await screen.findByRole("heading", { name: "Shell 01" });
+    const gallery = document.querySelector('[data-gallery="library"]');
+    const sidebarWidth = 13.5 * 16;
+    const sizes = [
+      { capacity: "3", pages: "7", windowWidth: 720 },
+      { capacity: "5", pages: "4", windowWidth: 1024 },
+      { capacity: "7", pages: "3", windowWidth: 1440 },
+      { capacity: "9", pages: "3", windowWidth: 1600 },
+    ];
+
+    for (const size of sizes) {
+      const outerPadding = Math.min(
+        48,
+        Math.max(24, size.windowWidth * 0.04),
+      );
+      const galleryWidth = Math.floor(
+        size.windowWidth - sidebarWidth - outerPadding * 2,
+      );
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: size.windowWidth,
+      });
+      fireEvent(window, new Event("resize"));
+      resizeGallery("library", galleryWidth, 284);
+      expect(gallery?.getAttribute("data-viewport-width")).toBe(
+        String(galleryWidth),
+      );
+      expect(gallery?.getAttribute("data-page-capacity")).toBe(size.capacity);
+      expect(gallery?.getAttribute("data-page-count")).toBe(size.pages);
+    }
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(fetchJavdbBrowseMock).not.toHaveBeenCalled();
+    expect(fetchFanzaCatalogMock).not.toHaveBeenCalled();
+  });
+
+  it("recalculates Library capacity immediately from mixed decoded cover ratios and height", async () => {
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(
+      Array.from(
+        { length: 8 },
+        (_, index) => `/Movies/Mixed ${String(index + 1).padStart(2, "0")}.mp4`,
+      ),
+    );
+    gallerySizes.library = { width: 600, height: 284 };
+    fetchLibraryPresentationMock.mockImplementation((parameters) =>
+      Promise.resolve(
+        automaticLibraryPresentation("movie", String(parameters?.itemId)),
+      ),
+    );
+
+    render(<App />);
+    selectLibrary();
+    const firstCard = (
+      await screen.findByRole("heading", { name: "Mixed 01" })
+    ).closest("article") as HTMLElement;
+    const secondCard = screen
+      .getByRole("heading", { name: "Mixed 02" })
+      .closest("article") as HTMLElement;
+    const firstCover = await waitFor(() => {
+      const image = firstCard.querySelector("img");
+      expect(image).not.toBeNull();
+      return image as HTMLImageElement;
+    });
+    const secondCover = await waitFor(() => {
+      const image = secondCard.querySelector("img");
+      expect(image).not.toBeNull();
+      return image as HTMLImageElement;
+    });
+    Object.defineProperties(firstCover, {
+      naturalHeight: { configurable: true, value: 180 },
+      naturalWidth: { configurable: true, value: 90 },
+    });
+    Object.defineProperties(secondCover, {
+      naturalHeight: { configurable: true, value: 180 },
+      naturalWidth: { configurable: true, value: 360 },
+    });
+    fireEvent.load(firstCover);
+    fireEvent.load(secondCover);
+
+    const gallery = document.querySelector('[data-gallery="library"]');
+    expect(firstCard.style.width).toBe("90px");
+    expect(secondCard.style.width).toBe("360px");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("2");
+    expect(gallery?.getAttribute("data-page-count")).toBe("3");
+
+    resizeGallery("library", 600, 584);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("6");
+    expect(gallery?.getAttribute("data-page-count")).toBe("2");
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not dispatch cover work for a presentation that completes after its page unmounts", async () => {
+    const latePresentation = createDeferred<string[]>();
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(["/Movies/Late presentation.mp4"]);
+    fetchLibraryPresentationMock.mockReturnValueOnce(latePresentation.promise);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByRole("heading", { name: "Late presentation" });
+    await waitFor(() => expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(1));
+    selectSettings();
+
+    await act(async () => {
+      latePresentation.resolve(automaticLibraryPresentation("movie"));
+      await latePresentation.promise;
+    });
+    expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
+    expect(createObjectUrlMock).not.toHaveBeenCalled();
+  });
+
+  it("shows one automatic details surface, isolates explicit actions, and revokes its cover", async () => {
+    const path = "/Movies/Exact local title.mp4";
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([path]);
+    fetchLibraryPresentationMock.mockResolvedValue(
+      automaticLibraryPresentation("movie"),
+    );
+
+    render(<App />);
+    selectLibrary();
+    const detailsTrigger = await screen.findByRole("button", {
+      name: "View Library details: Exact local title",
+    });
+    await waitFor(() => expect(fetchLibraryCoverMock).toHaveBeenCalledTimes(1));
+    detailsTrigger.focus();
+    fireEvent.click(detailsTrigger);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Automatic presentation")).toBeTruthy();
+    expect(within(dialog).getByText("Exact provider title")).toBeTruthy();
+    expect(within(dialog).getByText("Exact actor")).toBeTruthy();
+    expect(within(dialog).getByText(path)).toBeTruthy();
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(detailsTrigger));
+
+    fireEvent.click(
+      screen.getByRole("heading", { name: "Exact local title" }),
+    );
+    expect(await screen.findByRole("dialog")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Close Library details" }),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy title: Exact local title" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(clipboardWriteMock).toHaveBeenCalledWith("Exact local title");
+
+    selectSettings();
+    await waitFor(() => expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:javdb-cover"));
+  });
+
+  it("closes details and focuses the current category when Refresh removes its trigger", async () => {
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock
+      .mockResolvedValueOnce(["/Movies/Removed during refresh.mp4"])
+      .mockResolvedValueOnce(["/Movies/Replacement.mp4"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View Library details: Removed during refresh",
+      }),
+    );
+    await screen.findByRole("dialog");
+    fireEvent.click(
+      screen.getByRole("button", { hidden: true, name: "Refresh" }),
+    );
+
+    expect(await screen.findByRole("heading", { name: "Replacement" })).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("radio", { name: "Movies" }),
+      ),
+    );
+  });
+
+  it("keeps an explicit Movie association authoritative without automatic work", async () => {
+    const path = "/Movies/Exact local title.mp4";
+    savedMoviesFolder = "/Movies";
+    movieMetadataAssociations.set(path, {
+      generation: "4",
+      imdbId: "tt0123456",
+      posterPath: "/explicit.jpg",
+      title: "Explicit provider title",
+      tmdbMovieId: "419",
+    });
+    scanMoviesMock.mockResolvedValue([path]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View Library details: Exact local title",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Explicit match")).toBeTruthy();
+    expect(fetchLibraryPresentationMock).not.toHaveBeenCalled();
+    expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps an explicit grouped TV association authoritative without automatic work", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        association: {
+          imdbId: "tt1234567",
+          name: "Explicit TV title",
+          posterPath: "/explicit-tv.jpg",
+          tmdbTvId: "701",
+        },
+        members: [
+          {
+            path: "/TV/Exact Local Show.S01E01.mp4",
+            relativePath: "Exact Local Show.S01E01.mp4",
+          },
+        ],
+        metadataState: "ready",
+        showTitle: "Exact Local Show",
+      }),
+    );
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "View Library details: Exact Local Show",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Explicit match")).toBeTruthy();
+    expect(within(dialog).getByText("Explicit TV title")).toBeTruthy();
+    expect(fetchLibraryPresentationMock).not.toHaveBeenCalled();
+    expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["adult", "Adult", "ADLT-123", "/Adult/ADLT-123 Part 01.mp4"],
+    ["vr", "VR", "MDVR-419", "/VR/MDVR-419 PT 02.mkv"],
+  ] as const)(
+    "requests one exact current %s grouped identity and opens its automatic details",
+    async (category, categoryLabel, code, path) => {
+      if (category === "adult") {
+        savedAdultFolder = "/Adult";
+        scanAdultLibraryMock.mockResolvedValue([path, path.slice(7), "5"]);
+      } else {
+        savedVrFolder = "/VR";
+        scanVrLibraryMock.mockResolvedValue([path, "5"]);
+      }
+      fetchLibraryPresentationMock.mockResolvedValue(
+        automaticLibraryPresentation(category),
+      );
+
+      render(<App />);
+      selectLibrary();
+      fireEvent.click(screen.getByRole("radio", { name: categoryLabel }));
+      await waitFor(() => expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(1));
+      expect(fetchLibraryPresentationMock).toHaveBeenCalledWith({
+        category,
+        code,
+        itemId: `code:${code}`,
+        scanGeneration: "1",
+      });
+      await screen.findByText("Automatic · Fixture provider");
+      fireEvent.click(
+        screen.getByRole("button", { name: `View Library details: ${code}` }),
+      );
+      const dialog = await screen.findByRole("dialog");
+      expect(within(dialog).getByText("Automatic presentation")).toBeTruthy();
+      expect(within(dialog).getByRole("heading", { name: code })).toBeTruthy();
+    },
+  );
+
+  it("keeps unassociated Adult and TV files local without provider dispatch", async () => {
+    savedAdultFolder = "/Adult";
+    savedTvFolder = "/TV";
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/No product code.mp4",
+      "No product code.mp4",
+      "5",
+    ]);
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        members: [
+          {
+            path: "/TV/Unassociated feature.mp4",
+            relativePath: "Unassociated feature.mp4",
+          },
+        ],
+        showTitle: null,
+      }),
+    );
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { name: "No product code" });
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    await screen.findByRole("heading", { name: "Unassociated feature" });
+    expect(fetchLibraryPresentationMock).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "View Library details: Unassociated feature",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Local only")).toBeTruthy();
+    expect(within(dialog).getByText("/TV/Unassociated feature.mp4")).toBeTruthy();
+  });
+
+  it("retries presentation and cover failures locally without changing the Library item", async () => {
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(["/Movies/Retry local title.mp4"]);
+    fetchLibraryPresentationMock
+      .mockRejectedValueOnce("library_enrichment_failed")
+      .mockResolvedValueOnce(automaticLibraryPresentation("movie"));
+    fetchLibraryCoverMock
+      .mockRejectedValueOnce("library_enrichment_failed")
+      .mockResolvedValueOnce([
+        0xff, 0xd8, 0xff, 0xe0, 0, 16, 0, 0, 0, 0, 0, 0,
+      ]);
+
+    render(<App />);
+    selectLibrary();
+    const presentationRetry = await screen.findByRole("button", { name: "Retry" });
+    fireEvent.click(presentationRetry);
+    await waitFor(() => expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(2));
+    const coverRetry = await screen.findByRole("button", { name: "Retry" });
+    fireEvent.click(coverRetry);
+    await waitFor(() => expect(fetchLibraryCoverMock).toHaveBeenCalledTimes(2));
+    expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("heading", { name: "Retry local title" })).toBeTruthy();
+    expect(openMovieMock).not.toHaveBeenCalled();
+    expect(revealMovieMock).not.toHaveBeenCalled();
+    expect(trashMovieMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a presentation superseded by Refresh and uses only the current cover authority", async () => {
+    const stale = createDeferred<string[]>();
+    const path = "/Movies/Refresh identity.mp4";
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue([path]);
+    const current = automaticLibraryPresentation("movie", "Current provider title");
+    current[11] = "library-cover-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const old = automaticLibraryPresentation("movie", "Stale provider title");
+    fetchLibraryPresentationMock
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce(current);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByRole("heading", { name: "Refresh identity" });
+    await waitFor(() => expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(fetchLibraryCoverMock).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      stale.resolve(old);
+      await stale.promise;
+    });
+    expect(fetchLibraryCoverMock).toHaveBeenCalledTimes(1);
+    expect(fetchLibraryCoverMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        coverAuthorityId:
+          "library-cover-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "View Library details: Refresh identity",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Current provider title")).toBeTruthy();
+    expect(within(dialog).queryByText("Stale provider title")).toBeNull();
+  });
+
+  it("rejects a late presentation after TMDB token replacement and loads the current authority", async () => {
+    const stale = createDeferred<string[]>();
+    savedMoviesFolder = "/Movies";
+    loadTmdbTokenMock.mockResolvedValue("old-token");
+    scanMoviesMock.mockResolvedValue(["/Movies/Token identity.mp4"]);
+    const current = automaticLibraryPresentation(
+      "movie",
+      "Current token presentation",
+    );
+    current[11] =
+      "library-cover-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    fetchLibraryPresentationMock
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce(current);
+
+    render(<App />);
+    selectLibrary();
+    await screen.findByRole("heading", { name: "Token identity" });
+    await waitFor(() =>
+      expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(1),
+    );
+
+    selectSettings();
+    fireEvent.change(screen.getByLabelText("New token"), {
+      target: { value: "replacement-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Replace token" }));
+    expect(await screen.findByText("TMDB token replaced.")).toBeTruthy();
+    selectLibrary();
+    await waitFor(() =>
+      expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(2),
+    );
+    await screen.findByText("Automatic · Fixture provider");
+
+    await act(async () => {
+      stale.resolve(
+        automaticLibraryPresentation("movie", "Stale token presentation"),
+      );
+      await stale.promise;
+    });
+    expect(fetchLibraryCoverMock).toHaveBeenCalledTimes(1);
+    expect(fetchLibraryCoverMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        coverAuthorityId:
+          "library-cover-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "View Library details: Token identity",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Current token presentation")).toBeTruthy();
+    expect(within(dialog).queryByText("Stale token presentation")).toBeNull();
+  });
 });
 
 describe("parsed TV Library and Dashboard", () => {
@@ -1648,7 +2318,7 @@ describe("parsed TV Library and Dashboard", () => {
     );
   });
 
-  it("searches then sorts then paginates immediately across 25, 7, and 10 item capacities", async () => {
+  it("searches then sorts then paginates immediately across 14, 10, and 7 item capacities", async () => {
     savedTvFolder = "/TV";
     scanTvLibraryMock.mockResolvedValue([
       ...Array.from({ length: 30 }, (_, index) => {
@@ -1667,16 +2337,16 @@ describe("parsed TV Library and Dashboard", () => {
     fireEvent.click(screen.getByRole("radio", { name: "TV" }));
     await screen.findByRole("heading", { level: 3, name: "Show 01" });
     const gallery = document.querySelector('[data-gallery="library"]');
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("25");
-    expect(visibleCardCount("TV shows and unassociated files")).toBe(25);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("14");
+    expect(visibleCardCount("TV shows and unassociated files")).toBe(14);
     fireEvent.click(screen.getByRole("button", { name: /Next TV shows/ }));
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
 
     resizeGallery("library", 1528, 136);
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
     resizeGallery("library", 1088, 284);
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
 
     fireEvent.change(
@@ -2421,7 +3091,7 @@ describe("parsed TV Library and Dashboard", () => {
     scanTvLibraryMock
       .mockResolvedValueOnce(rows)
       .mockResolvedValueOnce(rows.slice(0, -3));
-    gallerySizes.library = { width: 1528, height: 136 };
+    gallerySizes.library = { width: 1088, height: 284 };
 
     render(<App />);
     selectLibrary();
@@ -3020,7 +3690,7 @@ describe("explicit TV Library TMDB show metadata matching", () => {
     ).toBeTruthy();
   });
 
-  it("keeps associations through the 25 to 7 to 10 responsive pager without provider requests", async () => {
+  it("keeps associations through the 14 to 10 to 7 responsive pager without provider requests", async () => {
     savedTvFolder = "/TV";
     const rows = Array.from({ length: 25 }, (_, index) => {
       const localTitle = `Local Show ${String(index + 1).padStart(2, "0")}`;
@@ -3054,11 +3724,11 @@ describe("explicit TV Library TMDB show metadata matching", () => {
     selectTvLibrary();
     await screen.findByRole("heading", { name: "Canonical Show 01" });
     resizeGallery("library", 1088, 728);
-    expect(visibleCardCount("TV shows and unassociated files")).toBe(25);
+    expect(visibleCardCount("TV shows and unassociated files")).toBe(14);
     resizeGallery("library", 1528, 136);
-    expect(visibleCardCount("TV shows and unassociated files")).toBe(7);
-    resizeGallery("library", 1088, 284);
     expect(visibleCardCount("TV shows and unassociated files")).toBe(10);
+    resizeGallery("library", 1088, 284);
+    expect(visibleCardCount("TV shows and unassociated files")).toBe(7);
     expect(screen.getByRole("heading", { name: "Canonical Show 01" })).toBeTruthy();
     expect(scanTvLibraryMock).toHaveBeenCalledTimes(1);
     expect(searchTvShowMetadataMock).not.toHaveBeenCalled();
@@ -3289,7 +3959,7 @@ describe("parsed Adult Library and Dashboard", () => {
     expect(unassociatedHeading.textContent).toBe("作品  without code");
   });
 
-  it("searches then sorts then paginates across 25, 7, and 10 without changing Dashboard totals", async () => {
+  it("searches then sorts then paginates across 14, 10, and 7 without changing Dashboard totals", async () => {
     savedAdultFolder = "/Adult";
     scanAdultLibraryMock.mockResolvedValue([
       ...Array.from({ length: 30 }, (_, index) => {
@@ -3308,16 +3978,16 @@ describe("parsed Adult Library and Dashboard", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
     await screen.findByRole("heading", { level: 3, name: "ADLT-101" });
     let gallery = document.querySelector('[data-gallery="library"]');
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("25");
-    expect(visibleCardCount("Adult titles and unassociated files")).toBe(25);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("14");
+    expect(visibleCardCount("Adult titles and unassociated files")).toBe(14);
     fireEvent.click(screen.getByRole("button", { name: /Next Adult titles/ }));
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
 
     resizeGallery("library", 1528, 136);
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
     resizeGallery("library", 1088, 284);
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
@@ -3885,7 +4555,7 @@ describe("parsed Adult Library and Dashboard", () => {
     scanAdultLibraryMock
       .mockResolvedValueOnce(rows)
       .mockResolvedValueOnce(rows.slice(0, -3));
-    gallerySizes.library = { width: 1528, height: 136 };
+    gallerySizes.library = { width: 1088, height: 284 };
 
     render(<App />);
     selectLibrary();
@@ -4239,18 +4909,18 @@ describe("parsed VR Library and Dashboard", () => {
     await screen.findByText("MDVR-101");
 
     resizeGallery("library", 1088, 728);
-    expect(visibleCardCount("VR titles")).toBe(25);
+    expect(visibleCardCount("VR titles")).toBe(14);
     resizeGallery("library", 1528, 136);
-    expect(visibleCardCount("VR titles")).toBe(7);
-    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    expect(visibleCardCount("VR titles")).toBe(10);
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
     fireEvent.click(
       screen.getByRole("button", { name: "Next VR titles page" }),
     );
-    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
-    resizeGallery("library", 1088, 284);
-    expect(visibleCardCount("VR titles")).toBe(10);
     expect(screen.getByText("Page 2 of 3")).toBeTruthy();
-    expect(screen.getByText("MDVR-111")).toBeTruthy();
+    resizeGallery("library", 1088, 284);
+    expect(visibleCardCount("VR titles")).toBe(7);
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+    expect(screen.getByText("MDVR-108")).toBeTruthy();
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
       target: { value: "MDVR-125" },
@@ -4700,7 +5370,7 @@ describe("parsed VR Library and Dashboard", () => {
     scanVrLibraryMock
       .mockResolvedValueOnce(rows)
       .mockResolvedValueOnce(rows.slice(0, -2));
-    gallerySizes.library = { width: 1528, height: 136 };
+    gallerySizes.library = { width: 1088, height: 284 };
 
     render(<App />);
     selectLibrary();
@@ -5358,7 +6028,7 @@ describe("Movies Library Dashboard", () => {
     expect(document.activeElement).toBe(openLibrary);
     fireEvent.click(openLibrary);
     await screen.findByText("Movie 01");
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
     expect(visibleCardCount("Movies")).toBe(7);
     fireEvent.click(
       screen.getByRole("button", { name: "Next Movies page" }),
@@ -15712,7 +16382,7 @@ describe("local Movies library", () => {
     );
     selectLibrary();
     await screen.findByText("Library 01");
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
     fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
     fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
     expect(screen.getByText("Page 3 of 3")).toBeTruthy();
@@ -16087,7 +16757,7 @@ describe("local Movies library", () => {
     );
     selectLibrary();
     await screen.findByText("Library 01");
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
     for (let page = 1; page < 4; page += 1) {
       fireEvent.click(
         screen.getByRole("button", { name: "Next Movies page" }),
@@ -16147,7 +16817,7 @@ describe("local Movies library", () => {
       within(card).getByRole("button", { name: /Open movie:/ }),
     ).toHaveProperty("disabled", false);
 
-    resizeGallery("library", 1088, 284);
+    resizeGallery("library", 1528, 136);
     expect(screen.getByText("Page 3 of 3")).toBeTruthy();
     expect(
       screen.getByRole("button", { name: /Copied title:/ }),
@@ -16238,7 +16908,7 @@ describe("local Movies library", () => {
     );
     selectLibrary();
     await screen.findByText("Library 01");
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
     for (let page = 1; page < 4; page += 1) {
       fireEvent.click(
         screen.getByRole("button", { name: "Next Movies page" }),
@@ -16331,7 +17001,7 @@ describe("local Movies library", () => {
     expect(revealMovieMock).toHaveBeenCalledTimes(2);
     expect(revealMovieMock).toHaveBeenNthCalledWith(2, { path: exactPath });
 
-    resizeGallery("library", 1088, 284);
+    resizeGallery("library", 1528, 136);
     expect(screen.getByText("Page 3 of 3")).toBeTruthy();
     expect(screen.getByRole("button", { name: /Copied title:/ })).toBeTruthy();
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
@@ -16531,7 +17201,7 @@ describe("Movies Library title search", () => {
     render(<App />);
     selectLibrary();
     await screen.findByText("Title 01");
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
     expect(visibleCardCount("Movies")).toBe(7);
     expect(screen.queryByText(exactTitle)).toBeNull();
 
@@ -16663,7 +17333,7 @@ describe("Movies Library title search", () => {
     render(<App />);
     selectLibrary();
     await screen.findByText("Match 01");
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
     searchMovies("Match");
     expect(screen.getByText("Page 1 of 3")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
@@ -16687,8 +17357,8 @@ describe("Movies Library title search", () => {
     expect(screen.getByText("Page 3 of 3")).toBeTruthy();
 
     resizeGallery("library", 1088, 136);
-    expect(screen.getByText("Page 3 of 4")).toBeTruthy();
-    expect(screen.getByText("Match 11")).toBeTruthy();
+    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    expect(screen.getByText("Match 15")).toBeTruthy();
 
     searchMovies("Match 0");
     expect(screen.getByText("Page 1 of 2")).toBeTruthy();
@@ -16696,7 +17366,7 @@ describe("Movies Library title search", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Clear Movies search" }),
     );
-    expect(screen.getByText("Page 1 of 5")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
     expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).not.toHaveBeenCalled();
@@ -16829,7 +17499,7 @@ describe("Movies Library title sorting", () => {
     render(<App />);
     selectLibrary();
     await screen.findByText("Zulu");
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
 
     const sortControl = screen.getByRole("combobox", {
       name: "Sort titles",
@@ -16900,7 +17570,7 @@ describe("Movies Library title sorting", () => {
     render(<App />);
     selectLibrary();
     await screen.findByText("Match 01");
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
     searchMovies("match");
     sortMovies("descending");
 
@@ -16939,11 +17609,11 @@ describe("Movies Library title sorting", () => {
     expect(screen.getByText("Page 3 of 3")).toBeTruthy();
 
     resizeGallery("library", 1088, 136);
-    expect(screen.getByText("Page 3 of 4")).toBeTruthy();
-    expect(visibleMovieTitles()[0]).toBe("Match 08");
+    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    expect(visibleMovieTitles()[0]).toBe("Match 04");
 
     sortMovies("ascending");
-    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
     expect(visibleMovieTitles()[0]).toBe("Match 01");
     expect(
       screen.getByRole("textbox", { name: "Search titles" }),
@@ -17183,7 +17853,7 @@ describe("resize-aware media galleries", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("updates Library through the 25 to 7 to 10 regression without rescanning and clamps its page", async () => {
+  it("updates Library through the 14 to 7 to 10 regression without rescanning and clamps its page", async () => {
     const paths = Array.from(
       { length: 25 },
       (_, index) =>
@@ -17197,8 +17867,8 @@ describe("resize-aware media galleries", () => {
     await screen.findByText("Library 01");
 
     resizeGallery("library", 1088, 728);
-    expect(visibleCardCount("Movies")).toBe(25);
-    expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+    expect(visibleCardCount("Movies")).toBe(14);
+    expect(screen.getByText("Page 1 of 2")).toBeTruthy();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Copy title: Library 01" }),
@@ -17209,7 +17879,7 @@ describe("resize-aware media galleries", () => {
       }),
     ).toBeTruthy();
 
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
     expect(visibleCardCount("Movies")).toBe(7);
     expect(screen.getByText("Page 1 of 4")).toBeTruthy();
     expect(
@@ -17223,14 +17893,14 @@ describe("resize-aware media galleries", () => {
     nextPage.focus();
     expect(document.activeElement).toBe(nextPage);
 
-    resizeGallery("library", 1088, 284);
+    resizeGallery("library", 1528, 136);
     expect(visibleCardCount("Movies")).toBe(10);
     expect(screen.getByText("Page 1 of 3")).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "Copied title: Library 01" }),
     ).toBeTruthy();
 
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
     for (let page = 1; page < 4; page += 1) {
       fireEvent.click(
         screen.getByRole("button", { name: "Next Movies page" }),
@@ -17240,7 +17910,7 @@ describe("resize-aware media galleries", () => {
     expect(visibleCardCount("Movies")).toBe(4);
     expect(screen.getByText("Library 22")).toBeTruthy();
 
-    resizeGallery("library", 1088, 284);
+    resizeGallery("library", 1528, 136);
     expect(screen.getByText("Page 3 of 3")).toBeTruthy();
     expect(visibleCardCount("Movies")).toBe(5);
     expect(screen.getByText("Library 21")).toBeTruthy();
@@ -17927,7 +18597,7 @@ describe("explicit Movie Library TMDB metadata matching", () => {
     render(<App />);
     selectLibrary();
     await screen.findByRole("heading", { name: "B Local" });
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 284);
     fireEvent.click(
       screen.getByRole("button", { name: "Match metadata: B Local" }),
     );
