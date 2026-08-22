@@ -30,6 +30,7 @@ const TMDB_POSTER_ASPECT: f64 = 2.0 / 3.0;
 const PROVIDER_TEXT_LIMIT: usize = 4 * 1024 * 1024;
 const COVER_BYTE_LIMIT: usize = 16 * 1024 * 1024;
 const COVER_MIN_BYTES: usize = 6_000;
+const MAX_PRESENTATION_ASPECT: f64 = 4.0;
 const HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
 #[cfg(target_os = "macos")]
 const HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_code}";
@@ -685,6 +686,24 @@ fn tmdb_candidate_matches_details(
     titles_match && dates_match
 }
 
+fn tmdb_candidates_are_consistent(left: &TmdbSearchCandidate, right: &TmdbSearchCandidate) -> bool {
+    let mut left_titles = left
+        .titles
+        .iter()
+        .map(|title| normalized_title(title))
+        .collect::<Vec<_>>();
+    left_titles.sort();
+    left_titles.dedup();
+    let mut right_titles = right
+        .titles
+        .iter()
+        .map(|title| normalized_title(title))
+        .collect::<Vec<_>>();
+    right_titles.sort();
+    right_titles.dedup();
+    left.date == right.date && left_titles == right_titles
+}
+
 fn has_descriptive_metadata(presentation: &LibraryPresentation) -> bool {
     presentation.title.is_some()
         || presentation.date.is_some()
@@ -776,6 +795,7 @@ fn tmdb_search(
         "first_air_date"
     };
     let mut candidates = Vec::new();
+    let mut provider_identities = Vec::new();
     for result in results {
         let Some(result) = json_object(result) else {
             continue;
@@ -785,10 +805,14 @@ fn tmdb_search(
         };
         let date = optional_date(result, date_key);
         let titles = tmdb_titles(result, &title_keys);
-        if titles.is_empty() || !year_matches(authority.year.as_deref(), date.as_deref()) {
+        if titles.is_empty() {
             continue;
         }
-        candidates.push(TmdbSearchCandidate { id, date, titles });
+        let candidate = TmdbSearchCandidate { id, date, titles };
+        provider_identities.push(candidate.clone());
+        if year_matches(authority.year.as_deref(), candidate.date.as_deref()) {
+            candidates.push(candidate);
+        }
     }
     if candidates.is_empty() {
         return Ok(TmdbSearchOutcome::Rejected);
@@ -824,6 +848,17 @@ fn tmdb_search(
     } else {
         return Ok(TmdbSearchOutcome::Rejected);
     };
+    let selected_candidates = provider_identities
+        .iter()
+        .filter(|candidate| candidate.id == provider_id)
+        .collect::<Vec<_>>();
+    if selected_candidates
+        .iter()
+        .skip(1)
+        .any(|candidate| !tmdb_candidates_are_consistent(selected_candidates[0], candidate))
+    {
+        return Ok(TmdbSearchOutcome::Rejected);
+    }
     Ok(TmdbSearchOutcome::Accepted {
         provider_id,
         candidates,
@@ -1787,6 +1822,68 @@ fn decode_text(value: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+fn valid_persisted_presentation(presentation: &LibraryPresentation) -> bool {
+    if !presentation.aspect_ratio.is_finite()
+        || presentation.aspect_ratio <= 0.0
+        || presentation.aspect_ratio > MAX_PRESENTATION_ASPECT
+    {
+        return false;
+    }
+    let automatic = presentation.is_automatic();
+    let local_only = presentation.source.is_none()
+        && presentation.provider_id.is_none()
+        && presentation.imdb_id.is_none()
+        && presentation.title.is_none()
+        && presentation.original_title.is_none()
+        && presentation.date.is_none()
+        && presentation.runtime.is_none()
+        && presentation.genres.is_empty()
+        && presentation.cast.is_empty()
+        && presentation.overview.is_none();
+    if !automatic && !local_only {
+        return false;
+    }
+    if presentation
+        .provider_id
+        .as_deref()
+        .is_some_and(|provider_id| {
+            provider_id != provider_id.trim()
+                || provider_id.len() > 128
+                || provider_id.bytes().any(|byte| byte.is_ascii_control())
+        })
+        || presentation.imdb_id.as_deref().is_some_and(|imdb_id| {
+            let digits = imdb_id.strip_prefix("tt").unwrap_or("");
+            !(7..=10).contains(&digits.len()) || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        || presentation
+            .date
+            .as_deref()
+            .is_some_and(|date| !valid_date(date))
+        || presentation
+            .genres
+            .iter()
+            .chain(&presentation.cast)
+            .any(|value| value.trim().is_empty())
+    {
+        return false;
+    }
+    match (presentation.cover_state, presentation.cover.as_ref()) {
+        ("ready", Some(cover)) => {
+            cover.aspect_ratio.is_finite()
+                && cover.aspect_ratio > 0.0
+                && cover.aspect_ratio <= MAX_PRESENTATION_ASPECT
+                && cover.aspect_ratio == presentation.aspect_ratio
+                && valid_image_request(&ProviderImageRequest {
+                    url: cover.url.clone(),
+                    referer: cover.referer.clone(),
+                    cookie: cover.cookie.clone(),
+                })
+        }
+        ("missing" | "unavailable", None) => true,
+        _ => false,
+    }
+}
+
 fn read_cache(path: &Path) -> Result<Vec<CacheEntry>, ()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -1864,6 +1961,9 @@ fn read_cache(path: &Path) -> Result<Vec<CacheEntry>, ()> {
                 .map(|value| decode_text(value).ok_or(()))
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        if !valid_persisted_presentation(&presentation) {
+            return Err(());
+        }
         entries.push(CacheEntry {
             identity,
             metadata_saved_at,
@@ -2011,6 +2111,14 @@ pub(crate) fn fetch_presentation_with(
     let cached_metadata = cached
         .as_ref()
         .filter(|entry| now.saturating_sub(entry.metadata_saved_at) <= METADATA_TTL_SECONDS)
+        .filter(|entry| {
+            !(matches!(
+                authority.category,
+                LibraryCategory::Adult | LibraryCategory::Vr
+            ) && entry.presentation.cover_state == "missing"
+                && !entry.presentation.is_automatic()
+                && now.saturating_sub(entry.cover_saved_at) > COVER_TTL_SECONDS)
+        })
         .cloned();
     let resolved = match authority.category {
         LibraryCategory::Movie | LibraryCategory::Tv => resolve_movie_or_tv_presentation(
@@ -2634,6 +2742,48 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_movie_provider_id_with_conflicting_search_identity_never_dispatches_details() {
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Movie,
+            identity: "duplicate-movie-id".to_owned(),
+            local_title: "Exact Movie".to_owned(),
+            year: Some("1999".to_owned()),
+            code: None,
+        };
+        let calls = Cell::new(0);
+        let presentation = tmdb_presentation(&authority, Some("token"), &mut |_| {
+            calls.set(calls.get() + 1);
+            Ok(r#"{"results":[{"id":419,"title":"Exact Movie","release_date":"1999-04-19"},{"id":419,"title":"Contradictory Movie","release_date":"2005-04-19"}]}"#.to_owned())
+        })
+        .expect("a conflicting duplicate Movie identity must remain local");
+
+        assert_eq!(calls.get(), 1);
+        assert!(!presentation.is_automatic());
+        assert!(presentation.provider_id.is_none());
+    }
+
+    #[test]
+    fn duplicate_tv_provider_id_with_conflicting_search_identity_never_dispatches_details() {
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Tv,
+            identity: "duplicate-tv-id".to_owned(),
+            local_title: "Exact Show".to_owned(),
+            year: None,
+            code: None,
+        };
+        let calls = Cell::new(0);
+        let presentation = tmdb_presentation(&authority, Some("token"), &mut |_| {
+            calls.set(calls.get() + 1);
+            Ok(r#"{"results":[{"id":701,"name":"Exact Show","first_air_date":"2020-01-01"},{"id":701,"name":"Contradictory Show","first_air_date":"2021-01-01"}]}"#.to_owned())
+        })
+        .expect("a conflicting duplicate TV identity must remain local");
+
+        assert_eq!(calls.get(), 1);
+        assert!(!presentation.is_automatic());
+        assert!(presentation.provider_id.is_none());
+    }
+
+    #[test]
     fn tv_cover_fallback_uses_imdb_then_title_before_anilist() {
         let authority = LibraryItemAuthority {
             category: LibraryCategory::Tv,
@@ -3093,38 +3243,224 @@ mod tests {
         original.cover_saved_at = 0;
         write_cache(&fixture.path, &entries).expect("expired miss must persist");
 
-        let refreshed_calls = Cell::new(0);
-        fetch_presentation_with(
+        let expired_entry = entries
+            .iter()
+            .find(|entry| entry.identity == authority.identity)
+            .expect("the expired miss must remain present")
+            .clone();
+        let transient_calls = Cell::new(0);
+        assert_eq!(
+            fetch_presentation_with(
+                &LibraryEnrichmentState::default(),
+                &fixture.path,
+                &authority,
+                None,
+                |_| {
+                    transient_calls.set(transient_calls.get() + 1);
+                    Err(ProviderRequestError::SourceUnavailable)
+                },
+                |_| {
+                    transient_calls.set(transient_calls.get() + 1);
+                    Err(ProviderRequestError::SourceUnavailable)
+                },
+                |_| {
+                    transient_calls.set(transient_calls.get() + 1);
+                    Err(ProviderRequestError::Network)
+                },
+            ),
+            Err(LIBRARY_ENRICHMENT_FAILED)
+        );
+        assert!(transient_calls.get() > 0);
+        let unchanged =
+            read_cache(&fixture.path).expect("the expired miss cache must remain valid");
+        let unchanged = unchanged
+            .iter()
+            .find(|entry| entry.identity == authority.identity)
+            .expect("a transient failure must not remove the expired miss record");
+        assert_eq!(unchanged.metadata_saved_at, expired_entry.metadata_saved_at);
+        assert_eq!(unchanged.cover_saved_at, expired_entry.cover_saved_at);
+
+        let retry_calls = Cell::new(0);
+        let retried = fetch_presentation_with(
             &LibraryEnrichmentState::default(),
             &fixture.path,
             &authority,
             None,
             |_| {
-                refreshed_calls.set(refreshed_calls.get() + 1);
+                retry_calls.set(retry_calls.get() + 1);
                 Err(ProviderRequestError::SourceUnavailable)
             },
             |_| {
-                refreshed_calls.set(refreshed_calls.get() + 1);
-                Err(ProviderRequestError::SourceUnavailable)
+                retry_calls.set(retry_calls.get() + 1);
+                Ok(jpeg(400, 600))
             },
             |_| {
-                refreshed_calls.set(refreshed_calls.get() + 1);
-                Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
+                retry_calls.set(retry_calls.get() + 1);
+                Err(ProviderRequestError::SourceUnavailable)
             },
         )
-        .expect("an expired miss may be confirmed again");
-        assert!(refreshed_calls.get() > 0);
+        .expect("retry after a transient failure must resolve current provider work");
+        assert!(retry_calls.get() > 0);
+        assert_eq!(retried[2], "automatic");
+        assert_eq!(retried[12], "ready");
 
         fetch_presentation_with(
             &LibraryEnrichmentState::default(),
             &fixture.path,
             &authority,
             None,
-            |_| panic!("the refreshed miss must suppress text provider work"),
-            |_| panic!("the refreshed miss must suppress image provider work"),
-            |_| panic!("the refreshed miss must suppress JavDB work"),
+            |_| panic!("the successful retry must suppress text provider work"),
+            |_| panic!("the successful retry must suppress image provider work"),
+            |_| panic!("the successful retry must suppress JavDB work"),
         )
-        .expect("the refreshed miss must remain durable");
+        .expect("the successful retry must remain durable");
+    }
+
+    #[test]
+    fn structurally_invalid_presentation_cache_entries_are_replaced_by_provider_resolution() {
+        let authority = LibraryItemAuthority {
+            category: LibraryCategory::Movie,
+            identity: "invalid-presentation-cache".to_owned(),
+            local_title: "Current Movie".to_owned(),
+            year: None,
+            code: None,
+        };
+        let valid_source = CoverSource {
+            url: "https://image.tmdb.org/t/p/w500/exact.jpg".to_owned(),
+            referer: String::new(),
+            cookie: String::new(),
+            aspect_ratio: TMDB_POSTER_ASPECT,
+        };
+        let ready_presentation = LibraryPresentation {
+            source: Some("TMDB".to_owned()),
+            provider_id: Some("1".to_owned()),
+            imdb_id: None,
+            title: Some("Stale Movie".to_owned()),
+            original_title: None,
+            date: Some("1999-01-01".to_owned()),
+            runtime: None,
+            genres: Vec::new(),
+            cast: Vec::new(),
+            overview: None,
+            cover: Some(valid_source.clone()),
+            cover_state: "ready",
+            aspect_ratio: TMDB_POSTER_ASPECT,
+        };
+        let invalid_presentations = [
+            (
+                "non-finite ratio",
+                LibraryPresentation {
+                    aspect_ratio: f64::NAN,
+                    cover: None,
+                    cover_state: "missing",
+                    ..ready_presentation.clone()
+                },
+            ),
+            (
+                "zero ratio",
+                LibraryPresentation {
+                    aspect_ratio: 0.0,
+                    cover: None,
+                    cover_state: "missing",
+                    ..ready_presentation.clone()
+                },
+            ),
+            (
+                "negative ratio",
+                LibraryPresentation {
+                    aspect_ratio: -0.5,
+                    cover: None,
+                    cover_state: "missing",
+                    ..ready_presentation.clone()
+                },
+            ),
+            (
+                "out-of-range ratio",
+                LibraryPresentation {
+                    aspect_ratio: MAX_PRESENTATION_ASPECT + 0.1,
+                    cover: None,
+                    cover_state: "missing",
+                    ..ready_presentation.clone()
+                },
+            ),
+            (
+                "ready without source",
+                LibraryPresentation {
+                    cover: None,
+                    ..ready_presentation.clone()
+                },
+            ),
+            (
+                "source with non-ready state",
+                LibraryPresentation {
+                    cover_state: "missing",
+                    ..ready_presentation.clone()
+                },
+            ),
+            (
+                "unapproved source",
+                LibraryPresentation {
+                    cover: Some(CoverSource {
+                        url: "https://evil.example/exact.jpg".to_owned(),
+                        ..valid_source.clone()
+                    }),
+                    ..ready_presentation.clone()
+                },
+            ),
+            (
+                "structurally invalid source",
+                LibraryPresentation {
+                    cover: Some(CoverSource {
+                        url: "https://image.tmdb.org\\t/p/w500/exact.jpg".to_owned(),
+                        ..valid_source.clone()
+                    }),
+                    ..ready_presentation.clone()
+                },
+            ),
+        ];
+
+        for (name, invalid_presentation) in invalid_presentations {
+            let fixture = CacheFixture::new();
+            write_cache(
+                &fixture.path,
+                &[CacheEntry {
+                    identity: authority.identity.clone(),
+                    metadata_saved_at: now_seconds(),
+                    cover_saved_at: now_seconds(),
+                    presentation: invalid_presentation,
+                }],
+            )
+            .unwrap_or_else(|_| panic!("{name} fixture must persist"));
+            let calls = Cell::new(0);
+            let mut responses = vec![
+                r#"{"results":[{"id":2,"title":"Current Movie","release_date":"2000-01-01"}]}"#.to_owned(),
+                r#"{"id":2,"title":"Current Movie","release_date":"2000-01-01","genres":[],"credits":{"cast":[]},"external_ids":{},"poster_path":null}"#.to_owned(),
+            ]
+            .into_iter();
+            let resolved = fetch_presentation_with(
+                &LibraryEnrichmentState::default(),
+                &fixture.path,
+                &authority,
+                Some("token"),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(responses.next().expect("provider fixture response"))
+                },
+                |_| panic!("the replacement presentation has no cover"),
+                |_| panic!("Movie enrichment must not use JavDB"),
+            )
+            .unwrap_or_else(|_| panic!("{name} must permit current provider resolution"));
+            assert_eq!(calls.get(), 2, "{name}");
+            assert_eq!(resolved[2], "automatic", "{name}");
+            assert_eq!(resolved[6], "Current Movie", "{name}");
+            assert_eq!(
+                read_cache(&fixture.path)
+                    .unwrap_or_else(|_| panic!("{name} replacement cache must be valid"))
+                    .len(),
+                1,
+                "{name}"
+            );
+        }
     }
 
     #[test]

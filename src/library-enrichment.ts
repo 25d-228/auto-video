@@ -34,6 +34,7 @@ export type LibraryPresentationState =
       presentation: LibraryPresentation;
       coverUrl: string | null;
       coverStatus: "loading" | "ready" | "missing" | "unavailable";
+      reportCoverDecodeFailure: (() => void) | null;
       retryCover: (() => void) | null;
     }
   | { status: "error"; retry: () => void };
@@ -379,6 +380,7 @@ export function useLibraryPresentation(
             presentation,
             coverUrl: null,
             coverStatus: presentation.coverState,
+            reportCoverDecodeFailure: null,
             retryCover:
               presentation.state === "automatic" &&
               presentation.coverState === "unavailable"
@@ -395,6 +397,7 @@ export function useLibraryPresentation(
           presentation,
           coverUrl: null,
           coverStatus: "loading",
+          reportCoverDecodeFailure: null,
           retryCover: null,
         });
         try {
@@ -406,11 +409,29 @@ export function useLibraryPresentation(
           objectUrl = URL.createObjectURL(
             new Blob([cover.bytes as BlobPart], { type: cover.type }),
           );
+          const coverKey = `${currentKey}\0${presentation.coverAuthorityId}`;
           setState({
             status: "ready",
             presentation,
             coverUrl: objectUrl,
             coverStatus: "ready",
+            reportCoverDecodeFailure: () => {
+              if (!current || objectUrl === null) return;
+              URL.revokeObjectURL(objectUrl);
+              objectUrl = null;
+              setState({
+                status: "ready",
+                presentation,
+                coverUrl: null,
+                coverStatus: "unavailable",
+                reportCoverDecodeFailure: null,
+                retryCover: () => {
+                  presentationRequests.delete(currentKey);
+                  coverRequests.delete(coverKey);
+                  setRetryGeneration((generation) => generation + 1);
+                },
+              });
+            },
             retryCover: null,
           });
         } catch {
@@ -420,6 +441,7 @@ export function useLibraryPresentation(
             presentation,
             coverUrl: null,
             coverStatus: "unavailable",
+            reportCoverDecodeFailure: null,
             retryCover: () =>
               setRetryGeneration((generation) => generation + 1),
           });

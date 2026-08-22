@@ -2073,6 +2073,72 @@ describe("automatic Library presentation", () => {
     expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
   });
 
+  it("uses the explicit Movie primary title for a missing-cover placeholder and trigger", async () => {
+    const path = "/Movies/Exact local title.mp4";
+    savedMoviesFolder = "/Movies";
+    movieMetadataAssociations.set(path, {
+      generation: "4",
+      imdbId: "tt0123456",
+      title: "Explicit provider title",
+      tmdbMovieId: "419",
+    });
+    scanMoviesMock.mockResolvedValue([path]);
+
+    render(<App />);
+    selectLibrary();
+    const trigger = await screen.findByRole("button", {
+      name: "View Library details: Explicit provider title",
+    });
+    expect(
+      within(trigger)
+        .getByLabelText("Cover unavailable for Explicit provider title")
+        .getAttribute("data-placeholder-title"),
+    ).toBe("Explicit provider title");
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getAllByText("Exact local title").length).toBeGreaterThan(0);
+    expect(within(dialog).getByText("Explicit provider title")).toBeTruthy();
+    expect(fetchLibraryPresentationMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the explicit grouped TV primary title for a missing-cover placeholder and trigger", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        association: {
+          imdbId: "tt1234567",
+          name: "Explicit TV title",
+          tmdbTvId: "701",
+        },
+        members: [
+          {
+            path: "/TV/Exact Local Show.S01E01.mp4",
+            relativePath: "Exact Local Show.S01E01.mp4",
+          },
+        ],
+        metadataState: "ready",
+        showTitle: "Exact Local Show",
+      }),
+    );
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    const trigger = await screen.findByRole("button", {
+      name: "View Library details: Explicit TV title",
+    });
+    expect(
+      within(trigger)
+        .getByLabelText("Cover unavailable for Explicit TV title")
+        .getAttribute("data-placeholder-title"),
+    ).toBe("Explicit TV title");
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getAllByText("Exact Local Show").length).toBeGreaterThan(0);
+    expect(within(dialog).getByText("Explicit TV title")).toBeTruthy();
+    expect(fetchLibraryPresentationMock).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["adult", "Adult", "ADLT-123", "/Adult/ADLT-123 Part 01.mp4"],
     ["vr", "VR", "MDVR-419", "/VR/MDVR-419 PT 02.mkv"],
@@ -2172,6 +2238,81 @@ describe("automatic Library presentation", () => {
     expect(openMovieMock).not.toHaveBeenCalled();
     expect(revealMovieMock).not.toHaveBeenCalled();
     expect(trashMovieMock).not.toHaveBeenCalled();
+  });
+
+  it("re-establishes presentation and cover authority after browser image decode fails", async () => {
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(["/Movies/Decode retry title.mp4"]);
+    fetchLibraryPresentationMock.mockResolvedValue(
+      automaticLibraryPresentation("movie"),
+    );
+    createObjectUrlMock
+      .mockReturnValueOnce("blob:decode-failed")
+      .mockReturnValueOnce("blob:decode-replacement");
+
+    render(<App />);
+    selectLibrary();
+    const card = (
+      await screen.findByRole("heading", { name: "Decode retry title" })
+    ).closest("article") as HTMLElement;
+    const failedImage = await waitFor(() => {
+      const image = card.querySelector("img");
+      expect(image?.getAttribute("src")).toBe("blob:decode-failed");
+      return image as HTMLImageElement;
+    });
+    fireEvent.error(failedImage);
+
+    await waitFor(() =>
+      expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:decode-failed"),
+    );
+    expect(card.style.width).toBe("90px");
+    expect(
+      within(card)
+        .getByLabelText("Cover unavailable for Decode retry title")
+        .getAttribute("data-placeholder-title"),
+    ).toBe("Decode retry title");
+    fireEvent.click(within(card).getByRole("button", { name: "Retry" }));
+
+    await waitFor(() =>
+      expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(2),
+    );
+    expect(fetchLibraryCoverMock).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(card.querySelector("img")?.getAttribute("src")).toBe(
+        "blob:decode-replacement",
+      ),
+    );
+    expect(within(card).queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "Decode retry title" })).toBeTruthy();
+  });
+
+  it("reports an expired exact-code miss refresh failure as unavailable and retries provider work", async () => {
+    savedAdultFolder = "/Adult";
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/ADLT-123.mp4",
+      "ADLT-123.mp4",
+      "5",
+    ]);
+    fetchLibraryPresentationMock
+      .mockRejectedValueOnce("library_enrichment_failed")
+      .mockResolvedValueOnce(automaticLibraryPresentation("adult"));
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    const card = screen.getByRole("heading", { name: "ADLT-123" }).closest(
+      "article",
+    ) as HTMLElement;
+    expect(within(card).getAllByText("Presentation unavailable")).toHaveLength(2);
+    expect(within(card).queryByText("Local only")).toBeNull();
+
+    fireEvent.click(retry);
+    await waitFor(() =>
+      expect(fetchLibraryPresentationMock).toHaveBeenCalledTimes(2),
+    );
+    expect(await within(card).findByText("Automatic · Fixture provider")).toBeTruthy();
+    expect(within(card).queryByText("Local only")).toBeNull();
   });
 
   it("rejects a presentation superseded by Refresh and uses only the current cover authority", async () => {

@@ -6101,6 +6101,7 @@ function LibraryPresentationSurface({
   onDetailsUpdate,
   onRatioChange,
   onUnmount,
+  primaryTitle,
   request,
   sizeBytes,
 }: {
@@ -6114,6 +6115,7 @@ function LibraryPresentationSurface({
   onDetailsUpdate: (context: LibraryDetailsContext) => void;
   onRatioChange: (ratio: number) => void;
   onUnmount: (triggerId: string) => void;
+  primaryTitle: string;
   request: LibraryEnrichmentRequest | null;
   sizeBytes: bigint;
 }) {
@@ -6164,6 +6166,10 @@ function LibraryPresentationSurface({
     explicitPresentation?.coverUrl ??
     (automaticState.status === "ready" ? automaticState.coverUrl : null);
   const coverUrl = imageFailed ? null : resolvedCoverUrl;
+  const coverAccessibleTitle =
+    explicitPresentation !== null && explicitPresentation.coverUrl === null
+      ? primaryTitle
+      : localTitle;
   const retry =
     automaticState.status === "error"
       ? automaticState.retry
@@ -6233,7 +6239,7 @@ function LibraryPresentationSurface({
   return (
     <div className="library-card__cover">
       <button
-        aria-label={`View Library details: ${localTitle}`}
+        aria-label={`View Library details: ${coverAccessibleTitle}`}
         className="library-card__details-trigger"
         id={triggerId}
         onClick={() => onDetails(detailsContextRef.current)}
@@ -6241,9 +6247,9 @@ function LibraryPresentationSurface({
       >
         {coverUrl === null ? (
           <span
-            aria-label={`${placeholderMessage} for ${localTitle}`}
+            aria-label={`${placeholderMessage} for ${coverAccessibleTitle}`}
             className="library-card__placeholder"
-            data-placeholder-title={localTitle}
+            data-placeholder-title={coverAccessibleTitle}
           >
             <AppIcon name={fallbackIcon} />
             <span>{placeholderMessage}</span>
@@ -6251,7 +6257,12 @@ function LibraryPresentationSurface({
         ) : (
           <img
             alt=""
-            onError={() => setImageFailed(true)}
+            onError={() => {
+              setImageFailed(true);
+              if (automaticState.status === "ready") {
+                automaticState.reportCoverDecodeFailure?.();
+              }
+            }}
             onLoad={(event) => {
               const { naturalHeight, naturalWidth } = event.currentTarget;
               if (naturalHeight > 0 && naturalWidth > 0) {
@@ -6660,6 +6671,7 @@ function LibraryMovieCard({
         onDetailsUpdate={onLibraryDetailsUpdate}
         onRatioChange={onPresentationRatio}
         onUnmount={onPresentationUnmount}
+        primaryTitle={primaryTitle}
         request={
           movie.association === null && enrichmentEnabled
             ? {
@@ -7175,6 +7187,7 @@ function VrLibraryCard({
         onDetailsUpdate={onLibraryDetailsUpdate}
         onRatioChange={onPresentationRatio}
         onUnmount={onPresentationUnmount}
+        primaryTitle={item.title}
         request={
           item.code === null
             ? null
@@ -7559,6 +7572,7 @@ function TvLibraryCard({
         onDetailsUpdate={onLibraryDetailsUpdate}
         onRatioChange={onPresentationRatio}
         onUnmount={onPresentationUnmount}
+        primaryTitle={item.title}
         request={
           item.association == null &&
           enrichmentEnabled &&
@@ -7965,6 +7979,7 @@ function AdultLibraryCard({
         onDetailsUpdate={onLibraryDetailsUpdate}
         onRatioChange={onPresentationRatio}
         onUnmount={onPresentationUnmount}
+        primaryTitle={item.title}
         request={
           item.code === null
             ? null
