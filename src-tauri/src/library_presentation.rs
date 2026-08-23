@@ -1936,6 +1936,42 @@ mod tests {
     }
 
     #[test]
+    fn distinct_javdb_cover_alternatives_dispatch_only_the_preferred_cover() {
+        let authority = authority(LibraryPresentationCategory::Vr);
+        let image_calls = Cell::new(0);
+        let (cover, metadata, transient) = resolve_cover_with(
+            &authority,
+            |url| {
+                Ok(if url.contains("search") {
+                    r#"{"success":1,"data":{"movies":[{"id":"item","number":"MDVR-419","title":"Exact listing","cover_url":"https://tp.cmastd.com/listing-cover.jpg","thumb_url":"https://tp.cmastd.com/listing-thumb.jpg"}]}}"#.to_owned()
+                } else {
+                    r#"{"success":1,"data":{"movie":{"id":"item","number":"MDVR-419","title":"Exact detail","tags":[{"id":"212","name":"VR"}],"cover_url":"https://tp.cmastd.com/detail-cover.jpg","thumb_url":"https://tp.cmastd.com/detail-thumb.jpg"}}}"#.to_owned()
+                })
+            },
+            |url| {
+                image_calls.set(image_calls.get() + 1);
+                assert_eq!(url, "https://tp.cmastd.com/detail-cover.jpg");
+                Ok(jpeg(600, 800))
+            },
+            |_| panic!("FANZA must not run after the preferred JavDB cover succeeds"),
+            |_| panic!("FANZA image must not run"),
+            |_| panic!("legacy must not run after the preferred JavDB cover succeeds"),
+            |_| panic!("legacy image must not run"),
+        );
+        let source = cover
+            .expect("the preferred exact JavDB cover must resolve")
+            .0;
+        assert_eq!(source.provider, "JavDB");
+        assert_eq!(source.url, "https://tp.cmastd.com/detail-cover.jpg");
+        assert_eq!(image_calls.get(), 1);
+        assert_eq!(
+            metadata.and_then(|value| value.title),
+            Some("Exact detail".to_owned())
+        );
+        assert!(!transient);
+    }
+
+    #[test]
     fn exact_3dsvr_identity_reaches_javdb_and_then_exact_category_fanza_fallback() {
         let authority = LibraryItemAuthority {
             category: LibraryPresentationCategory::Vr,

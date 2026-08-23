@@ -352,10 +352,9 @@ fn exact_cover_url(
             Some(JsonValue::String(url)) if valid_cover_url(url) => url,
             Some(_) => return Err(CatalogDocumentError::Malformed),
         };
-        if accepted.as_ref().is_some_and(|current| current != url) {
-            return Err(CatalogDocumentError::Conflicting);
+        if accepted.is_none() {
+            accepted = Some(url.clone());
         }
-        accepted = Some(url.clone());
     }
     Ok(accepted)
 }
@@ -2293,6 +2292,10 @@ mod tests {
             r#""cover_url":42"#,
             r#""cover_url":"https://tp.cmastd.com.evil.example/cover.jpg""#,
             r#""cover_url":" https://tp.cmastd.com/cover.jpg ""#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":42"#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":"https://tp.cmastd.com.evil.example/thumb.jpg""#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":" https://tp.cmastd.com/thumb.jpg ""#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":"https://tp.cmastd.com/thumb.jpg\u0000""#,
         ] {
             let calls = Cell::new(0);
             assert_eq!(
@@ -2322,15 +2325,55 @@ mod tests {
         assert!(accepted.cover_url.is_none());
         assert_eq!(calls.get(), 2);
 
+        for malformed_detail_cover in [
+            r#""cover_url":[]"#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":[]"#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":"https://tp.cmastd.com.evil.example/thumb.jpg""#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":" https://tp.cmastd.com/thumb.jpg ""#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":"https://tp.cmastd.com/thumb.jpg\u0000""#,
+        ] {
+            assert_eq!(
+                fetch_exact_library_item_with("adult", "CAWB-1", &mut |url| {
+                    Ok(if url.contains("search") {
+                        r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"CAWB-1","cover_url":null}]}}"#.to_owned()
+                    } else {
+                        r#"{"success":1,"data":{"movie":{"id":"Exact","number":"CAWB-1","tags":[],$COVER}}}"#
+                            .replace("$COVER", malformed_detail_cover)
+                    })
+                }),
+                Err(ProviderRequestError::Provider)
+            );
+        }
+    }
+
+    #[test]
+    fn exact_library_prefers_cover_url_over_a_distinct_valid_thumbnail() {
+        let listing_cover = fetch_exact_library_item_with("vr", "MDVR-419", &mut |url| {
+            Ok(if url.contains("search") {
+                r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"MDVR-419","cover_url":"https://tp.cmastd.com/listing-cover.jpg","thumb_url":"https://tp.cmastd.com/listing-thumb.jpg"}]}}"#.to_owned()
+            } else {
+                r#"{"success":1,"data":{"movie":{"id":"Exact","number":"MDVR-419","tags":[{"id":"212"}],"cover_url":null,"thumb_url":null}}}"#.to_owned()
+            })
+        })
+        .expect("distinct valid listing image alternatives must be accepted")
+        .expect("the exact listing item must remain accepted");
         assert_eq!(
-            fetch_exact_library_item_with("adult", "CAWB-1", &mut |url| {
-                Ok(if url.contains("search") {
-                    r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"CAWB-1","cover_url":null}]}}"#.to_owned()
-                } else {
-                    r#"{"success":1,"data":{"movie":{"id":"Exact","number":"CAWB-1","tags":[],"cover_url":[]}}}"#.to_owned()
-                })
-            }),
-            Err(ProviderRequestError::Provider)
+            listing_cover.cover_url.as_deref(),
+            Some("https://tp.cmastd.com/listing-cover.jpg")
+        );
+
+        let detail_cover = fetch_exact_library_item_with("vr", "MDVR-419", &mut |url| {
+            Ok(if url.contains("search") {
+                r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"MDVR-419","cover_url":null,"thumb_url":null}]}}"#.to_owned()
+            } else {
+                r#"{"success":1,"data":{"movie":{"id":"Exact","number":"MDVR-419","tags":[{"id":"212"}],"cover_url":"https://tp.cmastd.com/detail-cover.jpg","thumb_url":"https://tp.cmastd.com/detail-thumb.jpg"}}}"#.to_owned()
+            })
+        })
+        .expect("distinct valid detail image alternatives must be accepted")
+        .expect("the exact detail item must remain accepted");
+        assert_eq!(
+            detail_cover.cover_url.as_deref(),
+            Some("https://tp.cmastd.com/detail-cover.jpg")
         );
     }
 
