@@ -14,7 +14,7 @@ use std::process::Command;
 use std::process::Stdio;
 
 use crate::{
-    vr_torrent::{JsonParser, JsonValue},
+    vr_torrent::{product_code_display_form, product_code_forms, JsonParser, JsonValue},
     ProviderRequestError, ADULT_NETWORK_ERROR, ADULT_PROVIDER_ERROR, ADULT_SOURCE_UNAVAILABLE,
     VR_NETWORK_ERROR, VR_PROVIDER_ERROR, VR_SOURCE_UNAVAILABLE,
 };
@@ -231,6 +231,17 @@ struct ParsedDetail {
     preview_urls: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExactLibraryItem {
+    pub provider_item_id: String,
+    pub display_code: String,
+    pub title: Option<String>,
+    pub release_date: Option<String>,
+    pub duration: Option<String>,
+    pub actors: Vec<String>,
+    pub cover_url: Option<String>,
+}
+
 fn valid_provider_item_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -240,23 +251,7 @@ fn valid_provider_item_id(value: &str) -> bool {
 }
 
 fn canonical_product_code(value: &str) -> Option<String> {
-    let value = value.trim();
-    let prefix_end = value
-        .bytes()
-        .position(|character| !character.is_ascii_alphabetic())?;
-    let prefix = &value[..prefix_end];
-    if !(2..=16).contains(&prefix.len()) {
-        return None;
-    }
-    let number = value[prefix_end..].trim_start_matches([' ', '_', '-']);
-    if number.is_empty()
-        || number.len() > 10
-        || !number.bytes().all(|character| character.is_ascii_digit())
-    {
-        return None;
-    }
-    let number = number.parse::<u64>().ok()?;
-    (number > 0).then(|| format!("{}-{number}", prefix.to_ascii_uppercase()))
+    crate::vr_torrent::canonical_product_code(value)
 }
 
 fn optional_text(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {
@@ -334,6 +329,10 @@ fn valid_cover_url(value: &str) -> bool {
             .is_some_and(u8::is_ascii_alphanumeric)
 }
 
+pub(crate) fn valid_library_cover_url(value: &str) -> bool {
+    valid_cover_url(value)
+}
+
 fn cover_url(movie: &BTreeMap<String, JsonValue>) -> Option<String> {
     ["cover_url", "thumb_url"].into_iter().find_map(|key| {
         let JsonValue::String(value) = movie.get(key)? else {
@@ -407,7 +406,7 @@ fn parse_detail(
     let Some(JsonValue::String(number)) = movie.get("number") else {
         return Err(CatalogDocumentError::Malformed);
     };
-    if canonical_product_code(number).as_deref() != Some(code) {
+    if canonical_product_code(number) != canonical_product_code(code) {
         return Err(CatalogDocumentError::Conflicting);
     }
 
@@ -463,6 +462,61 @@ fn parse_detail(
     })
 }
 
+pub(crate) fn fetch_exact_library_item_with(
+    category: &str,
+    code: &str,
+    fetch: &mut impl FnMut(&str) -> Result<String, ProviderRequestError>,
+) -> Result<Option<ExactLibraryItem>, ProviderRequestError> {
+    let category = CatalogCategory::parse(category).ok_or(ProviderRequestError::Provider)?;
+    let requested_identity = canonical_product_code(code).ok_or(ProviderRequestError::Provider)?;
+    if product_code_display_form(code).as_deref() != Some(code) {
+        return Err(ProviderRequestError::Provider);
+    }
+
+    let listing = fetch(&format!(
+        "{JAVDB_API_URL}/api/v2/search?q={code}&type=movie"
+    ))?;
+    let listing = parse_listing(&listing).map_err(|_| ProviderRequestError::Provider)?;
+    let mut exact_items = listing
+        .items
+        .into_iter()
+        .filter(|item| canonical_product_code(&item.code).as_deref() == Some(&requested_identity))
+        .collect::<Vec<_>>();
+    exact_items.sort_by(|left, right| left.provider_item_id.cmp(&right.provider_item_id));
+    exact_items.dedup_by(|left, right| left == right);
+    if exact_items.is_empty() {
+        return Ok(None);
+    }
+    if exact_items.len() != 1 {
+        return Err(ProviderRequestError::Provider);
+    }
+    let item = exact_items
+        .pop()
+        .expect("one exact JavDB Library item was established");
+    let detail = fetch(&format!(
+        "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
+        item.provider_item_id
+    ))?;
+    let detail = parse_detail(&detail, category, &item.provider_item_id, &item.code)
+        .map_err(|_| ProviderRequestError::Provider)?;
+
+    Ok(Some(ExactLibraryItem {
+        provider_item_id: item.provider_item_id,
+        display_code: item.code,
+        title: detail.title.or(item.title),
+        release_date: detail.release_date.or(item.release_date),
+        duration: detail.duration.map(|duration| {
+            if duration.ends_with(" min") {
+                duration
+            } else {
+                format!("{duration} min")
+            }
+        }),
+        actors: detail.actors,
+        cover_url: detail.cover_url.or(item.cover_url),
+    }))
+}
+
 fn parse_listing(document: &str) -> Result<ParsedListing, CatalogDocumentError> {
     let JsonValue::Object(envelope) = JsonParser::new(document)
         .parse()
@@ -498,19 +552,19 @@ fn parse_listing(document: &str) -> Result<ParsedListing, CatalogDocumentError> 
         if !valid_provider_item_id(provider_item_id) {
             continue;
         }
-        let Some(code) = canonical_product_code(number) else {
+        let Some(forms) = product_code_forms(number) else {
             continue;
         };
         if let Some(previous_code) = accepted_codes.get(provider_item_id) {
-            if previous_code != &code {
+            if previous_code != &forms.display {
                 return Err(CatalogDocumentError::Conflicting);
             }
             continue;
         }
-        accepted_codes.insert(provider_item_id.clone(), code.clone());
+        accepted_codes.insert(provider_item_id.clone(), forms.display.clone());
         items.push(CatalogItem {
             provider_item_id: provider_item_id.clone(),
-            code,
+            code: forms.display,
             title: optional_text(movie, "title").or_else(|| optional_text(movie, "origin_title")),
             release_date: optional_text(movie, "release_date"),
             cover_url: cover_url(movie),
@@ -545,7 +599,7 @@ fn adult_item_category(
     match movie.get("number") {
         None | Some(JsonValue::Null) => {}
         Some(JsonValue::String(number)) => match canonical_product_code(number) {
-            Some(code) if code == retained_code => {}
+            Some(code) if Some(&code) == canonical_product_code(retained_code).as_ref() => {}
             Some(_) => return AdultCategoryCheck::Conflicting,
             None => return AdultCategoryCheck::Inconclusive,
         },
@@ -1037,7 +1091,7 @@ fn parsed_detail_request(
         .filter(|generation| *generation > 0)
         .ok_or_else(|| category.stale_error())?;
     if !valid_provider_item_id(&request.provider_item_id)
-        || canonical_product_code(&request.code).as_deref() != Some(&request.code)
+        || product_code_display_form(&request.code).as_deref() != Some(&request.code)
     {
         return Err(category.stale_error());
     }
@@ -2054,7 +2108,7 @@ mod tests {
         })
         .expect("unusable rows must not hide later provider pages");
         assert_eq!(response[1], "1");
-        assert_eq!(response[4], "MDVR-419");
+        assert_eq!(response[4], "MDVR-00419");
     }
 
     #[test]

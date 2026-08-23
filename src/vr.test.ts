@@ -24,6 +24,7 @@ import {
   parseJavdbBrowseResponse,
   parseJavdbDetailResponse,
   previewVrOrganization,
+  productCodeDisplayForm,
   queryVrStorage,
   scanVrLibrary,
   saveVrDownloadLimit,
@@ -108,15 +109,76 @@ describe("VR product-code identity", () => {
     ]) {
       expect(canonicalizeProductCode(value)).toBe("MDVR-419");
     }
+    for (const value of ["3DSVR-01871", "3dsvr_001871", "3DSVR1871"]) {
+      expect(canonicalizeProductCode(value)).toBe("3DSVR-1871");
+    }
+    for (const value of ["cawb-1", "CAWB-001", "cawb_00001"]) {
+      expect(canonicalizeProductCode(value)).toBe("CAWB-1");
+    }
+    expect(productCodeDisplayForm("cawb-1")).toBe("CAWB-1");
+    expect(productCodeDisplayForm("cawb_001")).toBe("CAWB-001");
+    expect(productCodeDisplayForm("CAWB-00001")).toBe("CAWB-00001");
   });
 
   it("rejects missing, malformed, and zero product codes", () => {
-    for (const value of ["", "   ", "MDVR", "419", "MDVR-0", "MDVR-41A"])
+    for (const value of [
+      "",
+      "   ",
+      "MDVR",
+      "419",
+      "MDVR-0",
+      "MDVR-41A",
+      "9DSVR-1871",
+      "12VR-1871",
+    ])
       expect(canonicalizeProductCode(value)).toBeNull();
   });
 });
 
 describe("parsed VR Library identity", () => {
+  it("groups exact 3DSVR members without associating unsupported digit-leading identities", async () => {
+    const first = "/VR/3DSVR-01871-A.mp4";
+    const second = "/VR/3dsvr_001871-B.MKV";
+    const unsupported = "/VR/9DSVR-01871-A.mp4";
+    const embedded = "/VR/X3DSVR-01871-A.mp4";
+    const extended = "/VR/3DSVR-01871B.mp4";
+    const adultOnly = "/VR/459TEN-00048.mp4";
+    const mixed = "/VR/3DSVR-01871-A + MDVR-419.mp4";
+    invokeMock.mockResolvedValue([
+      "12",
+      first,
+      "10",
+      second,
+      "20",
+      unsupported,
+      "30",
+      embedded,
+      "35",
+      extended,
+      "37",
+      adultOnly,
+      "38",
+      mixed,
+      "40",
+      "/VR/3DSVR-01872-A.mp4",
+      "45",
+    ]);
+
+    const { items } = await scanVrLibrary();
+
+    expect(items.find((item) => item.code === "3DSVR-01871")).toMatchObject({
+      id: "code:3DSVR-1871",
+      title: "3DSVR-01871",
+      files: [{ path: first }, { path: second }],
+    });
+    expect(items.find((item) => item.id === `file:${unsupported}`)?.code).toBeNull();
+    expect(items.find((item) => item.id === `file:${embedded}`)?.code).toBeNull();
+    expect(items.find((item) => item.id === `file:${extended}`)?.code).toBeNull();
+    expect(items.find((item) => item.id === `file:${adultOnly}`)?.code).toBeNull();
+    expect(items.find((item) => item.id === `file:${mixed}`)?.code).toBeNull();
+    expect(items.find((item) => item.code === "3DSVR-01872")?.files).toHaveLength(1);
+  });
+
   it("groups only equivalent exact codes and preserves every exact file identity", async () => {
     const firstPath = "/VR/作品/MDVR-419  Disc 01 — 前編.mp4";
     const secondPath = "/VR/mdvr_00419_CD2  特別版.MKV";
@@ -315,7 +377,7 @@ describe("native-owned JavDB browse boundary", () => {
     for (const response of [
       ["7", "1", "adult", "VrA", "MDVR-419", "", "", "", "1.48"],
       ["7", "1", "vr", "Bad Id", "MDVR-419", "", "", "", "1.48"],
-      ["7", "1", "vr", "VrA", "MDVR-0419", "", "", "", "1.48"],
+      ["7", "1", "vr", "VrA", "AB1-2", "", "", "", "1.48"],
       ["7", "1", "vr", "VrA", "MDVR-419", "", "", "https://tp.evil.com/a.jpg", "1.48"],
     ]) {
       expect(parseJavdbBrowseResponse(response, request, "3")).toEqual({
@@ -607,7 +669,7 @@ describe("JavDB exact-code catalog request", () => {
     await expect(fetchExactJavdbVrItem("MDVR-419")).resolves.toEqual({
       status: "ready",
       item: {
-        code: "MDVR-419",
+        code: "MDVR-00419",
         title: "Provider title",
         coverUrl: "https://images.example/exact.jpg",
         source: "JavDB",
@@ -615,6 +677,32 @@ describe("JavDB exact-code catalog request", () => {
     });
     expect(invokeMock).toHaveBeenCalledWith("fetch_javdb_vr_catalog", {
       code: "MDVR-419",
+    });
+  });
+
+  it("preserves the exact verified CAWB manufacturer display code", async () => {
+    invokeMock.mockResolvedValue(`
+      <div class="movie-list">
+        <div class="item">
+          <a class="box" href="/v/cawb">
+            <img data-src="https://images.example/cawb.jpg">
+            <div class="video-title"><strong>CAWB-001</strong> Exact title</div>
+          </a>
+        </div>
+      </div>
+    `);
+
+    await expect(fetchExactJavdbAdultItem("CAWB-1")).resolves.toEqual({
+      status: "ready",
+      item: {
+        code: "CAWB-001",
+        title: "Exact title",
+        coverUrl: "https://images.example/cawb.jpg",
+        source: "JavDB",
+      },
+    });
+    expect(invokeMock).toHaveBeenCalledWith("fetch_javdb_adult_catalog", {
+      code: "CAWB-1",
     });
   });
 
@@ -651,7 +739,7 @@ describe("JavDB exact-code catalog request", () => {
 
   it("rejects a non-canonical request before native dispatch", async () => {
     await expect(fetchExactJavdbVrItem("mdvr-419")).rejects.toThrow(
-      "A canonical VR product code is required.",
+      "An exact VR product code is required.",
     );
     expect(invokeMock).not.toHaveBeenCalled();
   });
@@ -866,7 +954,7 @@ describe("Adult exact-code provider boundaries", () => {
     await expect(fetchExactJavdbAdultItem("ADLT-123")).resolves.toEqual({
       status: "ready",
       item: {
-        code: "ADLT-123",
+        code: "ADLT-00123",
         title: "作品  —  Exact  Title!",
         coverUrl: "https://images.example/adult.jpg",
         source: "JavDB",
@@ -933,6 +1021,19 @@ describe("Adult exact-code provider boundaries", () => {
     });
     expect(invokeMock).toHaveBeenCalledWith("fetch_sukebei_adult_releases", {
       code: "ADLT-123",
+    });
+  });
+
+  it("uses numeric identity for a provider-padded Adult release lookup", async () => {
+    invokeMock.mockResolvedValue(
+      releaseFeed(releaseItem("CAWB-001 exact manufacturer release")),
+    );
+
+    await expect(
+      fetchVerifiedAdultSukebeiReleases("CAWB-001"),
+    ).resolves.toMatchObject({ status: "ready" });
+    expect(invokeMock).toHaveBeenCalledWith("fetch_sukebei_adult_releases", {
+      code: "CAWB-1",
     });
   });
 

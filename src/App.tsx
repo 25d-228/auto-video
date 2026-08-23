@@ -35,6 +35,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
+  useCallback,
   useEffect,
   useId,
   useLayoutEffect,
@@ -44,6 +45,10 @@ import {
 
 import tmdbLogo from "@/assets/tmdb-logo.svg";
 import { Button } from "@/components/ui/button";
+import {
+  naturalWidthGalleryPages,
+  providerGalleryMetrics,
+} from "@/gallery-pagination";
 import {
   fetchFanzaCatalog,
   fetchFanzaCoverObjectUrl,
@@ -142,6 +147,7 @@ import {
 import {
   applyVrOrganization,
   canonicalizeProductCode,
+  productCodeDisplayForm,
   cancelVrDownload,
   cleanupCancelledVrDownload,
   chooseVrFolder,
@@ -203,6 +209,10 @@ import {
   type VrRelease,
   type VrReleasesResult,
 } from "@/vr";
+import {
+  type LibraryPresentationState,
+  useLibraryPresentation,
+} from "@/library-presentation";
 
 import "./index.css";
 
@@ -558,7 +568,7 @@ const minimumGalleryCardWidth = 208;
 // Fixed title limits keep every calculated row within its observed viewport.
 const discoverCardBodyHeight = 160;
 const libraryCardHeight = 136;
-const providerCoverHeight = 180;
+const providerCoverHeight = providerGalleryMetrics.coverHeight;
 const javdbBrowsePeriods: Array<{
   label: string;
   value: JavdbBrowsePeriod;
@@ -2439,6 +2449,58 @@ function JavdbCover({
   );
 }
 
+function ProviderMediaCard({
+  actions,
+  badges = null,
+  className = "",
+  cover,
+  ratio,
+  secondary,
+  source,
+  title,
+  titleId,
+}: {
+  actions: ReactNode;
+  badges?: ReactNode;
+  className?: string;
+  cover: ReactNode;
+  ratio: number;
+  secondary: string;
+  source: string;
+  title: string;
+  titleId: string;
+}) {
+  return (
+    <article
+      aria-labelledby={titleId}
+      className={`provider-browse-card ${className}`.trim()}
+      data-cover-ratio={ratio}
+      data-presentation-card="provider"
+      style={{ width: `${Math.round(providerCoverHeight * ratio)}px` }}
+    >
+      <div className="provider-browse-card__cover">
+        {cover}
+        {badges === null ? null : (
+          <div className="provider-browse-card__badges">{badges}</div>
+        )}
+        <div
+          className="provider-browse-card__actions"
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          {actions}
+        </div>
+      </div>
+      <div className="provider-browse-card__body">
+        <h3 id={titleId}>{title}</h3>
+        <p>{secondary}</p>
+        <span>{source}</span>
+      </div>
+    </article>
+  );
+}
+
 function DiscoverJavdbBrowseCard({
   inLibrary,
   item,
@@ -2461,29 +2523,9 @@ function DiscoverJavdbBrowseCard({
   const releasesTriggerId = `${cardId}-releases`;
 
   return (
-    <article
-      aria-labelledby={`${cardId}-title`}
-      className="provider-browse-card"
-      data-cover-ratio={ratio}
-      style={{ width: `${Math.round(providerCoverHeight * ratio)}px` }}
-    >
-      <div className="provider-browse-card__cover">
-        <JavdbCover
-          item={item}
-          onRatio={(ratio) => {
-            onRatioChange(item, ratio);
-          }}
-        />
-        <div className="provider-browse-card__badges">
-          {inLibrary ? <span>In library</span> : null}
-          {transferState === null ? null : <span>{transferState}</span>}
-        </div>
-        <div
-          className="provider-browse-card__actions"
-          onClick={(event) => event.stopPropagation()}
-          onKeyDown={(event) => event.stopPropagation()}
-          onPointerDown={(event) => event.stopPropagation()}
-        >
+    <ProviderMediaCard
+      actions={
+        <>
           <CopyTitleAction title={item.code} />
           <Button
             aria-label={`Preview: ${item.code}`}
@@ -2517,14 +2559,28 @@ function DiscoverJavdbBrowseCard({
             <AppIcon name="releases" />
             Find releases
           </Button>
-        </div>
-      </div>
-      <div className="provider-browse-card__body">
-        <h3 id={`${cardId}-title`}>{item.code}</h3>
-        <p>{item.title ?? item.releaseDate ?? "Title unavailable"}</p>
-        <span>JavDB</span>
-      </div>
-    </article>
+        </>
+      }
+      badges={
+        <>
+          {inLibrary ? <span>In library</span> : null}
+          {transferState === null ? null : <span>{transferState}</span>}
+        </>
+      }
+      cover={
+        <JavdbCover
+          item={item}
+          onRatio={(ratio) => {
+            onRatioChange(item, ratio);
+          }}
+        />
+      }
+      ratio={ratio}
+      secondary={item.title ?? item.releaseDate ?? "Title unavailable"}
+      source="JavDB"
+      title={item.code}
+      titleId={`${cardId}-title`}
+    />
   );
 }
 
@@ -2604,95 +2660,27 @@ function DiscoverFanzaCard({
 }) {
   const titleId = `fanza-card-${item.category}-${item.requestGeneration}-${item.contentId}`;
   return (
-    <article
-      aria-labelledby={`${titleId}-title`}
-      className="provider-browse-card"
-      data-cover-ratio={ratio}
-      style={{ width: `${Math.round(providerCoverHeight * ratio)}px` }}
-    >
-      <div className="provider-browse-card__cover">
+    <ProviderMediaCard
+      actions={<CopyTitleAction title={item.displayCode} />}
+      cover={
         <FanzaCover item={item} onRatio={onRatioChange} />
-        <div className="provider-browse-card__actions">
-          <CopyTitleAction title={item.displayCode} />
-        </div>
-      </div>
-      <div className="provider-browse-card__body">
-        <h3 id={`${titleId}-title`}>{item.displayCode}</h3>
-        <p>{item.title ?? "Title unavailable"}</p>
-        <span>FANZA</span>
-      </div>
-    </article>
+      }
+      ratio={ratio}
+      secondary={item.title ?? "Title unavailable"}
+      source="FANZA"
+      title={item.displayCode}
+      titleId={`${titleId}-title`}
+    />
   );
 }
-
-// These values mirror the fixed provider-card body and gallery gaps in index.css.
-const naturalBrowseCardHeight = 260;
-const naturalBrowseColumnGap = 14;
-const naturalBrowseRowGap = 16;
 
 function javdbBrowseItemKey(item: JavdbBrowseItem) {
   return `${item.category}:${item.requestGeneration}:${item.providerItemId}`;
 }
 
-function naturalBrowsePages<Item>(
-  items: Item[],
-  itemKey: (item: Item) => string,
-  sourceRatio: (item: Item) => number,
-  ratios: Map<string, number>,
-  width: number,
-  height: number,
-) {
-  if (items.length === 0) {
-    return [[]];
-  }
-  if (width <= 0 || height <= 0) {
-    return items.map((item) => [item]);
-  }
-  const rowCount = Math.max(
-    1,
-    Math.floor(
-      (height + naturalBrowseRowGap) /
-        (naturalBrowseCardHeight + naturalBrowseRowGap),
-    ),
-  );
-  const pages: Item[][] = [];
-  let page: Item[] = [];
-  let rows = 1;
-  let rowWidth = 0;
-  for (const item of items) {
-    const cardWidth = Math.min(
-      width,
-      Math.round(
-        providerCoverHeight *
-          (ratios.get(itemKey(item)) ?? sourceRatio(item)),
-      ),
-    );
-    const nextWidth =
-      rowWidth === 0
-        ? cardWidth
-        : rowWidth + naturalBrowseColumnGap + cardWidth;
-    if (rowWidth !== 0 && nextWidth > width) {
-      if (rows === rowCount) {
-        pages.push(page);
-        page = [];
-        rows = 1;
-      } else {
-        rows += 1;
-      }
-      rowWidth = cardWidth;
-    } else {
-      rowWidth = nextWidth;
-    }
-    page.push(item);
-  }
-  if (page.length > 0) {
-    pages.push(page);
-  }
-  return pages;
-}
-
 function NaturalWidthBrowseGallery<Item>({
   ariaLabel,
+  gallery = "discover",
   itemKey,
   items,
   ratios,
@@ -2702,6 +2690,7 @@ function NaturalWidthBrowseGallery<Item>({
   sourceRatio,
 }: {
   ariaLabel: string;
+  gallery?: "discover" | "library";
   itemKey: (item: Item) => string;
   items: Item[];
   ratios: Map<string, number>;
@@ -2739,7 +2728,7 @@ function NaturalWidthBrowseGallery<Item>({
     return () => observer.disconnect();
   }, []);
 
-  const pages = naturalBrowsePages(
+  const pages = naturalWidthGalleryPages(
     items,
     itemKey,
     sourceRatio,
@@ -2761,7 +2750,7 @@ function NaturalWidthBrowseGallery<Item>({
     <div
       className="media-gallery media-gallery--provider-browse"
       data-current-page={currentPage}
-      data-gallery="discover"
+      data-gallery={gallery}
       data-page-capacity={visibleItems.length}
       data-page-count={pageCount}
       data-viewport-height={bounds.height}
@@ -6038,17 +6027,320 @@ function TvMetadataDetailsDialog({
   );
 }
 
+function useExplicitLibraryPoster(posterUrl: string | null) {
+  const [failed, setFailed] = useState(false);
+  const [retryGeneration, setRetryGeneration] = useState(0);
+
+  useEffect(() => {
+    setFailed(false);
+    setRetryGeneration(0);
+  }, [posterUrl]);
+
+  return {
+    failed,
+    reportFailure: () => setFailed(true),
+    retry: () => {
+      setFailed(false);
+      setRetryGeneration((generation) => generation + 1);
+    },
+    retryGeneration,
+  };
+}
+
+function LibraryCoverArtwork({
+  explicitPoster,
+  icon,
+  onDecodedRatio,
+  presentation,
+  posterUrl = null,
+  title,
+}: {
+  explicitPoster?: ReturnType<typeof useExplicitLibraryPoster>;
+  icon: IconName;
+  onDecodedRatio: (ratio: number) => void;
+  presentation: LibraryPresentationState | null;
+  posterUrl?: string | null;
+  title: string;
+}) {
+  const objectUrl = presentation?.cover.objectUrl ?? posterUrl;
+  const failed =
+    presentation === null
+      ? explicitPoster?.failed === true
+      : presentation.cover.status !== "ready";
+  if (objectUrl === null || failed) {
+    return (
+      <div className="provider-cover__placeholder">
+        <AppIcon name={icon} />
+        <span>{title}</span>
+      </div>
+    );
+  }
+  return (
+    <img
+      alt=""
+      key={`${objectUrl}:${explicitPoster?.retryGeneration ?? 0}`}
+      onError={() => {
+        if (presentation === null) {
+          explicitPoster?.reportFailure();
+        } else {
+          presentation.cover.reportDecodeFailure?.();
+        }
+      }}
+      onLoad={(event) => {
+        const { naturalHeight, naturalWidth } = event.currentTarget;
+        if (naturalHeight > 0 && naturalWidth > 0) {
+          onDecodedRatio(naturalWidth / naturalHeight);
+        }
+      }}
+      src={objectUrl}
+    />
+  );
+}
+
+function LibraryPresentationStatus({
+  explicitMatch,
+  presentation,
+}: {
+  explicitMatch: boolean;
+  presentation: LibraryPresentationState | null;
+}) {
+  if (presentation === null) {
+    return <span>{explicitMatch ? "Explicit match" : "Local only"}</span>;
+  }
+  const coverState = {
+    loading: "Loading cover",
+    ready: "Cover ready",
+    missing: "No cover",
+    unavailable: "Cover unavailable",
+  }[presentation.cover.status];
+  const metadataState = {
+    waiting: "Metadata waiting",
+    loading: "Loading metadata",
+    automatic: "Automatic presentation",
+    "local-only": "Local only",
+    unavailable: "Metadata unavailable",
+  }[presentation.metadata.status];
+  return (
+    <>
+      <span>{coverState}</span>
+      <span>{metadataState}</span>
+    </>
+  );
+}
+
+function LibraryProviderCard({
+  actions = null,
+  className,
+  coverSource,
+  cover,
+  details,
+  explicitMatch = false,
+  libraryCategory,
+  metadataSource,
+  presentation,
+  ratio,
+  secondary,
+  title,
+  titleId,
+}: {
+  actions?: ReactNode;
+  className: string;
+  coverSource: string;
+  cover: ReactNode;
+  details: ReactNode;
+  explicitMatch?: boolean;
+  libraryCategory: LibraryCategory;
+  metadataSource: string;
+  presentation: LibraryPresentationState | null;
+  ratio: number;
+  secondary: string;
+  title: string;
+  titleId: string;
+}) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const detailsOpenRef = useRef(false);
+  const detailsTrigger = useRef<HTMLButtonElement | null>(null);
+  const restoreDetailsFocus = useCallback(() => {
+    queueMicrotask(() => {
+      if (detailsTrigger.current?.isConnected) {
+        detailsTrigger.current.focus();
+        return;
+      }
+      const selectedCategory = document.querySelector<HTMLInputElement>(
+        'input[name="library-category"]:checked',
+      );
+      const currentCategory = ["movies", "tv", "adult", "vr"].includes(
+        selectedCategory?.value ?? "",
+      )
+        ? (selectedCategory?.value as LibraryCategory)
+        : libraryCategory;
+      const refreshId = {
+        movies: "movies-refresh",
+        tv: "tv-library-refresh",
+        adult: "adult-library-refresh",
+        vr: "vr-library-refresh",
+      }[currentCategory];
+      const refresh = document.getElementById(refreshId);
+      if (refresh instanceof HTMLButtonElement && !refresh.disabled) {
+        refresh.focus();
+      } else {
+        selectedCategory?.focus();
+      }
+    });
+  }, [libraryCategory]);
+  const updateDetailsOpen = (open: boolean) => {
+    detailsOpenRef.current = open;
+    setDetailsOpen(open);
+    if (!open) restoreDetailsFocus();
+  };
+
+  useEffect(
+    () => () => {
+      if (detailsOpenRef.current) restoreDetailsFocus();
+    },
+    [restoreDetailsFocus],
+  );
+
+  return (
+    <Dialog.Root onOpenChange={updateDetailsOpen} open={detailsOpen}>
+      <ProviderMediaCard
+        actions={
+          <>
+            <Dialog.Trigger
+              render={
+                <Button
+                  aria-label={`Details: ${title}`}
+                  id={`${titleId}-details-trigger`}
+                  onClick={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  size="xs"
+                  ref={detailsTrigger}
+                  type="button"
+                  variant="ghost"
+                >
+                  <AppIcon name="details" />
+                  Details
+                </Button>
+              }
+            />
+            <CopyTitleAction title={title} />
+            {actions}
+          </>
+        }
+        className={className}
+        cover={cover}
+        ratio={ratio}
+        secondary={secondary}
+        source={coverSource}
+        title={title}
+        titleId={titleId}
+      />
+      <Dialog.Portal>
+        <Dialog.Backdrop className="movie-metadata__backdrop" />
+        <Dialog.Viewport className="movie-metadata__viewport">
+          <Dialog.Popup className="movie-metadata__popup">
+            <div className="movie-metadata__dialog-heading">
+              <div>
+                <p className="card-eyebrow">Library details</p>
+                <Dialog.Title>{title}</Dialog.Title>
+              </div>
+              <Dialog.Close
+                render={
+                  <Button
+                    aria-label={`Close Library details: ${title}`}
+                    onClick={(event) => event.stopPropagation()}
+                    onKeyDown={(event) => event.stopPropagation()}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    size="icon-xs"
+                    type="button"
+                    variant="ghost"
+                  >
+                    <AppIcon name="close" />
+                  </Button>
+                }
+              />
+            </div>
+            <div className="library-presentation__status">
+              <LibraryPresentationStatus
+                explicitMatch={explicitMatch}
+                presentation={presentation}
+              />
+            </div>
+            <dl className="library-presentation__facts">
+              <div>
+                <dt>Cover source</dt>
+                <dd>{coverSource}</dd>
+              </div>
+              <div>
+                <dt>Metadata source</dt>
+                <dd>{metadataSource}</dd>
+              </div>
+            </dl>
+            {presentation?.metadata.value === null ||
+            presentation?.metadata.value === undefined ? null : (
+              <dl className="library-presentation__facts">
+                <div>
+                  <dt>Provider title</dt>
+                  <dd>{presentation.metadata.value.title ?? "Unavailable"}</dd>
+                </div>
+                <div>
+                  <dt>Date</dt>
+                  <dd>{presentation.metadata.value.date ?? "Unavailable"}</dd>
+                </div>
+                <div>
+                  <dt>Runtime</dt>
+                  <dd>{presentation.metadata.value.runtime ?? "Unavailable"}</dd>
+                </div>
+                <div>
+                  <dt>Cast</dt>
+                  <dd>
+                    {presentation.metadata.value.cast.length === 0
+                      ? "Unavailable"
+                      : presentation.metadata.value.cast.join(", ")}
+                  </dd>
+                </div>
+              </dl>
+            )}
+            {details}
+          </Dialog.Popup>
+        </Dialog.Viewport>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+function useLibraryCardRatio(
+  sourceRatio: number,
+  authorityKey: string,
+  onRatioChange: (ratio: number) => void,
+): [number, (ratio: number) => void] {
+  const [decodedRatio, setDecodedRatio] = useState<number | null>(null);
+  const reportedRatio = useRef<number | null>(null);
+  useEffect(() => setDecodedRatio(null), [authorityKey]);
+  const ratio = decodedRatio ?? sourceRatio;
+  useEffect(() => {
+    if (reportedRatio.current !== ratio) {
+      reportedRatio.current = ratio;
+      onRatioChange(ratio);
+    }
+  }, [onRatioChange, ratio]);
+  return [ratio, setDecodedRatio];
+}
+
 function LibraryMovieCard({
   folder,
   movie,
   onMatchMetadata,
   onMovieTrashed,
+  onRatioChange,
   onViewMetadataDetails,
 }: {
   folder: string;
   movie: Movie;
   onMatchMetadata: (movie: Movie, triggerId: string) => void;
   onMovieTrashed: (movie: Movie, folder: string) => void;
+  onRatioChange: (ratio: number) => void;
   onViewMetadataDetails: (movie: Movie, triggerId: string) => void;
 }) {
   const primaryTitle = moviePrimaryTitle(movie);
@@ -6065,12 +6357,17 @@ function LibraryMovieCard({
   const trashCancelButton = useRef<HTMLButtonElement | null>(null);
   const trashDialogPopup = useRef<HTMLDivElement | null>(null);
   const trashTriggerId = useId();
-  const metadataTriggerId = useId();
-  const [posterUnavailable, setPosterUnavailable] = useState(false);
-
-  useEffect(() => {
-    setPosterUnavailable(false);
-  }, [movie.association?.generation, movie.association?.posterPath]);
+  const metadataTriggerId = `movie-metadata-${movie.fileId}`;
+  const posterUrl =
+    movie.association?.posterPath == null
+      ? null
+      : tmdbPosterUrl(movie.association.posterPath);
+  const explicitPoster = useExplicitLibraryPoster(posterUrl);
+  const [ratio, reportDecodedRatio] = useLibraryCardRatio(
+    movie.association?.posterPath == null ? 0.72 : 2 / 3,
+    `${movie.association?.generation ?? "local"}:${movie.association?.posterPath ?? ""}`,
+    onRatioChange,
+  );
 
   const openMovie = async (event: ReactMouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -6171,76 +6468,10 @@ function LibraryMovieCard({
     }
   };
 
-  const fileActionErrorCount =
-    Number(openError !== null) + Number(revealError !== null);
-
   return (
-    <article
-      className="movie-card"
-      data-file-action-errors={fileActionErrorCount}
-      data-open-state={
-        openError === null ? (isOpening ? "pending" : "idle") : "error"
-      }
-      data-reveal-state={
-        revealError === null ? (isRevealing ? "pending" : "idle") : "error"
-      }
-    >
-      <div className="movie-card__header">
-        <span className="movie-card__icon">
-          {movie.association?.posterPath === undefined ||
-          movie.association.posterPath === null ||
-          posterUnavailable ? (
-            <AppIcon name="movie" />
-          ) : (
-            <img
-              alt=""
-              onError={() => setPosterUnavailable(true)}
-              src={tmdbPosterUrl(movie.association.posterPath)}
-            />
-          )}
-        </span>
-        <div className="movie-card__actions">
-          <Button
-            aria-label={`${isOpening ? "Opening" : "Open"} movie: ${primaryTitle}`}
-            disabled={isOpening}
-            onClick={openMovie}
-            onKeyDown={(event) => event.stopPropagation()}
-            onPointerDown={(event) => event.stopPropagation()}
-            size="xs"
-            type="button"
-            variant="outline"
-          >
-            <AppIcon name="open" />
-            {isOpening ? "Opening" : "Open"}
-          </Button>
-          <Button
-            aria-label={`${isRevealing ? "Revealing" : "Reveal"} movie: ${primaryTitle}`}
-            disabled={isRevealing}
-            onClick={revealMovie}
-            onKeyDown={(event) => event.stopPropagation()}
-            onPointerDown={(event) => event.stopPropagation()}
-            size="xs"
-            type="button"
-            variant="outline"
-          >
-            <AppIcon name="reveal" />
-            {isRevealing ? "Revealing" : "Reveal"}
-          </Button>
-        </div>
-      </div>
-      <div className="media-title-row">
-        <div>
-          <h3>{primaryTitle}</h3>
-          {movie.association === null ? null : (
-            <p className="movie-card__metadata-line">
-              TMDB
-              {movie.association.releaseDate === null
-                ? ""
-                : ` · ${movie.association.releaseDate.slice(0, 4)}`}
-            </p>
-          )}
-        </div>
-        <div className="movie-card__title-actions">
+    <LibraryProviderCard
+      actions={
+        <>
           <Button
             aria-label={
               movie.association === null
@@ -6258,134 +6489,208 @@ function LibraryMovieCard({
             }}
             onKeyDown={(event) => event.stopPropagation()}
             onPointerDown={(event) => event.stopPropagation()}
-            size="icon-xs"
-            title={
-              movie.association === null
-                ? "Match metadata"
-                : "View metadata details"
-            }
+            size="xs"
             type="button"
-            variant="outline"
+            variant="ghost"
           >
             <AppIcon name="details" />
+            {movie.association === null ? "Match metadata" : "View metadata"}
           </Button>
-          <AlertDialog.Root
-            onOpenChange={updateTrashDialog}
-            open={trashDialogOpen}
-            triggerId={trashDialogOpen ? trashTriggerId : null}
-          >
-            <AlertDialog.Trigger
-              id={trashTriggerId}
-              render={
-                <Button
-                  aria-label={`Move movie to Trash or Recycle Bin: ${primaryTitle}`}
-                  disabled={isTrashing}
-                  onClick={(event) => event.stopPropagation()}
-                  onKeyDown={(event) => event.stopPropagation()}
-                  onPointerDown={(event) => event.stopPropagation()}
-                  size="icon-xs"
-                  title="Move to Trash or Recycle Bin"
-                  type="button"
-                  variant="destructive"
-                >
-                  <AppIcon name="trash" />
-                </Button>
-              }
-            />
-            <AlertDialog.Portal>
-              <AlertDialog.Backdrop
-                className="trash-dialog__backdrop"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  updateTrashDialog(false);
-                }}
-                onPointerDown={(event) => event.stopPropagation()}
+          {posterUrl !== null && explicitPoster.failed ? (
+            <Button
+              aria-label={`Retry cover: ${primaryTitle}`}
+              onClick={explicitPoster.retry}
+              size="xs"
+              type="button"
+              variant="ghost"
+            >
+              <AppIcon name="refresh" />
+              Retry cover
+            </Button>
+          ) : null}
+        </>
+      }
+      className="movie-card"
+      coverSource={
+        posterUrl !== null && !explicitPoster.failed ? "TMDB" : "Local Library"
+      }
+      cover={
+        <LibraryCoverArtwork
+          explicitPoster={explicitPoster}
+          icon="movie"
+          onDecodedRatio={reportDecodedRatio}
+          posterUrl={posterUrl}
+          presentation={null}
+          title={primaryTitle}
+        />
+      }
+      details={
+        <>
+          <p>
+            Exact local title: <strong>{movie.title}</strong>
+          </p>
+          {movie.association === null ? null : (
+            <p>
+              Explicit provider title: <strong>{movie.association.title}</strong>
+            </p>
+          )}
+          <p title={movie.path}>{movie.relativePath}</p>
+          <p>{formatStorageBytes(BigInt(movie.sizeBytes))}</p>
+          <div className="library-details__file-actions">
+            <Button
+              aria-label={`${isOpening ? "Opening" : "Open"} movie: ${primaryTitle}`}
+              disabled={isOpening}
+              onClick={openMovie}
+              onKeyDown={(event) => event.stopPropagation()}
+              onPointerDown={(event) => event.stopPropagation()}
+              size="xs"
+              type="button"
+              variant="outline"
+            >
+              <AppIcon name="open" />
+              {isOpening ? "Opening" : "Open"}
+            </Button>
+            <Button
+              aria-label={`${isRevealing ? "Revealing" : "Reveal"} movie: ${primaryTitle}`}
+              disabled={isRevealing}
+              onClick={revealMovie}
+              onKeyDown={(event) => event.stopPropagation()}
+              onPointerDown={(event) => event.stopPropagation()}
+              size="xs"
+              type="button"
+              variant="outline"
+            >
+              <AppIcon name="reveal" />
+              {isRevealing ? "Revealing" : "Reveal"}
+            </Button>
+            <AlertDialog.Root
+              onOpenChange={updateTrashDialog}
+              open={trashDialogOpen}
+              triggerId={trashDialogOpen ? trashTriggerId : null}
+            >
+              <AlertDialog.Trigger
+                id={trashTriggerId}
+                render={
+                  <Button
+                    aria-label={`Move movie to Trash or Recycle Bin: ${primaryTitle}`}
+                    disabled={isTrashing}
+                    onClick={(event) => event.stopPropagation()}
+                    onKeyDown={(event) => event.stopPropagation()}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    size="icon-xs"
+                    title="Move to Trash or Recycle Bin"
+                    type="button"
+                    variant="destructive"
+                  >
+                    <AppIcon name="trash" />
+                  </Button>
+                }
               />
-              <AlertDialog.Viewport className="trash-dialog__viewport">
-                <AlertDialog.Popup
-                  aria-busy={isTrashing}
-                  className="trash-dialog__popup"
-                  initialFocus={() => trashCancelButton.current}
-                  onClick={(event) => event.stopPropagation()}
+              <AlertDialog.Portal>
+                <div
+                  aria-hidden="true"
+                  className="trash-dialog__backdrop"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    updateTrashDialog(false);
+                  }}
                   onPointerDown={(event) => event.stopPropagation()}
-                  ref={trashDialogPopup}
-                >
-                  <div className="trash-dialog__heading">
-                    <AlertDialog.Title>
-                      Move “{primaryTitle}” to Trash?
-                    </AlertDialog.Title>
-                    <AlertDialog.Close
-                      render={
-                        <Button
-                          aria-label="Close confirmation"
-                          disabled={isTrashing}
-                          size="icon-xs"
-                          type="button"
-                          variant="ghost"
-                        >
-                          <AppIcon name="close" />
-                        </Button>
-                      }
-                    />
-                  </div>
-                  <AlertDialog.Description>
-                    This moves the selected video to macOS Trash or the Windows
-                    Recycle Bin. It may be recoverable there.
-                  </AlertDialog.Description>
-                  {trashError === null ? null : (
-                    <p
-                      aria-atomic="true"
-                      className="trash-dialog__error"
-                      role="alert"
-                    >
-                      {trashError}
-                    </p>
-                  )}
-                  <div className="trash-dialog__actions">
-                    <AlertDialog.Close
-                      render={
-                        <Button
-                          disabled={isTrashing}
-                          ref={trashCancelButton}
-                          type="button"
-                          variant="outline"
-                        >
-                          Cancel
-                        </Button>
-                      }
-                    />
-                    <Button
-                      aria-label={`${isTrashing ? "Moving" : "Confirm moving"} movie to Trash or Recycle Bin: ${primaryTitle}`}
-                      disabled={isTrashing}
-                      onClick={trashMovie}
-                      onKeyDown={(event) => event.stopPropagation()}
-                      type="button"
-                      variant="destructive"
-                    >
-                      <AppIcon name="trash" />
-                      {isTrashing ? "Moving…" : "Move file"}
-                    </Button>
-                  </div>
-                </AlertDialog.Popup>
-              </AlertDialog.Viewport>
-            </AlertDialog.Portal>
-          </AlertDialog.Root>
-          <CopyTitleAction title={primaryTitle} />
-        </div>
-      </div>
-      <div className="movie-card__file-action-errors">
-        {openError === null ? null : (
-          <p aria-atomic="true" role="alert">
-            {openError}
-          </p>
-        )}
-        {revealError === null ? null : (
-          <p aria-atomic="true" role="alert">
-            {revealError}
-          </p>
-        )}
-      </div>
-    </article>
+                />
+                <AlertDialog.Viewport className="trash-dialog__viewport">
+                  <AlertDialog.Popup
+                    aria-busy={isTrashing}
+                    className="trash-dialog__popup"
+                    initialFocus={() => trashCancelButton.current}
+                    onClick={(event) => event.stopPropagation()}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    ref={trashDialogPopup}
+                  >
+                    <div className="trash-dialog__heading">
+                      <AlertDialog.Title>
+                        Move “{primaryTitle}” to Trash?
+                      </AlertDialog.Title>
+                      <AlertDialog.Close
+                        render={
+                          <Button
+                            aria-label="Close confirmation"
+                            disabled={isTrashing}
+                            size="icon-xs"
+                            type="button"
+                            variant="ghost"
+                          >
+                            <AppIcon name="close" />
+                          </Button>
+                        }
+                      />
+                    </div>
+                    <AlertDialog.Description>
+                      This moves the selected video to macOS Trash or the Windows
+                      Recycle Bin. It may be recoverable there.
+                    </AlertDialog.Description>
+                    {trashError === null ? null : (
+                      <p
+                        aria-atomic="true"
+                        className="trash-dialog__error"
+                        role="alert"
+                      >
+                        {trashError}
+                      </p>
+                    )}
+                    <div className="trash-dialog__actions">
+                      <AlertDialog.Close
+                        render={
+                          <Button
+                            disabled={isTrashing}
+                            ref={trashCancelButton}
+                            type="button"
+                            variant="outline"
+                          >
+                            Cancel
+                          </Button>
+                        }
+                      />
+                      <Button
+                        aria-label={`${isTrashing ? "Moving" : "Confirm moving"} movie to Trash or Recycle Bin: ${primaryTitle}`}
+                        disabled={isTrashing}
+                        onClick={trashMovie}
+                        onKeyDown={(event) => event.stopPropagation()}
+                        type="button"
+                        variant="destructive"
+                      >
+                        <AppIcon name="trash" />
+                        {isTrashing ? "Moving…" : "Move file"}
+                      </Button>
+                    </div>
+                  </AlertDialog.Popup>
+                </AlertDialog.Viewport>
+              </AlertDialog.Portal>
+            </AlertDialog.Root>
+          </div>
+          {openError === null ? null : (
+            <p aria-atomic="true" role="alert">
+              {openError}
+            </p>
+          )}
+          {revealError === null ? null : (
+            <p aria-atomic="true" role="alert">
+              {revealError}
+            </p>
+          )}
+        </>
+      }
+      explicitMatch={movie.association !== null}
+      libraryCategory="movies"
+      metadataSource={movie.association === null ? "Local Library" : "TMDB"}
+      presentation={null}
+      ratio={ratio}
+      secondary={
+        movie.association === null
+          ? "Local only"
+          : `Explicit match${movie.association.releaseDate === null ? "" : ` · ${movie.association.releaseDate.slice(0, 4)}`}`
+      }
+      title={primaryTitle}
+      titleId={`movie-library-card-${movie.fileId}`}
+    />
   );
 }
 
@@ -6560,7 +6865,8 @@ function VrLibraryFileRow({
             }
           />
           <AlertDialog.Portal>
-            <AlertDialog.Backdrop
+            <div
+              aria-hidden="true"
               className="trash-dialog__backdrop"
               onClick={(event) => {
                 event.stopPropagation();
@@ -6653,6 +6959,7 @@ function VrLibraryFileRow({
 
 function VrLibraryCard({
   item,
+  onRatioChange,
   onFileTrashed,
   onTrashPendingChange,
   scanGeneration,
@@ -6660,41 +6967,126 @@ function VrLibraryCard({
   trashPendingPath,
 }: {
   item: VrLibraryItem;
+  onRatioChange: (ratio: number) => void;
   onFileTrashed: (file: VrLibraryFile, scanGeneration: string) => void;
   onTrashPendingChange: (path: string | null) => void;
   scanGeneration: string;
   trashActionsDisabled: boolean;
   trashPendingPath: string | null;
 }) {
+  const presentation = useLibraryPresentation(
+    item.code === null
+      ? null
+      : {
+          category: "vr",
+          itemId: item.code,
+          scanGeneration,
+        },
+  );
+  const [ratio, reportDecodedRatio] = useLibraryCardRatio(
+    item.code === null ? 0.72 : presentation.cover.aspectRatio,
+    `${scanGeneration}:${item.code ?? item.id}:${presentation.cover.objectUrl ?? presentation.cover.status}`,
+    onRatioChange,
+  );
+  const metadata = item.code === null ? null : presentation.metadata.value;
+  const displayCode =
+    presentation.cover.displayCode ?? metadata?.displayCode ?? item.title;
+  const secondary =
+    metadata?.title ??
+    metadata?.date ??
+    (item.code === null
+      ? "Unassociated file"
+      : presentation.cover.status === "loading"
+        ? "Loading cover"
+        : presentation.metadata.status === "waiting" ||
+            presentation.metadata.status === "loading"
+          ? "Loading metadata"
+          : presentation.cover.status === "unavailable" ||
+              presentation.metadata.status === "unavailable"
+            ? "Presentation unavailable"
+            : `${item.files.length} ${item.files.length === 1 ? "file" : "files"}`);
+  const titleId = `vr-library-card-${encodeURIComponent(item.id)}`;
   return (
-    <article className="movie-card vr-library-card">
-      <div className="media-title-row">
-        <div>
-          <p className="card-eyebrow">
-            {item.code === null
-              ? "Unassociated file"
-              : `${item.files.length} ${item.files.length === 1 ? "file" : "files"}`}
-          </p>
-          <h3>{item.title}</h3>
-        </div>
-        <CopyTitleAction title={item.title} />
-      </div>
-      <ul aria-label={`Files for ${item.title}`} className="vr-library-card__files">
-        {item.files.map((file) => (
-          <VrLibraryFileRow
-            file={file}
-            itemCode={item.code}
-            itemTitle={item.title}
-            key={file.path}
-            onFileTrashed={onFileTrashed}
-            onTrashPendingChange={onTrashPendingChange}
-            scanGeneration={scanGeneration}
-            trashActionsDisabled={trashActionsDisabled}
-            trashPendingPath={trashPendingPath}
-          />
-        ))}
-      </ul>
-    </article>
+    <LibraryProviderCard
+      actions={
+        <>
+          {presentation.cover.retry === null ? null : (
+            <Button
+              aria-label={`Retry cover: ${displayCode}`}
+              onClick={presentation.cover.retry}
+              size="xs"
+              type="button"
+              variant="ghost"
+            >
+              <AppIcon name="refresh" />
+              Retry cover
+            </Button>
+          )}
+          {presentation.metadata.retry === null ? null : (
+            <Button
+              aria-label={`Retry presentation: ${displayCode}`}
+              onClick={presentation.metadata.retry}
+              size="xs"
+              type="button"
+              variant="ghost"
+            >
+              <AppIcon name="refresh" />
+              Retry presentation
+            </Button>
+          )}
+        </>
+      }
+      className="movie-card vr-library-card"
+      coverSource={
+        presentation.cover.status === "ready"
+          ? presentation.cover.source ?? "Local Library"
+          : "Local Library"
+      }
+      cover={
+        <LibraryCoverArtwork
+          icon="vr"
+          onDecodedRatio={reportDecodedRatio}
+          presentation={item.code === null ? null : presentation}
+          title={displayCode}
+        />
+      }
+      details={
+        <>
+          <dl className="library-presentation__facts">
+            <div>
+              <dt>Exact local product code</dt>
+              <dd>{item.title}</dd>
+            </div>
+            <div>
+              <dt>Provider display code</dt>
+              <dd>{displayCode}</dd>
+            </div>
+          </dl>
+          <ul aria-label={`Files for ${displayCode}`} className="library-details__members">
+          {item.files.map((file) => (
+            <VrLibraryFileRow
+              file={file}
+              itemCode={item.code}
+              itemTitle={displayCode}
+              key={file.path}
+              onFileTrashed={onFileTrashed}
+              onTrashPendingChange={onTrashPendingChange}
+              scanGeneration={scanGeneration}
+              trashActionsDisabled={trashActionsDisabled}
+              trashPendingPath={trashPendingPath}
+            />
+          ))}
+          </ul>
+        </>
+      }
+      libraryCategory="vr"
+      metadataSource={metadata?.source ?? "Local Library"}
+      presentation={item.code === null ? null : presentation}
+      ratio={ratio}
+      secondary={secondary}
+      title={displayCode}
+      titleId={titleId}
+    />
   );
 }
 
@@ -6865,7 +7257,8 @@ function TvLibraryFileRow({
             }
           />
           <AlertDialog.Portal>
-            <AlertDialog.Backdrop
+            <div
+              aria-hidden="true"
               className="trash-dialog__backdrop"
               onClick={(event) => {
                 event.stopPropagation();
@@ -6963,6 +7356,7 @@ function TvLibraryCard({
   metadataActionsDisabled,
   onMatchMetadata,
   onFileTrashed,
+  onRatioChange,
   onTrashPendingChange,
   onViewMetadataDetails,
   scanGeneration,
@@ -6972,108 +7366,146 @@ function TvLibraryCard({
   metadataActionsDisabled: boolean;
   onMatchMetadata: (item: TvLibraryItem, triggerId: string) => void;
   onFileTrashed: (file: TvLibraryFile, scanGeneration: string) => void;
+  onRatioChange: (ratio: number) => void;
   onTrashPendingChange: (path: string | null) => void;
   onViewMetadataDetails: (item: TvLibraryItem, triggerId: string) => void;
   scanGeneration: string;
   trashPendingPath: string | null;
 }) {
   const metadataTriggerId = useId();
-  const [posterUnavailable, setPosterUnavailable] = useState(false);
-
-  useEffect(() => {
-    setPosterUnavailable(false);
-  }, [item.association?.generation, item.association?.posterPath]);
+  const posterUrl =
+    item.association?.posterPath == null
+      ? null
+      : tmdbPosterUrl(item.association.posterPath);
+  const explicitPoster = useExplicitLibraryPoster(posterUrl);
+  const [ratio, reportDecodedRatio] = useLibraryCardRatio(
+    item.association?.posterPath == null ? 0.72 : 2 / 3,
+    `${item.association?.generation ?? "local"}:${item.association?.posterPath ?? ""}`,
+    onRatioChange,
+  );
+  const titleId = `tv-library-card-${encodeURIComponent(item.id)}`;
 
   return (
-    <article className="movie-card vr-library-card tv-library-card">
-      <div className="movie-card__header">
-        <span className="movie-card__icon">
-          {item.association?.posterPath == null || posterUnavailable ? (
-            <AppIcon name="tv" />
-          ) : (
-            <img
-              alt=""
-              onError={() => setPosterUnavailable(true)}
-              src={tmdbPosterUrl(item.association.posterPath)}
-            />
-          )}
-        </span>
-      </div>
-      <div className="media-title-row">
-        <div>
-          <p className="card-eyebrow">
-            {item.showTitle === null
-              ? "Unassociated file"
-              : `${item.files.length} ${item.files.length === 1 ? "episode" : "episodes"}`}
-          </p>
-          <h3>{item.title}</h3>
-          {item.association == null ? null : (
-            <p className="movie-card__metadata-line">
-              TMDB
-              {item.association.firstAirDate === null
-                ? ""
-                : ` · ${item.association.firstAirDate.slice(0, 4)}`}
-            </p>
-          )}
-        </div>
-        <div className="movie-card__title-actions">
-          <CopyTitleAction title={item.title} />
-          {item.groupId === undefined || item.showTitle === null ? null : item.association == null ? (
+    <LibraryProviderCard
+      actions={
+        <>
+          {item.groupId === undefined ||
+          item.showTitle === null ? null : item.association == null ? (
             <Button
               aria-label={`Match show metadata: ${item.showTitle}`}
-              disabled={metadataActionsDisabled || item.metadataState === "attention"}
+              disabled={
+                metadataActionsDisabled || item.metadataState === "attention"
+              }
               id={metadataTriggerId}
-              onClick={() => onMatchMetadata(item, metadataTriggerId)}
-              size="icon-xs"
-              title="Match show metadata"
+              onClick={(event) => {
+                event.stopPropagation();
+                onMatchMetadata(item, metadataTriggerId);
+              }}
+              size="xs"
               type="button"
-              variant="outline"
+              variant="ghost"
             >
               <AppIcon name="search" />
+              Match metadata
             </Button>
           ) : (
             <Button
               aria-label={`View show metadata details: ${item.title}`}
               disabled={metadataActionsDisabled}
               id={metadataTriggerId}
-              onClick={() => onViewMetadataDetails(item, metadataTriggerId)}
-              size="icon-xs"
-              title="View show metadata details"
+              onClick={(event) => {
+                event.stopPropagation();
+                onViewMetadataDetails(item, metadataTriggerId);
+              }}
+              size="xs"
               type="button"
-              variant="outline"
+              variant="ghost"
             >
               <AppIcon name="details" />
+              View metadata
             </Button>
           )}
-        </div>
-      </div>
-      {item.metadataState === "attention" ? (
-        <p className="movie-metadata__error" role="alert">
-          The saved show association no longer matches its trusted local member anchors. Local episodes remain available without enrichment.
-        </p>
-      ) : null}
-      <ul
-        aria-label={
-          item.showTitle === null
-            ? `File details for ${item.title}`
-            : `Episodes for ${item.title}`
-        }
-        className="vr-library-card__files"
-      >
-        {item.files.map((file) => (
-          <TvLibraryFileRow
-            file={file}
-            itemTitle={item.title}
-            key={file.path}
-            onFileTrashed={onFileTrashed}
-            onTrashPendingChange={onTrashPendingChange}
-            scanGeneration={scanGeneration}
-            showTitle={item.showTitle}
-            trashPendingPath={trashPendingPath}
-          />
-        ))}
-      </ul>
-    </article>
+          {posterUrl !== null && explicitPoster.failed ? (
+            <Button
+              aria-label={`Retry cover: ${item.title}`}
+              onClick={explicitPoster.retry}
+              size="xs"
+              type="button"
+              variant="ghost"
+            >
+              <AppIcon name="refresh" />
+              Retry cover
+            </Button>
+          ) : null}
+        </>
+      }
+      className="movie-card vr-library-card tv-library-card"
+      coverSource={
+        posterUrl !== null && !explicitPoster.failed ? "TMDB" : "Local Library"
+      }
+      cover={
+        <LibraryCoverArtwork
+          explicitPoster={explicitPoster}
+          icon="tv"
+          onDecodedRatio={reportDecodedRatio}
+          posterUrl={posterUrl}
+          presentation={null}
+          title={item.title}
+        />
+      }
+      details={
+        <>
+          <p>
+            Exact local title: <strong>{item.showTitle ?? item.title}</strong>
+          </p>
+          {item.association == null ? null : (
+            <p>
+              Explicit provider title: <strong>{item.association.name}</strong>
+            </p>
+          )}
+          {item.metadataState === "attention" ? (
+            <p className="movie-metadata__error" role="alert">
+              The saved show association no longer matches its trusted local member anchors. Local episodes remain available without enrichment.
+            </p>
+          ) : null}
+          <ul
+            aria-label={
+              item.showTitle === null
+                ? `File details for ${item.title}`
+                : `Episodes for ${item.title}`
+            }
+            className="library-details__members"
+          >
+            {item.files.map((file) => (
+              <TvLibraryFileRow
+                file={file}
+                itemTitle={item.title}
+                key={file.path}
+                onFileTrashed={onFileTrashed}
+                onTrashPendingChange={onTrashPendingChange}
+                scanGeneration={scanGeneration}
+                showTitle={item.showTitle}
+                trashPendingPath={trashPendingPath}
+              />
+            ))}
+          </ul>
+        </>
+      }
+      explicitMatch={item.association != null}
+      libraryCategory="tv"
+      metadataSource={item.association == null ? "Local Library" : "TMDB"}
+      presentation={null}
+      ratio={ratio}
+      secondary={
+        item.association == null
+          ? item.showTitle === null
+            ? "Unassociated file"
+            : `${item.files.length} ${item.files.length === 1 ? "episode" : "episodes"}`
+          : `Explicit match${item.association.firstAirDate === null ? "" : ` · ${item.association.firstAirDate.slice(0, 4)}`}`
+      }
+      title={item.title}
+      titleId={titleId}
+    />
   );
 }
 
@@ -7248,7 +7680,8 @@ function AdultLibraryFileRow({
             }
           />
           <AlertDialog.Portal>
-            <AlertDialog.Backdrop
+            <div
+              aria-hidden="true"
               className="trash-dialog__backdrop"
               onClick={(event) => {
                 event.stopPropagation();
@@ -7341,6 +7774,7 @@ function AdultLibraryFileRow({
 
 function AdultLibraryCard({
   item,
+  onRatioChange,
   onFileTrashed,
   onTrashPendingChange,
   scanGeneration,
@@ -7348,48 +7782,133 @@ function AdultLibraryCard({
   trashPendingPath,
 }: {
   item: AdultLibraryItem;
+  onRatioChange: (ratio: number) => void;
   onFileTrashed: (file: AdultLibraryFile, scanGeneration: string) => void;
   onTrashPendingChange: (path: string | null) => void;
   scanGeneration: string;
   trashActionsDisabled: boolean;
   trashPendingPath: string | null;
 }) {
+  const presentation = useLibraryPresentation(
+    item.code === null
+      ? null
+      : {
+          category: "adult",
+          itemId: item.code,
+          scanGeneration,
+        },
+  );
+  const [ratio, reportDecodedRatio] = useLibraryCardRatio(
+    item.code === null ? 0.72 : presentation.cover.aspectRatio,
+    `${scanGeneration}:${item.code ?? item.id}:${presentation.cover.objectUrl ?? presentation.cover.status}`,
+    onRatioChange,
+  );
+  const metadata = item.code === null ? null : presentation.metadata.value;
+  const displayCode =
+    presentation.cover.displayCode ?? metadata?.displayCode ?? item.title;
+  const secondary =
+    metadata?.title ??
+    metadata?.date ??
+    (item.code === null
+      ? "Unassociated file"
+      : presentation.cover.status === "loading"
+        ? "Loading cover"
+        : presentation.metadata.status === "waiting" ||
+            presentation.metadata.status === "loading"
+          ? "Loading metadata"
+          : presentation.cover.status === "unavailable" ||
+              presentation.metadata.status === "unavailable"
+            ? "Presentation unavailable"
+            : `${item.files.length} ${item.files.length === 1 ? "file" : "files"}`);
+  const titleId = `adult-library-card-${encodeURIComponent(item.id)}`;
   return (
-    <article className="movie-card vr-library-card adult-library-card">
-      <div className="media-title-row">
-        <div>
-          <p className="card-eyebrow">
-            {item.code === null
-              ? "Unassociated file"
-              : `${item.files.length} ${item.files.length === 1 ? "file" : "files"}`}
-          </p>
-          <h3>{item.title}</h3>
-        </div>
-        <CopyTitleAction title={item.title} />
-      </div>
-      <ul
-        aria-label={
-          item.code === null
-            ? `File details for ${item.title}`
-            : `Files for ${item.title}`
-        }
-        className="vr-library-card__files"
-      >
-        {item.files.map((file) => (
-          <AdultLibraryFileRow
-            file={file}
-            itemCode={item.code}
-            itemTitle={item.title}
-            key={file.path}
-            onFileTrashed={onFileTrashed}
-            onTrashPendingChange={onTrashPendingChange}
-            scanGeneration={scanGeneration}
-            trashActionsDisabled={trashActionsDisabled}
-            trashPendingPath={trashPendingPath}
-          />
-        ))}
-      </ul>
-    </article>
+    <LibraryProviderCard
+      actions={
+        <>
+          {presentation.cover.retry === null ? null : (
+            <Button
+              aria-label={`Retry cover: ${displayCode}`}
+              onClick={presentation.cover.retry}
+              size="xs"
+              type="button"
+              variant="ghost"
+            >
+              <AppIcon name="refresh" />
+              Retry cover
+            </Button>
+          )}
+          {presentation.metadata.retry === null ? null : (
+            <Button
+              aria-label={`Retry presentation: ${displayCode}`}
+              onClick={presentation.metadata.retry}
+              size="xs"
+              type="button"
+              variant="ghost"
+            >
+              <AppIcon name="refresh" />
+              Retry presentation
+            </Button>
+          )}
+        </>
+      }
+      className="movie-card vr-library-card adult-library-card"
+      coverSource={
+        presentation.cover.status === "ready"
+          ? presentation.cover.source ?? "Local Library"
+          : "Local Library"
+      }
+      cover={
+        <LibraryCoverArtwork
+          icon="adult"
+          onDecodedRatio={reportDecodedRatio}
+          presentation={item.code === null ? null : presentation}
+          title={displayCode}
+        />
+      }
+      details={
+        <>
+          <dl className="library-presentation__facts">
+            <div>
+              <dt>Exact local product code</dt>
+              <dd>{item.title}</dd>
+            </div>
+            <div>
+              <dt>Provider display code</dt>
+              <dd>{displayCode}</dd>
+            </div>
+          </dl>
+          <ul
+          aria-label={
+            item.code === null
+              ? `File details for ${displayCode}`
+              : `Files for ${displayCode}`
+          }
+          className="library-details__members"
+        >
+          {item.files.map((file) => (
+            <AdultLibraryFileRow
+              file={file}
+              itemCode={item.code}
+              itemTitle={displayCode}
+              key={file.path}
+              onFileTrashed={onFileTrashed}
+              onTrashPendingChange={onTrashPendingChange}
+              scanGeneration={scanGeneration}
+              trashActionsDisabled={trashActionsDisabled}
+              trashPendingPath={trashPendingPath}
+            />
+          ))}
+          </ul>
+        </>
+      }
+      libraryCategory="adult"
+      metadataSource={metadata?.source ?? "Local Library"}
+      presentation={item.code === null ? null : presentation}
+      ratio={ratio}
+      secondary={secondary}
+      title={displayCode}
+      titleId={titleId}
+    />
   );
 }
 
@@ -8305,6 +8824,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [moviesStorageState, setMoviesStorageState] =
     useState<VolumeStorageState>({ status: "unconfigured" });
   const [librarySelectedPage, setLibrarySelectedPage] = useState(1);
+  const [movieLibraryRatios, setMovieLibraryRatios] = useState<Map<string, number>>(
+    () => new Map(),
+  );
   const [librarySearchQuery, setLibrarySearchQuery] = useState("");
   const [libraryTitleSortDirection, setLibraryTitleSortDirection] =
     useState<LibraryTitleSortDirection>("ascending");
@@ -8347,6 +8869,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     status: "unconfigured",
   });
   const [tvLibrarySelectedPage, setTvLibrarySelectedPage] = useState(1);
+  const [tvLibraryRatios, setTvLibraryRatios] = useState<Map<string, number>>(
+    () => new Map(),
+  );
   const [tvLibrarySearchQuery, setTvLibrarySearchQuery] = useState("");
   const [tvLibraryTitleSortDirection, setTvLibraryTitleSortDirection] =
     useState<LibraryTitleSortDirection>("ascending");
@@ -8377,6 +8902,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     status: "unconfigured",
   });
   const [adultLibrarySelectedPage, setAdultLibrarySelectedPage] = useState(1);
+  const [adultLibraryRatios, setAdultLibraryRatios] = useState<Map<string, number>>(
+    () => new Map(),
+  );
   const [adultLibrarySearchQuery, setAdultLibrarySearchQuery] = useState("");
   const [adultLibraryTitleSortDirection, setAdultLibraryTitleSortDirection] =
     useState<LibraryTitleSortDirection>("ascending");
@@ -8402,6 +8930,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     status: "unconfigured",
   });
   const [vrLibrarySelectedPage, setVrLibrarySelectedPage] = useState(1);
+  const [vrLibraryRatios, setVrLibraryRatios] = useState<Map<string, number>>(
+    () => new Map(),
+  );
   const [vrLibrarySearchQuery, setVrLibrarySearchQuery] = useState("");
   const [vrLibraryTitleSortDirection, setVrLibraryTitleSortDirection] =
     useState<LibraryTitleSortDirection>("ascending");
@@ -13132,8 +13663,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
   const searchAdultCatalog = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const canonicalCode = canonicalizeProductCode(adultSearchInput);
-    if (canonicalCode === null) {
+    const displayCode = productCodeDisplayForm(adultSearchInput);
+    if (displayCode === null) {
       setAdultSearchInputError(
         "Enter a valid Adult product code, such as ADLT-123.",
       );
@@ -13142,9 +13673,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
     resetAdultReleaseComparison();
     adultCatalogRequestId.current += 1;
-    setAdultSearchInput(canonicalCode);
+    setAdultSearchInput(displayCode);
     setAdultSearchInputError(null);
-    setSubmittedAdultCode(canonicalCode);
+    setSubmittedAdultCode(displayCode);
     setAdultCatalogState({ status: "loading" });
     setAdultSelectedPage(1);
     setAdultCatalogRequestVersion((version) => version + 1);
@@ -13340,17 +13871,17 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
 
   const searchVrCatalog = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const canonicalCode = canonicalizeProductCode(vrSearchInput);
-    if (canonicalCode === null) {
+    const displayCode = productCodeDisplayForm(vrSearchInput);
+    if (displayCode === null) {
       setVrSearchInputError("Enter a valid VR product code, such as MDVR-419.");
       return;
     }
 
     closeVrReleaseComparison();
     vrCatalogRequestId.current += 1;
-    setVrSearchInput(canonicalCode);
+    setVrSearchInput(displayCode);
     setVrSearchInputError(null);
-    setSubmittedVrCode(canonicalCode);
+    setSubmittedVrCode(displayCode);
     setVrCatalogState({ status: "loading" });
     setVrSelectedPage(1);
     setVrCatalogRequestVersion((version) => version + 1);
@@ -13989,16 +14520,29 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     completeAdultLibraryItems.length - completeAdultLibraryGroupedCount;
   const currentVrDownloads =
     vrDownloadsState.status === "ready" ? vrDownloadsState.downloads : [];
-  const isJavdbItemInLibrary = (item: JavdbBrowseItem) =>
-    (item.category === "adult"
-      ? completeAdultLibraryItems
-      : completeVrLibraryItems
-    ).some((libraryItem) => libraryItem.code === item.code);
-  const javdbItemTransferState = (item: JavdbBrowseItem) =>
-    currentVrDownloads.find(
-      (download) =>
-        download.category === item.category && download.identity === item.code,
-    )?.state ?? null;
+  const isJavdbItemInLibrary = (item: JavdbBrowseItem) => {
+    const identity = canonicalizeProductCode(item.code);
+    return (
+      identity !== null &&
+      (item.category === "adult"
+        ? completeAdultLibraryItems
+        : completeVrLibraryItems
+      ).some(
+        (libraryItem) =>
+          libraryItem.code !== null &&
+          canonicalizeProductCode(libraryItem.code) === identity,
+      )
+    );
+  };
+  const javdbItemTransferState = (item: JavdbBrowseItem) => {
+    const identity = canonicalizeProductCode(item.code);
+    return (
+      currentVrDownloads.find(
+        (download) =>
+          download.category === item.category && download.identity === identity,
+      )?.state ?? null
+    );
+  };
   const vrDownloadSummary = summarizeVrDownloads(currentVrDownloads);
   const vrDownloadLimitRequiresAttention =
     vrDownloadLimitState.status === "error" ||
@@ -14361,7 +14905,14 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       </aside>
 
       <main className="workspace" ref={workspace}>
-        <div className="workspace__content">
+        <div
+          className={`workspace__content${
+            activeDestination.id === "discover" ||
+            activeDestination.id === "library"
+              ? " workspace__content--bounded-gallery"
+              : ""
+          }`}
+        >
           <header className="page-header">
             <p className="page-eyebrow">Auto-Video workspace</p>
             <h1>{activeDestination.label}</h1>
@@ -16023,6 +16574,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         adultTrashReconciliationState === "pending" ||
                         adultTrashPendingPath !== null
                       }
+                      id="adult-library-refresh"
                       onClick={refreshAdultLibrary}
                       type="button"
                       variant="outline"
@@ -16101,6 +16653,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         vrTrashReconciliationState === "pending" ||
                         vrTrashPendingPath !== null
                       }
+                      id="vr-library-refresh"
                       onClick={refreshVrLibrary}
                       type="button"
                       variant="outline"
@@ -16264,7 +16817,11 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           ? "Movie metadata associations are invalid or conflicting. Local files remain available without enrichment."
                           : "Movie metadata associations could not be read. Local files and exact file actions remain available."}
                       </p>
-                      <Button onClick={refreshMovies} type="button" variant="outline">
+                      <Button
+                        onClick={refreshMovies}
+                        type="button"
+                        variant="outline"
+                      >
                         <AppIcon name="refresh" />
                         Retry metadata
                       </Button>
@@ -16296,23 +16853,38 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       </p>
                     </div>
                   ) : (
-                    <ResizeAwareGallery
+                    <NaturalWidthBrowseGallery
                       ariaLabel="Movies"
-                      getItemKey={(movie) => movie.path}
+                      gallery="library"
+                      itemKey={(movie) =>
+                        `${movie.fileId}:${movie.association?.generation ?? "local"}`
+                      }
                       items={orderedLibraryMovies}
                       key="library-gallery"
                       onSelectedPageChange={setLibrarySelectedPage}
+                      ratios={movieLibraryRatios}
                       renderItem={(movie) => (
                         <LibraryMovieCard
                           folder={moviesFolder}
                           movie={movie}
                           onMatchMetadata={openMovieMetadataMatch}
                           onMovieTrashed={recordTrashedMovie}
+                          onRatioChange={(ratio) => {
+                            setMovieLibraryRatios((current) => {
+                              const key = `${movie.fileId}:${movie.association?.generation ?? "local"}`;
+                              if (current.get(key) === ratio) return current;
+                              const next = new Map(current);
+                              next.set(key, ratio);
+                              return next;
+                            });
+                          }}
                           onViewMetadataDetails={openMovieMetadataDetails}
                         />
                       )}
                       selectedPage={librarySelectedPage}
-                      variant="library"
+                      sourceRatio={(movie) =>
+                        movie.association?.posterPath == null ? 0.72 : 2 / 3
+                      }
                     />
                   )}
                 </>
@@ -16327,7 +16899,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   <h2>{currentMovieScanMessage?.heading}</h2>
                   <p>{currentMovieScanMessage?.message}</p>
                 </div>
-                )
+              )
               ) : libraryCategory === "tv" ? (
                 tvLibraryScanState.status === "ready" ? (
                   <>
@@ -16374,12 +16946,16 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         </p>
                       </div>
                     ) : (
-                      <ResizeAwareGallery
+                      <NaturalWidthBrowseGallery
                         ariaLabel="TV shows and unassociated files"
-                        getItemKey={(item) => item.id}
+                        gallery="library"
+                        itemKey={(item) =>
+                          `${tvLibraryScanState.generation}:${item.id}`
+                        }
                         items={orderedTvLibraryItems}
                         key="tv-library-gallery"
                         onSelectedPageChange={setTvLibrarySelectedPage}
+                        ratios={tvLibraryRatios}
                         renderItem={(item) => (
                           <TvLibraryCard
                             item={item}
@@ -16388,6 +16964,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                             }
                             onMatchMetadata={openTvMetadataMatch}
                             onFileTrashed={recordTrashedTvFile}
+                            onRatioChange={(ratio) => {
+                              setTvLibraryRatios((current) => {
+                                const key = `${tvLibraryScanState.generation}:${item.id}`;
+                                if (current.get(key) === ratio) return current;
+                                const next = new Map(current);
+                                next.set(key, ratio);
+                                return next;
+                              });
+                            }}
                             onTrashPendingChange={setTvTrashPendingPath}
                             onViewMetadataDetails={openTvMetadataDetails}
                             scanGeneration={tvLibraryScanState.generation}
@@ -16395,7 +16980,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           />
                         )}
                         selectedPage={tvLibrarySelectedPage}
-                        variant="library"
+                        sourceRatio={(item) =>
+                          item.association?.posterPath == null ? 0.72 : 2 / 3
+                        }
                       />
                     )}
                   </>
@@ -16440,16 +17027,29 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         </p>
                       </div>
                     ) : (
-                      <ResizeAwareGallery
+                      <NaturalWidthBrowseGallery
                         ariaLabel="Adult titles and unassociated files"
-                        getItemKey={(item) => item.id}
+                        gallery="library"
+                        itemKey={(item) =>
+                          `${adultLibraryScanState.generation}:${item.id}`
+                        }
                         items={orderedAdultLibraryItems}
                         key="adult-library-gallery"
                         onSelectedPageChange={setAdultLibrarySelectedPage}
+                        ratios={adultLibraryRatios}
                         renderItem={(item) => (
                           <AdultLibraryCard
                             item={item}
                             onFileTrashed={recordTrashedAdultFile}
+                            onRatioChange={(ratio) => {
+                              setAdultLibraryRatios((current) => {
+                                const key = `${adultLibraryScanState.generation}:${item.id}`;
+                                if (current.get(key) === ratio) return current;
+                                const next = new Map(current);
+                                next.set(key, ratio);
+                                return next;
+                              });
+                            }}
                             onTrashPendingChange={setAdultTrashPendingPath}
                             scanGeneration={adultLibraryScanState.generation}
                             trashActionsDisabled={
@@ -16459,7 +17059,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           />
                         )}
                         selectedPage={adultLibrarySelectedPage}
-                        variant="library"
+                        sourceRatio={() => 0.72}
                       />
                     )}
                   </>
@@ -16503,16 +17103,29 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       </p>
                     </div>
                   ) : (
-                    <ResizeAwareGallery
+                    <NaturalWidthBrowseGallery
                       ariaLabel="VR titles"
-                      getItemKey={(item) => item.id}
+                      gallery="library"
+                      itemKey={(item) =>
+                        `${vrLibraryScanState.generation}:${item.id}`
+                      }
                       items={orderedVrLibraryItems}
                       key="vr-library-gallery"
                       onSelectedPageChange={setVrLibrarySelectedPage}
+                      ratios={vrLibraryRatios}
                       renderItem={(item) => (
                         <VrLibraryCard
                           item={item}
                           onFileTrashed={recordTrashedVrFile}
+                          onRatioChange={(ratio) => {
+                            setVrLibraryRatios((current) => {
+                              const key = `${vrLibraryScanState.generation}:${item.id}`;
+                              if (current.get(key) === ratio) return current;
+                              const next = new Map(current);
+                              next.set(key, ratio);
+                              return next;
+                            });
+                          }}
                           onTrashPendingChange={setVrTrashPendingPath}
                           scanGeneration={vrLibraryScanState.generation}
                           trashActionsDisabled={
@@ -16522,7 +17135,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         />
                       )}
                       selectedPage={vrLibrarySelectedPage}
-                      variant="library"
+                      sourceRatio={() => 0.72}
                     />
                   )}
                 </>

@@ -211,7 +211,25 @@ export type SukebeiReleasesResult<Release extends SukebeiRelease> =
 
 export type VrReleasesResult = SukebeiReleasesResult<VrRelease>;
 
-const productCodePattern = /^([A-Za-z]{2,16})[ _-]*([0-9]{1,10})$/;
+const digitLeadingProductCodePrefixes = [
+  "3DSVR",
+  "459TEN",
+  "300MIUM",
+  "200GANA",
+  "230ORECZ",
+] as const;
+const adultDigitLeadingProductCodePrefixes = new Set([
+  "459TEN",
+  "300MIUM",
+  "200GANA",
+  "230ORECZ",
+]);
+const digitLeadingProductCodePrefixPattern =
+  digitLeadingProductCodePrefixes.join("|");
+const productCodePattern = new RegExp(
+  `^(${digitLeadingProductCodePrefixPattern}|[A-Za-z]{2,16})[ _-]*([0-9]{1,10})$`,
+  "i",
+);
 const unsignedU64Pattern = /^\d{1,20}$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const maximumSelectedVrFiles = 100_000;
@@ -318,17 +336,19 @@ function parseJavdbCatalog(
 
   for (const item of movieList.querySelectorAll(".item")) {
     const codeElement = item.querySelector(".video-title strong, strong");
-    const providerCode = canonicalizeProductCode(
-      codeElement?.textContent ?? "",
-    );
-    if (codeElement === null || providerCode !== requestedCode) {
+    const providerCode = productCodeForms(codeElement?.textContent ?? "");
+    if (
+      codeElement === null ||
+      providerCode === null ||
+      providerCode.identity !== canonicalizeProductCode(requestedCode)
+    ) {
       continue;
     }
 
     return {
       status: "ready",
       item: {
-        code: requestedCode,
+        code: providerCode.display,
         title: javdbTitle(item, codeElement),
         coverUrl: javdbCoverUrl(item),
         source: "JavDB",
@@ -412,16 +432,34 @@ function releaseArtifact(item: Element): SukebeiReleaseArtifact | null {
 }
 
 export function productCodeCandidates(value: string) {
-  const identityPattern =
-    /(^|[^A-Za-z0-9])([A-Za-z]{2,16})[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])/gi;
-  const candidates: Array<{ code: string; prefix: string }> = [];
+  const identityPattern = new RegExp(
+    `(^|[^A-Za-z0-9])(${digitLeadingProductCodePrefixPattern}|[A-Za-z]{2,16})[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])`,
+    "gi",
+  );
+  const candidates: Array<{
+    code: string;
+    displayCode: string;
+    prefix: string;
+  }> = [];
   for (const match of value.matchAll(identityPattern)) {
-    const identity = canonicalizeProductCode(`${match[2]}-${match[3]}`);
-    if (identity !== null) {
-      candidates.push({ code: identity, prefix: match[2].toUpperCase() });
+    const forms = productCodeForms(`${match[2]}-${match[3]}`);
+    if (forms !== null) {
+      candidates.push({
+        code: forms.identity,
+        displayCode: forms.display,
+        prefix: forms.prefix,
+      });
     }
   }
   return candidates;
+}
+
+export function adultLibraryProductCodePrefixIsSupported(prefix: string) {
+  return !/^\d/.test(prefix) || adultDigitLeadingProductCodePrefixes.has(prefix);
+}
+
+export function vrLibraryProductCodePrefixIsSupported(prefix: string) {
+  return !/^\d/.test(prefix) || prefix === "3DSVR";
 }
 
 function releaseMatchesProductCode(name: string, requestedCode: string) {
@@ -474,6 +512,14 @@ function parseSukebeiReleases(
 }
 
 export function canonicalizeProductCode(value: string) {
+  return productCodeForms(value)?.identity ?? null;
+}
+
+export function productCodeDisplayForm(value: string) {
+  return productCodeForms(value)?.display ?? null;
+}
+
+function productCodeForms(value: string) {
   const match = productCodePattern.exec(value.trim());
   if (match === null) {
     return null;
@@ -484,7 +530,12 @@ export function canonicalizeProductCode(value: string) {
     return null;
   }
 
-  return `${match[1].toUpperCase()}-${number}`;
+  const prefix = match[1].toUpperCase();
+  return {
+    display: `${prefix}-${match[2]}`,
+    identity: `${prefix}-${number}`,
+    prefix,
+  };
 }
 
 function validJavdbBrowseRequest(request: JavdbBrowseRequest) {
@@ -582,7 +633,7 @@ export function parseJavdbBrowseResponse(
       category !== request.category ||
       !javdbProviderItemPattern.test(providerItemId) ||
       providerItemIds.has(providerItemId) ||
-      canonicalizeProductCode(code) !== code ||
+      productCodeDisplayForm(code) !== code ||
       (coverAuthorityId !== "" &&
         !javdbCoverAuthorityPattern.test(coverAuthorityId)) ||
       Number(sourceAspectRatio) !== javdbSourceAspectRatio
@@ -776,7 +827,7 @@ function validJavdbItemAuthority(item: JavdbBrowseItem) {
     BigInt(item.requestGeneration) > 0n &&
     BigInt(item.requestGeneration) <= maximumU64 &&
     javdbProviderItemPattern.test(item.providerItemId) &&
-    canonicalizeProductCode(item.code) === item.code
+    productCodeDisplayForm(item.code) === item.code
   );
 }
 
@@ -1000,9 +1051,9 @@ export async function openJavdbDetailSource(detail: JavdbDetail) {
 export async function fetchExactJavdbVrItem(
   code: string,
 ): Promise<JavdbCatalogResult> {
-  const requestedCode = canonicalizeProductCode(code);
+  const requestedCode = productCodeDisplayForm(code);
   if (requestedCode === null || requestedCode !== code) {
-    throw new Error("A canonical VR product code is required.");
+    throw new Error("An exact VR product code is required.");
   }
 
   try {
@@ -1022,9 +1073,9 @@ export async function fetchExactJavdbVrItem(
 export async function fetchExactJavdbAdultItem(
   code: string,
 ): Promise<JavdbCatalogResult> {
-  const requestedCode = canonicalizeProductCode(code);
+  const requestedCode = productCodeDisplayForm(code);
   if (requestedCode === null || requestedCode !== code) {
-    throw new Error("A canonical Adult product code is required.");
+    throw new Error("An exact Adult product code is required.");
   }
 
   try {
@@ -1045,7 +1096,7 @@ export async function fetchVerifiedSukebeiReleases(
   code: string,
 ): Promise<VrReleasesResult> {
   const requestedCode = canonicalizeProductCode(code);
-  if (requestedCode === null || requestedCode !== code) {
+  if (requestedCode === null || productCodeDisplayForm(code) !== code) {
     throw new Error("A canonical VR product code is required.");
   }
 
@@ -1067,7 +1118,7 @@ export async function fetchVerifiedAdultSukebeiReleases(
   code: string,
 ): Promise<SukebeiReleasesResult<SukebeiRelease>> {
   const requestedCode = canonicalizeProductCode(code);
-  if (requestedCode === null || requestedCode !== code) {
+  if (requestedCode === null || productCodeDisplayForm(code) !== code) {
     throw new Error("A canonical Adult product code is required.");
   }
 
@@ -1166,7 +1217,7 @@ export async function inspectVerifiedSukebeiTorrent(
   release: VrRelease,
 ): Promise<TorrentInspectionResult> {
   const requestedCode = canonicalizeProductCode(code);
-  if (requestedCode === null || requestedCode !== code) {
+  if (requestedCode === null || productCodeDisplayForm(code) !== code) {
     throw new Error("A canonical VR product code is required.");
   }
   if (release.artifact === undefined) {
@@ -1177,7 +1228,7 @@ export async function inspectVerifiedSukebeiTorrent(
     const value = await window.__TAURI__.core.invoke<unknown>(
       "inspect_sukebei_vr_torrent",
       {
-        code,
+        code: requestedCode,
         releaseName: release.name,
         providerItemId: release.artifact.providerItemId,
         torrentUrl: release.artifact.torrentUrl,
@@ -1201,7 +1252,7 @@ export async function inspectVerifiedAdultSukebeiTorrent(
   release: SukebeiRelease,
 ): Promise<TorrentInspectionResult> {
   const requestedCode = canonicalizeProductCode(code);
-  if (requestedCode === null || requestedCode !== code) {
+  if (requestedCode === null || productCodeDisplayForm(code) !== code) {
     throw new Error("A canonical Adult product code is required.");
   }
   if (release.artifact === undefined) {
@@ -1212,7 +1263,7 @@ export async function inspectVerifiedAdultSukebeiTorrent(
     const value = await window.__TAURI__.core.invoke<unknown>(
       "inspect_sukebei_adult_torrent",
       {
-        code,
+        code: requestedCode,
         releaseName: release.name,
         providerItemId: release.artifact.providerItemId,
         torrentUrl: release.artifact.torrentUrl,
@@ -1327,12 +1378,15 @@ function vrPartLabel(title: string) {
   return partNumbers.size === 1 && !partNumbers.has("0") ? matches[0][2] : null;
 }
 
-function canonicalVrLibraryProductCode(title: string) {
+function vrLibraryProductCode(title: string) {
   const candidates = productCodeCandidates(title)
-    .filter((candidate) => !vrLibraryPartPrefixes.has(candidate.prefix))
-    .map((candidate) => candidate.code);
-  const uniqueCandidates = new Set(candidates);
-  return uniqueCandidates.size === 1 ? candidates[0] : null;
+    .filter(
+      (candidate) =>
+        vrLibraryProductCodePrefixIsSupported(candidate.prefix) &&
+        !vrLibraryPartPrefixes.has(candidate.prefix),
+    );
+  const identities = new Set(candidates.map((candidate) => candidate.code));
+  return identities.size === 1 ? candidates[0] : null;
 }
 
 function parseVrLibrary(value: unknown): VrLibraryScan {
@@ -1382,8 +1436,8 @@ function parseVrLibrary(value: unknown): VrLibraryScan {
   const groupedItems = new Map<string, VrLibraryItem>();
   const unassociatedItems: VrLibraryItem[] = [];
   for (const file of files) {
-    const code = canonicalVrLibraryProductCode(file.title);
-    if (code === null) {
+    const productCode = vrLibraryProductCode(file.title);
+    if (productCode === null) {
       unassociatedItems.push({
         id: `file:${file.path}`,
         title: file.title,
@@ -1392,12 +1446,12 @@ function parseVrLibrary(value: unknown): VrLibraryScan {
       });
       continue;
     }
-    const existingItem = groupedItems.get(code);
+    const existingItem = groupedItems.get(productCode.code);
     if (existingItem === undefined) {
-      groupedItems.set(code, {
-        id: `code:${code}`,
-        title: code,
-        code,
+      groupedItems.set(productCode.code, {
+        id: `code:${productCode.code}`,
+        title: productCode.displayCode,
+        code: productCode.displayCode,
         files: [file],
       });
     } else {

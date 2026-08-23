@@ -46,6 +46,44 @@ describe("Adult folder and storage boundaries", () => {
 });
 
 describe("conservative parsed Adult Library identity", () => {
+  it("groups evidenced Adult maker prefixes without accepting the VR-only 3DSVR family", async () => {
+    const first = "/Adult/459TEN-00048-A.mp4";
+    const second = "/Adult/459ten_0048-B.MKV";
+    const cawbFirst = "/Adult/CAWB-001-A.mp4";
+    const cawbSecond = "/Adult/cawb_00001-B.MKV";
+    const vrOnly = "/Adult/3DSVR-01871-A.mp4";
+    invokeMock.mockResolvedValue([
+      "13",
+      first,
+      "459TEN-00048-A.mp4",
+      "1",
+      second,
+      "459ten_0048-B.MKV",
+      "2",
+      cawbFirst,
+      "CAWB-001-A.mp4",
+      "3",
+      cawbSecond,
+      "cawb_00001-B.MKV",
+      "4",
+      vrOnly,
+      "3DSVR-01871-A.mp4",
+      "5",
+    ]);
+
+    const { items } = await scanAdultLibrary();
+
+    expect(items.find((item) => item.code === "459TEN-00048")).toMatchObject({
+      id: "code:459TEN-48",
+      files: [{ path: first }, { path: second }],
+    });
+    expect(items.find((item) => item.code === "CAWB-001")).toMatchObject({
+      id: "code:CAWB-1",
+      files: [{ path: cawbFirst }, { path: cawbSecond }],
+    });
+    expect(items.find((item) => item.id === `file:${vrOnly}`)?.code).toBeNull();
+  });
+
   it("groups equivalent ADLT-123 variants without accepting nearby or mixed identities", async () => {
     const firstPath = "/Adult/作品/ADLT-123 Part 01 — 前編.mp4";
     const secondPath = "/Adult/adlt_00123_CD2  特別版.MKV";
