@@ -335,6 +335,24 @@ fn package_cover_url(value: &str) -> Option<String> {
     })
 }
 
+fn parse_exact_cover_url(
+    content: &std::collections::BTreeMap<String, JsonValue>,
+) -> Result<Option<String>, DocumentError> {
+    let image = match content.get("packageImage") {
+        None | Some(JsonValue::Null) => return Ok(None),
+        Some(JsonValue::Object(image)) => image,
+        Some(_) => return Err(DocumentError::Malformed),
+    };
+    let url = match image.get("largeUrl") {
+        None | Some(JsonValue::Null) => return Ok(None),
+        Some(JsonValue::String(url)) => url,
+        Some(_) => return Err(DocumentError::Malformed),
+    };
+    package_cover_url(url)
+        .map(Some)
+        .ok_or(DocumentError::Malformed)
+}
+
 fn parse_content(value: &JsonValue) -> Option<ParsedItem> {
     let JsonValue::Object(object) = value else {
         return None;
@@ -556,21 +574,28 @@ fn parse_exact_content(
             }
             return Err(DocumentError::Malformed);
         };
-        let content_type = optional_text(content, "contentType").ok_or(DocumentError::Malformed)?;
-        let Some(item) = parse_content(value) else {
-            return Err(DocumentError::Malformed);
+        let content_id = match content.get("id") {
+            Some(JsonValue::String(content_id)) if valid_content_id(content_id) => content_id,
+            _ => return Err(DocumentError::Malformed),
         };
-        if item.content_id != request.content_id
-            || canonical_product_code(&item.display_code) != canonical_product_code(code)
-            || content_type != category.content_type()
-        {
+        let content_type = match content.get("contentType") {
+            Some(JsonValue::String(content_type)) => content_type,
+            _ => return Err(DocumentError::Malformed),
+        };
+        if content_id != &request.content_id || content_type != category.content_type() {
             return Err(DocumentError::Conflicting);
         }
+        let display_code =
+            display_code_from_content_id(content_id).ok_or(DocumentError::Malformed)?;
+        if canonical_product_code(&display_code) != canonical_product_code(code) {
+            return Err(DocumentError::Conflicting);
+        }
+        let cover_url = parse_exact_cover_url(content)?;
         accepted.push(ExactLibraryItem {
-            content_id: item.content_id,
-            display_code: item.display_code,
-            title: item.title,
-            cover_url: item.cover_url,
+            content_id: content_id.clone(),
+            display_code,
+            title: optional_text(content, "title"),
+            cover_url,
         });
     }
     accepted.sort_by(|left, right| left.content_id.cmp(&right.content_id));
@@ -1082,9 +1107,18 @@ mod tests {
             r#"{"data":{"c0":{"id":"cawb001","contentType":"TWO_DIMENSION","title":"Wrong transport","packageImage":null}}}"#,
             r#"{"data":{"c0":{"id":"cawb00002","contentType":"TWO_DIMENSION","title":"Wrong code","packageImage":null}}}"#,
             r#"{"data":{"c0":{"id":"cawb00001","contentType":"VR","title":"Wrong category","packageImage":null}}}"#,
+            r#"{"data":{"c0":{"id":" cawb00001 ","contentType":"TWO_DIMENSION","title":"Padded transport","packageImage":null}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001\u0000","contentType":"TWO_DIMENSION","title":"Controlled transport","packageImage":null}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":" TWO_DIMENSION ","title":"Padded category","packageImage":null}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION\u0000","title":"Controlled category","packageImage":null}}}"#,
             r#"{"data":{"c0":{"id":"unsafe-id","contentType":"TWO_DIMENSION","title":"Malformed identity","packageImage":null}}}"#,
             r#"{"data":{"c0":{"contentType":"TWO_DIMENSION","title":"Missing identity","packageImage":null}}}"#,
             r#"{"data":{"c1":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Unrequested alias","packageImage":null}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Malformed image","packageImage":[]}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Malformed image","packageImage":"missing"}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Malformed URL","packageImage":{"largeUrl":42}}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Padded URL","packageImage":{"largeUrl":" https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001pl.jpg "}}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Controlled URL","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001pl.jpg\u0000"}}}}"#,
         ] {
             assert_eq!(
                 fetch_exact_library_item_with("adult", "CAWB-1", |_| Ok(document.to_owned())),
@@ -1104,6 +1138,21 @@ mod tests {
             }),
             Ok(None)
         );
+
+        for cover in [
+            "",
+            r#","packageImage":null"#,
+            r#","packageImage":{}"#,
+            r#","packageImage":{"largeUrl":null}"#,
+        ] {
+            let document = format!(
+                r#"{{"data":{{"c0":{{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Exact without cover"{cover}}}}}}}"#
+            );
+            let item = fetch_exact_library_item_with("adult", "CAWB-1", |_| Ok(document))
+                .expect("missing or null cover data must remain valid")
+                .expect("the exact item must remain accepted");
+            assert!(item.cover_url.is_none());
+        }
     }
 
     #[test]

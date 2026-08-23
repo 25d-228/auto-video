@@ -2038,83 +2038,92 @@ mod tests {
     }
 
     #[test]
-    fn failed_fanza_identity_contributes_nothing_and_later_exact_source_can_succeed() {
+    fn failed_fanza_row_contributes_nothing_and_later_exact_source_can_succeed() {
         let authority = LibraryItemAuthority {
             category: LibraryPresentationCategory::Adult,
             identity: "a".repeat(40),
             code: "CAWB-1".to_owned(),
             product_identity: "CAWB-1".to_owned(),
         };
-        let fanza_image_calls = Cell::new(0);
-        let (cover, metadata, transient) = resolve_cover_with(
-            &authority,
-            |_| Err(ProviderRequestError::SourceUnavailable),
-            |_| panic!("missing JavDB item has no image"),
-            |_| {
-                Ok(r#"{"data":{"c0":{"id":"cawb001","contentType":"TWO_DIMENSION","title":"Conflicting FANZA title","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb001/cawb001pl.jpg"}}}}"#.to_owned())
-            },
-            |_| {
-                fanza_image_calls.set(fanza_image_calls.get() + 1);
-                Ok(jpeg(600, 800))
-            },
-            |_| {
-                Ok(r#"{"content_id":"CAWB-1","title_ja":"Legacy title","images":{"jacket_image":{"large":"https://pics.dmm.co.jp/digital/video/cawb00001/cawb00001pl.jpg"}}}"#.to_owned())
-            },
-            |_| Ok(jpeg(600, 800)),
-        );
-        let source = cover
-            .expect("the later exact legacy source must remain eligible")
-            .0;
-        assert_eq!(source.provider, "r18.dev");
-        assert_eq!(source.display_code, "CAWB-1");
-        assert_eq!(fanza_image_calls.get(), 0);
-        assert_eq!(
-            metadata.and_then(|value| value.title),
-            Some("Legacy title".to_owned())
-        );
-        assert!(transient);
+        for document in [
+            r#"{"data":{"c0":{"id":"cawb001","contentType":"TWO_DIMENSION","title":"Conflicting FANZA title","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb001/cawb001pl.jpg"}}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Malformed FANZA cover","packageImage":{"largeUrl":" https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001pl.jpg "}}}}"#,
+        ] {
+            let fanza_image_calls = Cell::new(0);
+            let (cover, metadata, transient) = resolve_cover_with(
+                &authority,
+                |_| Err(ProviderRequestError::SourceUnavailable),
+                |_| panic!("missing JavDB item has no image"),
+                |_| Ok(document.to_owned()),
+                |_| {
+                    fanza_image_calls.set(fanza_image_calls.get() + 1);
+                    Ok(jpeg(600, 800))
+                },
+                |_| {
+                    Ok(r#"{"content_id":"CAWB-1","title_ja":"Legacy title","images":{"jacket_image":{"large":"https://pics.dmm.co.jp/digital/video/cawb00001/cawb00001pl.jpg"}}}"#.to_owned())
+                },
+                |_| Ok(jpeg(600, 800)),
+            );
+            let source = cover
+                .expect("the later exact legacy source must remain eligible")
+                .0;
+            assert_eq!(source.provider, "r18.dev");
+            assert_eq!(source.display_code, "CAWB-1");
+            assert_eq!(fanza_image_calls.get(), 0);
+            assert_eq!(
+                metadata.and_then(|value| value.title),
+                Some("Legacy title".to_owned())
+            );
+            assert!(transient);
+        }
     }
 
     #[test]
-    fn failed_fanza_identity_without_later_success_is_unavailable_and_not_cached() {
-        let fixture = CacheFixture::new("fanza-conflict");
+    fn failed_fanza_row_without_later_success_is_unavailable_and_not_cached() {
         let authority = LibraryItemAuthority {
             category: LibraryPresentationCategory::Adult,
             identity: "b".repeat(40),
             code: "CAWB-1".to_owned(),
             product_identity: "CAWB-1".to_owned(),
         };
-        let fanza_image_calls = Cell::new(0);
-        let response = resolve_cover_at_with(
-            &LibraryPresentationState::default(),
-            &fixture.path,
-            &authority,
-            100,
-            || true,
-            || {
-                resolve_cover_with(
-                    &authority,
-                    |_| Err(ProviderRequestError::SourceUnavailable),
-                    |_| panic!("missing JavDB item has no image"),
-                    |_| {
-                        Ok(r#"{"data":{"c0":{"id":"cawb00002","contentType":"TWO_DIMENSION","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00002/cawb00002pl.jpg"}}}}"#.to_owned())
-                    },
-                    |_| {
-                        fanza_image_calls.set(fanza_image_calls.get() + 1);
-                        Ok(jpeg(600, 800))
-                    },
-                    |_| Err(ProviderRequestError::SourceUnavailable),
-                    |_| panic!("missing legacy item has no image"),
-                )
-            },
-        )
-        .expect("a current provider conflict must remain a local state");
-        assert_eq!(response[2], "unavailable");
-        assert_eq!(response[3], "");
-        assert_eq!(response[4], "");
-        assert_eq!(response[5], "");
-        assert_eq!(fanza_image_calls.get(), 0);
-        assert!(!fixture.path.exists());
+        for (index, document) in [
+            r#"{"data":{"c0":{"id":"cawb00002","contentType":"TWO_DIMENSION","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00002/cawb00002pl.jpg"}}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Malformed FANZA cover","packageImage":{"largeUrl":42}}}}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = CacheFixture::new(&format!("fanza-failure-{index}"));
+            let fanza_image_calls = Cell::new(0);
+            let response = resolve_cover_at_with(
+                &LibraryPresentationState::default(),
+                &fixture.path,
+                &authority,
+                100,
+                || true,
+                || {
+                    resolve_cover_with(
+                        &authority,
+                        |_| Err(ProviderRequestError::SourceUnavailable),
+                        |_| panic!("missing JavDB item has no image"),
+                        |_| Ok(document.to_owned()),
+                        |_| {
+                            fanza_image_calls.set(fanza_image_calls.get() + 1);
+                            Ok(jpeg(600, 800))
+                        },
+                        |_| Err(ProviderRequestError::SourceUnavailable),
+                        |_| panic!("missing legacy item has no image"),
+                    )
+                },
+            )
+            .expect("a current provider failure must remain a local state");
+            assert_eq!(response[2], "unavailable");
+            assert_eq!(response[3], "");
+            assert_eq!(response[4], "");
+            assert_eq!(response[5], "");
+            assert_eq!(fanza_image_calls.get(), 0);
+            assert!(!fixture.path.exists());
+        }
     }
 
     #[test]
