@@ -7,7 +7,10 @@ use std::{
 use std::process::Command;
 
 use crate::{
-    vr_torrent::{JsonParser, JsonValue},
+    vr_torrent::{
+        canonical_product_code, product_code_display_form, product_code_forms, JsonParser,
+        JsonValue,
+    },
     ProviderRequestError, ADULT_NETWORK_ERROR, ADULT_PROVIDER_ERROR, ADULT_SOURCE_UNAVAILABLE,
     VR_NETWORK_ERROR, VR_PROVIDER_ERROR, VR_SOURCE_UNAVAILABLE,
 };
@@ -185,6 +188,14 @@ struct ParsedItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExactLibraryItem {
+    pub content_id: String,
+    pub display_code: String,
+    pub title: Option<String>,
+    pub cover_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct AuthorizedItem {
     content_id: String,
     display_code: String,
@@ -227,17 +238,7 @@ fn valid_content_id(value: &str) -> bool {
 }
 
 fn valid_display_code(value: &str) -> bool {
-    let Some((prefix, number)) = value.split_once('-') else {
-        return false;
-    };
-    (2..=16).contains(&prefix.len())
-        && prefix
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-        && prefix.as_bytes().last().is_some_and(u8::is_ascii_uppercase)
-        && !number.starts_with('0')
-        && (1..=10).contains(&number.len())
-        && number.bytes().all(|byte| byte.is_ascii_digit())
+    product_code_display_form(value).as_deref() == Some(value)
 }
 
 fn display_code_from_content_id(value: &str) -> Option<String> {
@@ -276,7 +277,15 @@ fn display_code_from_content_id(value: &str) -> Option<String> {
         prefix = &prefix[1..];
     }
     let number = content_id[number_start..].parse::<u64>().ok()?;
-    let code = (number > 0).then(|| format!("{}-{number}", prefix.to_ascii_uppercase()))?;
+    if number == 0 {
+        return None;
+    }
+    let prefix = prefix.to_ascii_uppercase();
+    let code = match prefix.as_str() {
+        "CAWB" => format!("CAWB-{number:03}"),
+        "3DSVR" => format!("3DSVR-{number}"),
+        _ => format!("{prefix}-{number}"),
+    };
     valid_display_code(&code).then_some(code)
 }
 
@@ -309,6 +318,10 @@ fn valid_image_url(value: &str) -> bool {
         && !authority.contains('@')
         && !authority.contains(':')
         && rest.len() > authority.len() + 1
+}
+
+pub(crate) fn valid_library_cover_url(value: &str) -> bool {
+    valid_image_url(value)
 }
 
 fn package_cover_url(value: &str) -> Option<String> {
@@ -463,6 +476,108 @@ fn graphql_body(category: Category, feed: &str, count: u16) -> String {
             category.content_type()
         )
     }
+}
+
+fn exact_content_id_candidates(code: &str) -> Vec<String> {
+    let Some(forms) = product_code_forms(code) else {
+        return Vec::new();
+    };
+    if forms.display != code {
+        return Vec::new();
+    }
+    let number = forms
+        .identity
+        .split_once('-')
+        .map(|(_, number)| number)
+        .unwrap_or_default();
+    if forms.prefix == "CAWB" {
+        return vec![format!("cawb{number:0>5}")];
+    }
+    if forms.prefix == "3DSVR" {
+        return vec![format!("13dsvr{number:0>5}")];
+    }
+    let prefix = match forms.prefix.to_ascii_lowercase().as_str() {
+        "ebon" => "ebod".to_owned(),
+        value => value.to_owned(),
+    };
+    let mut candidates = vec![
+        format!("{prefix}{number:0>5}"),
+        format!("{prefix}{number:0>3}"),
+        format!("{prefix}{number}"),
+        format!("1{prefix}{number:0>5}"),
+        format!("1{prefix}{number:0>3}"),
+        format!("13{prefix}{number:0>5}"),
+        format!("13{prefix}{number:0>3}"),
+    ];
+    let mut unique = std::collections::HashSet::new();
+    candidates.retain(|candidate| unique.insert(candidate.clone()));
+    candidates
+}
+
+fn exact_content_body(code: &str) -> Option<String> {
+    let fields = exact_content_id_candidates(code)
+        .into_iter()
+        .enumerate()
+        .map(|(index, content_id)| {
+            format!(
+                "c{index}:ppvContent(id:\"{content_id}\"){{id contentType title packageImage{{largeUrl}}}}"
+            )
+        })
+        .collect::<String>();
+    (!fields.is_empty()).then(|| format!(r#"{{"query":"query{{{fields}}}","variables":{{}}}}"#))
+}
+
+fn parse_exact_content(
+    document: &str,
+    category: Category,
+    code: &str,
+) -> Result<Option<ExactLibraryItem>, DocumentError> {
+    let root = parse_root(document)?;
+    let Some(JsonValue::Object(data)) = root.get("data") else {
+        return Err(DocumentError::Malformed);
+    };
+    let mut accepted = Vec::new();
+    for value in data.values() {
+        let JsonValue::Object(content) = value else {
+            if matches!(value, JsonValue::Null) {
+                continue;
+            }
+            return Err(DocumentError::Malformed);
+        };
+        let content_type = optional_text(content, "contentType").ok_or(DocumentError::Malformed)?;
+        let Some(item) = parse_content(value) else {
+            return Err(DocumentError::Malformed);
+        };
+        if canonical_product_code(&item.display_code) != canonical_product_code(code)
+            || content_type != category.content_type()
+        {
+            continue;
+        }
+        accepted.push(ExactLibraryItem {
+            content_id: item.content_id,
+            display_code: item.display_code,
+            title: item.title,
+            cover_url: item.cover_url,
+        });
+    }
+    accepted.sort_by(|left, right| left.content_id.cmp(&right.content_id));
+    accepted.dedup();
+    match accepted.len() {
+        0 => Ok(None),
+        1 => Ok(accepted.pop()),
+        _ => Err(DocumentError::Conflicting),
+    }
+}
+
+pub(crate) fn fetch_exact_library_item_with(
+    category: &str,
+    code: &str,
+    fetch: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+) -> Result<Option<ExactLibraryItem>, ProviderRequestError> {
+    let category = Category::parse(category).ok_or(ProviderRequestError::Provider)?;
+    let body = exact_content_body(code).ok_or(ProviderRequestError::Provider)?;
+    let document = fetch(&body)?;
+    parse_exact_content(&document, category, code).map_err(|_| ProviderRequestError::Provider)
 }
 
 fn authority(context: &CatalogContext, category: Category) -> Option<&CatalogAuthority> {
@@ -919,8 +1034,46 @@ mod tests {
     }
 
     #[test]
+    fn exact_library_content_requires_the_returned_code_and_category() {
+        let accepted = fetch_exact_library_item_with("vr", "MDVR-419", |body| {
+            assert!(body.contains("ppvContent"));
+            assert!(body.contains("mdvr00419"));
+            Ok(r#"{"data":{"c0":{"id":"mdvr00419","contentType":"VR","title":"Exact VR","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/mdvr00419/mdvr00419pl.jpg"}},"c1":null}}"#.to_owned())
+        })
+        .expect("the exact FANZA response must parse")
+        .expect("the exact item must be retained");
+        assert_eq!(accepted.content_id, "mdvr00419");
+        assert_eq!(accepted.title.as_deref(), Some("Exact VR"));
+        assert!(accepted
+            .cover_url
+            .as_deref()
+            .is_some_and(|url| url.ends_with("ps.jpg")));
+
+        let cawb = fetch_exact_library_item_with("adult", "CAWB-1", |body| {
+            assert!(body.contains("c0:ppvContent(id:\"cawb00001\")"));
+            assert!(!body.contains("cawb001"));
+            Ok(r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Exact Adult","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001pl.jpg"}}}}"#.to_owned())
+        })
+        .expect("the exact FANZA response must parse")
+        .expect("the exact CAWB item must be retained");
+        assert_eq!(cawb.content_id, "cawb00001");
+        assert_eq!(cawb.display_code, "CAWB-001");
+
+        for document in [
+            r#"{"data":{"c0":{"id":"abc00419","contentType":"VR","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
+            r#"{"data":{"c0":{"id":"mdvr00419","contentType":"TWO_DIMENSION","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
+        ] {
+            assert_eq!(
+                fetch_exact_library_item_with("vr", "MDVR-419", |_| Ok(document.to_owned())),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
     fn maps_required_content_ids_without_shared_media_identity() {
         for (content_id, display_code) in [
+            ("cawb00001", "CAWB-001"),
             ("vrkm01577", "VRKM-1577"),
             ("13dsvr01947", "3DSVR-1947"),
             ("n_709maraa244tk", "MARAA-244"),

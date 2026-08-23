@@ -1641,7 +1641,89 @@ fn decode_xml_text(value: &str) -> Option<String> {
     Some(decoded.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
-fn product_code_candidates(name: &str) -> Vec<(String, String)> {
+const DIGIT_LEADING_PRODUCT_CODE_PREFIXES: [&str; 5] =
+    ["3DSVR", "459TEN", "300MIUM", "200GANA", "230ORECZ"];
+
+pub(crate) fn adult_library_product_code_prefix_is_supported(prefix: &str) -> bool {
+    !prefix.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        || matches!(prefix, "459TEN" | "300MIUM" | "200GANA" | "230ORECZ")
+}
+
+pub(crate) fn vr_library_product_code_prefix_is_supported(prefix: &str) -> bool {
+    !prefix.as_bytes().first().is_some_and(u8::is_ascii_digit) || prefix == "3DSVR"
+}
+
+fn product_code_prefix_length(value: &[u8]) -> Option<usize> {
+    if value.first().is_some_and(u8::is_ascii_alphabetic) {
+        let length = value
+            .iter()
+            .take_while(|character| character.is_ascii_alphabetic())
+            .count();
+        return (2..=16).contains(&length).then_some(length);
+    }
+
+    DIGIT_LEADING_PRODUCT_CODE_PREFIXES
+        .iter()
+        .find(|prefix| {
+            value
+                .get(..prefix.len())
+                .is_some_and(|value| value.eq_ignore_ascii_case(prefix.as_bytes()))
+        })
+        .map(|prefix| prefix.len())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProductCodeForms {
+    pub identity: String,
+    pub display: String,
+    pub prefix: String,
+}
+
+pub(crate) fn product_code_forms(value: &str) -> Option<ProductCodeForms> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    let prefix_length = product_code_prefix_length(bytes)?;
+    let mut index = prefix_length;
+    while index < bytes.len() && matches!(bytes[index], b' ' | b'_' | b'-') {
+        index += 1;
+    }
+    let number_start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    let number_length = index - number_start;
+    if !(1..=10).contains(&number_length) || index != bytes.len() {
+        return None;
+    }
+    let digits = &value[number_start..];
+    let number = digits.parse::<u64>().ok()?;
+    let prefix = value[..prefix_length].to_ascii_uppercase();
+    (number > 0).then(|| ProductCodeForms {
+        display: format!("{prefix}-{digits}"),
+        identity: format!("{prefix}-{number}"),
+        prefix,
+    })
+}
+
+pub(crate) fn canonical_product_code(value: &str) -> Option<String> {
+    product_code_forms(value).map(|forms| forms.identity)
+}
+
+pub(crate) fn product_code_display_form(value: &str) -> Option<String> {
+    product_code_forms(value).map(|forms| forms.display)
+}
+
+pub(crate) fn javdb_product_code_query_form(value: &str) -> Option<String> {
+    let forms = product_code_forms(value)?;
+    let number = forms.identity.split_once('-')?.1;
+    Some(match forms.prefix.as_str() {
+        "CAWB" => format!("CAWB-{number:0>3}"),
+        "3DSVR" => format!("3DSVR-{number:0>5}"),
+        _ => forms.display,
+    })
+}
+
+pub(crate) fn product_code_candidates_with_display(name: &str) -> Vec<(String, String, String)> {
     let bytes = name.as_bytes();
     let mut candidates = Vec::new();
     let mut index = 0;
@@ -1652,14 +1734,11 @@ fn product_code_candidates(name: &str) -> Vec<(String, String)> {
         }
 
         let prefix_start = index;
-        while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
-            index += 1;
-        }
-        let prefix_length = index - prefix_start;
-        if !(2..=16).contains(&prefix_length) {
+        let Some(prefix_length) = product_code_prefix_length(&bytes[prefix_start..]) else {
             index = prefix_start + 1;
             continue;
-        }
+        };
+        index += prefix_length;
         while index < bytes.len() && matches!(bytes[index], b' ' | b'_' | b'-') {
             index += 1;
         }
@@ -1682,11 +1761,24 @@ fn product_code_candidates(name: &str) -> Vec<(String, String)> {
             let prefix = std::str::from_utf8(&bytes[prefix_start..prefix_start + prefix_length])
                 .expect("ASCII product-code prefixes are valid UTF-8");
             let prefix = prefix.to_ascii_uppercase();
-            candidates.push((format!("{prefix}-{number}"), prefix));
+            let digits = std::str::from_utf8(&bytes[number_start..index])
+                .expect("ASCII product-code digits are valid UTF-8");
+            candidates.push((
+                format!("{prefix}-{number}"),
+                prefix.clone(),
+                format!("{prefix}-{digits}"),
+            ));
         }
     }
 
     candidates
+}
+
+pub(crate) fn product_code_candidates(name: &str) -> Vec<(String, String)> {
+    product_code_candidates_with_display(name)
+        .into_iter()
+        .map(|(identity, prefix, _)| (identity, prefix))
+        .collect()
 }
 
 fn release_matches_product_code(name: &str, requested_code: &str) -> bool {
@@ -2727,6 +2819,60 @@ mod tests {
     use crate::tv_release::{fetch_apibay_tv_releases_for_state_with, TvReleaseState};
 
     use super::*;
+
+    #[test]
+    fn exact_product_code_parser_supports_only_evidenced_digit_leading_families() {
+        for value in ["3DSVR-01871", "3dsvr_001871", "3DSVR1871"] {
+            assert_eq!(canonical_product_code(value).as_deref(), Some("3DSVR-1871"));
+        }
+        for (value, expected) in [
+            ("cawb-1", "CAWB-1"),
+            ("CAWB-001", "CAWB-1"),
+            ("cawb_00001", "CAWB-1"),
+            ("459TEN-00048", "459TEN-48"),
+            ("300MIUM-1380", "300MIUM-1380"),
+            ("200GANA-3386", "200GANA-3386"),
+            ("230ORECZ-553", "230ORECZ-553"),
+        ] {
+            assert_eq!(canonical_product_code(value).as_deref(), Some(expected));
+        }
+        assert_eq!(
+            product_code_display_form("cawb-1").as_deref(),
+            Some("CAWB-1")
+        );
+        assert_eq!(
+            product_code_display_form("cawb_001").as_deref(),
+            Some("CAWB-001")
+        );
+        assert_eq!(
+            product_code_display_form("CAWB-00001").as_deref(),
+            Some("CAWB-00001")
+        );
+        assert_eq!(
+            javdb_product_code_query_form("CAWB-1").as_deref(),
+            Some("CAWB-001")
+        );
+        assert_eq!(
+            javdb_product_code_query_form("3DSVR-1871").as_deref(),
+            Some("3DSVR-01871")
+        );
+        for value in ["9DSVR-1871", "12VR-1871", "3DSVR-0", "3DSVR-1871-A"] {
+            assert_eq!(canonical_product_code(value), None);
+        }
+
+        assert_eq!(
+            product_code_candidates("3DSVR-01871-A").as_slice(),
+            &[("3DSVR-1871".to_owned(), "3DSVR".to_owned())]
+        );
+        assert!(product_code_candidates("9DSVR-01871-A").is_empty());
+        assert_eq!(
+            product_code_candidates("3DSVR-01871-A + MDVR-419")
+                .into_iter()
+                .map(|(code, _)| code)
+                .collect::<Vec<_>>(),
+            ["3DSVR-1871", "MDVR-419"]
+        );
+    }
 
     fn single_file_torrent_with_fields(
         length: &str,

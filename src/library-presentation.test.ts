@@ -1,0 +1,617 @@
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  parseLibraryCover,
+  parseLibraryMetadata,
+  scheduleLibraryPresentation,
+  useLibraryPresentation,
+} from "./library-presentation";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
+describe("Library presentation boundary", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("accepts exact cover and metadata responses and rejects mismatched authority", () => {
+    expect(
+      parseLibraryCover(
+        [
+          "library-cover-v2",
+          "vr",
+          "ready",
+          "JavDB",
+          "item",
+          "MDVR-419",
+          `library-cover-${"a".repeat(40)}`,
+          "1.7777777777777777",
+        ],
+        "vr",
+      ),
+    ).toMatchObject({ state: "ready", source: "JavDB" });
+    expect(
+      parseLibraryCover(
+        [
+          "library-cover-v2",
+          "adult",
+          "ready",
+          "JavDB",
+          "item",
+          "ADLT-123",
+          `library-cover-${"a".repeat(40)}`,
+          "1.77",
+        ],
+        "vr",
+      ),
+    ).toBeNull();
+    expect(
+      parseLibraryMetadata(
+        [
+          "library-metadata-v2",
+          "adult",
+          "automatic",
+          "JavDB",
+          "item",
+          "ADLT-123",
+          "Exact title",
+          "2024-01-02",
+          "90 min",
+          "1",
+          "Actor",
+        ],
+        "adult",
+      ),
+    ).toMatchObject({ state: "automatic", cast: ["Actor"] });
+  });
+
+  it("prioritizes visible cover work and discards obsolete queued work before a slot", async () => {
+    const blockers = Array.from({ length: 4 }, () => deferred<void>());
+    const running = blockers.map((blocker) =>
+      scheduleLibraryPresentation("metadata", () => blocker.promise),
+    );
+    let obsoleteCurrent = true;
+    const obsolete = vi.fn(async () => undefined);
+    const obsoleteResult = scheduleLibraryPresentation(
+      "metadata",
+      obsolete,
+      () => obsoleteCurrent,
+    ).catch((error: unknown) => error);
+    const cover = vi.fn(async () => "cover");
+    const coverResult = scheduleLibraryPresentation("cover", cover);
+
+    obsoleteCurrent = false;
+    blockers[0].resolve();
+    await expect(coverResult).resolves.toBe("cover");
+    expect(cover).toHaveBeenCalledTimes(1);
+    expect(obsolete).not.toHaveBeenCalled();
+
+    blockers.slice(1).forEach((blocker) => blocker.resolve());
+    await Promise.all(running);
+    await expect(obsoleteResult).resolves.toBeInstanceOf(Error);
+  });
+
+  it("fetches all fourteen current cover authorities before the native bound can evict one", async () => {
+    const pendingResolutions = new Map<
+      string,
+      ReturnType<typeof deferred<unknown>>
+    >();
+    const retainedAuthorityOrder: string[] = [];
+    const retainedAuthorities = new Set<string>();
+    let maximumRetainedAuthorities = 0;
+    let staleFetches = 0;
+    const invoke = vi.fn(
+      (command: string, parameters?: Record<string, unknown>) => {
+        if (command === "resolve_library_cover") {
+          const itemId = String(parameters?.itemId);
+          const resolution = deferred<unknown>();
+          pendingResolutions.set(itemId, resolution);
+          return resolution.promise;
+        }
+        if (command === "fetch_library_cover") {
+          const authorityId = String(parameters?.coverAuthorityId);
+          if (!retainedAuthorities.delete(authorityId)) {
+            staleFetches += 1;
+            return Promise.reject(new Error("cover authority was evicted"));
+          }
+          retainedAuthorityOrder.splice(
+            retainedAuthorityOrder.indexOf(authorityId),
+            1,
+          );
+          return Promise.resolve([0xff, 0xd8]);
+        }
+        if (command === "resolve_library_metadata") {
+          return Promise.resolve([
+            "library-metadata-v2",
+            "adult",
+            "local-only",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "0",
+          ]);
+        }
+        if (command === "cancel_library_cover_request") return Promise.resolve();
+        return Promise.reject(new Error(`Unexpected command ${command}`));
+      },
+    );
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => `blob:cover-${retainedAuthorities.size}`),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    const hooks = Array.from({ length: 14 }, (_, index) =>
+      renderHook(() =>
+        useLibraryPresentation({
+          category: "adult",
+          itemId: `ADLT-${index + 1}`,
+          scanGeneration: "14-card-page",
+        }),
+      ),
+    );
+
+    let resolvedCount = 0;
+    while (resolvedCount < hooks.length) {
+      const batchSize = Math.min(4, hooks.length - resolvedCount);
+      await waitFor(() => expect(pendingResolutions.size).toBe(batchSize));
+      const batch = Array.from(pendingResolutions.entries());
+      pendingResolutions.clear();
+      for (const [itemId, resolution] of batch) {
+        const itemNumber = Number(itemId.slice("ADLT-".length));
+        const authorityId = `library-cover-${itemNumber.toString(16).padStart(40, "0")}`;
+        retainedAuthorityOrder.push(authorityId);
+        retainedAuthorities.add(authorityId);
+        if (retainedAuthorityOrder.length > 8) {
+          const evictedAuthority = retainedAuthorityOrder.shift();
+          if (evictedAuthority !== undefined) {
+            retainedAuthorities.delete(evictedAuthority);
+          }
+        }
+        maximumRetainedAuthorities = Math.max(
+          maximumRetainedAuthorities,
+          retainedAuthorities.size,
+        );
+        resolution.resolve([
+          "library-cover-v2",
+          "adult",
+          "ready",
+          "JavDB",
+          `item-${itemNumber}`,
+          "ADLT-123",
+          authorityId,
+          "0.72",
+        ]);
+      }
+      resolvedCount += batchSize;
+      await waitFor(() =>
+        expect(
+          invoke.mock.calls.filter(
+            ([command]) => command === "fetch_library_cover",
+          ),
+        ).toHaveLength(resolvedCount),
+      );
+    }
+
+    await waitFor(() =>
+      expect(hooks.map(({ result }) => result.current.cover.status)).toEqual(
+        Array.from({ length: 14 }, () => "ready"),
+      ),
+    );
+    expect(maximumRetainedAuthorities).toBeLessThanOrEqual(4);
+    expect(staleFetches).toBe(0);
+    expect(retainedAuthorities.size).toBe(0);
+    expect(
+      invoke.mock.calls.filter(
+        ([command]) => command === "resolve_library_cover",
+      ),
+    ).toHaveLength(14);
+    expect(
+      invoke.mock.calls.filter(
+        ([command]) => command === "fetch_library_cover",
+      ),
+    ).toHaveLength(14);
+  });
+
+  it("shows a validated cover before optional metadata finishes", async () => {
+    const metadata = deferred<unknown>();
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") {
+        return Promise.resolve([
+          "library-cover-v2",
+          "vr",
+          "ready",
+          "JavDB",
+          "item",
+          "MDVR-419",
+          `library-cover-${"a".repeat(40)}`,
+          "1.7777777777777777",
+        ]);
+      }
+      if (command === "fetch_library_cover") {
+        return Promise.resolve([0xff, 0xd8]);
+      }
+      if (command === "resolve_library_metadata") return metadata.promise;
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    const createObjectURL = vi.fn(() => "blob:wide-cover");
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectURL,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    const { result } = renderHook(() =>
+      useLibraryPresentation({
+        category: "vr",
+        itemId: "MDVR-419",
+        scanGeneration: "7",
+      }),
+    );
+    await waitFor(() => expect(result.current.cover.status).toBe("ready"));
+    expect(result.current.cover.objectUrl).toBe("blob:wide-cover");
+    expect(result.current.cover.aspectRatio).toBe(16 / 9);
+    expect(result.current.metadata.status).toBe("loading");
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+      "resolve_library_cover",
+      "fetch_library_cover",
+      "resolve_library_metadata",
+    ]);
+
+    await act(async () => {
+      metadata.resolve([
+        "library-metadata-v2",
+        "vr",
+        "automatic",
+        "JavDB",
+        "item",
+        "MDVR-419",
+        "Provider title",
+        "2024-01-02",
+        "90 min",
+        "0",
+      ]);
+      await metadata.promise;
+    });
+    expect(result.current.cover.objectUrl).toBe("blob:wide-cover");
+    expect(result.current.metadata.status).toBe("automatic");
+  });
+
+  it("revokes a decode failure, retains geometry, and retries the exact cover", async () => {
+    let generation = 0;
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") {
+        generation += 1;
+        return Promise.resolve([
+          "library-cover-v2",
+          "adult",
+          "ready",
+          "JavDB",
+          "item",
+          "ADLT-123",
+          `library-cover-${String(generation).repeat(40)}`,
+          "0.5",
+        ]);
+      }
+      if (command === "fetch_library_cover") return Promise.resolve([0xff, 0xd8]);
+      if (command === "invalidate_library_cover") return Promise.resolve();
+      if (command === "resolve_library_metadata") {
+        return Promise.resolve([
+          "library-metadata-v2",
+          "adult",
+          "local-only",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "0",
+        ]);
+      }
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    const createObjectURL = vi
+      .fn()
+      .mockReturnValueOnce("blob:first")
+      .mockReturnValueOnce("blob:replacement");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectURL,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectURL,
+    });
+
+    const { result } = renderHook(() =>
+      useLibraryPresentation({
+        category: "adult",
+        itemId: "ADLT-123",
+        scanGeneration: "9",
+      }),
+    );
+    await waitFor(() => expect(result.current.cover.objectUrl).toBe("blob:first"));
+    act(() => result.current.cover.reportDecodeFailure?.());
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:first");
+    expect(result.current.cover.status).toBe("unavailable");
+    expect(result.current.cover.aspectRatio).toBe(0.5);
+
+    act(() => result.current.cover.retry?.());
+    await waitFor(() =>
+      expect(result.current.cover.objectUrl).toBe("blob:replacement"),
+    );
+    expect(result.current.cover.aspectRatio).toBe(0.5);
+    expect(invoke.mock.calls.filter(([command]) => command === "resolve_library_cover"))
+      .toHaveLength(2);
+    expect(
+      invoke.mock.calls.filter(
+        ([command]) => command === "invalidate_library_cover",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("cancels an obsolete native authority before byte fetch after unmount", async () => {
+    const resolution = deferred<unknown>();
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") return resolution.promise;
+      if (command === "cancel_library_cover_request") return Promise.resolve();
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+
+    const { unmount } = renderHook(() =>
+      useLibraryPresentation({
+        category: "vr",
+        itemId: "3DSVR-1871",
+        scanGeneration: "12",
+      }),
+    );
+    unmount();
+    resolution.resolve([
+      "library-cover-v2",
+      "vr",
+      "ready",
+      "JavDB",
+      "item",
+      "MDVR-419",
+      `library-cover-${"c".repeat(40)}`,
+      "0.5",
+    ]);
+
+    await waitFor(() =>
+      expect(
+        invoke.mock.calls.filter(
+          ([command]) => command === "cancel_library_cover_request",
+        ),
+      ).toHaveLength(1),
+    );
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "fetch_library_cover"),
+    ).toHaveLength(0);
+  });
+
+  it("invalidates a failed cached source and retries provider resolution without losing geometry", async () => {
+    let resolution = 0;
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") {
+        resolution += 1;
+        return Promise.resolve([
+          "library-cover-v2",
+          "adult",
+          "ready",
+          resolution === 1 ? "JavDB" : "FANZA",
+          resolution === 1 ? "old" : "fresh",
+          "ADLT-123",
+          `library-cover-${(resolution === 1 ? "d" : "e").repeat(40)}`,
+          "0.5",
+        ]);
+      }
+      if (command === "fetch_library_cover") {
+        return resolution === 1
+          ? Promise.reject(new Error("cached source failed"))
+          : Promise.resolve([0xff, 0xd8]);
+      }
+      if (command === "invalidate_library_cover") return Promise.resolve();
+      if (command === "resolve_library_metadata") {
+        return Promise.resolve([
+          "library-metadata-v2",
+          "adult",
+          "local-only",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "0",
+        ]);
+      }
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:fresh"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    const { result } = renderHook(() =>
+      useLibraryPresentation({
+        category: "adult",
+        itemId: "ADLT-123",
+        scanGeneration: "15",
+      }),
+    );
+    await waitFor(() => expect(result.current.cover.status).toBe("unavailable"));
+    expect(result.current.cover.aspectRatio).toBe(0.5);
+
+    act(() => result.current.cover.retry?.());
+    await waitFor(() => expect(result.current.cover.objectUrl).toBe("blob:fresh"));
+    expect(result.current.cover.aspectRatio).toBe(0.5);
+    expect(
+      invoke.mock.calls.filter(
+        ([command]) => command === "invalidate_library_cover",
+      ),
+    ).toHaveLength(1);
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "resolve_library_cover"),
+    ).toHaveLength(2);
+  });
+
+  it("retries metadata without restarting accepted cover resolution", async () => {
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") {
+        return Promise.resolve([
+          "library-cover-v2",
+          "adult",
+          "missing",
+          "",
+          "",
+          "",
+          "",
+          "0.72",
+        ]);
+      }
+      if (command === "resolve_library_metadata") {
+        const metadataAttempt = invoke.mock.calls.filter(
+          ([calledCommand]) => calledCommand === "resolve_library_metadata",
+        ).length;
+        if (metadataAttempt === 1) return Promise.reject(new Error("offline"));
+        return Promise.resolve([
+          "library-metadata-v2",
+          "adult",
+          "local-only",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "0",
+        ]);
+      }
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+
+    const { result } = renderHook(() =>
+      useLibraryPresentation({
+        category: "adult",
+        itemId: "ADLT-123",
+        scanGeneration: "11",
+      }),
+    );
+    await waitFor(() => expect(result.current.metadata.status).toBe("unavailable"));
+    act(() => result.current.metadata.retry?.());
+    await waitFor(() => expect(result.current.metadata.status).toBe("local-only"));
+
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "resolve_library_cover"),
+    ).toHaveLength(1);
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "resolve_library_metadata"),
+    ).toHaveLength(2);
+  });
+
+  it("rejects a late cover result after the exact item authority changes", async () => {
+    const oldCover = deferred<unknown>();
+    const invoke = vi.fn(
+      (command: string, parameters?: Record<string, unknown>) => {
+        if (command === "resolve_library_cover") {
+          if (parameters?.itemId === "MDVR-419") return oldCover.promise;
+          return Promise.resolve([
+            "library-cover-v2",
+            "vr",
+            "missing",
+            "",
+            "",
+            "",
+            "",
+            "0.72",
+          ]);
+        }
+        if (command === "resolve_library_metadata") {
+          return Promise.resolve([
+            "library-metadata-v2",
+            "vr",
+            "local-only",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "0",
+          ]);
+        }
+        if (command === "fetch_library_cover") {
+          return Promise.resolve([0xff, 0xd8]);
+        }
+        return Promise.reject(new Error(`Unexpected command ${command}`));
+      },
+    );
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+
+    const { rerender, result } = renderHook(
+      ({ itemId }) =>
+        useLibraryPresentation({
+          category: "vr",
+          itemId,
+          scanGeneration: "15",
+        }),
+      { initialProps: { itemId: "MDVR-419" } },
+    );
+    rerender({ itemId: "MDVR-420" });
+    await waitFor(() => expect(result.current.metadata.status).toBe("local-only"));
+    await act(async () => {
+      oldCover.resolve([
+        "library-cover-v2",
+        "vr",
+        "ready",
+        "JavDB",
+        "old-item",
+        "MDVR-419",
+        `library-cover-${"a".repeat(40)}`,
+        "1.77",
+      ]);
+      await oldCover.promise;
+    });
+
+    expect(result.current.cover.status).toBe("missing");
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "fetch_library_cover"),
+    ).toHaveLength(0);
+    expect(
+      invoke.mock.calls.filter(
+        ([command, parameters]) =>
+          command === "resolve_library_metadata" &&
+          parameters?.itemId === "MDVR-419",
+      ),
+    ).toHaveLength(0);
+  });
+});

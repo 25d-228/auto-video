@@ -1,5 +1,8 @@
 import { hasSupportedLibraryExtension } from "@/library-media";
-import { productCodeCandidates } from "@/vr";
+import {
+  adultLibraryProductCodePrefixIsSupported,
+  productCodeCandidates,
+} from "@/vr";
 
 export type AdultFolderState =
   | { status: "unconfigured" }
@@ -80,12 +83,15 @@ function exactMultipartLabel(title: string) {
   return matches[0][2];
 }
 
-function canonicalAdultLibraryProductCode(title: string) {
+function adultLibraryProductCode(title: string) {
   const candidates = productCodeCandidates(title)
-    .filter((candidate) => !multipartIdentityPrefixes.has(candidate.prefix))
-    .map((candidate) => candidate.code);
-  const uniqueCandidates = new Set(candidates);
-  return uniqueCandidates.size === 1 ? candidates[0] : null;
+    .filter(
+      (candidate) =>
+        adultLibraryProductCodePrefixIsSupported(candidate.prefix) &&
+        !multipartIdentityPrefixes.has(candidate.prefix),
+    );
+  const identities = new Set(candidates.map((candidate) => candidate.code));
+  return identities.size === 1 ? candidates[0] : null;
 }
 
 function parseAdultLibrary(value: unknown): AdultLibraryScan {
@@ -137,8 +143,8 @@ function parseAdultLibrary(value: unknown): AdultLibraryScan {
       sizeBytes,
       partLabel: exactMultipartLabel(title),
     };
-    const code = canonicalAdultLibraryProductCode(title);
-    if (code === null) {
+    const productCode = adultLibraryProductCode(title);
+    if (productCode === null) {
       unassociatedItems.push({
         id: `file:${path}`,
         title,
@@ -147,12 +153,12 @@ function parseAdultLibrary(value: unknown): AdultLibraryScan {
       });
       continue;
     }
-    const existingItem = groupedItems.get(code);
+    const existingItem = groupedItems.get(productCode.code);
     if (existingItem === undefined) {
-      groupedItems.set(code, {
-        id: `code:${code}`,
-        title: code,
-        code,
+      groupedItems.set(productCode.code, {
+        id: `code:${productCode.code}`,
+        title: productCode.displayCode,
+        code: productCode.displayCode,
         files: [file],
       });
     } else {
