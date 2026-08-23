@@ -231,6 +231,16 @@ struct ParsedDetail {
     preview_urls: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExactLibraryItem {
+    pub provider_item_id: String,
+    pub title: Option<String>,
+    pub release_date: Option<String>,
+    pub duration: Option<String>,
+    pub actors: Vec<String>,
+    pub cover_url: Option<String>,
+}
+
 fn valid_provider_item_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -332,6 +342,10 @@ fn valid_cover_url(value: &str) -> bool {
             .as_bytes()
             .last()
             .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+pub(crate) fn valid_library_cover_url(value: &str) -> bool {
+    valid_cover_url(value)
 }
 
 fn cover_url(movie: &BTreeMap<String, JsonValue>) -> Option<String> {
@@ -461,6 +475,59 @@ fn parse_detail(
         cover_url: cover_url(movie),
         preview_urls: preview_urls(movie),
     })
+}
+
+pub(crate) fn fetch_exact_library_item_with(
+    category: &str,
+    code: &str,
+    fetch: &mut impl FnMut(&str) -> Result<String, ProviderRequestError>,
+) -> Result<Option<ExactLibraryItem>, ProviderRequestError> {
+    let category = CatalogCategory::parse(category).ok_or(ProviderRequestError::Provider)?;
+    if canonical_product_code(code).as_deref() != Some(code) {
+        return Err(ProviderRequestError::Provider);
+    }
+
+    let listing = fetch(&format!(
+        "{JAVDB_API_URL}/api/v2/search?q={code}&type=movie"
+    ))?;
+    let listing = parse_listing(&listing).map_err(|_| ProviderRequestError::Provider)?;
+    let mut exact_items = listing
+        .items
+        .into_iter()
+        .filter(|item| item.code == code)
+        .collect::<Vec<_>>();
+    exact_items.sort_by(|left, right| left.provider_item_id.cmp(&right.provider_item_id));
+    exact_items.dedup_by(|left, right| left == right);
+    if exact_items.is_empty() {
+        return Ok(None);
+    }
+    if exact_items.len() != 1 {
+        return Err(ProviderRequestError::Provider);
+    }
+    let item = exact_items
+        .pop()
+        .expect("one exact JavDB Library item was established");
+    let detail = fetch(&format!(
+        "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
+        item.provider_item_id
+    ))?;
+    let detail = parse_detail(&detail, category, &item.provider_item_id, code)
+        .map_err(|_| ProviderRequestError::Provider)?;
+
+    Ok(Some(ExactLibraryItem {
+        provider_item_id: item.provider_item_id,
+        title: detail.title.or(item.title),
+        release_date: detail.release_date.or(item.release_date),
+        duration: detail.duration.map(|duration| {
+            if duration.ends_with(" min") {
+                duration
+            } else {
+                format!("{duration} min")
+            }
+        }),
+        actors: detail.actors,
+        cover_url: detail.cover_url.or(item.cover_url),
+    }))
 }
 
 fn parse_listing(document: &str) -> Result<ParsedListing, CatalogDocumentError> {

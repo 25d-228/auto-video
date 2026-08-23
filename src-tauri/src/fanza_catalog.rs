@@ -185,6 +185,13 @@ struct ParsedItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExactLibraryItem {
+    pub content_id: String,
+    pub title: Option<String>,
+    pub cover_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct AuthorizedItem {
     content_id: String,
     display_code: String,
@@ -309,6 +316,10 @@ fn valid_image_url(value: &str) -> bool {
         && !authority.contains('@')
         && !authority.contains(':')
         && rest.len() > authority.len() + 1
+}
+
+pub(crate) fn valid_library_cover_url(value: &str) -> bool {
+    valid_image_url(value)
 }
 
 fn package_cover_url(value: &str) -> Option<String> {
@@ -463,6 +474,95 @@ fn graphql_body(category: Category, feed: &str, count: u16) -> String {
             category.content_type()
         )
     }
+}
+
+fn exact_content_id_candidates(code: &str) -> Vec<String> {
+    let Some((prefix, number)) = code.split_once('-') else {
+        return Vec::new();
+    };
+    if !valid_display_code(code) {
+        return Vec::new();
+    }
+    let prefix = match prefix.to_ascii_lowercase().as_str() {
+        "ebon" => "ebod".to_owned(),
+        value => value.to_owned(),
+    };
+    let number = number.trim_start_matches('0');
+    let mut candidates = vec![
+        format!("{prefix}{number:0>5}"),
+        format!("{prefix}{number:0>3}"),
+        format!("{prefix}{number}"),
+        format!("1{prefix}{number:0>5}"),
+        format!("1{prefix}{number:0>3}"),
+        format!("13{prefix}{number:0>5}"),
+        format!("13{prefix}{number:0>3}"),
+    ];
+    let mut unique = std::collections::HashSet::new();
+    candidates.retain(|candidate| unique.insert(candidate.clone()));
+    candidates
+}
+
+fn exact_content_body(code: &str) -> Option<String> {
+    let fields = exact_content_id_candidates(code)
+        .into_iter()
+        .enumerate()
+        .map(|(index, content_id)| {
+            format!(
+                "c{index}:ppvContent(id:\"{content_id}\"){{id contentType title packageImage{{largeUrl}}}}"
+            )
+        })
+        .collect::<String>();
+    (!fields.is_empty()).then(|| format!(r#"{{"query":"query{{{fields}}}","variables":{{}}}}"#))
+}
+
+fn parse_exact_content(
+    document: &str,
+    category: Category,
+    code: &str,
+) -> Result<Option<ExactLibraryItem>, DocumentError> {
+    let root = parse_root(document)?;
+    let Some(JsonValue::Object(data)) = root.get("data") else {
+        return Err(DocumentError::Malformed);
+    };
+    let mut accepted = Vec::new();
+    for value in data.values() {
+        let JsonValue::Object(content) = value else {
+            if matches!(value, JsonValue::Null) {
+                continue;
+            }
+            return Err(DocumentError::Malformed);
+        };
+        let content_type = optional_text(content, "contentType").ok_or(DocumentError::Malformed)?;
+        let Some(item) = parse_content(value) else {
+            return Err(DocumentError::Malformed);
+        };
+        if item.display_code != code || content_type != category.content_type() {
+            continue;
+        }
+        accepted.push(ExactLibraryItem {
+            content_id: item.content_id,
+            title: item.title,
+            cover_url: item.cover_url,
+        });
+    }
+    accepted.sort_by(|left, right| left.content_id.cmp(&right.content_id));
+    accepted.dedup();
+    match accepted.len() {
+        0 => Ok(None),
+        1 => Ok(accepted.pop()),
+        _ => Err(DocumentError::Conflicting),
+    }
+}
+
+pub(crate) fn fetch_exact_library_item_with(
+    category: &str,
+    code: &str,
+    fetch: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+) -> Result<Option<ExactLibraryItem>, ProviderRequestError> {
+    let category = Category::parse(category).ok_or(ProviderRequestError::Provider)?;
+    let body = exact_content_body(code).ok_or(ProviderRequestError::Provider)?;
+    let document = fetch(&body)?;
+    parse_exact_content(&document, category, code).map_err(|_| ProviderRequestError::Provider)
 }
 
 fn authority(context: &CatalogContext, category: Category) -> Option<&CatalogAuthority> {
@@ -916,6 +1016,33 @@ mod tests {
 
     fn search_document(contents: &str) -> String {
         format!(r#"{{"data":{{"legacySearchPPV":{{"result":{{"contents":[{contents}]}}}}}}}}"#)
+    }
+
+    #[test]
+    fn exact_library_content_requires_the_returned_code_and_category() {
+        let accepted = fetch_exact_library_item_with("vr", "MDVR-419", |body| {
+            assert!(body.contains("ppvContent"));
+            assert!(body.contains("mdvr00419"));
+            Ok(r#"{"data":{"c0":{"id":"mdvr00419","contentType":"VR","title":"Exact VR","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/mdvr00419/mdvr00419pl.jpg"}},"c1":null}}"#.to_owned())
+        })
+        .expect("the exact FANZA response must parse")
+        .expect("the exact item must be retained");
+        assert_eq!(accepted.content_id, "mdvr00419");
+        assert_eq!(accepted.title.as_deref(), Some("Exact VR"));
+        assert!(accepted
+            .cover_url
+            .as_deref()
+            .is_some_and(|url| url.ends_with("ps.jpg")));
+
+        for document in [
+            r#"{"data":{"c0":{"id":"abc00419","contentType":"VR","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
+            r#"{"data":{"c0":{"id":"mdvr00419","contentType":"TWO_DIMENSION","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
+        ] {
+            assert_eq!(
+                fetch_exact_library_item_with("vr", "MDVR-419", |_| Ok(document.to_owned())),
+                Ok(None)
+            );
+        }
     }
 
     #[test]

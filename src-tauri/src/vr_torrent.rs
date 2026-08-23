@@ -1641,7 +1641,7 @@ fn decode_xml_text(value: &str) -> Option<String> {
     Some(decoded.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
-fn product_code_candidates(name: &str) -> Vec<(String, String)> {
+pub(crate) fn product_code_candidates(name: &str) -> Vec<(String, String)> {
     let bytes = name.as_bytes();
     let mut candidates = Vec::new();
     let mut index = 0;

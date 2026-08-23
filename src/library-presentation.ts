@@ -1,0 +1,478 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+
+export type AutomaticLibraryCategory = "adult" | "vr";
+
+export type LibraryPresentationRequest = {
+  category: AutomaticLibraryCategory;
+  itemId: string;
+  scanGeneration: string;
+};
+
+export type LibraryCover = {
+  state: "ready" | "missing" | "unavailable";
+  source: string | null;
+  providerId: string | null;
+  authorityId: string | null;
+  aspectRatio: number;
+};
+
+export type LibraryMetadata = {
+  state: "automatic" | "local-only" | "unavailable";
+  source: string | null;
+  providerId: string | null;
+  title: string | null;
+  date: string | null;
+  runtime: string | null;
+  cast: string[];
+};
+
+export type LibraryPresentationState = {
+  cover: {
+    status: "loading" | "ready" | "missing" | "unavailable";
+    objectUrl: string | null;
+    aspectRatio: number;
+    source: string | null;
+    retry: (() => void) | null;
+    reportDecodeFailure: (() => void) | null;
+  };
+  metadata: {
+    status: "waiting" | "loading" | "automatic" | "local-only" | "unavailable";
+    value: LibraryMetadata | null;
+    retry: (() => void) | null;
+  };
+};
+
+const defaultAspectRatio = 0.72;
+const maximumCoverBytes = 16 * 1024 * 1024;
+const maximumConcurrentWork = 4;
+const coverAuthorityPattern = /^library-cover-[a-f0-9]{40}$/;
+
+type Work = {
+  priority: "cover" | "metadata";
+  shouldStart: () => boolean;
+  run: () => Promise<void>;
+};
+
+const queue: Work[] = [];
+let activeWork = 0;
+
+function runQueuedWork() {
+  while (activeWork < maximumConcurrentWork) {
+    const coverIndex = queue.findIndex((work) => work.priority === "cover");
+    const work = queue.splice(coverIndex < 0 ? 0 : coverIndex, 1)[0];
+    if (work === undefined) return;
+    if (!work.shouldStart()) {
+      void work.run();
+      continue;
+    }
+    activeWork += 1;
+    void work.run().finally(() => {
+      activeWork -= 1;
+      runQueuedWork();
+    });
+  }
+}
+
+export function scheduleLibraryPresentation<T>(
+  priority: Work["priority"],
+  work: () => Promise<T>,
+  shouldStart: () => boolean = () => true,
+) {
+  return new Promise<T>((resolve, reject) => {
+    queue.push({
+      priority,
+      shouldStart,
+      run: async () => {
+        if (!shouldStart()) {
+          reject(new Error("The Library presentation request is no longer current."));
+          return;
+        }
+        try {
+          resolve(await work());
+        } catch (error: unknown) {
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      },
+    });
+    runQueuedWork();
+  });
+}
+
+function optionalText(value: string) {
+  return value === "" ? null : value;
+}
+
+export function parseLibraryCover(
+  value: unknown,
+  category: AutomaticLibraryCategory,
+): LibraryCover | null {
+  if (
+    !Array.isArray(value) ||
+    value.length !== 7 ||
+    !value.every((field) => typeof field === "string")
+  ) {
+    return null;
+  }
+  const [version, returnedCategory, state, source, providerId, authorityId, ratioText] =
+    value as string[];
+  const ratio = Number(ratioText);
+  if (
+    version !== "library-cover-v1" ||
+    returnedCategory !== category ||
+    !["ready", "missing", "unavailable"].includes(state) ||
+    !Number.isFinite(ratio) ||
+    ratio <= 0 ||
+    ratio > 4 ||
+    (state === "ready" &&
+      (source === "" ||
+        providerId === "" ||
+        !coverAuthorityPattern.test(authorityId))) ||
+    (state !== "ready" && (source !== "" || providerId !== "" || authorityId !== ""))
+  ) {
+    return null;
+  }
+  return {
+    state: state as LibraryCover["state"],
+    source: optionalText(source),
+    providerId: optionalText(providerId),
+    authorityId: optionalText(authorityId),
+    aspectRatio: ratio,
+  };
+}
+
+export function parseLibraryMetadata(
+  value: unknown,
+  category: AutomaticLibraryCategory,
+): LibraryMetadata | null {
+  if (
+    !Array.isArray(value) ||
+    value.length < 9 ||
+    !value.every((field) => typeof field === "string")
+  ) {
+    return null;
+  }
+  const fields = value as string[];
+  const [version, returnedCategory, state, source, providerId, title, date, runtime, castCountText] =
+    fields;
+  const castCount = Number(castCountText);
+  if (
+    version !== "library-metadata-v1" ||
+    returnedCategory !== category ||
+    !["automatic", "local-only", "unavailable"].includes(state) ||
+    !/^\d{1,2}$/.test(castCountText) ||
+    !Number.isSafeInteger(castCount) ||
+    fields.length !== 9 + castCount ||
+    fields.slice(9).some((entry) => entry.trim() === "") ||
+    (state === "automatic" && (source === "" || providerId === "")) ||
+    (state !== "automatic" &&
+      [source, providerId, title, date, runtime, ...fields.slice(9)].some(Boolean)) ||
+    (date !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(date))
+  ) {
+    return null;
+  }
+  return {
+    state: state as LibraryMetadata["state"],
+    source: optionalText(source),
+    providerId: optionalText(providerId),
+    title: optionalText(title),
+    date: optionalText(date),
+    runtime: optionalText(runtime),
+    cast: fields.slice(9),
+  };
+}
+
+function coverMimeType(bytes: Uint8Array) {
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
+  if (
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47
+  ) {
+    return "image/png";
+  }
+  if (
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
+function requestArguments(request: LibraryPresentationRequest) {
+  return {
+    category: request.category,
+    itemId: request.itemId,
+    scanGeneration: request.scanGeneration,
+  };
+}
+
+async function resolveCover(request: LibraryPresentationRequest) {
+  const value = await window.__TAURI__.core.invoke<unknown>(
+    "resolve_library_cover",
+    requestArguments(request),
+  );
+  const cover = parseLibraryCover(value, request.category);
+  if (cover === null) throw new Error("The native Library cover response was invalid.");
+  return cover;
+}
+
+async function fetchCover(
+  request: LibraryPresentationRequest,
+  authorityId: string,
+) {
+  const value = await window.__TAURI__.core.invoke<unknown>("fetch_library_cover", {
+    ...requestArguments(request),
+    coverAuthorityId: authorityId,
+  });
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > maximumCoverBytes ||
+    !value.every(
+      (entry) => Number.isInteger(entry) && Number(entry) >= 0 && Number(entry) <= 255,
+    )
+  ) {
+    throw new Error("The native Library cover bytes were invalid.");
+  }
+  const bytes = Uint8Array.from(value as number[]);
+  const type = coverMimeType(bytes);
+  if (type === null) throw new Error("The native Library cover bytes were invalid.");
+  return URL.createObjectURL(new Blob([bytes], { type }));
+}
+
+async function resolveMetadata(request: LibraryPresentationRequest) {
+  const value = await window.__TAURI__.core.invoke<unknown>(
+    "resolve_library_metadata",
+    requestArguments(request),
+  );
+  const metadata = parseLibraryMetadata(value, request.category);
+  if (metadata === null) {
+    throw new Error("The native Library metadata response was invalid.");
+  }
+  return metadata;
+}
+
+function initialState(): LibraryPresentationState {
+  return {
+    cover: {
+      status: "loading",
+      objectUrl: null,
+      aspectRatio: defaultAspectRatio,
+      source: null,
+      retry: null,
+      reportDecodeFailure: null,
+    },
+    metadata: { status: "waiting", value: null, retry: null },
+  };
+}
+
+export function useLibraryPresentation(
+  request: LibraryPresentationRequest | null,
+): LibraryPresentationState {
+  const requestKey = request === null ? "" : JSON.stringify(request);
+  const stableRequest = useMemo<LibraryPresentationRequest | null>(
+    () => (requestKey === "" ? null : (JSON.parse(requestKey) as LibraryPresentationRequest)),
+    [requestKey],
+  );
+  const [coverRetry, setCoverRetry] = useState(0);
+  const [metadataRetry, setMetadataRetry] = useState(0);
+  const [coverCompletedRequestKey, setCoverCompletedRequestKey] = useState("");
+  const [state, setState] = useState<LibraryPresentationState>(initialState);
+  const currentObjectUrl = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (stableRequest === null) {
+      setState(initialState());
+      setCoverCompletedRequestKey("");
+      return;
+    }
+    setState(initialState());
+    setCoverCompletedRequestKey("");
+  }, [stableRequest]);
+
+  useEffect(() => {
+    if (stableRequest === null) return;
+    let current = true;
+    setState((value) => ({
+      ...value,
+      cover: {
+        status: "loading",
+        objectUrl: null,
+        aspectRatio: value.cover.aspectRatio,
+        source: value.cover.source,
+        retry: null,
+        reportDecodeFailure: null,
+      },
+    }));
+    const completeCover = () => {
+      if (current) setCoverCompletedRequestKey(requestKey);
+    };
+
+    void scheduleLibraryPresentation(
+      "cover",
+      () => resolveCover(stableRequest),
+      () => current,
+    )
+      .then(async (cover) => {
+        if (!current) return;
+        if (cover.state !== "ready" || cover.authorityId === null) {
+          setState((value) => ({
+            ...value,
+            cover: {
+              status: cover.state,
+              objectUrl: null,
+              aspectRatio: cover.aspectRatio,
+              source: cover.source,
+              retry:
+                cover.state === "unavailable"
+                  ? () => setCoverRetry((generation) => generation + 1)
+                  : null,
+              reportDecodeFailure: null,
+            },
+          }));
+          completeCover();
+          return;
+        }
+        setState((value) => ({
+          ...value,
+          cover: {
+            status: "loading",
+            objectUrl: null,
+            aspectRatio: cover.aspectRatio,
+            source: cover.source,
+            retry: null,
+            reportDecodeFailure: null,
+          },
+        }));
+        try {
+          const objectUrl = await scheduleLibraryPresentation(
+            "cover",
+            () => fetchCover(stableRequest, cover.authorityId as string),
+            () => current,
+          );
+          if (!current) {
+            URL.revokeObjectURL(objectUrl);
+            return;
+          }
+          currentObjectUrl.current = objectUrl;
+          setState((value) => ({
+            ...value,
+            cover: {
+              status: "ready",
+              objectUrl,
+              aspectRatio: cover.aspectRatio,
+              source: cover.source,
+              retry: null,
+              reportDecodeFailure: () => {
+                if (!current || currentObjectUrl.current === null) return;
+                URL.revokeObjectURL(currentObjectUrl.current);
+                currentObjectUrl.current = null;
+                setState((currentState) => ({
+                  ...currentState,
+                  cover: {
+                    ...currentState.cover,
+                    status: "unavailable",
+                    objectUrl: null,
+                    retry: () => setCoverRetry((generation) => generation + 1),
+                    reportDecodeFailure: null,
+                  },
+                }));
+              },
+            },
+          }));
+        } catch {
+          if (!current) return;
+          setState((value) => ({
+            ...value,
+            cover: {
+              status: "unavailable",
+              objectUrl: null,
+              aspectRatio: cover.aspectRatio,
+              source: cover.source,
+              retry: () => setCoverRetry((generation) => generation + 1),
+              reportDecodeFailure: null,
+            },
+          }));
+        }
+        completeCover();
+      })
+      .catch(() => {
+        if (!current) return;
+        setState((value) => ({
+          ...value,
+          cover: {
+            ...value.cover,
+            status: "unavailable",
+            retry: () => setCoverRetry((generation) => generation + 1),
+          },
+        }));
+        completeCover();
+      });
+
+    return () => {
+      current = false;
+      if (currentObjectUrl.current !== null) {
+        URL.revokeObjectURL(currentObjectUrl.current);
+        currentObjectUrl.current = null;
+      }
+    };
+  }, [coverRetry, requestKey, stableRequest]);
+
+  useEffect(() => {
+    if (
+      stableRequest === null ||
+      coverCompletedRequestKey !== requestKey
+    ) {
+      return;
+    }
+    let current = true;
+    setState((value) => ({
+      ...value,
+      metadata: { status: "loading", value: null, retry: null },
+    }));
+    void scheduleLibraryPresentation(
+      "metadata",
+      () => resolveMetadata(stableRequest),
+      () => current,
+    )
+      .then((metadata) => {
+        if (!current) return;
+        setState((value) => ({
+          ...value,
+          metadata: {
+            status: metadata.state,
+            value: metadata,
+            retry:
+              metadata.state === "unavailable"
+                ? () => setMetadataRetry((generation) => generation + 1)
+                : null,
+          },
+        }));
+      })
+      .catch(() => {
+        if (!current) return;
+        setState((value) => ({
+          ...value,
+          metadata: {
+            status: "unavailable",
+            value: null,
+            retry: () => setMetadataRetry((generation) => generation + 1),
+          },
+        }));
+      });
+
+    return () => {
+      current = false;
+    };
+  }, [coverCompletedRequestKey, metadataRetry, requestKey, stableRequest]);
+
+  return state;
+}

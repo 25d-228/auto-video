@@ -6,7 +6,11 @@ use std::{
     time::SystemTime,
 };
 
-use crate::library_scan::{is_supported_library_media, scan_library_files};
+use crate::{
+    library_presentation::{LibraryItemAuthority, LibraryPresentationCategory},
+    library_scan::{is_supported_library_media, scan_library_files},
+    vr_torrent::{hex_sha1, product_code_candidates},
+};
 
 pub const ADULT_FOLDER_STORAGE_FAILED: &str = "adult_folder_storage_failed";
 pub const ADULT_FOLDER_UNAVAILABLE: &str = "adult_folder_unavailable";
@@ -56,6 +60,63 @@ struct AdultLibraryContext {
 
 #[derive(Clone, Default)]
 pub struct AdultLibraryState(Arc<Mutex<AdultLibraryContext>>);
+
+const MULTIPART_IDENTITY_PREFIXES: &[&str] = &["PART", "CD", "DISC", "DISK"];
+
+fn exact_file_product_code(path: &Path) -> Option<String> {
+    let title = path.file_stem()?.to_str()?;
+    let mut codes = product_code_candidates(title)
+        .into_iter()
+        .filter(|(_, prefix)| !MULTIPART_IDENTITY_PREFIXES.contains(&prefix.as_str()))
+        .map(|(code, _)| code)
+        .collect::<Vec<_>>();
+    codes.sort();
+    codes.dedup();
+    (codes.len() == 1).then(|| codes.remove(0))
+}
+
+pub(crate) fn adult_library_presentation_authority(
+    state: &AdultLibraryState,
+    scan_generation: u64,
+    code: &str,
+) -> Result<LibraryItemAuthority, &'static str> {
+    if exact_file_product_code(Path::new(code)).as_deref() != Some(code) {
+        return Err(ADULT_LIBRARY_STALE);
+    }
+    let context = state.0.lock().map_err(|_| ADULT_LIBRARY_SCAN_FAILED)?;
+    let scan = context.completed_scan.as_ref().ok_or(ADULT_LIBRARY_STALE)?;
+    if scan.generation != scan_generation || context.folder.as_ref() != Some(&scan.folder) {
+        return Err(ADULT_LIBRARY_STALE);
+    }
+    let mut members = scan
+        .files
+        .iter()
+        .filter(|file| exact_file_product_code(&file.path).as_deref() == Some(code))
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        return Err(ADULT_LIBRARY_STALE);
+    }
+    members.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut identity = format!("adult\0{}\0{code}", scan.folder.display());
+    for member in members {
+        let modified = member
+            .modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| ADULT_LIBRARY_STALE)?;
+        identity.push_str(&format!(
+            "\0{}\0{}\0{}\0{}",
+            member.path.display(),
+            member.size,
+            modified.as_secs(),
+            modified.subsec_nanos()
+        ));
+    }
+    Ok(LibraryItemAuthority {
+        category: LibraryPresentationCategory::Adult,
+        identity: hex_sha1(identity.as_bytes()),
+        code: code.to_owned(),
+    })
+}
 
 #[derive(Clone, Copy)]
 enum AdultFileValidationError {
@@ -432,6 +493,55 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn presentation_authority_requires_one_exact_current_group_and_member_identity() {
+        let fixture = Fixture::new("presentation-authority");
+        for name in [
+            "ADLT-123 Part 01.mp4",
+            "adlt_00123 CD2.MKV",
+            "ADLT-124.mp4",
+            "ADLT-123 + XYZ-7.mp4",
+            "unassociated.mp4",
+        ] {
+            fs::write(fixture.path.join(name), name.as_bytes())
+                .expect("Adult member must be written");
+        }
+        let state = AdultLibraryState::default();
+        set_adult_folder(&state, &fixture.path.join("config"), fixture.path.clone())
+            .expect("Adult folder must be configured");
+        let scan = scan_adult_library_with(&state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+
+        let authority = adult_library_presentation_authority(&state, generation, "ADLT-123")
+            .expect("one exact grouped code must authorize presentation");
+        assert_eq!(authority.category, LibraryPresentationCategory::Adult);
+        assert_eq!(authority.code, "ADLT-123");
+        assert_eq!(authority.identity.len(), 40);
+        assert_eq!(
+            adult_library_presentation_authority(&state, generation, "ADLT-125"),
+            Err(ADULT_LIBRARY_STALE)
+        );
+        assert_eq!(
+            adult_library_presentation_authority(&state, generation, "ADLT-123 + XYZ-7"),
+            Err(ADULT_LIBRARY_STALE)
+        );
+
+        fs::write(fixture.path.join("ADLT-123 Part 01.mp4"), b"changed")
+            .expect("member must change");
+        let refreshed = scan_adult_library_with(&state).expect("refresh must complete");
+        let refreshed_generation = refreshed[0].parse().expect("generation must be valid");
+        assert_eq!(
+            adult_library_presentation_authority(&state, generation, "ADLT-123"),
+            Err(ADULT_LIBRARY_STALE)
+        );
+        assert_ne!(
+            adult_library_presentation_authority(&state, refreshed_generation, "ADLT-123")
+                .expect("refreshed authority must resolve")
+                .identity,
+            authority.identity
+        );
     }
 
     #[test]

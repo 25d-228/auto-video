@@ -5,10 +5,14 @@ use std::{
     time::SystemTime,
 };
 
-use crate::library_scan::{is_supported_library_media, scan_library_files};
 use crate::vr_download::{
     configured_vr_folder, with_configured_vr_folder, with_unowned_vr_library_path, VrDownloadState,
     VrLibraryTrashOwnershipError,
+};
+use crate::{
+    library_presentation::{LibraryItemAuthority, LibraryPresentationCategory},
+    library_scan::{is_supported_library_media, scan_library_files},
+    vr_torrent::{hex_sha1, product_code_candidates},
 };
 
 pub const VR_LIBRARY_FOLDER_UNAVAILABLE: &str = "vr_library_folder_unavailable";
@@ -59,6 +63,64 @@ struct VrLibraryContext {
 
 #[derive(Clone, Default)]
 pub struct VrLibraryState(Arc<Mutex<VrLibraryContext>>);
+
+const MULTIPART_IDENTITY_PREFIXES: &[&str] = &["PART", "PT", "CD", "DISC", "DISK"];
+
+fn exact_file_product_code(path: &Path) -> Option<String> {
+    let title = path.file_stem()?.to_str()?;
+    let mut codes = product_code_candidates(title)
+        .into_iter()
+        .filter(|(_, prefix)| !MULTIPART_IDENTITY_PREFIXES.contains(&prefix.as_str()))
+        .map(|(code, _)| code)
+        .collect::<Vec<_>>();
+    codes.sort();
+    codes.dedup();
+    (codes.len() == 1).then(|| codes.remove(0))
+}
+
+pub(crate) fn vr_library_presentation_authority(
+    state: &VrLibraryState,
+    scan_generation: u64,
+    configured_folder: &Path,
+    code: &str,
+) -> Result<LibraryItemAuthority, &'static str> {
+    if exact_file_product_code(Path::new(code)).as_deref() != Some(code) {
+        return Err(VR_LIBRARY_STALE);
+    }
+    let context = state.0.lock().map_err(|_| VR_LIBRARY_SCAN_FAILED)?;
+    let scan = context.completed_scan.as_ref().ok_or(VR_LIBRARY_STALE)?;
+    if scan.generation != scan_generation || scan.folder != configured_folder {
+        return Err(VR_LIBRARY_STALE);
+    }
+    let mut members = scan
+        .files
+        .iter()
+        .filter(|file| exact_file_product_code(&file.path).as_deref() == Some(code))
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        return Err(VR_LIBRARY_STALE);
+    }
+    members.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut identity = format!("vr\0{}\0{code}", scan.folder.display());
+    for member in members {
+        let modified = member
+            .modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| VR_LIBRARY_STALE)?;
+        identity.push_str(&format!(
+            "\0{}\0{}\0{}\0{}",
+            member.path.display(),
+            member.size,
+            modified.as_secs(),
+            modified.subsec_nanos()
+        ));
+    }
+    Ok(LibraryItemAuthority {
+        category: LibraryPresentationCategory::Vr,
+        identity: hex_sha1(identity.as_bytes()),
+        code: code.to_owned(),
+    })
+}
 
 #[derive(Clone, Copy)]
 enum VrFileValidationError {
@@ -368,6 +430,47 @@ mod tests {
         ))
         .expect("empty transfer state must load");
         state
+    }
+
+    #[test]
+    fn presentation_authority_requires_the_exact_current_mdvr_group() {
+        let fixture = Fixture::new("presentation-authority");
+        for name in [
+            "MDVR-419 Part 01.mp4",
+            "mdvr_00419 Disc 02.MKV",
+            "MDVR-420.mp4",
+            "MDVR-419 + ABC-123 pack.mp4",
+            "unassociated.mp4",
+        ] {
+            fs::write(fixture.path.join(name), name.as_bytes()).expect("VR member must be written");
+        }
+        let config = fixture.path.join("config");
+        let download_state = configured_state(&fixture.path, &config);
+        let state = VrLibraryState::default();
+        let scan = scan_vr_library_with(&download_state, &state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+
+        let authority =
+            vr_library_presentation_authority(&state, generation, &fixture.path, "MDVR-419")
+                .expect("one exact MDVR group must authorize presentation");
+        assert_eq!(authority.category, LibraryPresentationCategory::Vr);
+        assert_eq!(authority.code, "MDVR-419");
+        assert_eq!(authority.identity.len(), 40);
+        for code in ["MDVR-421", "MDVR-419 + ABC-123"] {
+            assert_eq!(
+                vr_library_presentation_authority(&state, generation, &fixture.path, code,),
+                Err(VR_LIBRARY_STALE)
+            );
+        }
+        assert_eq!(
+            vr_library_presentation_authority(
+                &state,
+                generation,
+                &fixture.path.join("other"),
+                "MDVR-419",
+            ),
+            Err(VR_LIBRARY_STALE)
+        );
     }
 
     #[test]

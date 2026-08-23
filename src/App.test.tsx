@@ -103,6 +103,15 @@ let revealAdultFileMock: Mock<
 let trashAdultFileMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
+let resolveLibraryCoverMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let resolveLibraryMetadataMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
+let fetchLibraryCoverMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<number[]>
+>;
 let loadTmdbTokenMock: Mock<() => Promise<string | null>>;
 let saveTmdbTokenMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
@@ -928,6 +937,63 @@ function visibleCardCount(listName: string) {
   ).length;
 }
 
+function libraryDetailsAction(name: string | RegExp) {
+  const accessibleName =
+    typeof name === "string" ? name.replace(/\s+/g, " ") : name;
+  const currentAction = screen.queryByRole("button", { name: accessibleName });
+  if (currentAction !== null) {
+    return currentAction;
+  }
+  const openDialog = screen.queryByRole("dialog", { name: /.+/ });
+  if (openDialog !== null) {
+    const close = within(openDialog).queryByRole("button", {
+      name: /^Close Library details:/,
+    });
+    if (close !== null) fireEvent.click(close);
+  }
+  for (const trigger of screen.getAllByRole("button", { name: /^Details:/ })) {
+    fireEvent.click(trigger);
+    const action = screen.queryByRole("button", { name: accessibleName });
+    if (action !== null) return action;
+    fireEvent.click(
+      screen.getByRole("button", { name: /^Close Library details:/ }),
+    );
+  }
+  throw new Error(`No Library details action matched ${String(name)}.`);
+}
+
+function libraryDetailsActionForCard(
+  card: HTMLElement,
+  name: string | RegExp,
+) {
+  const accessibleName =
+    typeof name === "string" ? name.replace(/\s+/g, " ") : name;
+  const currentAction = screen.queryByRole("button", { name: accessibleName });
+  if (currentAction !== null) {
+    return currentAction;
+  }
+  const openDialog = screen.queryByRole("dialog", { name: /.+/ });
+  if (openDialog !== null) {
+    fireEvent.click(
+      within(openDialog).getByRole("button", {
+        name: /^Close Library details:/,
+      }),
+    );
+  }
+  fireEvent.click(
+    within(card).getByRole("button", { name: /^Details:/ }),
+  );
+  return screen.getByRole("button", { name: accessibleName });
+}
+
+function openLibraryDetails(title: string) {
+  const accessibleTitle = title.replace(/\s+/g, " ");
+  fireEvent.click(
+    screen.getByRole("button", { name: `Details: ${accessibleTitle}` }),
+  );
+  return screen.getByRole("dialog", { name: accessibleTitle });
+}
+
 function visibleMovieTitles() {
   return within(screen.getByRole("list", { name: "Movies" }))
     .getAllByRole("heading", { level: 3 })
@@ -1076,6 +1142,31 @@ beforeEach(() => {
   openAdultFileMock = vi.fn().mockResolvedValue(undefined);
   revealAdultFileMock = vi.fn().mockResolvedValue(undefined);
   trashAdultFileMock = vi.fn().mockResolvedValue(undefined);
+  resolveLibraryCoverMock = vi.fn().mockImplementation((parameters) =>
+    Promise.resolve([
+      "library-cover-v1",
+      parameters?.category as string,
+      "missing",
+      "",
+      "",
+      "",
+      "0.72",
+    ]),
+  );
+  resolveLibraryMetadataMock = vi.fn().mockImplementation((parameters) =>
+    Promise.resolve([
+      "library-metadata-v1",
+      parameters?.category as string,
+      "local-only",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "0",
+    ]),
+  );
+  fetchLibraryCoverMock = vi.fn().mockResolvedValue([]);
   loadTmdbTokenMock = vi.fn().mockResolvedValue(null);
   saveTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
   clearTmdbTokenMock = vi.fn().mockResolvedValue(undefined);
@@ -1337,6 +1428,12 @@ beforeEach(() => {
           return revealAdultFileMock(parameters);
         case "trash_adult_file":
           return trashAdultFileMock(parameters);
+        case "resolve_library_cover":
+          return resolveLibraryCoverMock(parameters);
+        case "resolve_library_metadata":
+          return resolveLibraryMetadataMock(parameters);
+        case "fetch_library_cover":
+          return fetchLibraryCoverMock(parameters);
         case "load_tmdb_token":
           return loadTmdbTokenMock();
         case "save_tmdb_token":
@@ -1632,23 +1729,32 @@ describe("parsed TV Library and Dashboard", () => {
     if (showCard === null) {
       throw new Error("The grouped TV show card was not rendered.");
     }
-    expect(showCard.querySelectorAll("[data-tv-file-path]")).toHaveLength(2);
-    expect(screen.getByText("Season 1 · Episode 2 · 1.0 GiB")).toBeTruthy();
-    expect(screen.getByText("Unknown release.mp4")).toBeTruthy();
-    const visibleFilePaths = Array.from(
-      document.querySelectorAll("[data-tv-file-path]"),
-      (row) => row.getAttribute("data-tv-file-path"),
+    expect(showCard.querySelectorAll("[data-tv-file-path]")).toHaveLength(0);
+    const details = openLibraryDetails("星  Show");
+    expect(within(details).getAllByRole("listitem")).toHaveLength(2);
+    expect(within(details).getByText("Season 1 · Episode 2 · 1.0 GiB"))
+      .toBeTruthy();
+    fireEvent.click(
+      within(details).getByRole("button", {
+        name: "Close Library details: 星 Show",
+      }),
     );
-    expect(visibleFilePaths).toEqual(
-      expect.arrayContaining([
-        "/TV/番組  Library/星  Show.S01E02-E03.mp4",
-        "/TV/番組  Library/星  Show.S01E02-03.mkv",
-        "/TV/番組  Library/星  Show.1x02-03.mp4",
-      ]),
-    );
+    for (const title of [
+      "Unknown release",
+      "星  Show.S01E02-E03",
+      "星  Show.S01E02-03",
+      "星  Show.1x02-03",
+    ]) {
+      expect(
+        screen.getByRole("heading", {
+          level: 3,
+          name: title.replace(/\s+/g, " "),
+        }),
+      ).toBeTruthy();
+    }
   });
 
-  it("searches then sorts then paginates immediately across 25, 7, and 10 item capacities", async () => {
+  it("searches then sorts then paginates immediately across natural card capacities", async () => {
     savedTvFolder = "/TV";
     scanTvLibraryMock.mockResolvedValue([
       ...Array.from({ length: 30 }, (_, index) => {
@@ -1667,16 +1773,16 @@ describe("parsed TV Library and Dashboard", () => {
     fireEvent.click(screen.getByRole("radio", { name: "TV" }));
     await screen.findByRole("heading", { level: 3, name: "Show 01" });
     const gallery = document.querySelector('[data-gallery="library"]');
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("25");
-    expect(visibleCardCount("TV shows and unassociated files")).toBe(25);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("14");
+    expect(visibleCardCount("TV shows and unassociated files")).toBe(14);
     fireEvent.click(screen.getByRole("button", { name: /Next TV shows/ }));
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
 
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1100, 136);
     expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
-    resizeGallery("library", 1088, 284);
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
+    resizeGallery("library", 1088, 536);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("14");
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
 
     fireEvent.change(
@@ -1826,17 +1932,13 @@ describe("parsed TV Library and Dashboard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Copy title: 星 Show" }));
     expect(clipboardWriteMock).toHaveBeenCalledWith("星  Show");
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Open TV file: 星 Show.S01E02 — Pilot.mp4",
-      }),
+      libraryDetailsAction("Open TV file: 星 Show.S01E02 — Pilot.mp4"),
     );
     expect(
       await screen.findByText("This file is no longer part of the current TV Library."),
     ).toBeTruthy();
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Reveal TV file: 星 Show.S01E02 — Pilot.mp4",
-      }),
+      libraryDetailsAction("Reveal TV file: 星 Show.S01E02 — Pilot.mp4"),
     );
     expect(openTvFileMock).toHaveBeenCalledWith({ path });
     expect(revealTvFileMock).toHaveBeenCalledWith({ path });
@@ -1861,9 +1963,10 @@ describe("parsed TV Library and Dashboard", () => {
     );
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "TV" }));
-    const trashButton = await screen.findByRole("button", {
-      name: "Move TV file to Trash or Recycle Bin: Exact Show.S02E03 — Finale.MKV",
-    });
+    await screen.findByRole("heading", { name: "Exact Show" });
+    const trashButton = libraryDetailsAction(
+      "Move TV file to Trash or Recycle Bin: Exact Show.S02E03 — Finale.MKV",
+    );
     parentActivation.mockClear();
     trashButton.focus();
     fireEvent.click(trashButton);
@@ -1963,9 +2066,9 @@ describe("parsed TV Library and Dashboard", () => {
       target: { value: "Exact Show" },
     });
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Move TV file to Trash or Recycle Bin: Exact Show.S01E01.mp4",
-      }),
+      libraryDetailsAction(
+        "Move TV file to Trash or Recycle Bin: Exact Show.S01E01.mp4",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     const confirmButton = within(dialog).getByRole("button", {
@@ -2008,6 +2111,11 @@ describe("parsed TV Library and Dashboard", () => {
     ).toBeTruthy();
     expect(screen.queryByText("Exact Show.S01E01.mp4")).toBeNull();
     expect(screen.getByText("Exact Show.S01E02.mkv")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Close Library details: Exact Show",
+      }),
+    );
     expect(screen.getByRole("heading", { level: 3, name: "Exact Show" }))
       .toBeTruthy();
     expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
@@ -2019,13 +2127,9 @@ describe("parsed TV Library and Dashboard", () => {
       "descending",
     );
     fireEvent.click(screen.getByRole("button", { name: "Clear TV search" }));
-    await waitFor(() => {
-      expect(
-        Array.from(document.querySelectorAll("[data-tv-file-path]"), (row) =>
-          row.getAttribute("data-tv-file-path"),
-        ),
-      ).toContain(unassociatedPath);
-    });
+    expect(
+      await screen.findByRole("heading", { name: "Unicode 特典" }),
+    ).toBeTruthy();
     expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
     expect(queryTvStorageMock).toHaveBeenCalledTimes(2);
     expect(scanMoviesMock).not.toHaveBeenCalled();
@@ -2083,10 +2187,11 @@ describe("parsed TV Library and Dashboard", () => {
     render(<App />);
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    await screen.findByRole("heading", { name: "Unassociated — remove me" });
     fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Move TV file to Trash or Recycle Bin: Unassociated — remove me.MKV",
-      }),
+      libraryDetailsAction(
+        "Move TV file to Trash or Recycle Bin: Unassociated — remove me.MKV",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog.textContent).toContain(
@@ -2104,7 +2209,7 @@ describe("parsed TV Library and Dashboard", () => {
       ),
     ).toBeTruthy();
     expect(screen.queryByText("Unassociated  —  remove me.MKV")).toBeNull();
-    expect(screen.getByText("Keep Show.S01E01.mp4")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Keep Show" })).toBeTruthy();
     const attention = await screen.findByRole("alert");
     expect(attention.textContent).toContain("file move succeeded");
     expect(attention.textContent).toContain("remains removed");
@@ -2173,9 +2278,9 @@ describe("parsed TV Library and Dashboard", () => {
       await screen.findByRole("heading", { name: providerName }),
     ).toBeTruthy();
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
-      }),
+      libraryDetailsAction(
+        "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
+      ),
     );
     fireEvent.click(
       within(await screen.findByRole("alertdialog")).getByRole("button", {
@@ -2186,6 +2291,11 @@ describe("parsed TV Library and Dashboard", () => {
     expect(
       await screen.findByRole("heading", { name: "Exact Local Show" }),
     ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Close Library details: Exact Local Show",
+      }),
+    );
     expect(screen.queryByRole("heading", { name: providerName })).toBeNull();
     expect(
       screen.queryByRole("button", {
@@ -2206,15 +2316,15 @@ describe("parsed TV Library and Dashboard", () => {
       }),
     ).toHaveProperty("disabled", true);
 
-    const open = screen.getByRole("button", {
-      name: "Open TV file: Exact Local Show.S01E02.mkv",
-    });
-    const reveal = screen.getByRole("button", {
-      name: "Reveal TV file: Exact Local Show.S01E02.mkv",
-    });
-    const remainingTrash = screen.getByRole("button", {
-      name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E02.mkv",
-    });
+    const open = libraryDetailsAction(
+      "Open TV file: Exact Local Show.S01E02.mkv",
+    );
+    const reveal = libraryDetailsAction(
+      "Reveal TV file: Exact Local Show.S01E02.mkv",
+    );
+    const remainingTrash = libraryDetailsAction(
+      "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E02.mkv",
+    );
     expect(open).toHaveProperty("disabled", false);
     expect(reveal).toHaveProperty("disabled", false);
     expect(remainingTrash).toHaveProperty("disabled", false);
@@ -2227,6 +2337,11 @@ describe("parsed TV Library and Dashboard", () => {
     await waitFor(() => {
       expect(revealTvFileMock).toHaveBeenCalledWith({ path: laterMemberPath });
     });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Close Library details: Exact Local Show",
+      }),
+    );
 
     const reconciliationAlert = screen
       .getByText(/file move succeeded, but the TV Library or storage/)
@@ -2240,7 +2355,7 @@ describe("parsed TV Library and Dashboard", () => {
       }),
     );
     expect(
-      await screen.findByText("Exact Local Show.S01E02.mkv"),
+      await screen.findByRole("heading", { name: "Exact Local Show" }),
     ).toBeTruthy();
     expect(
       screen.getByRole("button", {
@@ -2295,9 +2410,9 @@ describe("parsed TV Library and Dashboard", () => {
     fireEvent.click(screen.getByRole("radio", { name: "TV" }));
     await screen.findByRole("heading", { name: providerName });
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
-      }),
+      libraryDetailsAction(
+        "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E01.mp4",
+      ),
     );
     fireEvent.click(
       within(await screen.findByRole("alertdialog")).getByRole("button", {
@@ -2308,6 +2423,11 @@ describe("parsed TV Library and Dashboard", () => {
     expect(
       await screen.findByRole("heading", { name: "Exact Local Show" }),
     ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Close Library details: Exact Local Show",
+      }),
+    );
     expect(screen.queryByRole("heading", { name: providerName })).toBeNull();
     expect(
       screen.getByRole("button", {
@@ -2315,10 +2435,15 @@ describe("parsed TV Library and Dashboard", () => {
       }),
     ).toHaveProperty("disabled", true);
     expect(
-      screen.getByRole("button", {
-        name: "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E02.mkv",
-      }),
+      libraryDetailsAction(
+        "Move TV file to Trash or Recycle Bin: Exact Local Show.S01E02.mkv",
+      ),
     ).toHaveProperty("disabled", false);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Close Library details: Exact Local Show",
+      }),
+    );
 
     await act(async () => {
       reconciliation.resolve(
@@ -2387,10 +2512,11 @@ describe("parsed TV Library and Dashboard", () => {
     render(<App />);
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    await screen.findByRole("heading", { name: "Failure Show" });
     fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Move TV file to Trash or Recycle Bin: Failure Show.S01E01.mp4",
-      }),
+      libraryDetailsAction(
+        "Move TV file to Trash or Recycle Bin: Failure Show.S01E01.mp4",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -2414,7 +2540,7 @@ describe("parsed TV Library and Dashboard", () => {
 
   it("removing the final grouped member clamps only an invalid TV page", async () => {
     savedTvFolder = "/TV";
-    const rows = Array.from({ length: 29 }, (_, index) => {
+    const rows = Array.from({ length: 21 }, (_, index) => {
       const title = `Show ${String(index + 1).padStart(2, "0")}`;
       return [`/TV/${title}.S01E01.mp4`, `${title}.S01E01.mp4`, "1"];
     }).flat();
@@ -2427,28 +2553,28 @@ describe("parsed TV Library and Dashboard", () => {
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "TV" }));
     await screen.findByRole("heading", { level: 3, name: "Show 01" });
-    for (let page = 1; page < 5; page += 1) {
+    for (let page = 1; page < 3; page += 1) {
       fireEvent.click(
         screen.getByRole("button", { name: "Next TV shows and unassociated files page" }),
       );
     }
-    expect(screen.getByText("Page 5 of 5")).toBeTruthy();
+    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Move TV file to Trash or Recycle Bin: Show 29.S01E01.mp4",
-      }),
+      libraryDetailsAction(
+        "Move TV file to Trash or Recycle Bin: Show 21.S01E01.mp4",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
       within(dialog).getByRole("button", {
-        name: "Confirm moving TV file to Trash or Recycle Bin: Show 29.S01E01.mp4",
+        name: "Confirm moving TV file to Trash or Recycle Bin: Show 21.S01E01.mp4",
       }),
     );
 
-    expect(await screen.findByText("Page 4 of 4")).toBeTruthy();
-    expect(screen.queryByRole("heading", { level: 3, name: "Show 29" }))
+    expect(await screen.findByText("Page 2 of 2")).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 3, name: "Show 21" }))
       .toBeNull();
-    expect(screen.getByRole("heading", { level: 3, name: "Show 28" }))
+    expect(screen.getByRole("heading", { level: 3, name: "Show 20" }))
       .toBeTruthy();
     expect(scanTvLibraryMock).toHaveBeenCalledTimes(2);
     expect(queryTvStorageMock).toHaveBeenCalledTimes(2);
@@ -2563,8 +2689,16 @@ describe("explicit TV Library TMDB show metadata matching", () => {
     ).toBeTruthy();
     expect(screen.getByText(/metadata was matched to the exact local TV show/)).toBeTruthy();
     expect(saveTvShowMetadataMatchMock).toHaveBeenCalledWith({ verificationId });
-    expect(screen.getByText(/Season 1 · Episode 1/)).toBeTruthy();
-    expect(screen.getByText(/Season 1 · Episode 2/)).toBeTruthy();
+    const libraryDetails = openLibraryDetails("Accepted 番組 — 特別版");
+    expect(within(libraryDetails).getByText(/Season 1 · Episode 1/))
+      .toBeTruthy();
+    expect(within(libraryDetails).getByText(/Season 1 · Episode 2/))
+      .toBeTruthy();
+    fireEvent.click(
+      within(libraryDetails).getByRole("button", {
+        name: "Close Library details: Accepted 番組 — 特別版",
+      }),
+    );
     fireEvent.click(
       screen.getByRole("button", { name: "Copy title: Accepted 番組 — 特別版" }),
     );
@@ -2719,8 +2853,11 @@ describe("explicit TV Library TMDB show metadata matching", () => {
         }),
       ).toBeTruthy();
       expect(
-        screen.getAllByRole("button", { hidden: true, name: /^Open TV file:/ }),
-      ).toHaveLength(2);
+        screen.getByRole("heading", {
+          hidden: true,
+          name: "Exact Local — 番組",
+        }),
+      ).toBeTruthy();
     }
     expect(saveTvShowMetadataMatchMock).toHaveBeenCalledTimes(3);
     expect(openTvFileMock).not.toHaveBeenCalled();
@@ -2766,9 +2903,8 @@ describe("explicit TV Library TMDB show metadata matching", () => {
       fireEvent.click(clear);
       expect((await screen.findByRole("alert")).textContent).toBe(message);
       expect(screen.getByRole("heading", { name: "Current Show" })).toBeTruthy();
-      expect(
-        screen.getAllByRole("button", { hidden: true, name: /^Open TV file:/ }),
-      ).toHaveLength(2);
+      expect(screen.getByRole("dialog", { name: "Current Show" }))
+        .toBeTruthy();
     }
     expect(clearTvShowMetadataMatchMock).toHaveBeenCalledTimes(3);
     expect(openTvFileMock).not.toHaveBeenCalled();
@@ -3054,11 +3190,11 @@ describe("explicit TV Library TMDB show metadata matching", () => {
     selectTvLibrary();
     await screen.findByRole("heading", { name: "Canonical Show 01" });
     resizeGallery("library", 1088, 728);
-    expect(visibleCardCount("TV shows and unassociated files")).toBe(25);
-    resizeGallery("library", 1528, 136);
+    expect(visibleCardCount("TV shows and unassociated files")).toBe(14);
+    resizeGallery("library", 1088, 136);
     expect(visibleCardCount("TV shows and unassociated files")).toBe(7);
     resizeGallery("library", 1088, 284);
-    expect(visibleCardCount("TV shows and unassociated files")).toBe(10);
+    expect(visibleCardCount("TV shows and unassociated files")).toBe(7);
     expect(screen.getByRole("heading", { name: "Canonical Show 01" })).toBeTruthy();
     expect(scanTvLibraryMock).toHaveBeenCalledTimes(1);
     expect(searchTvShowMetadataMock).not.toHaveBeenCalled();
@@ -3254,29 +3390,36 @@ describe("parsed Adult Library and Dashboard", () => {
     if (groupedCard === null) {
       throw new Error("The grouped Adult card was not rendered.");
     }
-    expect(groupedCard.querySelectorAll("[data-adult-file-path]")).toHaveLength(5);
-    expect(within(groupedCard).getByText("Part 01 · 1.0 GiB")).toBeTruthy();
-    expect(within(groupedCard).getByText("CD2 · 2.0 GiB")).toBeTruthy();
-    const ambiguousRow = groupedCard.querySelector(
+    expect(groupedCard.querySelectorAll("[data-adult-file-path]")).toHaveLength(0);
+    const details = openLibraryDetails("ADLT-123");
+    expect(within(details).getAllByRole("listitem")).toHaveLength(5);
+    expect(within(details).getByText("Part 01 · 1.0 GiB")).toBeTruthy();
+    expect(within(details).getByText("CD2 · 2.0 GiB")).toBeTruthy();
+    const ambiguousRow = details.querySelector(
       '[data-adult-file-path="/Adult/作品  Library/ADLT-123 Part 01 Disc 02.mp4"]',
     );
     expect(ambiguousRow?.textContent).toContain("3.0 GiB");
     expect(ambiguousRow?.textContent).not.toContain("Part 01 ·");
-    const compactPartRow = groupedCard.querySelector(
+    const compactPartRow = details.querySelector(
       '[data-adult-file-path="/Adult/作品  Library/ADLT-123 Part 1-2.mp4"]',
     );
     expect(compactPartRow?.textContent).toContain("ADLT-123 Part 1-2.mp4");
     expect(compactPartRow?.textContent).not.toContain("Part 1 ·");
-    const compactCdRow = groupedCard.querySelector(
+    const compactCdRow = details.querySelector(
       '[data-adult-file-path="/Adult/作品  Library/ADLT-123 CD1+2.mkv"]',
     );
     expect(compactCdRow?.textContent).toContain("ADLT-123 CD1+2.mkv");
     expect(compactCdRow?.textContent).not.toContain("CD1 ·");
     expect(
-      groupedCard.querySelector(
+      details.querySelector(
         '[data-adult-file-path="/Adult/作品  Library/ADLT-123 + PT-7.mp4"]',
       ),
     ).toBeNull();
+    fireEvent.click(
+      within(details).getByRole("button", {
+        name: "Close Library details: ADLT-123",
+      }),
+    );
     const vrOnlyPartHeading = within(gallery).getByRole("heading", {
       level: 3,
       name: "ADLT-123 + PT-7",
@@ -3289,7 +3432,7 @@ describe("parsed Adult Library and Dashboard", () => {
     expect(unassociatedHeading.textContent).toBe("作品  without code");
   });
 
-  it("searches then sorts then paginates across 25, 7, and 10 without changing Dashboard totals", async () => {
+  it("searches then sorts then paginates across natural capacities without changing Dashboard totals", async () => {
     savedAdultFolder = "/Adult";
     scanAdultLibraryMock.mockResolvedValue([
       ...Array.from({ length: 30 }, (_, index) => {
@@ -3308,16 +3451,16 @@ describe("parsed Adult Library and Dashboard", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
     await screen.findByRole("heading", { level: 3, name: "ADLT-101" });
     let gallery = document.querySelector('[data-gallery="library"]');
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("25");
-    expect(visibleCardCount("Adult titles and unassociated files")).toBe(25);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("14");
+    expect(visibleCardCount("Adult titles and unassociated files")).toBe(14);
     fireEvent.click(screen.getByRole("button", { name: /Next Adult titles/ }));
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
 
     resizeGallery("library", 1528, 136);
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
     resizeGallery("library", 1088, 284);
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
@@ -3516,9 +3659,7 @@ describe("parsed Adult Library and Dashboard", () => {
       }),
     ).toBeTruthy();
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Open Adult file: ADLT-123 Part 01.mp4",
-      }),
+      libraryDetailsAction("Open Adult file: ADLT-123 Part 01.mp4"),
     );
     expect(
       await screen.findByText(
@@ -3526,9 +3667,7 @@ describe("parsed Adult Library and Dashboard", () => {
       ),
     ).toBeTruthy();
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Reveal Adult file: 作品 Special — Edition.mkv",
-      }),
+      libraryDetailsAction("Reveal Adult file: 作品 Special — Edition.mkv"),
     );
     expect(openAdultFileMock).toHaveBeenCalledWith({ path: groupedPath });
     expect(revealAdultFileMock).toHaveBeenCalledWith({ path: unassociatedPath });
@@ -3556,9 +3695,10 @@ describe("parsed Adult Library and Dashboard", () => {
     );
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
-    const trashButton = await screen.findByRole("button", {
-      name: "Move Adult file to Trash or Recycle Bin: ADLT-123 Part 01 — 前編.MKV",
-    });
+    await screen.findByRole("heading", { name: "ADLT-123" });
+    const trashButton = libraryDetailsAction(
+      "Move Adult file to Trash or Recycle Bin: ADLT-123 Part 01 — 前編.MKV",
+    );
     parentActivation.mockClear();
     trashButton.focus();
     fireEvent.click(trashButton);
@@ -3656,9 +3796,9 @@ describe("parsed Adult Library and Dashboard", () => {
       target: { value: "ADLT-123" },
     });
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Move Adult file to Trash or Recycle Bin: ADLT-123 Part 01.mp4",
-      }),
+      libraryDetailsAction(
+        "Move Adult file to Trash or Recycle Bin: ADLT-123 Part 01.mp4",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     const confirmButton = within(dialog).getByRole("button", {
@@ -3703,6 +3843,11 @@ describe("parsed Adult Library and Dashboard", () => {
     expect(screen.getByText("CD2 · 20 B")).toBeTruthy();
     expect(screen.getByText("ADLT-123 Part 1-2.mp4")).toBeTruthy();
     expect(screen.queryByText("Part 1 · 30 B")).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Close Library details: ADLT-123",
+      }),
+    );
     expect(screen.getByRole("heading", { level: 3, name: "ADLT-123" }))
       .toBeTruthy();
     expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
@@ -3714,13 +3859,9 @@ describe("parsed Adult Library and Dashboard", () => {
       "descending",
     );
     fireEvent.click(screen.getByRole("button", { name: "Clear Adult search" }));
-    await waitFor(() => {
-      expect(
-        Array.from(document.querySelectorAll("[data-adult-file-path]"), (row) =>
-          row.getAttribute("data-adult-file-path"),
-        ),
-      ).toContain(unassociatedPath);
-    });
+    expect(
+      await screen.findByRole("heading", { name: "Unicode 特典" }),
+    ).toBeTruthy();
     expect(scanAdultLibraryMock).toHaveBeenCalledTimes(2);
     expect(queryAdultStorageMock).toHaveBeenCalledTimes(2);
     expect(scanMoviesMock).not.toHaveBeenCalled();
@@ -3770,10 +3911,11 @@ describe("parsed Adult Library and Dashboard", () => {
     render(<App />);
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { name: "Unassociated — remove me" });
     fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Move Adult file to Trash or Recycle Bin: Unassociated — remove me.MKV",
-      }),
+      libraryDetailsAction(
+        "Move Adult file to Trash or Recycle Bin: Unassociated — remove me.MKV",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog.textContent).toContain(
@@ -3791,7 +3933,8 @@ describe("parsed Adult Library and Dashboard", () => {
       ),
     ).toBeTruthy();
     expect(screen.queryByText("Unassociated  —  remove me.MKV")).toBeNull();
-    expect(screen.getByText("ADLT-123 Disk-4.mp4")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "ADLT-123" }))
+      .toBeTruthy();
     const attention = await screen.findByRole("alert");
     expect(attention.textContent).toContain("file move succeeded");
     expect(attention.textContent).toContain("remains removed");
@@ -3851,10 +3994,11 @@ describe("parsed Adult Library and Dashboard", () => {
     render(<App />);
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { name: "ADLT-123" });
     fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Move Adult file to Trash or Recycle Bin: ADLT-123 Disc 03.mp4",
-      }),
+      libraryDetailsAction(
+        "Move Adult file to Trash or Recycle Bin: ADLT-123 Disc 03.mp4",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -3885,7 +4029,7 @@ describe("parsed Adult Library and Dashboard", () => {
     scanAdultLibraryMock
       .mockResolvedValueOnce(rows)
       .mockResolvedValueOnce(rows.slice(0, -3));
-    gallerySizes.library = { width: 1528, height: 136 };
+    gallerySizes.library = { width: 1088, height: 136 };
 
     render(<App />);
     selectLibrary();
@@ -3900,9 +4044,9 @@ describe("parsed Adult Library and Dashboard", () => {
     }
     expect(screen.getByText("Page 5 of 5")).toBeTruthy();
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Move Adult file to Trash or Recycle Bin: ADLT-129.mp4",
-      }),
+      libraryDetailsAction(
+        "Move Adult file to Trash or Recycle Bin: ADLT-129.mp4",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -4051,7 +4195,9 @@ describe("parsed VR Library and Dashboard", () => {
       restoredFolder.resolve(["ready", folder]);
       await restoredFolder.promise;
     });
-    expect(await screen.findByText("MDVR-419")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "MDVR-419" }),
+    ).toBeTruthy();
     await waitFor(() => {
       expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
       expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
@@ -4130,7 +4276,9 @@ describe("parsed VR Library and Dashboard", () => {
     });
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "VR" }));
-    expect(await screen.findByText("MDVR-422")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "MDVR-422" }),
+    ).toBeTruthy();
     expect(screen.queryByText("/VR/A")).toBeNull();
     expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
     expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
@@ -4151,7 +4299,9 @@ describe("parsed VR Library and Dashboard", () => {
       pendingScan.resolve(["/VR/MDVR-419.mp4", "1"]);
       await pendingScan.promise;
     });
-    expect(await screen.findByText("MDVR-419")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "MDVR-419" }),
+    ).toBeTruthy();
   });
 
   it("shows grouped counts while preserving exact member copy, open, and reveal actions", async () => {
@@ -4187,14 +4337,7 @@ describe("parsed VR Library and Dashboard", () => {
       (screen.getByRole("radio", { name: "VR" }) as HTMLInputElement).checked,
     ).toBe(true);
     expect(await screen.findByRole("heading", { level: 3, name: "MDVR-419" })).toBeTruthy();
-    const renderedFileRows = Array.from(
-      document.querySelectorAll<HTMLElement>("[data-vr-file-path]"),
-    );
-    expect(renderedFileRows.map((row) => row.dataset.vrFilePath)).toEqual([
-      firstPath,
-      secondPath,
-      unassociatedPath,
-    ]);
+    expect(document.querySelectorAll("[data-vr-file-path]")).toHaveLength(0);
 
     fireEvent.click(screen.getByRole("button", { name: "Copy title: MDVR-419" }));
     await waitFor(() => expect(clipboardWriteMock).toHaveBeenCalledWith("MDVR-419"));
@@ -4210,8 +4353,8 @@ describe("parsed VR Library and Dashboard", () => {
     await waitFor(() =>
       expect(clipboardWriteMock).toHaveBeenCalledWith(unassociatedTitle),
     );
-    const firstOpen = within(renderedFileRows[0]).getByTitle("Open file");
-    const secondReveal = within(renderedFileRows[1]).getByTitle("Reveal file");
+    const firstOpen = libraryDetailsAction(`Open VR file: ${firstPath}`);
+    const secondReveal = libraryDetailsAction(`Reveal VR file: ${secondPath}`);
     expect(firstOpen.getAttribute("aria-label")).toBe(`Open VR file: ${firstPath}`);
     expect(secondReveal.getAttribute("aria-label")).toBe(
       `Reveal VR file: ${secondPath}`,
@@ -4236,26 +4379,29 @@ describe("parsed VR Library and Dashboard", () => {
     render(<App />);
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "VR" }));
-    await screen.findByText("MDVR-101");
+    await screen.findByRole("heading", { level: 3, name: "MDVR-101" });
 
     resizeGallery("library", 1088, 728);
-    expect(visibleCardCount("VR titles")).toBe(25);
+    expect(visibleCardCount("VR titles")).toBe(14);
     resizeGallery("library", 1528, 136);
-    expect(visibleCardCount("VR titles")).toBe(7);
-    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    expect(visibleCardCount("VR titles")).toBe(10);
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
     fireEvent.click(
       screen.getByRole("button", { name: "Next VR titles page" }),
     );
-    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
-    resizeGallery("library", 1088, 284);
-    expect(visibleCardCount("VR titles")).toBe(10);
     expect(screen.getByText("Page 2 of 3")).toBeTruthy();
-    expect(screen.getByText("MDVR-111")).toBeTruthy();
+    resizeGallery("library", 1088, 284);
+    expect(visibleCardCount("VR titles")).toBe(7);
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "MDVR-108" }))
+      .toBeTruthy();
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
       target: { value: "MDVR-125" },
     });
-    expect(await screen.findByText("MDVR-125")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "MDVR-125" }),
+    ).toBeTruthy();
     expect(visibleCardCount("VR titles")).toBe(1);
     fireEvent.click(screen.getByRole("button", { name: "Clear VR search" }));
     fireEvent.change(screen.getByRole("combobox", { name: "Sort titles" }), {
@@ -4289,7 +4435,8 @@ describe("parsed VR Library and Dashboard", () => {
         .value,
     ).toBe("descending");
     resizeGallery("library", 720, 520);
-    expect(screen.getByText("MDVR-125")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "MDVR-125" }))
+      .toBeTruthy();
     expect(scanVrLibraryMock).toHaveBeenCalledTimes(1);
     expect(queryVrStorageMock).toHaveBeenCalledTimes(1);
     expect(fetchJavdbCatalogMock).not.toHaveBeenCalled();
@@ -4314,16 +4461,22 @@ describe("parsed VR Library and Dashboard", () => {
     render(<App />);
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "VR" }));
-    await screen.findByText("MDVR-419");
-    fireEvent.click(screen.getByRole("button", { name: `Open VR file: ${firstPath}` }));
+    await screen.findByRole("heading", { level: 3, name: "MDVR-419" });
+    fireEvent.click(libraryDetailsAction(`Open VR file: ${firstPath}`));
     expect(
       await screen.findByText("This file is no longer part of the current VR Library."),
     ).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: `Reveal VR file: ${secondPath}` }));
+    fireEvent.click(libraryDetailsAction(`Reveal VR file: ${secondPath}`));
     await waitFor(() =>
       expect(revealVrFileMock).toHaveBeenCalledWith({ path: secondPath }),
     );
-    expect(screen.getByText("MDVR-422")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Close Library details: MDVR-422",
+      }),
+    );
+    expect(screen.getByRole("heading", { level: 3, name: "MDVR-422" }))
+      .toBeTruthy();
 
     scanVrLibraryMock.mockRejectedValueOnce("vr_library_scan_failed");
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
@@ -4351,9 +4504,10 @@ describe("parsed VR Library and Dashboard", () => {
     );
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "VR" }));
-    const trashButton = await screen.findByRole("button", {
-      name: "Move VR file to Trash or Recycle Bin: MDVR-419 Disc 01 — 前編.MKV",
-    });
+    await screen.findByRole("heading", { name: "MDVR-419" });
+    const trashButton = libraryDetailsAction(
+      "Move VR file to Trash or Recycle Bin: MDVR-419 Disc 01 — 前編.MKV",
+    );
     parentActivation.mockClear();
     trashButton.focus();
     fireEvent.click(trashButton);
@@ -4458,9 +4612,9 @@ describe("parsed VR Library and Dashboard", () => {
       target: { value: "MDVR-419" },
     });
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Move VR file to Trash or Recycle Bin: MDVR-419 Part 01.mp4",
-      }),
+      libraryDetailsAction(
+        "Move VR file to Trash or Recycle Bin: MDVR-419 Part 01.mp4",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     const confirmButton = within(dialog).getByRole("button", {
@@ -4518,6 +4672,9 @@ describe("parsed VR Library and Dashboard", () => {
       "/VR/MDVR-419 Part 01 Disc 02.mp4",
     );
     expect(ambiguousRow?.textContent).not.toContain("Part 01 ·");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Close Library details: MDVR-419" }),
+    );
     expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
       "value",
       "MDVR-419",
@@ -4531,10 +4688,8 @@ describe("parsed VR Library and Dashboard", () => {
       expect(screen.getByRole("heading", { level: 3, name: code })).toBeTruthy();
     }
     expect(
-      document.querySelector(
-        '[data-vr-file-path="/VR/MDVR-419 + ABC-123 pack.mkv"]',
-      ),
-    ).not.toBeNull();
+      screen.getByRole("heading", { name: "MDVR-419 + ABC-123 pack" }),
+    ).toBeTruthy();
     expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
     expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
     expect(scanMoviesMock).not.toHaveBeenCalled();
@@ -4577,10 +4732,11 @@ describe("parsed VR Library and Dashboard", () => {
     render(<App />);
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    await screen.findByRole("heading", { name: "Unassociated — remove me" });
     fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Move VR file to Trash or Recycle Bin: Unassociated — remove me.MKV",
-      }),
+      libraryDetailsAction(
+        "Move VR file to Trash or Recycle Bin: Unassociated — remove me.MKV",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog.textContent).toContain(
@@ -4598,8 +4754,8 @@ describe("parsed VR Library and Dashboard", () => {
       ),
     ).toBeTruthy();
     expect(document.querySelector(`[data-vr-file-path="${removedPath}"]`)).toBeNull();
-    expect(document.querySelector(`[data-vr-file-path="${remainingPath}"]`))
-      .not.toBeNull();
+    expect(screen.getByRole("heading", { level: 3, name: "MDVR-419" }))
+      .toBeTruthy();
     const attention = await screen.findByRole("alert");
     expect(attention.textContent).toContain("file move succeeded");
     expect(attention.textContent).toContain("remains removed");
@@ -4660,10 +4816,11 @@ describe("parsed VR Library and Dashboard", () => {
     render(<App />);
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    await screen.findByRole("heading", { name: "MDVR-419" });
     fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Move VR file to Trash or Recycle Bin: MDVR-419 Disc 03.mp4",
-      }),
+      libraryDetailsAction(
+        "Move VR file to Trash or Recycle Bin: MDVR-419 Disc 03.mp4",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -4700,7 +4857,7 @@ describe("parsed VR Library and Dashboard", () => {
     scanVrLibraryMock
       .mockResolvedValueOnce(rows)
       .mockResolvedValueOnce(rows.slice(0, -2));
-    gallerySizes.library = { width: 1528, height: 136 };
+    gallerySizes.library = { width: 1088, height: 136 };
 
     render(<App />);
     selectLibrary();
@@ -4713,9 +4870,9 @@ describe("parsed VR Library and Dashboard", () => {
     }
     expect(screen.getByText("Page 5 of 5")).toBeTruthy();
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Move VR file to Trash or Recycle Bin: MDVR-129.mp4",
-      }),
+      libraryDetailsAction(
+        "Move VR file to Trash or Recycle Bin: MDVR-129.mp4",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -4760,7 +4917,9 @@ describe("parsed VR Library and Dashboard", () => {
 
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "VR" }));
-    expect(await screen.findByText("MDVR-422")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "MDVR-422" }),
+    ).toBeTruthy();
     await act(async () => {
       oldScan.resolve(["/VR/A/MDVR-419.mp4", "1"]);
       oldStorage.resolve(["8192", "4096"]);
@@ -5357,14 +5516,15 @@ describe("Movies Library Dashboard", () => {
     openLibrary.focus();
     expect(document.activeElement).toBe(openLibrary);
     fireEvent.click(openLibrary);
-    await screen.findByText("Movie 01");
+    await screen.findByRole("heading", { level: 3, name: "Movie 01" });
     resizeGallery("library", 1528, 136);
-    expect(visibleCardCount("Movies")).toBe(7);
+    expect(visibleCardCount("Movies")).toBe(10);
     fireEvent.click(
       screen.getByRole("button", { name: "Next Movies page" }),
     );
-    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
-    expect(screen.getByText("Movie 08")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "Movie 11" }))
+      .toBeTruthy();
 
     selectDashboard();
     expect(
@@ -5378,8 +5538,9 @@ describe("Movies Library Dashboard", () => {
     expect(fetchMock).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
-    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
-    expect(screen.getByText("Movie 08")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "Movie 11" }))
+      .toBeTruthy();
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
     expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
 
@@ -5392,8 +5553,9 @@ describe("Movies Library Dashboard", () => {
     expect(fetchMock).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
-    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
-    expect(screen.getByText("Movie 08")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "Movie 11" }))
+      .toBeTruthy();
   });
 
   it("reports an available empty folder as exactly zero Movies", async () => {
@@ -5514,7 +5676,7 @@ describe("Movies Library Dashboard", () => {
     expect(storageValue("Used")).toBe("4.0 TiB");
 
     fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
-    await screen.findByText("Current");
+    await screen.findByRole("heading", { level: 3, name: "Current" });
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     selectDashboard();
     await screen.findByRole("heading", {
@@ -5533,9 +5695,7 @@ describe("Movies Library Dashboard", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Open Library" }));
     fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Move movie to Trash or Recycle Bin: Current",
-      }),
+      libraryDetailsAction("Move movie to Trash or Recycle Bin: Current"),
     );
     fireEvent.click(
       screen.getByRole("button", {
@@ -5678,7 +5838,7 @@ describe("Movies volume storage Dashboard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Change folder" }));
     await screen.findByText(newFolder);
     selectLibrary();
-    await screen.findByText("Current");
+    await screen.findByRole("heading", { level: 3, name: "Current" });
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     selectDashboard();
     await waitFor(() => expect(storageValue("Total")).toBe("4.0 TiB"));
@@ -15633,9 +15793,10 @@ describe("local Movies library", () => {
     );
     selectLibrary();
 
-    const trashButton = await screen.findByRole("button", {
-      name: "Move movie to Trash or Recycle Bin: 映画 — Confirm me",
-    });
+    await screen.findByRole("heading", { name: "映画 — Confirm me" });
+    const trashButton = libraryDetailsAction(
+      "Move movie to Trash or Recycle Bin: 映画 — Confirm me",
+    );
     parentActivation.mockClear();
     trashButton.focus();
     fireEvent.keyDown(trashButton, { key: "Enter" });
@@ -15711,9 +15872,10 @@ describe("local Movies library", () => {
       </div>,
     );
     selectLibrary();
-    await screen.findByText("Library 01");
-    resizeGallery("library", 1528, 136);
+    await screen.findByRole("heading", { level: 3, name: "Library 01" });
+    resizeGallery("library", 1100, 136);
     fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
     expect(screen.getByText("Page 3 of 3")).toBeTruthy();
 
@@ -15732,9 +15894,10 @@ describe("local Movies library", () => {
     clipboardWriteMock.mockClear();
     parentActivation.mockClear();
 
-    const trashButton = within(card).getByRole("button", {
-      name: /Move movie to Trash or Recycle Bin:/,
-    });
+    const trashButton = libraryDetailsActionForCard(
+      card,
+      /Move movie to Trash or Recycle Bin:/,
+    );
     fireEvent.pointerDown(trashButton);
     fireEvent.click(trashButton);
     const dialog = await screen.findByRole("alertdialog");
@@ -15827,16 +15990,20 @@ describe("local Movies library", () => {
         name: "Keep my feedback",
       })
     ).closest("article") as HTMLElement;
+    fireEvent.click(libraryDetailsActionForCard(secondCard, /Open movie:/));
+    fireEvent.click(libraryDetailsActionForCard(secondCard, /Reveal movie:/));
+    const secondDetails = screen.getByRole("dialog", {
+      name: "Keep my feedback",
+    });
+    expect(await within(secondDetails).findAllByRole("alert")).toHaveLength(2);
     fireEvent.click(
-      within(secondCard).getByRole("button", { name: /Open movie:/ }),
-    );
-    fireEvent.click(
-      within(secondCard).getByRole("button", { name: /Reveal movie:/ }),
+      within(secondDetails).getByRole("button", {
+        name: "Close Library details: Keep my feedback",
+      }),
     );
     fireEvent.click(
       within(secondCard).getByRole("button", { name: /Copy title:/ }),
     );
-    expect(await within(secondCard).findAllByRole("alert")).toHaveLength(2);
     expect(
       await within(secondCard).findByRole("button", { name: /Copied title:/ }),
     ).toBeTruthy();
@@ -15847,9 +16014,9 @@ describe("local Movies library", () => {
     clipboardWriteMock.mockClear();
     parentActivation.mockClear();
     fireEvent.click(
-      screen.getByRole("button", {
-        name: "Move movie to Trash or Recycle Bin: Remove only me",
-      }),
+      libraryDetailsAction(
+        "Move movie to Trash or Recycle Bin: Remove only me",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -15867,14 +16034,15 @@ describe("local Movies library", () => {
     expect(
       screen.queryByRole("heading", { level: 3, name: "Remove only me" }),
     ).toBeNull();
-    const fileActionErrors = within(secondCard).getAllByRole("alert");
+    expect(
+      within(secondCard).getByRole("button", { name: /Copied title:/ }),
+    ).toBeTruthy();
+    const retainedDetails = openLibraryDetails("Keep my feedback");
+    const fileActionErrors = within(retainedDetails).getAllByRole("alert");
     expect(fileActionErrors.map((alert) => alert.textContent)).toEqual([
       "The operating system could not open this movie.",
       "The operating system could not reveal this movie.",
     ]);
-    expect(
-      within(secondCard).getByRole("button", { name: /Copied title:/ }),
-    ).toBeTruthy();
     expect(trashMovieMock).toHaveBeenCalledWith({
       path: firstPath,
     });
@@ -15924,10 +16092,15 @@ describe("local Movies library", () => {
       render(<App />);
       selectLibrary();
 
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "First — exact",
+      });
+
       fireEvent.click(
-        await screen.findByRole("button", {
-          name: "Move movie to Trash or Recycle Bin: First — exact",
-        }),
+        libraryDetailsAction(
+          "Move movie to Trash or Recycle Bin: First — exact",
+        ),
       );
       const dialog = await screen.findByRole("alertdialog");
       fireEvent.click(
@@ -15973,10 +16146,15 @@ describe("local Movies library", () => {
     render(<App />);
     selectLibrary();
 
+    await screen.findByRole("heading", {
+      level: 3,
+      name: "Trash during refresh",
+    });
+
     fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Move movie to Trash or Recycle Bin: Trash during refresh",
-      }),
+      libraryDetailsAction(
+        "Move movie to Trash or Recycle Bin: Trash during refresh",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -15995,7 +16173,9 @@ describe("local Movies library", () => {
       await pendingTrash.promise;
     });
 
-    expect(await screen.findByText("Remaining")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "Remaining" }),
+    ).toBeTruthy();
     expect(scanMoviesMock).toHaveBeenCalledTimes(3);
     expect(
       screen.queryByRole("heading", {
@@ -16008,7 +16188,9 @@ describe("local Movies library", () => {
       staleRefresh.resolve([trashedPath, remainingPath]);
       await staleRefresh.promise;
     });
-    expect(screen.getByText("Remaining")).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { level: 3, name: "Remaining" }),
+    ).toBeTruthy();
     expect(screen.queryByText("Trash during refresh")).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -16029,10 +16211,12 @@ describe("local Movies library", () => {
     render(<App />);
     selectLibrary();
 
+    await screen.findByRole("heading", { level: 3, name: "Old movie" });
+
     fireEvent.click(
-      await screen.findByRole("button", {
-        name: "Move movie to Trash or Recycle Bin: Old movie",
-      }),
+      libraryDetailsAction(
+        "Move movie to Trash or Recycle Bin: Old movie",
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -16049,14 +16233,18 @@ describe("local Movies library", () => {
       await Promise.resolve();
     });
     selectLibrary();
-    expect(await screen.findByText("New movie")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "New movie" }),
+    ).toBeTruthy();
 
     await act(async () => {
       pendingTrash.resolve(undefined);
       await pendingTrash.promise;
     });
 
-    expect(screen.getByText("New movie")).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { level: 3, name: "New movie" }),
+    ).toBeTruthy();
     expect(
       screen.queryByText("Old movie was moved to Trash or the Recycle Bin."),
     ).toBeNull();
@@ -16086,8 +16274,8 @@ describe("local Movies library", () => {
       </div>,
     );
     selectLibrary();
-    await screen.findByText("Library 01");
-    resizeGallery("library", 1528, 136);
+    await screen.findByRole("heading", { level: 3, name: "Library 01" });
+    resizeGallery("library", 1100, 136);
     for (let page = 1; page < 4; page += 1) {
       fireEvent.click(
         screen.getByRole("button", { name: "Next Movies page" }),
@@ -16112,8 +16300,9 @@ describe("local Movies library", () => {
 
     clipboardWriteMock.mockClear();
     parentActivation.mockClear();
-    const openButton = within(card).getByRole("button", {
-      name: /Open movie:/,
+    const openButton = libraryDetailsActionForCard(card, /Open movie:/);
+    const details = screen.getByRole("dialog", {
+      name: "映画 — Final.CUT & punctuation! [1080p]",
     });
     openButton.focus();
     expect(document.activeElement).toBe(openButton);
@@ -16129,10 +16318,7 @@ describe("local Movies library", () => {
     expect(openButton.getAttribute("aria-label")).toBe(
       `Opening movie: ${title}`,
     );
-    expect(within(card).queryByText("Opened")).toBeNull();
-    expect(
-      within(card).getByRole("button", { name: /Copied title:/ }),
-    ).toBeTruthy();
+    expect(within(details).queryByText("Opened")).toBeNull();
     expect(clipboardWriteMock).not.toHaveBeenCalled();
     expect(parentActivation).not.toHaveBeenCalled();
     expect(screen.getByText("Page 4 of 4")).toBeTruthy();
@@ -16144,11 +16330,17 @@ describe("local Movies library", () => {
       await pendingOpen.promise;
     });
     expect(
-      within(card).getByRole("button", { name: /Open movie:/ }),
+      within(details).getByRole("button", { name: /Open movie:/ }),
     ).toHaveProperty("disabled", false);
 
-    resizeGallery("library", 1088, 284);
-    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    fireEvent.click(
+      within(details).getByRole("button", {
+        name: "Close Library details: 映画 — Final.CUT & punctuation! [1080p]",
+      }),
+    );
+
+    resizeGallery("library", 1088, 536);
+    expect(screen.getByText("Page 2 of 2")).toBeTruthy();
     expect(
       screen.getByRole("button", { name: /Copied title:/ }),
     ).toBeTruthy();
@@ -16185,24 +16377,25 @@ describe("local Movies library", () => {
       render(<App />);
       selectLibrary();
 
-      const firstOpenButton = await screen.findByRole("button", {
-        name: "Open movie: First — exact",
+      const firstCard = (
+        await screen.findByRole("heading", { name: "First — exact" })
+      ).closest("article") as HTMLElement;
+      const firstOpenButton = libraryDetailsActionForCard(
+        firstCard,
+        "Open movie: First — exact",
+      );
+      const firstDetails = screen.getByRole("dialog", {
+        name: "First — exact",
       });
-      const firstCard = firstOpenButton.closest("article") as HTMLElement;
-      const secondCard = screen
-        .getByRole("button", {
-          name: "Open movie: Second remains available",
-        })
-        .closest("article") as HTMLElement;
       firstOpenButton.focus();
       fireEvent.keyDown(firstOpenButton, { key: "Enter" });
       fireEvent.click(firstOpenButton);
 
-      expect(await within(firstCard).findByRole("alert")).toHaveProperty(
+      expect(await within(firstDetails).findByRole("alert")).toHaveProperty(
         "textContent",
         expectedMessage,
       );
-      expect(within(secondCard).queryByRole("alert")).toBeNull();
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
       expect(firstCard.textContent).not.toContain(firstPath);
       expect(firstOpenButton).toHaveProperty("disabled", false);
       expect(openMovieMock).toHaveBeenCalledWith({ path: firstPath });
@@ -16237,8 +16430,8 @@ describe("local Movies library", () => {
       </div>,
     );
     selectLibrary();
-    await screen.findByText("Library 01");
-    resizeGallery("library", 1528, 136);
+    await screen.findByRole("heading", { level: 3, name: "Library 01" });
+    resizeGallery("library", 1100, 136);
     for (let page = 1; page < 4; page += 1) {
       fireEvent.click(
         screen.getByRole("button", { name: "Next Movies page" }),
@@ -16251,13 +16444,6 @@ describe("local Movies library", () => {
     });
     const card = heading.closest("article") as HTMLElement;
     fireEvent.click(
-      within(card).getByRole("button", { name: /Open movie:/ }),
-    );
-    expect(await within(card).findByRole("alert")).toHaveProperty(
-      "textContent",
-      "The operating system could not open this movie.",
-    );
-    fireEvent.click(
       within(card).getByRole("button", { name: /Copy title:/ }),
     );
     const copiedButton = await within(card).findByRole("button", {
@@ -16266,11 +16452,20 @@ describe("local Movies library", () => {
     expect(copiedButton.getAttribute("aria-label")).toBe(
       `Copied title: ${title}`,
     );
+    const openButton = libraryDetailsActionForCard(card, /Open movie:/);
+    fireEvent.click(openButton);
+    const details = screen.getByRole("dialog", {
+      name: "映画 — Final.CUT & punctuation! [1080p]",
+    });
+    expect(await within(details).findByRole("alert")).toHaveProperty(
+      "textContent",
+      "The operating system could not open this movie.",
+    );
 
     openMovieMock.mockClear();
     clipboardWriteMock.mockClear();
     parentActivation.mockClear();
-    const revealButton = within(card).getByRole("button", {
+    const revealButton = within(details).getByRole("button", {
       name: /Reveal movie:/,
     });
     revealButton.focus();
@@ -16286,16 +16481,13 @@ describe("local Movies library", () => {
     expect(revealButton.getAttribute("aria-label")).toBe(
       `Revealing movie: ${title}`,
     );
-    expect(within(card).queryByText("Revealed")).toBeNull();
-    expect(within(card).getByRole("alert")).toHaveProperty(
+    expect(within(details).queryByText("Revealed")).toBeNull();
+    expect(within(details).getByRole("alert")).toHaveProperty(
       "textContent",
       "The operating system could not open this movie.",
     );
     expect(
-      within(card).getByRole("button", { name: /Copied title:/ }),
-    ).toBeTruthy();
-    expect(
-      within(card).getByRole("button", { name: /Open movie:/ }),
+      within(details).getByRole("button", { name: /Open movie:/ }),
     ).toHaveProperty("disabled", false);
     expect(openMovieMock).not.toHaveBeenCalled();
     expect(clipboardWriteMock).not.toHaveBeenCalled();
@@ -16309,30 +16501,32 @@ describe("local Movies library", () => {
       await pendingReveal.promise;
     });
     expect(
-      within(card).getByRole("button", { name: /Reveal movie:/ }),
+      within(details).getByRole("button", { name: /Reveal movie:/ }),
     ).toHaveProperty("disabled", false);
 
     fireEvent.click(
-      within(card).getByRole("button", { name: /Reveal movie:/ }),
+      within(details).getByRole("button", { name: /Reveal movie:/ }),
     );
     expect(
-      await within(card).findByText(
+      await within(details).findByText(
         "The operating system could not reveal this movie.",
       ),
     ).toBeTruthy();
-    const fileActionErrors = within(card).getAllByRole("alert");
+    const fileActionErrors = within(details).getAllByRole("alert");
     expect(fileActionErrors.map((alert) => alert.textContent)).toEqual([
       "The operating system could not open this movie.",
       "The operating system could not reveal this movie.",
     ]);
-    expect(
-      within(card).getByRole("button", { name: /Copied title:/ }),
-    ).toBeTruthy();
     expect(revealMovieMock).toHaveBeenCalledTimes(2);
     expect(revealMovieMock).toHaveBeenNthCalledWith(2, { path: exactPath });
 
-    resizeGallery("library", 1088, 284);
-    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    fireEvent.click(
+      within(details).getByRole("button", {
+        name: "Close Library details: 映画 — Final.CUT & punctuation! [1080p]",
+      }),
+    );
+    resizeGallery("library", 1088, 536);
+    expect(screen.getByText("Page 2 of 2")).toBeTruthy();
     expect(screen.getByRole("button", { name: /Copied title:/ })).toBeTruthy();
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
       "Library",
@@ -16367,24 +16561,25 @@ describe("local Movies library", () => {
       render(<App />);
       selectLibrary();
 
-      const firstRevealButton = await screen.findByRole("button", {
-        name: "Reveal movie: First — exact",
+      const firstCard = (
+        await screen.findByRole("heading", { name: "First — exact" })
+      ).closest("article") as HTMLElement;
+      const firstRevealButton = libraryDetailsActionForCard(
+        firstCard,
+        "Reveal movie: First — exact",
+      );
+      const firstDetails = screen.getByRole("dialog", {
+        name: "First — exact",
       });
-      const firstCard = firstRevealButton.closest("article") as HTMLElement;
-      const secondCard = screen
-        .getByRole("button", {
-          name: "Reveal movie: Second remains available",
-        })
-        .closest("article") as HTMLElement;
       firstRevealButton.focus();
       fireEvent.keyDown(firstRevealButton, { key: "Enter" });
       fireEvent.click(firstRevealButton);
 
-      expect(await within(firstCard).findByRole("alert")).toHaveProperty(
+      expect(await within(firstDetails).findByRole("alert")).toHaveProperty(
         "textContent",
         expectedMessage,
       );
-      expect(within(secondCard).queryByRole("alert")).toBeNull();
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
       expect(firstCard.textContent).not.toContain(firstPath);
       expect(firstRevealButton).toHaveProperty("disabled", false);
       expect(revealMovieMock).toHaveBeenCalledWith({ path: firstPath });
@@ -16403,11 +16598,15 @@ describe("local Movies library", () => {
 
     render(<App />);
     selectLibrary();
-    expect(await screen.findByText("First")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "First" }),
+    ).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
-    expect(await screen.findByText("Second")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "Second" }),
+    ).toBeTruthy();
     expect(screen.queryByText("First")).toBeNull();
     expect(scanMoviesMock).toHaveBeenCalledTimes(2);
     expect(scanMoviesMock).toHaveBeenNthCalledWith(2, undefined);
@@ -16480,7 +16679,9 @@ describe("local Movies library", () => {
 
     render(<App />);
     selectLibrary();
-    expect(await screen.findByText("Old title")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "Old title" }),
+    ).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(screen.queryByText("Old title")).toBeNull();
@@ -16491,14 +16692,18 @@ describe("local Movies library", () => {
     expect(await screen.findByText("/Movies/New")).toBeTruthy();
 
     selectLibrary();
-    expect(await screen.findByText("New title")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "New title" }),
+    ).toBeTruthy();
 
     await act(async () => {
       earlierScan.resolve(["/Movies/Old/Stale title.mp4"]);
       await earlierScan.promise;
     });
     expect(screen.queryByText("Stale title")).toBeNull();
-    expect(screen.getByText("New title")).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { level: 3, name: "New title" }),
+    ).toBeTruthy();
   });
 
   it("reports a native folder-picker failure without changing configuration", async () => {
@@ -16530,9 +16735,9 @@ describe("Movies Library title search", () => {
 
     render(<App />);
     selectLibrary();
-    await screen.findByText("Title 01");
+    await screen.findByRole("heading", { level: 3, name: "Title 01" });
     resizeGallery("library", 1528, 136);
-    expect(visibleCardCount("Movies")).toBe(7);
+    expect(visibleCardCount("Movies")).toBe(10);
     expect(screen.queryByText(exactTitle)).toBeNull();
 
     searchMovies("target");
@@ -16576,7 +16781,7 @@ describe("Movies Library title search", () => {
 
     render(<App />);
     selectLibrary();
-    await screen.findByText("Other title");
+    await screen.findByRole("heading", { level: 3, name: "Other title" });
 
     searchMovies("final.cut!");
     const matchingHeading = screen.getByRole("heading", {
@@ -16616,7 +16821,7 @@ describe("Movies Library title search", () => {
 
     render(<App />);
     selectLibrary();
-    await screen.findByText("Actual title");
+    await screen.findByRole("heading", { level: 3, name: "Actual title" });
 
     searchMovies("Searchable Folder");
 
@@ -16638,7 +16843,8 @@ describe("Movies Library title search", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Clear Movies search" }),
     );
-    expect(screen.getByText("Actual title")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "Actual title" }))
+      .toBeTruthy();
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
     expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).not.toHaveBeenCalled();
@@ -16662,13 +16868,12 @@ describe("Movies Library title search", () => {
 
     render(<App />);
     selectLibrary();
-    await screen.findByText("Match 01");
+    await screen.findByRole("heading", { level: 3, name: "Match 01" });
     resizeGallery("library", 1528, 136);
     searchMovies("Match");
-    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 2")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
-    fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
-    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 2")).toBeTruthy();
 
     selectDashboard();
     expect(
@@ -16684,19 +16889,21 @@ describe("Movies Library title search", () => {
       "value",
       "Match",
     );
-    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 2")).toBeTruthy();
 
     resizeGallery("library", 1088, 136);
-    expect(screen.getByText("Page 3 of 4")).toBeTruthy();
-    expect(screen.getByText("Match 11")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "Match 08" }))
+      .toBeTruthy();
 
     searchMovies("Match 0");
     expect(screen.getByText("Page 1 of 2")).toBeTruthy();
-    expect(screen.getByText("Match 01")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "Match 01" }))
+      .toBeTruthy();
     fireEvent.click(
       screen.getByRole("button", { name: "Clear Movies search" }),
     );
-    expect(screen.getByText("Page 1 of 5")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
     expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).not.toHaveBeenCalled();
@@ -16714,7 +16921,7 @@ describe("Movies Library title search", () => {
 
     render(<App />);
     selectLibrary();
-    await screen.findByText("Old Current");
+    await screen.findByRole("heading", { level: 3, name: "Old Current" });
     searchMovies("Current");
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
@@ -16723,7 +16930,9 @@ describe("Movies Library title search", () => {
     expect(await screen.findByText("/Movies/New")).toBeTruthy();
 
     selectLibrary();
-    expect(await screen.findByText("New Current")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "New Current" }),
+    ).toBeTruthy();
     expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
       "value",
       "Current",
@@ -16734,10 +16943,16 @@ describe("Movies Library title search", () => {
       await earlierScan.promise;
     });
     expect(screen.queryByText("Obsolete Current")).toBeNull();
-    expect(screen.getByText("New Current")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "New Current" }))
+      .toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-    expect(await screen.findByText("Replacement Current")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "Replacement Current",
+      }),
+    ).toBeTruthy();
     expect(screen.queryByText("New Current")).toBeNull();
     expect(screen.getByRole("textbox", { name: "Search titles" })).toHaveProperty(
       "value",
@@ -16756,7 +16971,7 @@ describe("Movies Library title search", () => {
 
     render(<App />);
     selectLibrary();
-    await screen.findByText("Other movie");
+    await screen.findByRole("heading", { level: 3, name: "Other movie" });
     searchMovies("action.cut!");
 
     const matchingHeading = screen.getByRole("heading", {
@@ -16768,17 +16983,18 @@ describe("Movies Library title search", () => {
 
     fireEvent.click(within(card).getByRole("button", { name: /Copy title:/ }));
     expect(clipboardWriteMock).toHaveBeenCalledWith(exactTitle);
-    fireEvent.click(within(card).getByRole("button", { name: /Open movie:/ }));
-    fireEvent.click(within(card).getByRole("button", { name: /Reveal movie:/ }));
+    fireEvent.click(libraryDetailsActionForCard(card, /Open movie:/));
+    fireEvent.click(libraryDetailsActionForCard(card, /Reveal movie:/));
     await waitFor(() => {
       expect(openMovieMock).toHaveBeenCalledWith({ path: exactPath });
       expect(revealMovieMock).toHaveBeenCalledWith({ path: exactPath });
     });
 
     fireEvent.click(
-      within(card).getByRole("button", {
-        name: /Move movie to Trash or Recycle Bin:/,
-      }),
+      libraryDetailsActionForCard(
+        card,
+        /Move movie to Trash or Recycle Bin:/,
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -16828,7 +17044,7 @@ describe("Movies Library title sorting", () => {
 
     render(<App />);
     selectLibrary();
-    await screen.findByText("Zulu");
+    await screen.findByRole("heading", { level: 3, name: "Zulu" });
     resizeGallery("library", 1528, 136);
 
     const sortControl = screen.getByRole("combobox", {
@@ -16852,8 +17068,11 @@ describe("Movies Library title sorting", () => {
       "Middle 02",
       "Middle 03",
       "Middle 04",
+      "Middle 05",
+      "Middle 06",
+      "Middle 07",
     ]);
-    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
 
     sortControl.focus();
     fireEvent.keyDown(sortControl, { key: "End" });
@@ -16869,13 +17088,16 @@ describe("Movies Library title sorting", () => {
       "Punctuation !",
       "Middle 17",
       "Middle 16",
+      "Middle 15",
+      "Middle 14",
+      "Middle 13",
     ]);
     const unicodeHeading = screen.getByRole("heading", {
       level: 3,
       name: "映画 — Exact!",
     });
     expect(unicodeHeading.textContent).toBe(exactUnicodeTitle);
-    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
     expect(queryMoviesStorageMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).not.toHaveBeenCalled();
@@ -16899,17 +17121,20 @@ describe("Movies Library title sorting", () => {
 
     render(<App />);
     selectLibrary();
-    await screen.findByText("Match 01");
+    await screen.findByRole("heading", { level: 3, name: "Match 01" });
     resizeGallery("library", 1528, 136);
     searchMovies("match");
     sortMovies("descending");
 
     expect(visibleMovieTitles()[0]).toBe("Match 18");
-    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 2")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
-    fireEvent.click(screen.getByRole("button", { name: "Next Movies page" }));
-    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 2")).toBeTruthy();
     expect(visibleMovieTitles()).toEqual([
+      "Match 08",
+      "Match 07",
+      "Match 06",
+      "Match 05",
       "Match 04",
       "Match 03",
       "Match 02",
@@ -16936,14 +17161,14 @@ describe("Movies Library title sorting", () => {
     expect(
       screen.getByRole("combobox", { name: "Sort titles" }),
     ).toHaveProperty("value", "descending");
-    expect(screen.getByText("Page 3 of 3")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 2")).toBeTruthy();
 
     resizeGallery("library", 1088, 136);
-    expect(screen.getByText("Page 3 of 4")).toBeTruthy();
-    expect(visibleMovieTitles()[0]).toBe("Match 08");
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(visibleMovieTitles()[0]).toBe("Match 11");
 
     sortMovies("ascending");
-    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
     expect(visibleMovieTitles()[0]).toBe("Match 01");
     expect(
       screen.getByRole("textbox", { name: "Search titles" }),
@@ -16977,7 +17202,7 @@ describe("Movies Library title sorting", () => {
 
     render(<App />);
     selectLibrary();
-    await screen.findByText("Alpha Current");
+    await screen.findByRole("heading", { level: 3, name: "Alpha Current" });
     searchMovies("Current");
     sortMovies("descending");
     expect(visibleMovieTitles()).toEqual(["Zulu Current", "Alpha Current"]);
@@ -16987,7 +17212,9 @@ describe("Movies Library title sorting", () => {
     fireEvent.click(screen.getByRole("button", { name: "Change folder" }));
     expect(await screen.findByText("/Movies/New")).toBeTruthy();
     selectLibrary();
-    expect(await screen.findByText("Echo Current")).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "Echo Current" }),
+    ).toBeTruthy();
     expect(visibleMovieTitles()).toEqual(["Echo Current", "Bravo Current"]);
 
     await act(async () => {
@@ -17005,9 +17232,10 @@ describe("Movies Library title sorting", () => {
     expect(visibleMovieTitles()).toEqual(["Charlie Current", "Beta Current"]);
     const currentCard = currentHeading.closest("article") as HTMLElement;
     fireEvent.click(
-      within(currentCard).getByRole("button", {
-        name: /Move movie to Trash or Recycle Bin:/,
-      }),
+      libraryDetailsActionForCard(
+        currentCard,
+        /Move movie to Trash or Recycle Bin:/,
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -17049,7 +17277,7 @@ describe("Movies Library title sorting", () => {
       </div>,
     );
     selectLibrary();
-    await screen.findByText("same title");
+    await screen.findByRole("heading", { level: 3, name: "same title" });
     searchMovies("same title");
     sortMovies("descending");
     parentActivation.mockClear();
@@ -17063,12 +17291,8 @@ describe("Movies Library title sorting", () => {
     fireEvent.click(
       within(cards[0]).getByRole("button", { name: /Copy title:/ }),
     );
-    fireEvent.click(
-      within(cards[0]).getByRole("button", { name: /Open movie:/ }),
-    );
-    fireEvent.click(
-      within(cards[0]).getByRole("button", { name: /Reveal movie:/ }),
-    );
+    fireEvent.click(libraryDetailsActionForCard(cards[0], /Open movie:/));
+    fireEvent.click(libraryDetailsActionForCard(cards[0], /Reveal movie:/));
     await waitFor(() => {
       expect(clipboardWriteMock).toHaveBeenCalledWith("Same Title");
       expect(openMovieMock).toHaveBeenCalledWith({ path: firstPath });
@@ -17076,9 +17300,10 @@ describe("Movies Library title sorting", () => {
     });
 
     fireEvent.click(
-      within(cards[0]).getByRole("button", {
-        name: /Move movie to Trash or Recycle Bin:/,
-      }),
+      libraryDetailsActionForCard(
+        cards[0],
+        /Move movie to Trash or Recycle Bin:/,
+      ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
@@ -17097,9 +17322,7 @@ describe("Movies Library title sorting", () => {
     expect(
       within(cards[0]).getByRole("heading", { level: 3 }).textContent,
     ).toBe("Same Title");
-    fireEvent.click(
-      within(cards[0]).getByRole("button", { name: /Open movie:/ }),
-    );
+    fireEvent.click(libraryDetailsActionForCard(cards[0], /Open movie:/));
     await waitFor(() => {
       expect(openMovieMock).toHaveBeenNthCalledWith(2, { path: secondPath });
     });
@@ -17110,6 +17333,187 @@ describe("Movies Library title sorting", () => {
       expect(queryMoviesStorageMock).toHaveBeenCalledTimes(2),
     );
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("explicit Library cover recovery", () => {
+  it("retries Movie and grouped-TV posters without changing explicit authority", async () => {
+    const moviePath = "/Movies/Local Movie.mkv";
+    savedMoviesFolder = "/Movies";
+    movieMetadataAssociations.set(moviePath, {
+      generation: "12",
+      imdbId: "tt1234567",
+      posterPath: "/movie-cover.jpg",
+      title: "Exact Movie Title",
+      tmdbMovieId: "55",
+    });
+    scanMoviesMock.mockResolvedValue([moviePath]);
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        association: {
+          imdbId: "tt7654321",
+          name: "Exact TV Title",
+          posterPath: "/tv-cover.jpg",
+          tmdbTvId: "77",
+        },
+        members: [
+          {
+            path: "/TV/Local Show/Season 01/Local Show.S01E01.mkv",
+            relativePath: "Local Show/Season 01/Local Show.S01E01.mkv",
+          },
+        ],
+        metadataState: "ready",
+        showTitle: "Local Show",
+      }),
+    );
+
+    render(<App />);
+    selectLibrary();
+    const movieHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "Exact Movie Title",
+    });
+    const movieCard = movieHeading.closest("article") as HTMLElement;
+    const firstMovieCover = movieCard.querySelector(
+      'img[src="https://image.tmdb.org/t/p/w500/movie-cover.jpg"]',
+    );
+    if (!(firstMovieCover instanceof HTMLImageElement)) {
+      throw new Error("The explicit Movie cover was not rendered.");
+    }
+    fireEvent.error(firstMovieCover);
+    expect(
+      movieCard.querySelector(".provider-cover__placeholder")?.textContent,
+    ).toContain("Exact Movie Title");
+    fireEvent.click(
+      within(movieCard).getByRole("button", {
+        name: "Retry cover: Exact Movie Title",
+      }),
+    );
+    const replacementMovieCover = await waitFor(() => {
+      const cover = movieCard.querySelector(
+        'img[src="https://image.tmdb.org/t/p/w500/movie-cover.jpg"]',
+      );
+      expect(cover).not.toBeNull();
+      return cover as HTMLImageElement;
+    });
+    expect(replacementMovieCover).not.toBe(firstMovieCover);
+
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    const tvHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "Exact TV Title",
+    });
+    const tvCard = tvHeading.closest("article") as HTMLElement;
+    const firstTvCover = tvCard.querySelector(
+      'img[src="https://image.tmdb.org/t/p/w500/tv-cover.jpg"]',
+    );
+    if (!(firstTvCover instanceof HTMLImageElement)) {
+      throw new Error("The explicit TV cover was not rendered.");
+    }
+    fireEvent.error(firstTvCover);
+    expect(
+      tvCard.querySelector(".provider-cover__placeholder")?.textContent,
+    ).toContain("Exact TV Title");
+    fireEvent.click(
+      within(tvCard).getByRole("button", {
+        name: "Retry cover: Exact TV Title",
+      }),
+    );
+    const replacementTvCover = await waitFor(() => {
+      const cover = tvCard.querySelector(
+        'img[src="https://image.tmdb.org/t/p/w500/tv-cover.jpg"]',
+      );
+      expect(cover).not.toBeNull();
+      return cover as HTMLImageElement;
+    });
+    expect(replacementTvCover).not.toBe(firstTvCover);
+    expect(resolveLibraryCoverMock).not.toHaveBeenCalled();
+    expect(resolveLibraryMetadataMock).not.toHaveBeenCalled();
+    expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
+    expect(searchMovieMetadataMock).not.toHaveBeenCalled();
+    expect(searchTvShowMetadataMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the Discover provider-card structure for every Library category", async () => {
+    savedMoviesFolder = "/Movies";
+    scanMoviesMock.mockResolvedValue(["/Movies/Complete Movie Title.mkv"]);
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        members: [
+          {
+            path: "/TV/Complete Show/Season 01/Complete Show.S01E01.mkv",
+            relativePath: "Complete Show/Season 01/Complete Show.S01E01.mkv",
+          },
+        ],
+        showTitle: "Complete Show",
+      }),
+    );
+    savedAdultFolder = "/Adult";
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/ADLT-123.mp4",
+      "ADLT-123.mp4",
+      "5",
+    ]);
+    savedVrFolder = "/VR";
+    scanVrLibraryMock.mockResolvedValue(["/VR/MDVR-419.mp4", "5"]);
+    fetchJavdbBrowseMock.mockResolvedValue(
+      javdbBrowseFixture("vr", [
+        { code: "MDVR-500", cover: false, id: "SharedContract" },
+      ]),
+    );
+
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectVrBrowseProvider("JavDB");
+    const discoverCard = (
+      await screen.findByRole("heading", { level: 3, name: "MDVR-500" })
+    ).closest("article") as HTMLElement;
+    const sharedStructure = (card: HTMLElement) => ({
+      actions: card.querySelector(".provider-browse-card__actions")?.parentElement
+        ?.className,
+      body: card.querySelector(".provider-browse-card__body")?.className,
+      card: card.getAttribute("data-presentation-card"),
+      cover: card.querySelector(".provider-browse-card__cover")?.className,
+    });
+    const discoverStructure = sharedStructure(discoverCard);
+
+    selectLibrary();
+    for (const fixture of [
+      { category: "Movies", title: "Complete Movie Title" },
+      { category: "TV", title: "Complete Show" },
+      { category: "Adult", title: "ADLT-123" },
+      { category: "VR", title: "MDVR-419" },
+    ]) {
+      if (fixture.category !== "Movies") {
+        fireEvent.click(screen.getByRole("radio", { name: fixture.category }));
+      }
+      const heading = await screen.findByRole("heading", {
+        level: 3,
+        name: fixture.title,
+      });
+      const card = heading.closest("article") as HTMLElement;
+      expect(sharedStructure(card)).toEqual(discoverStructure);
+      expect(
+        card.querySelector(".provider-cover__placeholder")?.textContent,
+      ).toContain(fixture.title);
+      const actions = card.querySelector(
+        ".provider-browse-card__actions",
+      ) as HTMLElement;
+      expect(within(actions).getByRole("button", { name: /Details:/ })).toBeTruthy();
+      expect(within(actions).getByRole("button", { name: /Copy title:/ })).toBeTruthy();
+      fireEvent.click(within(actions).getByRole("button", { name: /Details:/ }));
+      const details = await screen.findByRole("dialog");
+      expect(details.querySelector(".library-details__members") ?? details).toBeTruthy();
+      expect(card.querySelector(".library-details__members")).toBeNull();
+      fireEvent.click(
+        within(details).getByRole("button", {
+          name: new RegExp(`^Close Library details: ${fixture.title}`),
+        }),
+      );
+    }
   });
 });
 
@@ -17183,7 +17587,7 @@ describe("resize-aware media galleries", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("updates Library through the 25 to 7 to 10 regression without rescanning and clamps its page", async () => {
+  it("updates Library through natural card capacities without rescanning and clamps its page", async () => {
     const paths = Array.from(
       { length: 25 },
       (_, index) =>
@@ -17194,11 +17598,11 @@ describe("resize-aware media galleries", () => {
 
     render(<App />);
     selectLibrary();
-    await screen.findByText("Library 01");
+    await screen.findByRole("heading", { level: 3, name: "Library 01" });
 
     resizeGallery("library", 1088, 728);
-    expect(visibleCardCount("Movies")).toBe(25);
-    expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+    expect(visibleCardCount("Movies")).toBe(14);
+    expect(screen.getByText("Page 1 of 2")).toBeTruthy();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Copy title: Library 01" }),
@@ -17209,7 +17613,7 @@ describe("resize-aware media galleries", () => {
       }),
     ).toBeTruthy();
 
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 136);
     expect(visibleCardCount("Movies")).toBe(7);
     expect(screen.getByText("Page 1 of 4")).toBeTruthy();
     expect(
@@ -17217,20 +17621,6 @@ describe("resize-aware media galleries", () => {
     ).toBeTruthy();
     expect(scanMoviesMock).toHaveBeenCalledTimes(1);
 
-    const nextPage = screen.getByRole("button", {
-      name: "Next Movies page",
-    });
-    nextPage.focus();
-    expect(document.activeElement).toBe(nextPage);
-
-    resizeGallery("library", 1088, 284);
-    expect(visibleCardCount("Movies")).toBe(10);
-    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
-    expect(
-      screen.getByRole("button", { name: "Copied title: Library 01" }),
-    ).toBeTruthy();
-
-    resizeGallery("library", 1528, 136);
     for (let page = 1; page < 4; page += 1) {
       fireEvent.click(
         screen.getByRole("button", { name: "Next Movies page" }),
@@ -17238,12 +17628,14 @@ describe("resize-aware media galleries", () => {
     }
     expect(screen.getByText("Page 4 of 4")).toBeTruthy();
     expect(visibleCardCount("Movies")).toBe(4);
-    expect(screen.getByText("Library 22")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "Library 22" }))
+      .toBeTruthy();
 
-    resizeGallery("library", 1088, 284);
+    resizeGallery("library", 1528, 136);
     expect(screen.getByText("Page 3 of 3")).toBeTruthy();
     expect(visibleCardCount("Movies")).toBe(5);
-    expect(screen.getByText("Library 21")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "Library 21" }))
+      .toBeTruthy();
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
       "Library",
     );
@@ -17428,19 +17820,20 @@ describe("explicit Movie Library TMDB metadata matching", () => {
       await screen.findByRole("heading", { name: "A Canonical Movie" }),
     ).toBeTruthy();
     expect(searchMovieMetadataMock).not.toHaveBeenCalled();
-    fireEvent.click(
-      screen.getByRole("button", { name: "Open movie: A Canonical Movie" }),
-    );
-    fireEvent.click(
-      screen.getByRole("button", { name: "Reveal movie: A Canonical Movie" }),
-    );
+    fireEvent.click(libraryDetailsAction("Open movie: A Canonical Movie"));
+    fireEvent.click(libraryDetailsAction("Reveal movie: A Canonical Movie"));
     expect(openMovieMock).toHaveBeenCalledWith({ path: associatedPath });
     expect(revealMovieMock).toHaveBeenCalledWith({ path: associatedPath });
     expect(
-      screen.getByRole("button", {
-        name: "Move movie to Trash or Recycle Bin: A Canonical Movie",
-      }),
+      libraryDetailsAction(
+        "Move movie to Trash or Recycle Bin: A Canonical Movie",
+      ),
     ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Close Library details: A Canonical Movie",
+      }),
+    );
 
     sortMovies("ascending");
     expect(visibleMovieTitles()).toEqual(["A Canonical Movie", "B Plain Local"]);
@@ -17927,7 +18320,7 @@ describe("explicit Movie Library TMDB metadata matching", () => {
     render(<App />);
     selectLibrary();
     await screen.findByRole("heading", { name: "B Local" });
-    resizeGallery("library", 1528, 136);
+    resizeGallery("library", 1088, 136);
     fireEvent.click(
       screen.getByRole("button", { name: "Match metadata: B Local" }),
     );
