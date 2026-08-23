@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
@@ -342,6 +342,115 @@ fn cover_url(movie: &BTreeMap<String, JsonValue>) -> Option<String> {
     })
 }
 
+fn exact_cover_url(
+    movie: &BTreeMap<String, JsonValue>,
+) -> Result<Option<String>, CatalogDocumentError> {
+    let mut accepted = None;
+    for key in ["cover_url", "thumb_url"] {
+        let url = match movie.get(key) {
+            None | Some(JsonValue::Null) => continue,
+            Some(JsonValue::String(url)) if valid_cover_url(url) => url,
+            Some(_) => return Err(CatalogDocumentError::Malformed),
+        };
+        if accepted.as_ref().is_some_and(|current| current != url) {
+            return Err(CatalogDocumentError::Conflicting);
+        }
+        accepted = Some(url.clone());
+    }
+    Ok(accepted)
+}
+
+fn exact_listing_items(
+    document: &str,
+    requested_identity: &str,
+) -> Result<Vec<CatalogItem>, CatalogDocumentError> {
+    let JsonValue::Object(envelope) = JsonParser::new(document)
+        .parse()
+        .ok_or(CatalogDocumentError::Malformed)?
+    else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::Number(success)) = envelope.get("success") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    if success != "1" {
+        return Err(CatalogDocumentError::Provider);
+    }
+    let Some(JsonValue::Object(data)) = envelope.get("data") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::Array(movies)) = data.get("movies") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+
+    let relevant_ids = movies
+        .iter()
+        .filter_map(|value| match value {
+            JsonValue::Object(movie) => Some(movie),
+            _ => None,
+        })
+        .filter_map(|movie| {
+            let JsonValue::String(provider_item_id) = movie.get("id")? else {
+                return None;
+            };
+            let JsonValue::String(number) = movie.get("number")? else {
+                return None;
+            };
+            (valid_provider_item_id(provider_item_id)
+                && canonical_product_code(number).as_deref() == Some(requested_identity))
+            .then(|| provider_item_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let mut exact_items = HashMap::<String, CatalogItem>::new();
+    for movie in movies.iter().filter_map(|value| match value {
+        JsonValue::Object(movie) => Some(movie),
+        _ => None,
+    }) {
+        let Some(JsonValue::String(provider_item_id)) = movie.get("id") else {
+            continue;
+        };
+        if !relevant_ids.contains(provider_item_id) {
+            continue;
+        }
+        let Some(JsonValue::String(number)) = movie.get("number") else {
+            return Err(CatalogDocumentError::Malformed);
+        };
+        let forms = product_code_forms(number).ok_or(CatalogDocumentError::Malformed)?;
+        let item = CatalogItem {
+            provider_item_id: provider_item_id.clone(),
+            code: forms.display,
+            title: optional_text(movie, "title").or_else(|| optional_text(movie, "origin_title")),
+            release_date: optional_text(movie, "release_date"),
+            cover_url: exact_cover_url(movie)?,
+        };
+        if canonical_product_code(&item.code).as_deref() != Some(requested_identity) {
+            return Err(CatalogDocumentError::Conflicting);
+        }
+        if exact_items
+            .insert(provider_item_id.clone(), item.clone())
+            .is_some_and(|previous| previous != item)
+        {
+            return Err(CatalogDocumentError::Conflicting);
+        }
+    }
+    let mut exact_items = exact_items.into_values().collect::<Vec<_>>();
+    exact_items.sort_by(|left, right| left.provider_item_id.cmp(&right.provider_item_id));
+    Ok(exact_items)
+}
+
+fn exact_detail_cover_url(document: &str) -> Result<Option<String>, CatalogDocumentError> {
+    let Some(JsonValue::Object(envelope)) = JsonParser::new(document).parse() else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::Object(data)) = envelope.get("data") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::Object(movie)) = data.get("movie") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    exact_cover_url(movie)
+}
+
 fn preview_urls(movie: &BTreeMap<String, JsonValue>) -> Vec<String> {
     let Some(JsonValue::Array(previews)) = movie.get("preview_images") else {
         return Vec::new();
@@ -476,14 +585,8 @@ pub(crate) fn fetch_exact_library_item_with(
     let listing = fetch(&format!(
         "{JAVDB_API_URL}/api/v2/search?q={code}&type=movie"
     ))?;
-    let listing = parse_listing(&listing).map_err(|_| ProviderRequestError::Provider)?;
-    let mut exact_items = listing
-        .items
-        .into_iter()
-        .filter(|item| canonical_product_code(&item.code).as_deref() == Some(&requested_identity))
-        .collect::<Vec<_>>();
-    exact_items.sort_by(|left, right| left.provider_item_id.cmp(&right.provider_item_id));
-    exact_items.dedup_by(|left, right| left == right);
+    let mut exact_items = exact_listing_items(&listing, &requested_identity)
+        .map_err(|_| ProviderRequestError::Provider)?;
     if exact_items.is_empty() {
         return Ok(None);
     }
@@ -493,12 +596,19 @@ pub(crate) fn fetch_exact_library_item_with(
     let item = exact_items
         .pop()
         .expect("one exact JavDB Library item was established");
-    let detail = fetch(&format!(
+    let detail_document = fetch(&format!(
         "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
         item.provider_item_id
     ))?;
-    let detail = parse_detail(&detail, category, &item.provider_item_id, &item.code)
-        .map_err(|_| ProviderRequestError::Provider)?;
+    let mut detail = parse_detail(
+        &detail_document,
+        category,
+        &item.provider_item_id,
+        &item.code,
+    )
+    .map_err(|_| ProviderRequestError::Provider)?;
+    detail.cover_url =
+        exact_detail_cover_url(&detail_document).map_err(|_| ProviderRequestError::Provider)?;
 
     Ok(Some(ExactLibraryItem {
         provider_item_id: item.provider_item_id,
@@ -2139,6 +2249,88 @@ mod tests {
                 Ok(r#"{"success":1,"data":{"movies":[{"id":"Same","number":"MDVR-419"},{"id":"Same","number":"MDVR-422"}]}}"#.to_owned())
             }),
             Err(VR_JAVDB_CONFLICTING)
+        );
+    }
+
+    #[test]
+    fn exact_library_rejects_conflicting_rows_for_one_provider_item() {
+        for (first_fields, second_fields) in [
+            (r#""title":"First title""#, r#""title":"Another title""#),
+            (
+                r#""release_date":"2024-01-01""#,
+                r#""release_date":"2024-02-01""#,
+            ),
+            (
+                r#""cover_url":"https://tp.cmastd.com/first.jpg""#,
+                r#""cover_url":"https://tp.cmastd.com/second.jpg""#,
+            ),
+        ] {
+            let rows = format!(
+                r#"{{"id":"Same","number":"MDVR-419",{first_fields}}},{{"id":"Same","number":"MDVR-419",{second_fields}}}"#
+            );
+            let calls = Cell::new(0);
+            assert_eq!(
+                fetch_exact_library_item_with("vr", "MDVR-419", &mut |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(format!(r#"{{"success":1,"data":{{"movies":[{rows}]}}}}"#))
+                }),
+                Err(ProviderRequestError::Provider)
+            );
+            assert_eq!(calls.get(), 1);
+        }
+
+        assert_eq!(
+            fetch_exact_library_item_with("vr", "MDVR-419", &mut |_| {
+                Ok(r#"{"success":1,"data":{"movies":[{"id":"Same","number":"MDVR-419","title":"Exact"},{"id":"Same","number":"MDVR-420","title":"Exact"}]}}"#.to_owned())
+            }),
+            Err(ProviderRequestError::Provider)
+        );
+    }
+
+    #[test]
+    fn exact_library_distinguishes_absent_cover_from_malformed_cover_data() {
+        for malformed_cover in [
+            r#""cover_url":42"#,
+            r#""cover_url":"https://tp.cmastd.com.evil.example/cover.jpg""#,
+            r#""cover_url":" https://tp.cmastd.com/cover.jpg ""#,
+        ] {
+            let calls = Cell::new(0);
+            assert_eq!(
+                fetch_exact_library_item_with("adult", "CAWB-1", &mut |url| {
+                    calls.set(calls.get() + 1);
+                    assert!(url.contains("search"));
+                    Ok(format!(
+                        r#"{{"success":1,"data":{{"movies":[{{"id":"Exact","number":"CAWB-1",{malformed_cover}}}]}}}}"#
+                    ))
+                }),
+                Err(ProviderRequestError::Provider)
+            );
+            assert_eq!(calls.get(), 1);
+        }
+
+        let calls = Cell::new(0);
+        let accepted = fetch_exact_library_item_with("adult", "CAWB-1", &mut |url| {
+            calls.set(calls.get() + 1);
+            Ok(if url.contains("search") {
+                r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"CAWB-1","cover_url":null}]}}"#.to_owned()
+            } else {
+                r#"{"success":1,"data":{"movie":{"id":"Exact","number":"CAWB-1","tags":[],"cover_url":null}}}"#.to_owned()
+            })
+        })
+        .expect("an exact null cover must remain a valid provider response")
+        .expect("the exact item must remain accepted");
+        assert!(accepted.cover_url.is_none());
+        assert_eq!(calls.get(), 2);
+
+        assert_eq!(
+            fetch_exact_library_item_with("adult", "CAWB-1", &mut |url| {
+                Ok(if url.contains("search") {
+                    r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"CAWB-1","cover_url":null}]}}"#.to_owned()
+                } else {
+                    r#"{"success":1,"data":{"movie":{"id":"Exact","number":"CAWB-1","tags":[],"cover_url":[]}}}"#.to_owned()
+                })
+            }),
+            Err(ProviderRequestError::Provider)
         );
     }
 

@@ -12,7 +12,7 @@ use std::process::Command;
 
 use crate::{
     fanza_catalog, javdb_catalog,
-    vr_torrent::{hex_sha1, json_array, json_object, json_string, JsonParser, JsonValue},
+    vr_torrent::{hex_sha1, json_array, json_object, JsonParser, JsonValue},
     ProviderRequestError,
 };
 
@@ -319,28 +319,45 @@ fn metadata_from_javdb(item: &javdb_catalog::ExactLibraryItem) -> PresentationMe
     }
 }
 
-fn exact_legacy_cover_url(document: &str, identity: &str) -> Option<String> {
-    let JsonValue::Object(root) = JsonParser::new(document).parse()? else {
-        return None;
+fn exact_legacy_cover_url(
+    document: &str,
+    identity: &str,
+) -> Result<Option<String>, ProviderRequestError> {
+    let Some(JsonValue::Object(root)) = JsonParser::new(document).parse() else {
+        return Err(ProviderRequestError::Provider);
     };
-    let content_id = root.get("content_id").and_then(|value| match value {
-        JsonValue::String(value) => Some(value),
-        _ => None,
-    })?;
+    let Some(JsonValue::String(content_id)) = root.get("content_id") else {
+        return Err(ProviderRequestError::Provider);
+    };
     let canonical = crate::vr_torrent::product_code_candidates(content_id)
         .into_iter()
         .map(|(candidate, _)| candidate)
         .collect::<HashSet<_>>();
     if canonical.len() != 1 || !canonical.contains(identity) {
-        return None;
+        return Err(ProviderRequestError::Provider);
     }
-    let images = root.get("images").and_then(json_object)?;
-    let jacket = images.get("jacket_image").and_then(json_object)?;
-    ["large2", "large"]
-        .into_iter()
-        .find_map(|key| json_string(jacket, key))
-        .filter(|url| valid_legacy_cover_url(url))
-        .map(str::to_owned)
+    let images = match root.get("images") {
+        None | Some(JsonValue::Null) => return Ok(None),
+        Some(JsonValue::Object(images)) => images,
+        Some(_) => return Err(ProviderRequestError::Provider),
+    };
+    let jacket = match images.get("jacket_image") {
+        None | Some(JsonValue::Null) => return Ok(None),
+        Some(JsonValue::Object(jacket)) => jacket,
+        Some(_) => return Err(ProviderRequestError::Provider),
+    };
+    let mut accepted = None;
+    for key in ["large2", "large"] {
+        let url = match jacket.get(key) {
+            None | Some(JsonValue::Null) => continue,
+            Some(JsonValue::String(url)) if valid_legacy_cover_url(url) => url,
+            Some(_) => return Err(ProviderRequestError::Provider),
+        };
+        if accepted.is_none() {
+            accepted = Some(url.clone());
+        }
+    }
+    Ok(accepted)
 }
 
 fn metadata_from_legacy(
@@ -465,7 +482,11 @@ fn legacy_url(code: &str) -> String {
     format!("https://r18.dev/videos/vod/movies/detail/-/dvd_id={code}/json")
 }
 
-fn cover_source_valid(source: &CoverSource) -> bool {
+fn cover_source_valid(
+    source: &CoverSource,
+    category: LibraryPresentationCategory,
+    code: &str,
+) -> bool {
     !source.provider_id.is_empty()
         && crate::vr_torrent::product_code_display_form(&source.display_code).as_deref()
             == Some(&source.display_code)
@@ -474,9 +495,13 @@ fn cover_source_valid(source: &CoverSource) -> bool {
         && source.aspect_ratio <= MAX_COVER_RATIO
         && match source.provider {
             "JavDB" => javdb_catalog::valid_library_cover_url(&source.url),
-            "FANZA" => {
-                fanza_catalog::valid_exact_library_cover_url(&source.url, &source.provider_id)
-            }
+            "FANZA" => fanza_catalog::valid_cached_exact_library_cover(
+                category.value(),
+                code,
+                &source.provider_id,
+                &source.display_code,
+                &source.url,
+            ),
             "r18.dev" => valid_legacy_cover_url(&source.url),
             _ => false,
         }
@@ -514,7 +539,6 @@ fn fetch_exact_javdb_item(
     authority: &LibraryItemAuthority,
     fetch: &mut impl FnMut(&str) -> Result<String, ProviderRequestError>,
 ) -> Result<Option<javdb_catalog::ExactLibraryItem>, ProviderRequestError> {
-    let mut last_error = None;
     for query in javdb_query_forms(&authority.code) {
         match javdb_catalog::fetch_exact_library_item_with(
             authority.category.value(),
@@ -522,14 +546,11 @@ fn fetch_exact_javdb_item(
             fetch,
         ) {
             Ok(Some(item)) => return Ok(Some(item)),
-            Ok(None) | Err(ProviderRequestError::SourceUnavailable) => {}
-            Err(error) => last_error = Some(error),
+            Ok(None) => {}
+            Err(error) => return Err(error),
         }
     }
-    match last_error {
-        Some(error) => Err(error),
-        None => Ok(None),
-    }
+    Ok(None)
 }
 
 fn fetch_current_cover_source(
@@ -577,12 +598,11 @@ fn resolve_cover_with(
                             transient,
                         );
                     }
-                    Err(ProviderRequestError::SourceUnavailable) => {}
                     Err(_) => transient = true,
                 }
             }
         }
-        Ok(None) | Err(ProviderRequestError::SourceUnavailable) => {}
+        Ok(None) => {}
         Err(_) => transient = true,
     }
 
@@ -613,12 +633,11 @@ fn resolve_cover_with(
                             transient,
                         );
                     }
-                    Err(ProviderRequestError::SourceUnavailable) => {}
                     Err(_) => transient = true,
                 }
             }
         }
-        Ok(None) | Err(ProviderRequestError::SourceUnavailable) => {}
+        Ok(None) => {}
         Err(_) => transient = true,
     }
 
@@ -628,8 +647,8 @@ fn resolve_cover_with(
                 metadata =
                     metadata_from_legacy(&document, &authority.product_identity, &authority.code);
             }
-            if let Some(url) = exact_legacy_cover_url(&document, &authority.product_identity) {
-                match legacy_image(&url).and_then(validate_cover) {
+            match exact_legacy_cover_url(&document, &authority.product_identity) {
+                Ok(Some(url)) => match legacy_image(&url).and_then(validate_cover) {
                     Ok((bytes, ratio)) => {
                         return (
                             Some((
@@ -648,12 +667,12 @@ fn resolve_cover_with(
                             transient,
                         );
                     }
-                    Err(ProviderRequestError::SourceUnavailable) => {}
                     Err(_) => transient = true,
-                }
+                },
+                Ok(None) => {}
+                Err(_) => transient = true,
             }
         }
-        Err(ProviderRequestError::SourceUnavailable) => {}
         Err(_) => transient = true,
     }
     (None, metadata, transient)
@@ -775,7 +794,7 @@ fn cache_entry_valid(entry: &CacheEntry) -> bool {
                 == crate::vr_torrent::canonical_product_code(&entry.code)
         })
         && match (entry.cover_state, entry.cover.as_ref()) {
-            ("ready", Some(source)) => cover_source_valid(source),
+            ("ready", Some(source)) => cover_source_valid(source, entry.category, &entry.code),
             ("missing", None) => true,
             _ => false,
         }
@@ -2004,9 +2023,11 @@ mod tests {
             code: "CAWB-1".to_owned(),
             product_identity: "CAWB-1".to_owned(),
         };
+        let javdb_requests = std::cell::RefCell::new(Vec::new());
         let (resolved, metadata, transient) = resolve_cover_with(
             &authority,
             |url| {
+                javdb_requests.borrow_mut().push(url.to_owned());
                 if url.contains("search?q=CAWB-1&") {
                     return Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned());
                 }
@@ -2034,7 +2055,85 @@ mod tests {
             metadata.and_then(|metadata| metadata.display_code),
             Some("CAWB-001".to_owned())
         );
+        let javdb_requests = javdb_requests.into_inner();
+        assert_eq!(javdb_requests.len(), 3);
+        assert!(javdb_requests[0].contains("search?q=CAWB-1&"));
+        assert!(javdb_requests[1].contains("search?q=CAWB-001&"));
+        assert!(javdb_requests[2].contains("/api/v4/movies/item?"));
         assert!(!transient);
+    }
+
+    #[test]
+    fn failed_first_javdb_form_advances_directly_to_fanza() {
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "7".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
+        let javdb_requests = Cell::new(0);
+        let (cover, metadata, transient) = resolve_cover_with(
+            &authority,
+            |_| {
+                javdb_requests.set(javdb_requests.get() + 1);
+                Err(ProviderRequestError::Network)
+            },
+            |_| panic!("a failed JavDB document must not dispatch an image"),
+            |_| {
+                Ok(r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Exact FANZA","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001pl.jpg"}}}}"#.to_owned())
+            },
+            |_| Ok(jpeg(600, 800)),
+            |_| panic!("legacy must not run after exact FANZA success"),
+            |_| panic!("legacy image must not run"),
+        );
+        let source = cover
+            .expect("FANZA must remain eligible after a JavDB failure")
+            .0;
+        assert_eq!(source.provider, "FANZA");
+        assert_eq!(javdb_requests.get(), 1);
+        assert!(metadata.is_none());
+        assert!(transient);
+    }
+
+    #[test]
+    fn failed_javdb_cover_data_dispatches_no_image_and_later_fanza_can_succeed() {
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "6".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
+        for document in [
+            r#"{"success":1,"data":{"movies":[{"id":"Same","number":"CAWB-1","title":"First","cover_url":"https://tp.cmastd.com/first.jpg"},{"id":"Same","number":"CAWB-001","title":"Second","cover_url":"https://tp.cmastd.com/second.jpg"}]}}"#,
+            r#"{"success":1,"data":{"movies":[{"id":"Same","number":"CAWB-1","cover_url":42}]}}"#,
+            r#"{"success":1,"data":{"movies":[{"id":"Same","number":"CAWB-1","cover_url":"https://tp.cmastd.com.evil.example/cover.jpg"}]}}"#,
+        ] {
+            let javdb_requests = Cell::new(0);
+            let javdb_images = Cell::new(0);
+            let (cover, metadata, transient) = resolve_cover_with(
+                &authority,
+                |_| {
+                    javdb_requests.set(javdb_requests.get() + 1);
+                    Ok(document.to_owned())
+                },
+                |_| {
+                    javdb_images.set(javdb_images.get() + 1);
+                    Ok(jpeg(600, 800))
+                },
+                |_| {
+                    Ok(r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Exact FANZA","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001pl.jpg"}}}}"#.to_owned())
+                },
+                |_| Ok(jpeg(600, 800)),
+                |_| panic!("legacy must not run after exact FANZA success"),
+                |_| panic!("legacy image must not run"),
+            );
+            let source = cover.expect("the later exact FANZA cover must resolve").0;
+            assert_eq!(source.provider, "FANZA");
+            assert_eq!(javdb_requests.get(), 1);
+            assert_eq!(javdb_images.get(), 0);
+            assert!(metadata.is_none());
+            assert!(transient);
+        }
     }
 
     #[test]
@@ -2155,6 +2254,154 @@ mod tests {
             assert_eq!(response[5], "");
             assert_eq!(fanza_image_calls.get(), 0);
             assert!(!fixture.path.exists());
+        }
+    }
+
+    #[test]
+    fn failed_javdb_or_legacy_cover_data_is_unavailable_and_never_cached_as_a_miss() {
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "5".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
+        let javdb_fixture = CacheFixture::new("failed-javdb-no-miss");
+        let javdb_images = Cell::new(0);
+        let response = resolve_cover_at_with(
+            &LibraryPresentationState::default(),
+            &javdb_fixture.path,
+            &authority,
+            100,
+            || true,
+            || {
+                resolve_cover_with(
+                    &authority,
+                    |_| {
+                        Ok(r#"{"success":1,"data":{"movies":[{"id":"Same","number":"CAWB-1","cover_url":42}]}}"#.to_owned())
+                    },
+                    |_| {
+                        javdb_images.set(javdb_images.get() + 1);
+                        Ok(jpeg(600, 800))
+                    },
+                    |_| Ok(r#"{"data":{"c0":null}}"#.to_owned()),
+                    |_| panic!("an absent FANZA item has no image"),
+                    |_| Ok(r#"{"content_id":"CAWB-1","images":null}"#.to_owned()),
+                    |_| panic!("an absent legacy cover has no image"),
+                )
+            },
+        )
+        .expect("a failed exact source must remain a current local state");
+        assert_eq!(response[2], "unavailable");
+        assert_eq!(javdb_images.get(), 0);
+        assert!(!javdb_fixture.path.exists());
+
+        for (index, legacy_cover) in [
+            r#""images":[]"#,
+            r#""images":{"jacket_image":{"large":42}}"#,
+            r#""images":{"jacket_image":{"large":"https://pics.dmm.co.jp/ unsafe.jpg"}}"#,
+            r#""images":{"jacket_image":{"large2":"https://pics.dmm.co.jp/first.jpg","large":"https://pics.dmm.co.jp/ unsafe.jpg"}}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = CacheFixture::new(&format!("failed-legacy-no-miss-{index}"));
+            let legacy_images = Cell::new(0);
+            let response = resolve_cover_at_with(
+                &LibraryPresentationState::default(),
+                &fixture.path,
+                &authority,
+                100,
+                || true,
+                || {
+                    resolve_cover_with(
+                        &authority,
+                        |_| Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned()),
+                        |_| panic!("an empty JavDB result has no image"),
+                        |_| Ok(r#"{"data":{"c0":null}}"#.to_owned()),
+                        |_| panic!("an absent FANZA item has no image"),
+                        |_| {
+                            Ok(format!(
+                                r#"{{"content_id":"CAWB-1",{legacy_cover}}}"#
+                            ))
+                        },
+                        |_| {
+                            legacy_images.set(legacy_images.get() + 1);
+                            Ok(jpeg(600, 800))
+                        },
+                    )
+                },
+            )
+            .expect("malformed legacy cover data must remain a current local state");
+            assert_eq!(response[2], "unavailable");
+            assert_eq!(legacy_images.get(), 0);
+            assert!(!fixture.path.exists());
+        }
+    }
+
+    #[test]
+    fn exact_absent_and_null_cover_results_create_a_reusable_confirmed_miss() {
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "4".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
+        for (index, javdb_cover, fanza_cover, legacy_cover) in [
+            (0, "", "", ""),
+            (
+                1,
+                r#","cover_url":null"#,
+                r#","packageImage":null"#,
+                r#","images":null"#,
+            ),
+        ] {
+            let fixture = CacheFixture::new(&format!("confirmed-provider-miss-{index}"));
+            let response = resolve_cover_at_with(
+                &LibraryPresentationState::default(),
+                &fixture.path,
+                &authority,
+                100,
+                || true,
+                || {
+                    resolve_cover_with(
+                        &authority,
+                        |url| {
+                            Ok(if url.contains("search") {
+                                r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"CAWB-1"$COVER}]}}"#
+                                    .replace("$COVER", javdb_cover)
+                            } else {
+                                r#"{"success":1,"data":{"movie":{"id":"Exact","number":"CAWB-1","tags":[]$COVER}}}"#
+                                    .replace("$COVER", javdb_cover)
+                            })
+                        },
+                        |_| panic!("an absent JavDB cover has no image"),
+                        |_| {
+                            Ok(r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION"$COVER}}}"#
+                                .replace("$COVER", fanza_cover))
+                        },
+                        |_| panic!("an absent FANZA cover has no image"),
+                        |_| {
+                            Ok(r#"{"content_id":"CAWB-1"$COVER}"#
+                                .replace("$COVER", legacy_cover))
+                        },
+                        |_| panic!("an absent legacy cover has no image"),
+                    )
+                },
+            )
+            .expect("genuine absent cover data must establish a confirmed miss");
+            assert_eq!(response[2], "missing");
+            assert!(fixture.path.exists());
+
+            let cached = resolve_cover_at_with(
+                &LibraryPresentationState::default(),
+                &fixture.path,
+                &authority,
+                101,
+                || true,
+                || panic!("a fresh confirmed miss must skip provider rediscovery"),
+            )
+            .expect("the confirmed miss must remain reusable");
+            assert_eq!(cached[2], "missing");
         }
     }
 
@@ -2919,11 +3166,137 @@ mod tests {
     }
 
     #[test]
-    fn cached_fanza_cover_must_belong_to_its_persisted_provider_item() {
-        let fixture = CacheFixture::new("fanza-image-identity");
+    fn cached_fanza_cover_requires_the_exact_transport_display_and_image_association() {
+        for (index, authority, persisted_display, persisted_url, expected_display) in [
+            (
+                0,
+                LibraryItemAuthority {
+                    category: LibraryPresentationCategory::Adult,
+                    identity: "d".repeat(40),
+                    code: "CAWB-1".to_owned(),
+                    product_identity: "CAWB-1".to_owned(),
+                },
+                "CAWB-1",
+                "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001ps.jpg",
+                "CAWB-001",
+            ),
+            (
+                1,
+                LibraryItemAuthority {
+                    category: LibraryPresentationCategory::Adult,
+                    identity: "e".repeat(40),
+                    code: "CAWB-1".to_owned(),
+                    product_identity: "CAWB-1".to_owned(),
+                },
+                "CAWB-00001",
+                "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001ps.jpg",
+                "CAWB-001",
+            ),
+            (
+                2,
+                LibraryItemAuthority {
+                    category: LibraryPresentationCategory::Vr,
+                    identity: "f".repeat(40),
+                    code: "3DSVR-01871".to_owned(),
+                    product_identity: "3DSVR-1871".to_owned(),
+                },
+                "3DSVR-1871",
+                "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/13dsvr01871/13dsvr01871ps.jpg",
+                "3DSVR-01871",
+            ),
+            (
+                3,
+                LibraryItemAuthority {
+                    category: LibraryPresentationCategory::Adult,
+                    identity: "9".repeat(40),
+                    code: "CAWB-1".to_owned(),
+                    product_identity: "CAWB-1".to_owned(),
+                },
+                "CAWB-001",
+                "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00002/cawb00002ps.jpg",
+                "CAWB-001",
+            ),
+        ] {
+            let fixture = CacheFixture::new(&format!("fanza-image-identity-{index}"));
+            let provider_id = if authority.category == LibraryPresentationCategory::Adult {
+                "cawb00001"
+            } else {
+                "13dsvr01871"
+            };
+            let exact_url = if authority.category == LibraryPresentationCategory::Adult {
+                "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001ps.jpg"
+            } else {
+                "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/13dsvr01871/13dsvr01871ps.jpg"
+            };
+            write_cache(
+                &fixture.path,
+                &[CacheEntry {
+                    identity: authority.identity.clone(),
+                    category: authority.category,
+                    code: authority.code.clone(),
+                    cover_saved_at: 100,
+                    cover_state: "ready",
+                    cover: Some(CoverSource {
+                        provider: "FANZA",
+                        provider_id: provider_id.to_owned(),
+                        display_code: persisted_display.to_owned(),
+                        url: persisted_url.to_owned(),
+                        aspect_ratio: 0.72,
+                    }),
+                    metadata_saved_at: 0,
+                    metadata_state: "missing",
+                    metadata: PresentationMetadata::default(),
+                }],
+            )
+            .expect("the mismatched FANZA cache fixture must be written");
+
+            let provider_calls = Cell::new(0);
+            let response = resolve_cover_at_with(
+                &LibraryPresentationState::default(),
+                &fixture.path,
+                &authority,
+                101,
+                || true,
+                || {
+                    provider_calls.set(provider_calls.get() + 1);
+                    (
+                        Some((
+                            CoverSource {
+                                provider: "FANZA",
+                                provider_id: provider_id.to_owned(),
+                                display_code: expected_display.to_owned(),
+                                url: exact_url.to_owned(),
+                                aspect_ratio: 0.75,
+                            },
+                            jpeg(600, 800),
+                        )),
+                        None,
+                        false,
+                    )
+                },
+            )
+            .expect("a mismatched FANZA cache must permit fresh provider resolution");
+            assert_eq!(provider_calls.get(), 1);
+            assert_eq!(
+                &response[2..6],
+                ["ready", "FANZA", provider_id, expected_display]
+            );
+            let cache = read_cache(&fixture.path).expect("the replacement cache must be valid");
+            let source = cache[0]
+                .cover
+                .as_ref()
+                .expect("the fresh exact FANZA source must be persisted");
+            assert_eq!(source.display_code, expected_display);
+            assert_eq!(source.url, exact_url);
+        }
+    }
+
+    #[test]
+    fn exact_fanza_cache_is_reused_without_provider_rediscovery() {
+        let fixture = CacheFixture::new("valid-fanza-cache");
         let authority = LibraryItemAuthority {
             category: LibraryPresentationCategory::Adult,
-            identity: "d".repeat(40),
+            identity: "8".repeat(40),
             code: "CAWB-1".to_owned(),
             product_identity: "CAWB-1".to_owned(),
         };
@@ -2939,17 +3312,25 @@ mod tests {
                     provider: "FANZA",
                     provider_id: "cawb00001".to_owned(),
                     display_code: "CAWB-001".to_owned(),
-                    url: "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00002/cawb00002ps.jpg".to_owned(),
-                    aspect_ratio: 0.72,
+                    url: "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001ps.jpg".to_owned(),
+                    aspect_ratio: 0.75,
                 }),
                 metadata_saved_at: 0,
                 metadata_state: "missing",
                 metadata: PresentationMetadata::default(),
             }],
         )
-        .expect("the tampered FANZA cache fixture must be written");
-
-        assert_invalid_cache_refreshes(&fixture.path, &authority);
+        .expect("the exact FANZA cache fixture must be written");
+        let response = resolve_cover_at_with(
+            &LibraryPresentationState::default(),
+            &fixture.path,
+            &authority,
+            101,
+            || true,
+            || panic!("a valid exact FANZA cache must skip provider rediscovery"),
+        )
+        .expect("the exact FANZA cache must remain reusable");
+        assert_eq!(&response[2..6], ["ready", "FANZA", "cawb00001", "CAWB-001"]);
     }
 
     #[test]

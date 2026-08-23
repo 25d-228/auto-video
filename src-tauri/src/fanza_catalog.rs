@@ -351,6 +351,29 @@ pub(crate) fn valid_exact_library_cover_url(value: &str, content_id: &str) -> bo
         && package_image_matches_content_id(value, content_id)
 }
 
+pub(crate) fn valid_cached_exact_library_cover(
+    category: &str,
+    code: &str,
+    content_id: &str,
+    display_code: &str,
+    url: &str,
+) -> bool {
+    let Some(category) = Category::parse(category) else {
+        return false;
+    };
+    let category_matches = match category {
+        Category::Adult => content_id.starts_with("cawb"),
+        Category::Vr => content_id.starts_with("13dsvr"),
+    };
+    let candidates = exact_content_id_candidates(code);
+    category_matches
+        && candidates.len() == 1
+        && candidates[0] == content_id
+        && display_code_from_content_id(content_id).as_deref() == Some(display_code)
+        && canonical_product_code(display_code) == canonical_product_code(code)
+        && valid_exact_library_cover_url(url, content_id)
+}
+
 fn parse_exact_cover_url(
     content: &std::collections::BTreeMap<String, JsonValue>,
     content_id: &str,
