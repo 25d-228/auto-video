@@ -211,7 +211,25 @@ export type SukebeiReleasesResult<Release extends SukebeiRelease> =
 
 export type VrReleasesResult = SukebeiReleasesResult<VrRelease>;
 
-const productCodePattern = /^([A-Za-z]{2,16})[ _-]*([0-9]{1,10})$/;
+const digitLeadingProductCodePrefixes = [
+  "3DSVR",
+  "459TEN",
+  "300MIUM",
+  "200GANA",
+  "230ORECZ",
+] as const;
+const adultDigitLeadingProductCodePrefixes = new Set([
+  "459TEN",
+  "300MIUM",
+  "200GANA",
+  "230ORECZ",
+]);
+const digitLeadingProductCodePrefixPattern =
+  digitLeadingProductCodePrefixes.join("|");
+const productCodePattern = new RegExp(
+  `^(${digitLeadingProductCodePrefixPattern}|[A-Za-z]{2,16})[ _-]*([0-9]{1,10})$`,
+  "i",
+);
 const unsignedU64Pattern = /^\d{1,20}$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const maximumSelectedVrFiles = 100_000;
@@ -412,8 +430,10 @@ function releaseArtifact(item: Element): SukebeiReleaseArtifact | null {
 }
 
 export function productCodeCandidates(value: string) {
-  const identityPattern =
-    /(^|[^A-Za-z0-9])([A-Za-z]{2,16})[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])/gi;
+  const identityPattern = new RegExp(
+    `(^|[^A-Za-z0-9])(${digitLeadingProductCodePrefixPattern}|[A-Za-z]{2,16})[ _-]*([0-9]{1,10})(?=$|[^A-Za-z0-9])`,
+    "gi",
+  );
   const candidates: Array<{ code: string; prefix: string }> = [];
   for (const match of value.matchAll(identityPattern)) {
     const identity = canonicalizeProductCode(`${match[2]}-${match[3]}`);
@@ -422,6 +442,14 @@ export function productCodeCandidates(value: string) {
     }
   }
   return candidates;
+}
+
+export function adultLibraryProductCodePrefixIsSupported(prefix: string) {
+  return !/^\d/.test(prefix) || adultDigitLeadingProductCodePrefixes.has(prefix);
+}
+
+export function vrLibraryProductCodePrefixIsSupported(prefix: string) {
+  return !/^\d/.test(prefix) || prefix === "3DSVR";
 }
 
 function releaseMatchesProductCode(name: string, requestedCode: string) {
@@ -1329,7 +1357,11 @@ function vrPartLabel(title: string) {
 
 function canonicalVrLibraryProductCode(title: string) {
   const candidates = productCodeCandidates(title)
-    .filter((candidate) => !vrLibraryPartPrefixes.has(candidate.prefix))
+    .filter(
+      (candidate) =>
+        vrLibraryProductCodePrefixIsSupported(candidate.prefix) &&
+        !vrLibraryPartPrefixes.has(candidate.prefix),
+    )
     .map((candidate) => candidate.code);
   const uniqueCandidates = new Set(candidates);
   return uniqueCandidates.size === 1 ? candidates[0] : null;

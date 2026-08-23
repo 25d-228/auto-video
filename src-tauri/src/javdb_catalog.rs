@@ -250,23 +250,7 @@ fn valid_provider_item_id(value: &str) -> bool {
 }
 
 fn canonical_product_code(value: &str) -> Option<String> {
-    let value = value.trim();
-    let prefix_end = value
-        .bytes()
-        .position(|character| !character.is_ascii_alphabetic())?;
-    let prefix = &value[..prefix_end];
-    if !(2..=16).contains(&prefix.len()) {
-        return None;
-    }
-    let number = value[prefix_end..].trim_start_matches([' ', '_', '-']);
-    if number.is_empty()
-        || number.len() > 10
-        || !number.bytes().all(|character| character.is_ascii_digit())
-    {
-        return None;
-    }
-    let number = number.parse::<u64>().ok()?;
-    (number > 0).then(|| format!("{}-{number}", prefix.to_ascii_uppercase()))
+    crate::vr_torrent::canonical_product_code(value)
 }
 
 fn optional_text(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {

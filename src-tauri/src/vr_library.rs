@@ -12,7 +12,7 @@ use crate::vr_download::{
 use crate::{
     library_presentation::{LibraryItemAuthority, LibraryPresentationCategory},
     library_scan::{is_supported_library_media, scan_library_files},
-    vr_torrent::{hex_sha1, product_code_candidates},
+    vr_torrent::{hex_sha1, product_code_candidates, vr_library_product_code_prefix_is_supported},
 };
 
 pub const VR_LIBRARY_FOLDER_UNAVAILABLE: &str = "vr_library_folder_unavailable";
@@ -70,7 +70,10 @@ fn exact_file_product_code(path: &Path) -> Option<String> {
     let title = path.file_stem()?.to_str()?;
     let mut codes = product_code_candidates(title)
         .into_iter()
-        .filter(|(_, prefix)| !MULTIPART_IDENTITY_PREFIXES.contains(&prefix.as_str()))
+        .filter(|(_, prefix)| {
+            vr_library_product_code_prefix_is_supported(prefix)
+                && !MULTIPART_IDENTITY_PREFIXES.contains(&prefix.as_str())
+        })
         .map(|(code, _)| code)
         .collect::<Vec<_>>();
     codes.sort();
@@ -471,6 +474,45 @@ mod tests {
             ),
             Err(VR_LIBRARY_STALE)
         );
+    }
+
+    #[test]
+    fn presentation_authority_accepts_one_exact_current_3dsvr_group() {
+        let fixture = Fixture::new("presentation-authority-3dsvr");
+        for name in [
+            "3DSVR-01871-A.mp4",
+            "3dsvr_001871-B.MKV",
+            "3DSVR-01872-A.mp4",
+            "9DSVR-01871-A.mp4",
+            "X3DSVR-01871-A.mp4",
+            "3DSVR-01871B.mp4",
+            "459TEN-00048.mp4",
+            "3DSVR-01871-A + MDVR-419.mp4",
+        ] {
+            fs::write(fixture.path.join(name), name.as_bytes()).expect("VR member must be written");
+        }
+        let config = fixture.path.join("config");
+        let download_state = configured_state(&fixture.path, &config);
+        let state = VrLibraryState::default();
+        let scan = scan_vr_library_with(&download_state, &state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+
+        let authority =
+            vr_library_presentation_authority(&state, generation, &fixture.path, "3DSVR-1871")
+                .expect("one exact 3DSVR group must authorize presentation");
+        assert_eq!(authority.category, LibraryPresentationCategory::Vr);
+        assert_eq!(authority.code, "3DSVR-1871");
+        assert_eq!(authority.identity.len(), 40);
+        let neighbor =
+            vr_library_presentation_authority(&state, generation, &fixture.path, "3DSVR-1872")
+                .expect("a neighboring exact code must remain a separate group");
+        assert_ne!(neighbor.identity, authority.identity);
+        for code in ["9DSVR-1871", "459TEN-48", "3DSVR-1871 + MDVR-419"] {
+            assert_eq!(
+                vr_library_presentation_authority(&state, generation, &fixture.path, code),
+                Err(VR_LIBRARY_STALE)
+            );
+        }
     }
 
     #[test]

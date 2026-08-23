@@ -1,5 +1,8 @@
 import { hasSupportedLibraryExtension } from "@/library-media";
-import { productCodeCandidates } from "@/vr";
+import {
+  adultLibraryProductCodePrefixIsSupported,
+  productCodeCandidates,
+} from "@/vr";
 
 export type AdultFolderState =
   | { status: "unconfigured" }
@@ -82,7 +85,11 @@ function exactMultipartLabel(title: string) {
 
 function canonicalAdultLibraryProductCode(title: string) {
   const candidates = productCodeCandidates(title)
-    .filter((candidate) => !multipartIdentityPrefixes.has(candidate.prefix))
+    .filter(
+      (candidate) =>
+        adultLibraryProductCodePrefixIsSupported(candidate.prefix) &&
+        !multipartIdentityPrefixes.has(candidate.prefix),
+    )
     .map((candidate) => candidate.code);
   const uniqueCandidates = new Set(candidates);
   return uniqueCandidates.size === 1 ? candidates[0] : null;

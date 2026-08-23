@@ -28,11 +28,13 @@ const COVER_MIN_BYTES: usize = 6_000;
 const RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_COVER_RATIO: f64 = 0.72;
 const MAX_COVER_RATIO: f64 = 4.0;
+const MAX_RETAINED_COVER_AUTHORITIES: usize = 8;
+const MAX_RETAINED_COVER_REQUESTS: usize = 128;
 const HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
 #[cfg(target_os = "macos")]
 const HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_code}";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum LibraryPresentationCategory {
     Adult,
     Vr,
@@ -99,9 +101,19 @@ impl PresentationMetadata {
 
 #[derive(Clone)]
 struct CoverAuthority {
+    category: LibraryPresentationCategory,
+    code: String,
     item_identity: String,
     source: CoverSource,
     bytes: Option<Vec<u8>>,
+    request_generation: u64,
+    sequence: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CoverRequestAuthority {
+    active: bool,
+    generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +132,22 @@ struct CacheEntry {
 #[derive(Default)]
 struct LibraryPresentationContext {
     covers: HashMap<String, CoverAuthority>,
+    cover_requests: HashMap<(LibraryPresentationCategory, String), CoverRequestAuthority>,
     metadata_seeds: HashMap<String, PresentationMetadata>,
+    next_cover_sequence: u64,
+}
+
+fn cover_request_matches(
+    context: &LibraryPresentationContext,
+    category: LibraryPresentationCategory,
+    code: &str,
+    request_generation: u64,
+) -> bool {
+    request_generation == 0
+        || context
+            .cover_requests
+            .get(&(category, code.to_owned()))
+            .is_some_and(|request| request.active && request.generation == request_generation)
 }
 
 #[derive(Clone, Default)]
@@ -764,30 +791,61 @@ fn merge_cache_entry(path: &Path, entry: CacheEntry) -> Result<(), ()> {
 fn cover_response(
     state: &LibraryPresentationState,
     authority: &LibraryItemAuthority,
+    request_generation: u64,
     cover_state: &'static str,
     cover: Option<CoverSource>,
     bytes: Option<Vec<u8>>,
 ) -> Result<Vec<String>, &'static str> {
-    let cover_authority_id = cover.as_ref().map(|cover| {
-        format!(
+    let mut cover_authority_id = None;
+    if let Some(source) = &cover {
+        let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+        if !cover_request_matches(
+            &context,
+            authority.category,
+            &authority.code,
+            request_generation,
+        ) {
+            return Err(LIBRARY_PRESENTATION_STALE);
+        }
+        context.covers.retain(|_, retained| {
+            retained.category != authority.category || retained.code != authority.code
+        });
+        context.next_cover_sequence = context.next_cover_sequence.wrapping_add(1);
+        let sequence = context.next_cover_sequence;
+        let id = format!(
             "library-cover-{}",
-            hex_sha1(format!("{}\0{}", authority.identity, cover.url).as_bytes())
-        )
-    });
-    if let (Some(id), Some(source)) = (&cover_authority_id, &cover) {
-        state
-            .0
-            .lock()
-            .map_err(|_| LIBRARY_PRESENTATION_FAILED)?
-            .covers
-            .insert(
-                id.clone(),
-                CoverAuthority {
-                    item_identity: authority.identity.clone(),
-                    source: source.clone(),
-                    bytes,
-                },
-            );
+            hex_sha1(
+                format!(
+                    "{}\0{}\0{request_generation}",
+                    authority.identity, source.url
+                )
+                .as_bytes(),
+            )
+        );
+        context.covers.insert(
+            id.clone(),
+            CoverAuthority {
+                category: authority.category,
+                code: authority.code.clone(),
+                item_identity: authority.identity.clone(),
+                source: source.clone(),
+                bytes,
+                request_generation,
+                sequence,
+            },
+        );
+        cover_authority_id = Some(id);
+        while context.covers.len() > MAX_RETAINED_COVER_AUTHORITIES {
+            let Some(oldest) = context
+                .covers
+                .iter()
+                .min_by_key(|(_, retained)| retained.sequence)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            context.covers.remove(&oldest);
+        }
     }
     Ok(vec![
         "library-cover-v1".to_owned(),
@@ -811,12 +869,14 @@ pub(crate) fn resolve_cover(
     state: &LibraryPresentationState,
     cache_path: &Path,
     authority: &LibraryItemAuthority,
+    request_generation: u64,
     is_current: impl Fn() -> bool,
 ) -> Result<Vec<String>, &'static str> {
-    resolve_cover_at_with(
+    resolve_cover_at_with_request(
         state,
         cache_path,
         authority,
+        request_generation,
         now_seconds(),
         is_current,
         || {
@@ -833,10 +893,23 @@ pub(crate) fn resolve_cover(
     )
 }
 
+#[cfg(test)]
 fn resolve_cover_at_with(
     state: &LibraryPresentationState,
     cache_path: &Path,
     authority: &LibraryItemAuthority,
+    now: u64,
+    is_current: impl Fn() -> bool,
+    resolve: impl FnOnce() -> CoverResolution,
+) -> Result<Vec<String>, &'static str> {
+    resolve_cover_at_with_request(state, cache_path, authority, 0, now, is_current, resolve)
+}
+
+fn resolve_cover_at_with_request(
+    state: &LibraryPresentationState,
+    cache_path: &Path,
+    authority: &LibraryItemAuthority,
+    request_generation: u64,
     now: u64,
     is_current: impl Fn() -> bool,
     resolve: impl FnOnce() -> CoverResolution,
@@ -849,6 +922,7 @@ fn resolve_cover_at_with(
         entry.identity == authority.identity
             && entry.category == authority.category
             && entry.code == authority.code
+            && entry.cover_saved_at > 0
             && entry.cover_saved_at <= now
             && now.saturating_sub(entry.cover_saved_at) <= COVER_TTL_SECONDS
     }) {
@@ -858,6 +932,7 @@ fn resolve_cover_at_with(
         return cover_response(
             state,
             authority,
+            request_generation,
             entry.cover_state,
             entry.cover.clone(),
             None,
@@ -870,6 +945,14 @@ fn resolve_cover_at_with(
     }
     if let Some(metadata) = metadata_seed {
         if let Ok(mut context) = state.0.lock() {
+            if !cover_request_matches(
+                &context,
+                authority.category,
+                &authority.code,
+                request_generation,
+            ) {
+                return Err(LIBRARY_PRESENTATION_STALE);
+            }
             context
                 .metadata_seeds
                 .insert(authority.identity.clone(), metadata);
@@ -882,6 +965,14 @@ fn resolve_cover_at_with(
     };
     if cover_state != "unavailable" {
         let _guard = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+        if !cover_request_matches(
+            &_guard,
+            authority.category,
+            &authority.code,
+            request_generation,
+        ) {
+            return Err(LIBRARY_PRESENTATION_STALE);
+        }
         let mut entry = cache
             .into_iter()
             .find(|entry| entry.identity == authority.identity)
@@ -901,9 +992,16 @@ fn resolve_cover_at_with(
         entry.cover_saved_at = now;
         entry.cover_state = cover_state;
         entry.cover = source.clone();
-        let _ = merge_cache_entry(cache_path, entry);
+        merge_cache_entry(cache_path, entry).map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
     }
-    cover_response(state, authority, cover_state, source, bytes)
+    cover_response(
+        state,
+        authority,
+        request_generation,
+        cover_state,
+        source,
+        bytes,
+    )
 }
 
 pub(crate) fn resolve_metadata(
@@ -1044,28 +1142,166 @@ fn fetch_cover_with(
     cover_authority_id: &str,
     fetch: impl FnOnce(&CoverSource) -> Result<Vec<u8>, ProviderRequestError>,
 ) -> Result<Vec<u8>, &'static str> {
-    let cover = state
-        .0
-        .lock()
-        .map_err(|_| LIBRARY_PRESENTATION_STALE)?
-        .covers
-        .get(cover_authority_id)
-        .filter(|cover| cover.item_identity == authority.identity)
-        .cloned()
-        .ok_or(LIBRARY_PRESENTATION_STALE)?;
+    let cover = {
+        let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_STALE)?;
+        let matches = context.covers.get(cover_authority_id).is_some_and(|cover| {
+            cover.category == authority.category
+                && cover.code == authority.code
+                && cover.item_identity == authority.identity
+        });
+        matches
+            .then(|| context.covers.remove(cover_authority_id))
+            .flatten()
+            .ok_or(LIBRARY_PRESENTATION_STALE)?
+    };
     let bytes = match cover.bytes {
         Some(bytes) => validate_cover(bytes),
         None => fetch(&cover.source).and_then(validate_cover),
     }
     .map(|(bytes, _)| bytes)
     .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+    Ok(bytes)
+}
+
+pub(crate) fn begin_cover_request(
+    state: &LibraryPresentationState,
+    category: LibraryPresentationCategory,
+    code: &str,
+    request_generation: u64,
+) -> Result<(), &'static str> {
+    if request_generation == 0 {
+        return Err(LIBRARY_PRESENTATION_STALE);
+    }
+    let key = (category, code.to_owned());
+    let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_STALE)?;
+    if context
+        .cover_requests
+        .get(&key)
+        .is_some_and(|request| request_generation <= request.generation)
+    {
+        return Err(LIBRARY_PRESENTATION_STALE);
+    }
+    context
+        .covers
+        .retain(|_, cover| cover.category != category || cover.code != code);
+    context.cover_requests.insert(
+        key,
+        CoverRequestAuthority {
+            active: true,
+            generation: request_generation,
+        },
+    );
+    while context.cover_requests.len() > MAX_RETAINED_COVER_REQUESTS {
+        let oldest_inactive = context
+            .cover_requests
+            .iter()
+            .filter(|(_, request)| !request.active)
+            .min_by_key(|(_, request)| request.generation)
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest_inactive.or_else(|| {
+            context
+                .cover_requests
+                .iter()
+                .min_by_key(|(_, request)| request.generation)
+                .map(|(key, _)| key.clone())
+        }) else {
+            break;
+        };
+        context
+            .covers
+            .retain(|_, cover| cover.category != oldest.0 || cover.code != oldest.1);
+        context.cover_requests.remove(&oldest);
+    }
+    Ok(())
+}
+
+pub(crate) fn cover_request_is_current(
+    state: &LibraryPresentationState,
+    category: LibraryPresentationCategory,
+    code: &str,
+    request_generation: u64,
+) -> bool {
     state
         .0
         .lock()
-        .map_err(|_| LIBRARY_PRESENTATION_STALE)?
-        .covers
-        .remove(cover_authority_id);
-    Ok(bytes)
+        .is_ok_and(|context| cover_request_matches(&context, category, code, request_generation))
+}
+
+pub(crate) fn cancel_cover_request(
+    state: &LibraryPresentationState,
+    category: LibraryPresentationCategory,
+    code: &str,
+    request_generation: u64,
+) -> Result<(), &'static str> {
+    let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_STALE)?;
+    let key = (category, code.to_owned());
+    if let Some(request) = context.cover_requests.get_mut(&key) {
+        if request.generation == request_generation {
+            request.active = false;
+            context.covers.retain(|_, cover| {
+                cover.category != category
+                    || cover.code != code
+                    || cover.request_generation != request_generation
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn invalidate_cover(
+    state: &LibraryPresentationState,
+    cache_path: &Path,
+    authority: &LibraryItemAuthority,
+    request_generation: u64,
+    cover_authority_id: &str,
+) -> Result<(), &'static str> {
+    let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_STALE)?;
+    if !cover_request_matches(
+        &context,
+        authority.category,
+        &authority.code,
+        request_generation,
+    ) {
+        return Err(LIBRARY_PRESENTATION_STALE);
+    }
+    if context.covers.get(cover_authority_id).is_some_and(|cover| {
+        cover.category == authority.category
+            && cover.code == authority.code
+            && cover.item_identity == authority.identity
+    }) {
+        context.covers.remove(cover_authority_id);
+    }
+    let mut entries = load_cache(cache_path);
+    let entry = entries
+        .iter_mut()
+        .find(|entry| {
+            entry.identity == authority.identity
+                && entry.category == authority.category
+                && entry.code == authority.code
+        })
+        .ok_or(LIBRARY_PRESENTATION_STALE)?;
+    let source = entry
+        .cover
+        .as_ref()
+        .filter(|_| entry.cover_state == "ready")
+        .ok_or(LIBRARY_PRESENTATION_STALE)?;
+    let expected_id = format!(
+        "library-cover-{}",
+        hex_sha1(
+            format!(
+                "{}\0{}\0{request_generation}",
+                authority.identity, source.url
+            )
+            .as_bytes()
+        )
+    );
+    if expected_id != cover_authority_id {
+        return Err(LIBRARY_PRESENTATION_STALE);
+    }
+    entry.cover_saved_at = 0;
+    entry.cover_state = "missing";
+    entry.cover = None;
+    write_cache(cache_path, &entries).map_err(|_| LIBRARY_PRESENTATION_FAILED)
 }
 
 #[cfg(target_os = "macos")]
@@ -1386,6 +1622,56 @@ mod tests {
     }
 
     #[test]
+    fn exact_3dsvr_identity_reaches_javdb_and_then_exact_category_fanza_fallback() {
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Vr,
+            identity: "3".repeat(40),
+            code: "3DSVR-1871".to_owned(),
+        };
+        let javdb = resolve_cover_with(
+            &authority,
+            |url| {
+                if url.contains("search") {
+                    Ok(javdb_listing("3DSVR-01871"))
+                } else {
+                    Ok(javdb_detail("3DSVR-01871", authority.category))
+                }
+            },
+            |_| Ok(jpeg(600, 800)),
+            |_| panic!("FANZA must not run after exact JavDB success"),
+            |_| panic!("FANZA image must not run"),
+            |_| panic!("legacy must not run"),
+            |_| panic!("legacy image must not run"),
+        )
+        .0
+        .expect("JavDB must accept canonical 3DSVR padding");
+        assert_eq!(javdb.0.provider, "JavDB");
+
+        let fanza = resolve_cover_with(
+            &authority,
+            |url| {
+                if url.contains("search") {
+                    Ok(r#"{"success":1,"data":{"movies":[{"id":"item","number":"3DSVR-01871","title":"Provider title","tags":[],"cover_url":null}]}}"#.to_owned())
+                } else {
+                    Ok(r#"{"success":1,"data":{"movie":{"id":"item","number":"3DSVR-01871","title":"Provider title","tags":[{"id":"212","name":"VR"}],"cover_url":null}}}"#.to_owned())
+                }
+            },
+            |_| panic!("JavDB without a cover must not dispatch an image"),
+            |body| {
+                assert!(body.contains("13dsvr01871"));
+                Ok(r#"{"data":{"c0":{"id":"13dsvr01871","contentType":"VR","title":"Exact VR","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/13dsvr01871/13dsvr01871pl.jpg"}}}}"#.to_owned())
+            },
+            |_| Ok(jpeg(600, 800)),
+            |_| panic!("legacy must not run after exact FANZA success"),
+            |_| panic!("legacy image must not run"),
+        )
+        .0
+        .expect("FANZA must accept the exact 3DSVR category and content identity");
+        assert_eq!(fanza.0.provider, "FANZA");
+        assert_eq!(fanza.0.provider_id, "13dsvr01871");
+    }
+
+    #[test]
     fn mismatched_fanza_category_and_code_cannot_supply_a_cover() {
         for document in [
             r#"{"data":{"c0":{"id":"abc00123","contentType":"TWO_DIMENSION","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
@@ -1518,6 +1804,270 @@ mod tests {
             || panic!("a fresh confirmed miss must skip providers after restart"),
         )
         .expect("cached miss must resolve");
+    }
+
+    #[test]
+    fn cover_authority_is_released_on_cancellation_and_consumed_on_fetch_failure() {
+        let fixture = CacheFixture::new("cover-authority-lifecycle");
+        let authority = authority(LibraryPresentationCategory::Vr);
+        let state = LibraryPresentationState::default();
+        begin_cover_request(&state, authority.category, &authority.code, 1)
+            .expect("cover request must begin");
+        let resolved = resolve_cover_at_with_request(
+            &state,
+            &fixture.path,
+            &authority,
+            1,
+            100,
+            || true,
+            || {
+                (
+                    Some((cover("item", 16.0 / 9.0), jpeg(1600, 900))),
+                    None,
+                    false,
+                )
+            },
+        )
+        .expect("cover must resolve");
+        let authority_id = &resolved[5];
+        assert_eq!(state.0.lock().unwrap().covers.len(), 1);
+        cancel_cover_request(&state, authority.category, &authority.code, 1)
+            .expect("cancellation must release the exact authority");
+        assert!(state.0.lock().unwrap().covers.is_empty());
+        assert_eq!(
+            fetch_cover_with(&state, &authority, authority_id, |_| {
+                panic!("a released source must not be fetched")
+            }),
+            Err(LIBRARY_PRESENTATION_STALE)
+        );
+
+        let restarted = LibraryPresentationState::default();
+        begin_cover_request(&restarted, authority.category, &authority.code, 2)
+            .expect("restarted request must begin");
+        let cached = resolve_cover_at_with_request(
+            &restarted,
+            &fixture.path,
+            &authority,
+            2,
+            101,
+            || true,
+            || panic!("fresh cached source must skip provider discovery"),
+        )
+        .expect("cached source must create one current authority");
+        assert_eq!(
+            fetch_cover_with(&restarted, &authority, &cached[5], |_| {
+                Err(ProviderRequestError::Network)
+            }),
+            Err(LIBRARY_PRESENTATION_FAILED)
+        );
+        assert!(restarted.0.lock().unwrap().covers.is_empty());
+        assert_eq!(
+            fetch_cover_with(&restarted, &authority, &cached[5], |_| {
+                panic!("a failed source must be single use")
+            }),
+            Err(LIBRARY_PRESENTATION_STALE)
+        );
+    }
+
+    #[test]
+    fn repeated_scan_identity_replacement_and_global_bound_retire_obsolete_bytes() {
+        let state = LibraryPresentationState::default();
+        let mut previous_id = String::new();
+        for index in 0..16 {
+            let authority = LibraryItemAuthority {
+                category: LibraryPresentationCategory::Vr,
+                identity: format!("{index:040x}"),
+                code: "3DSVR-1871".to_owned(),
+            };
+            let response = cover_response(
+                &state,
+                &authority,
+                0,
+                "ready",
+                Some(cover(&format!("item-{index}"), 0.72)),
+                Some(jpeg(600, 800)),
+            )
+            .expect("replacement authority must be retained");
+            if !previous_id.is_empty() {
+                assert!(!state.0.lock().unwrap().covers.contains_key(&previous_id));
+            }
+            previous_id = response[5].clone();
+            assert_eq!(state.0.lock().unwrap().covers.len(), 1);
+        }
+
+        for index in 0..MAX_RETAINED_COVER_AUTHORITIES + 3 {
+            let authority = LibraryItemAuthority {
+                category: LibraryPresentationCategory::Adult,
+                identity: format!("f{index:039x}"),
+                code: format!("ADLT-{}", index + 1),
+            };
+            cover_response(
+                &state,
+                &authority,
+                0,
+                "ready",
+                Some(cover(&format!("adult-{index}"), 0.72)),
+                Some(jpeg(600, 800)),
+            )
+            .expect("bounded authority must be retained");
+        }
+        let context = state.0.lock().unwrap();
+        assert_eq!(context.covers.len(), MAX_RETAINED_COVER_AUTHORITIES);
+        assert!(context
+            .covers
+            .values()
+            .all(|retained| retained.bytes.is_some()));
+    }
+
+    #[test]
+    fn obsolete_cover_request_cannot_replace_or_cancel_the_latest_authority() {
+        let fixture = CacheFixture::new("obsolete-cover-request");
+        let state = LibraryPresentationState::default();
+        let authority = authority(LibraryPresentationCategory::Vr);
+        begin_cover_request(&state, authority.category, &authority.code, 1)
+            .expect("first request must begin");
+        begin_cover_request(&state, authority.category, &authority.code, 2)
+            .expect("replacement request must begin");
+        assert_eq!(
+            resolve_cover_at_with_request(
+                &state,
+                &fixture.path,
+                &authority,
+                1,
+                10,
+                || true,
+                || (None, None, false),
+            ),
+            Err(LIBRARY_PRESENTATION_STALE)
+        );
+        assert!(!fixture.path.exists());
+        assert_eq!(
+            cover_response(
+                &state,
+                &authority,
+                1,
+                "ready",
+                Some(cover("obsolete", 0.72)),
+                Some(jpeg(600, 800)),
+            ),
+            Err(LIBRARY_PRESENTATION_STALE)
+        );
+        let current = cover_response(
+            &state,
+            &authority,
+            2,
+            "ready",
+            Some(cover("current", 0.72)),
+            Some(jpeg(600, 800)),
+        )
+        .expect("latest request must retain its authority");
+        cancel_cover_request(&state, authority.category, &authority.code, 1)
+            .expect("obsolete cancellation must be harmless");
+        assert!(cover_request_is_current(
+            &state,
+            authority.category,
+            &authority.code,
+            2
+        ));
+        assert!(state.0.lock().unwrap().covers.contains_key(&current[5]));
+        cancel_cover_request(&state, authority.category, &authority.code, 2)
+            .expect("current cancellation must retire the authority");
+        assert!(!cover_request_is_current(
+            &state,
+            authority.category,
+            &authority.code,
+            2
+        ));
+        assert!(state.0.lock().unwrap().covers.is_empty());
+    }
+
+    #[test]
+    fn retained_cover_request_tombstones_remain_bounded() {
+        let state = LibraryPresentationState::default();
+        for generation in 1..=MAX_RETAINED_COVER_REQUESTS as u64 + 3 {
+            let code = format!("ADLT-{generation}");
+            begin_cover_request(
+                &state,
+                LibraryPresentationCategory::Adult,
+                &code,
+                generation,
+            )
+            .expect("bounded request must begin");
+        }
+        assert_eq!(
+            state.0.lock().unwrap().cover_requests.len(),
+            MAX_RETAINED_COVER_REQUESTS
+        );
+        assert!(!cover_request_is_current(
+            &state,
+            LibraryPresentationCategory::Adult,
+            "ADLT-1",
+            1
+        ));
+        assert!(cover_request_is_current(
+            &state,
+            LibraryPresentationCategory::Adult,
+            "ADLT-131",
+            131
+        ));
+    }
+
+    #[test]
+    fn invalidated_cached_source_is_not_retried_and_provider_resolution_can_replace_it() {
+        let fixture = CacheFixture::new("cover-invalidation");
+        let authority = authority(LibraryPresentationCategory::Vr);
+        let state = LibraryPresentationState::default();
+        let first = resolve_cover_at_with(
+            &state,
+            &fixture.path,
+            &authority,
+            100,
+            || true,
+            || (Some((cover("unusable", 0.5), jpeg(400, 800))), None, false),
+        )
+        .expect("first source must resolve");
+        fetch_cover_with(&state, &authority, &first[5], |_| {
+            panic!("fresh bytes must be retained")
+        })
+        .expect("browser decode begins after exact bytes are returned");
+        invalidate_cover(&state, &fixture.path, &authority, 0, &first[5])
+            .expect("browser decode failure must invalidate the exact cached source");
+
+        let provider_calls = Cell::new(0);
+        let replacement = resolve_cover_at_with(
+            &state,
+            &fixture.path,
+            &authority,
+            101,
+            || true,
+            || {
+                provider_calls.set(provider_calls.get() + 1);
+                (
+                    Some((
+                        CoverSource {
+                            provider: "FANZA",
+                            provider_id: "13dsvr01871".to_owned(),
+                            url: "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/13dsvr01871/13dsvr01871ps.jpg".to_owned(),
+                            aspect_ratio: 0.72,
+                        },
+                        jpeg(576, 800),
+                    )),
+                    None,
+                    false,
+                )
+            },
+        )
+        .expect("retry must run provider resolution again");
+        assert_eq!(provider_calls.get(), 1);
+        assert_eq!(replacement[2], "ready");
+        assert_eq!(replacement[3], "FANZA");
+        assert_ne!(replacement[5], first[5]);
+        assert_eq!(
+            fetch_cover_with(&state, &authority, &first[5], |_| {
+                panic!("invalidated authority must not be fetchable")
+            }),
+            Err(LIBRARY_PRESENTATION_STALE)
+        );
     }
 
     #[test]

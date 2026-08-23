@@ -108,15 +108,70 @@ describe("VR product-code identity", () => {
     ]) {
       expect(canonicalizeProductCode(value)).toBe("MDVR-419");
     }
+    for (const value of ["3DSVR-01871", "3dsvr_001871", "3DSVR1871"]) {
+      expect(canonicalizeProductCode(value)).toBe("3DSVR-1871");
+    }
   });
 
   it("rejects missing, malformed, and zero product codes", () => {
-    for (const value of ["", "   ", "MDVR", "419", "MDVR-0", "MDVR-41A"])
+    for (const value of [
+      "",
+      "   ",
+      "MDVR",
+      "419",
+      "MDVR-0",
+      "MDVR-41A",
+      "9DSVR-1871",
+      "12VR-1871",
+    ])
       expect(canonicalizeProductCode(value)).toBeNull();
   });
 });
 
 describe("parsed VR Library identity", () => {
+  it("groups exact 3DSVR members without associating unsupported digit-leading identities", async () => {
+    const first = "/VR/3DSVR-01871-A.mp4";
+    const second = "/VR/3dsvr_001871-B.MKV";
+    const unsupported = "/VR/9DSVR-01871-A.mp4";
+    const embedded = "/VR/X3DSVR-01871-A.mp4";
+    const extended = "/VR/3DSVR-01871B.mp4";
+    const adultOnly = "/VR/459TEN-00048.mp4";
+    const mixed = "/VR/3DSVR-01871-A + MDVR-419.mp4";
+    invokeMock.mockResolvedValue([
+      "12",
+      first,
+      "10",
+      second,
+      "20",
+      unsupported,
+      "30",
+      embedded,
+      "35",
+      extended,
+      "37",
+      adultOnly,
+      "38",
+      mixed,
+      "40",
+      "/VR/3DSVR-01872-A.mp4",
+      "45",
+    ]);
+
+    const { items } = await scanVrLibrary();
+
+    expect(items.find((item) => item.code === "3DSVR-1871")).toMatchObject({
+      id: "code:3DSVR-1871",
+      title: "3DSVR-1871",
+      files: [{ path: first }, { path: second }],
+    });
+    expect(items.find((item) => item.id === `file:${unsupported}`)?.code).toBeNull();
+    expect(items.find((item) => item.id === `file:${embedded}`)?.code).toBeNull();
+    expect(items.find((item) => item.id === `file:${extended}`)?.code).toBeNull();
+    expect(items.find((item) => item.id === `file:${adultOnly}`)?.code).toBeNull();
+    expect(items.find((item) => item.id === `file:${mixed}`)?.code).toBeNull();
+    expect(items.find((item) => item.code === "3DSVR-1872")?.files).toHaveLength(1);
+  });
+
   it("groups only equivalent exact codes and preserves every exact file identity", async () => {
     const firstPath = "/VR/作品/MDVR-419  Disc 01 — 前編.mp4";
     const secondPath = "/VR/mdvr_00419_CD2  特別版.MKV";

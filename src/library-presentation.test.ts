@@ -178,6 +178,7 @@ describe("Library presentation boundary", () => {
         ]);
       }
       if (command === "fetch_library_cover") return Promise.resolve([0xff, 0xd8]);
+      if (command === "invalidate_library_cover") return Promise.resolve();
       if (command === "resolve_library_metadata") {
         return Promise.resolve([
           "library-metadata-v1",
@@ -228,6 +229,119 @@ describe("Library presentation boundary", () => {
     expect(result.current.cover.aspectRatio).toBe(0.5);
     expect(invoke.mock.calls.filter(([command]) => command === "resolve_library_cover"))
       .toHaveLength(2);
+    expect(
+      invoke.mock.calls.filter(
+        ([command]) => command === "invalidate_library_cover",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("cancels an obsolete native authority before byte fetch after unmount", async () => {
+    const resolution = deferred<unknown>();
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") return resolution.promise;
+      if (command === "cancel_library_cover_request") return Promise.resolve();
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+
+    const { unmount } = renderHook(() =>
+      useLibraryPresentation({
+        category: "vr",
+        itemId: "3DSVR-1871",
+        scanGeneration: "12",
+      }),
+    );
+    unmount();
+    resolution.resolve([
+      "library-cover-v1",
+      "vr",
+      "ready",
+      "JavDB",
+      "item",
+      `library-cover-${"c".repeat(40)}`,
+      "0.5",
+    ]);
+
+    await waitFor(() =>
+      expect(
+        invoke.mock.calls.filter(
+          ([command]) => command === "cancel_library_cover_request",
+        ),
+      ).toHaveLength(1),
+    );
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "fetch_library_cover"),
+    ).toHaveLength(0);
+  });
+
+  it("invalidates a failed cached source and retries provider resolution without losing geometry", async () => {
+    let resolution = 0;
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") {
+        resolution += 1;
+        return Promise.resolve([
+          "library-cover-v1",
+          "adult",
+          "ready",
+          resolution === 1 ? "JavDB" : "FANZA",
+          resolution === 1 ? "old" : "fresh",
+          `library-cover-${(resolution === 1 ? "d" : "e").repeat(40)}`,
+          "0.5",
+        ]);
+      }
+      if (command === "fetch_library_cover") {
+        return resolution === 1
+          ? Promise.reject(new Error("cached source failed"))
+          : Promise.resolve([0xff, 0xd8]);
+      }
+      if (command === "invalidate_library_cover") return Promise.resolve();
+      if (command === "resolve_library_metadata") {
+        return Promise.resolve([
+          "library-metadata-v1",
+          "adult",
+          "local-only",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "0",
+        ]);
+      }
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:fresh"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    const { result } = renderHook(() =>
+      useLibraryPresentation({
+        category: "adult",
+        itemId: "ADLT-123",
+        scanGeneration: "15",
+      }),
+    );
+    await waitFor(() => expect(result.current.cover.status).toBe("unavailable"));
+    expect(result.current.cover.aspectRatio).toBe(0.5);
+
+    act(() => result.current.cover.retry?.());
+    await waitFor(() => expect(result.current.cover.objectUrl).toBe("blob:fresh"));
+    expect(result.current.cover.aspectRatio).toBe(0.5);
+    expect(
+      invoke.mock.calls.filter(
+        ([command]) => command === "invalidate_library_cover",
+      ),
+    ).toHaveLength(1);
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "resolve_library_cover"),
+    ).toHaveLength(2);
   });
 
   it("retries metadata without restarting accepted cover resolution", async () => {

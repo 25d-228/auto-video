@@ -1434,6 +1434,9 @@ beforeEach(() => {
           return resolveLibraryMetadataMock(parameters);
         case "fetch_library_cover":
           return fetchLibraryCoverMock(parameters);
+        case "cancel_library_cover_request":
+        case "invalidate_library_cover":
+          return Promise.resolve();
         case "load_tmdb_token":
           return loadTmdbTokenMock();
         case "save_tmdb_token":
@@ -15960,6 +15963,12 @@ describe("local Movies library", () => {
     expect(screen.getByRole("status").textContent).toBe(
       `${title} was moved to Trash or the Recycle Bin.`,
     );
+    await waitFor(() =>
+      expect([
+        document.getElementById("movies-refresh"),
+        screen.getByRole("radio", { name: "Movies" }),
+      ]).toContain(document.activeElement),
+    );
     expect(visibleCardCount("Movies")).toBe(7);
     expect(savedMoviesFolder).toBe(folder);
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
@@ -17337,6 +17346,59 @@ describe("Movies Library title sorting", () => {
 });
 
 describe("explicit Library cover recovery", () => {
+  it("resolves one exact 3DSVR group without starting presentation for rejected digit-leading files", async () => {
+    savedVrFolder = "/VR";
+    scanVrLibraryMock.mockResolvedValue([
+      "/VR/3DSVR-01871-A.mp4",
+      "5",
+      "/VR/3DSVR-01871-B.MKV",
+      "6",
+      "/VR/9DSVR-01871-A.mp4",
+      "7",
+      "/VR/3DSVR-01871-A + MDVR-419.mp4",
+      "8",
+    ]);
+    resolveLibraryCoverMock.mockImplementation((parameters) => {
+      expect(parameters).toMatchObject({
+        category: "vr",
+        itemId: "3DSVR-1871",
+        scanGeneration: "1",
+      });
+      return Promise.resolve([
+        "library-cover-v1",
+        "vr",
+        "ready",
+        "JavDB",
+        "exact-3dsvr",
+        `library-cover-${"3".repeat(40)}`,
+        "0.5",
+      ]);
+    });
+    fetchLibraryCoverMock.mockResolvedValue([0xff, 0xd8]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    const exactHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "3DSVR-1871",
+    });
+    const exactCard = exactHeading.closest("article") as HTMLElement;
+    await waitFor(() => expect(exactCard.querySelector("img")).not.toBeNull());
+    expect(
+      screen.getByRole("heading", { level: 3, name: "9DSVR-01871-A" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("heading", {
+        level: 3,
+        name: "3DSVR-01871-A + MDVR-419",
+      }),
+    ).toBeTruthy();
+    expect(resolveLibraryCoverMock).toHaveBeenCalledTimes(1);
+    expect(resolveLibraryMetadataMock).toHaveBeenCalledTimes(1);
+    expect(fetchLibraryCoverMock).toHaveBeenCalledTimes(1);
+  });
+
   it("retries Movie and grouped-TV posters without changing explicit authority", async () => {
     const moviePath = "/Movies/Local Movie.mkv";
     savedMoviesFolder = "/Movies";
@@ -17514,6 +17576,109 @@ describe("explicit Library cover recovery", () => {
         }),
       );
     }
+  });
+
+  it("binds duplicate visible titles to exact Library card identities and restores details focus", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue([
+      "/TV/A/Same title.mp4",
+      "A/Same title.mp4",
+      "1",
+      "/TV/B/Same title.mp4",
+      "B/Same title.mp4",
+      "2",
+    ]);
+    savedAdultFolder = "/Adult";
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/A/Same title.mp4",
+      "A/Same title.mp4",
+      "1",
+      "/Adult/B/Same title.mp4",
+      "B/Same title.mp4",
+      "2",
+    ]);
+    savedVrFolder = "/VR";
+    scanVrLibraryMock.mockResolvedValue([
+      "/VR/A/Same title.mp4",
+      "1",
+      "/VR/B/Same title.mp4",
+      "2",
+    ]);
+
+    render(<App />);
+    selectLibrary();
+
+    for (const [category, listName] of [
+      ["TV", "TV shows and unassociated files"],
+      ["Adult", "Adult titles and unassociated files"],
+      ["VR", "VR titles"],
+    ] as const) {
+      fireEvent.click(screen.getByRole("radio", { name: category }));
+      const list = await screen.findByRole("list", { name: listName });
+      const headings = within(list).getAllByRole("heading", {
+        level: 3,
+        name: "Same title",
+      });
+      expect(headings).toHaveLength(2);
+      const headingIds = headings.map((heading) => heading.id);
+      expect(new Set(headingIds).size).toBe(2);
+      const cards = headings.map((heading) => heading.closest("article") as HTMLElement);
+      cards.forEach((card, index) => {
+        expect(card.getAttribute("aria-labelledby")).toBe(headingIds[index]);
+        expect(document.getElementById(headingIds[index])).toBe(headings[index]);
+        expect(card.contains(headings[index])).toBe(true);
+      });
+      const triggers = cards.map((card) =>
+        within(card).getByRole("button", { name: "Details: Same title" }),
+      );
+      expect(new Set(triggers.map((trigger) => trigger.id)).size).toBe(2);
+    }
+
+    const vrCards = within(screen.getByRole("list", { name: "VR titles" }))
+      .getAllByRole("heading", { level: 3, name: "Same title" })
+      .map((heading) => heading.closest("article") as HTMLElement);
+    const detailsTrigger = within(vrCards[0]).getByRole("button", {
+      name: "Details: Same title",
+    });
+    fireEvent.click(detailsTrigger);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Close Library details: Same title" }),
+    );
+    await waitFor(() => expect(document.activeElement).toBe(detailsTrigger));
+
+    fireEvent.click(detailsTrigger);
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(detailsTrigger));
+
+    fireEvent.click(detailsTrigger);
+    const backdrop = document.querySelector(".movie-metadata__backdrop");
+    if (backdrop === null) throw new Error("Library details backdrop was not rendered.");
+    fireEvent.pointerDown(backdrop);
+    fireEvent.click(backdrop);
+    await waitFor(() => expect(document.activeElement).toBe(detailsTrigger));
+
+    fireEvent.click(detailsTrigger);
+    scanVrLibraryMock.mockResolvedValueOnce(["/VR/B/Same title.mp4", "2"]);
+    fireEvent.click(document.getElementById("vr-library-refresh") as HTMLElement);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const refresh = document.getElementById("vr-library-refresh");
+    const category = screen.getByRole("radio", { name: "VR" });
+    expect([refresh, category]).toContain(document.activeElement);
+
+    const remainingTrigger = screen.getByRole("button", {
+      name: "Details: Same title",
+    });
+    fireEvent.click(remainingTrigger);
+    fireEvent.click(
+      document.querySelector(
+        'input[name="library-category"][value="adult"]',
+      ) as HTMLInputElement,
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect([
+      document.getElementById("adult-library-refresh"),
+      screen.getByRole("radio", { name: "Adult" }),
+    ]).toContain(document.activeElement);
   });
 });
 

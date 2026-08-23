@@ -55,6 +55,7 @@ type Work = {
 
 const queue: Work[] = [];
 let activeWork = 0;
+let nextCoverRequestGeneration = 0;
 
 function runQueuedWork() {
   while (activeWork < maximumConcurrentWork) {
@@ -214,10 +215,13 @@ function requestArguments(request: LibraryPresentationRequest) {
   };
 }
 
-async function resolveCover(request: LibraryPresentationRequest) {
+async function resolveCover(
+  request: LibraryPresentationRequest,
+  coverRequestGeneration: string,
+) {
   const value = await window.__TAURI__.core.invoke<unknown>(
     "resolve_library_cover",
-    requestArguments(request),
+    { ...requestArguments(request), coverRequestGeneration },
   );
   const cover = parseLibraryCover(value, request.category);
   if (cover === null) throw new Error("The native Library cover response was invalid.");
@@ -246,6 +250,29 @@ async function fetchCover(
   const type = coverMimeType(bytes);
   if (type === null) throw new Error("The native Library cover bytes were invalid.");
   return URL.createObjectURL(new Blob([bytes], { type }));
+}
+
+async function cancelCoverRequest(
+  request: LibraryPresentationRequest,
+  coverRequestGeneration: string,
+) {
+  await window.__TAURI__.core.invoke("cancel_library_cover_request", {
+    category: request.category,
+    itemId: request.itemId,
+    coverRequestGeneration,
+  });
+}
+
+async function invalidateCover(
+  request: LibraryPresentationRequest,
+  coverRequestGeneration: string,
+  authorityId: string,
+) {
+  await window.__TAURI__.core.invoke("invalidate_library_cover", {
+    ...requestArguments(request),
+    coverRequestGeneration,
+    coverAuthorityId: authorityId,
+  });
 }
 
 async function resolveMetadata(request: LibraryPresentationRequest) {
@@ -301,6 +328,26 @@ export function useLibraryPresentation(
   useEffect(() => {
     if (stableRequest === null) return;
     let current = true;
+    nextCoverRequestGeneration += 1;
+    const coverRequestGeneration = nextCoverRequestGeneration.toString();
+    let coverAuthorityId: string | null = null;
+    let invalidationPending = false;
+    const retryUnavailableCover = () => {
+      if (!current || coverAuthorityId === null || invalidationPending) return;
+      invalidationPending = true;
+      void invalidateCover(
+        stableRequest,
+        coverRequestGeneration,
+        coverAuthorityId,
+      )
+        .then(() => {
+          if (current) setCoverRetry((generation) => generation + 1);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          invalidationPending = false;
+        });
+    };
     setState((value) => ({
       ...value,
       cover: {
@@ -318,11 +365,14 @@ export function useLibraryPresentation(
 
     void scheduleLibraryPresentation(
       "cover",
-      () => resolveCover(stableRequest),
+      () => resolveCover(stableRequest, coverRequestGeneration),
       () => current,
     )
       .then(async (cover) => {
-        if (!current) return;
+        coverAuthorityId = cover.authorityId;
+        if (!current) {
+          return;
+        }
         if (cover.state !== "ready" || cover.authorityId === null) {
           setState((value) => ({
             ...value,
@@ -381,7 +431,7 @@ export function useLibraryPresentation(
                     ...currentState.cover,
                     status: "unavailable",
                     objectUrl: null,
-                    retry: () => setCoverRetry((generation) => generation + 1),
+                    retry: retryUnavailableCover,
                     reportDecodeFailure: null,
                   },
                 }));
@@ -397,7 +447,7 @@ export function useLibraryPresentation(
               objectUrl: null,
               aspectRatio: cover.aspectRatio,
               source: cover.source,
-              retry: () => setCoverRetry((generation) => generation + 1),
+              retry: retryUnavailableCover,
               reportDecodeFailure: null,
             },
           }));
@@ -419,6 +469,9 @@ export function useLibraryPresentation(
 
     return () => {
       current = false;
+      void cancelCoverRequest(stableRequest, coverRequestGeneration).catch(
+        () => undefined,
+      );
       if (currentObjectUrl.current !== null) {
         URL.revokeObjectURL(currentObjectUrl.current);
         currentObjectUrl.current = null;

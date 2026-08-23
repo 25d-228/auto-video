@@ -35,6 +35,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
+  useCallback,
   useEffect,
   useId,
   useLayoutEffect,
@@ -6190,6 +6191,7 @@ function LibraryProviderCard({
   cover,
   details,
   explicitMatch = false,
+  libraryCategory,
   presentation,
   ratio,
   secondary,
@@ -6202,6 +6204,7 @@ function LibraryProviderCard({
   cover: ReactNode;
   details: ReactNode;
   explicitMatch?: boolean;
+  libraryCategory: LibraryCategory;
   presentation: LibraryPresentationState | null;
   ratio: number;
   secondary: string;
@@ -6209,8 +6212,52 @@ function LibraryProviderCard({
   title: string;
   titleId: string;
 }) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const detailsOpenRef = useRef(false);
+  const detailsTrigger = useRef<HTMLButtonElement | null>(null);
+  const restoreDetailsFocus = useCallback(() => {
+    queueMicrotask(() => {
+      if (detailsTrigger.current?.isConnected) {
+        detailsTrigger.current.focus();
+        return;
+      }
+      const selectedCategory = document.querySelector<HTMLInputElement>(
+        'input[name="library-category"]:checked',
+      );
+      const currentCategory = ["movies", "tv", "adult", "vr"].includes(
+        selectedCategory?.value ?? "",
+      )
+        ? (selectedCategory?.value as LibraryCategory)
+        : libraryCategory;
+      const refreshId = {
+        movies: "movies-refresh",
+        tv: "tv-library-refresh",
+        adult: "adult-library-refresh",
+        vr: "vr-library-refresh",
+      }[currentCategory];
+      const refresh = document.getElementById(refreshId);
+      if (refresh instanceof HTMLButtonElement && !refresh.disabled) {
+        refresh.focus();
+      } else {
+        selectedCategory?.focus();
+      }
+    });
+  }, [libraryCategory]);
+  const updateDetailsOpen = (open: boolean) => {
+    detailsOpenRef.current = open;
+    setDetailsOpen(open);
+    if (!open) restoreDetailsFocus();
+  };
+
+  useEffect(
+    () => () => {
+      if (detailsOpenRef.current) restoreDetailsFocus();
+    },
+    [restoreDetailsFocus],
+  );
+
   return (
-    <Dialog.Root>
+    <Dialog.Root onOpenChange={updateDetailsOpen} open={detailsOpen}>
       <ProviderMediaCard
         actions={
           <>
@@ -6218,10 +6265,12 @@ function LibraryProviderCard({
               render={
                 <Button
                   aria-label={`Details: ${title}`}
+                  id={`${titleId}-details-trigger`}
                   onClick={(event) => event.stopPropagation()}
                   onKeyDown={(event) => event.stopPropagation()}
                   onPointerDown={(event) => event.stopPropagation()}
                   size="xs"
+                  ref={detailsTrigger}
                   type="button"
                   variant="ghost"
                 >
@@ -6675,6 +6724,7 @@ function LibraryMovieCard({
         </>
       }
       explicitMatch={movie.association !== null}
+      libraryCategory="movies"
       presentation={null}
       ratio={ratio}
       secondary={
@@ -6998,7 +7048,7 @@ function VrLibraryCard({
               presentation.metadata.status === "unavailable"
             ? "Presentation unavailable"
             : `${item.files.length} ${item.files.length === 1 ? "file" : "files"}`);
-  const titleId = `vr-library-card-${encodeURIComponent(item.title)}`;
+  const titleId = `vr-library-card-${encodeURIComponent(item.id)}`;
   return (
     <LibraryProviderCard
       actions={
@@ -7055,6 +7105,7 @@ function VrLibraryCard({
           ))}
         </ul>
       }
+      libraryCategory="vr"
       presentation={item.code === null ? null : presentation}
       ratio={ratio}
       secondary={secondary}
@@ -7358,7 +7409,7 @@ function TvLibraryCard({
     `${item.association?.generation ?? "local"}:${item.association?.posterPath ?? ""}`,
     onRatioChange,
   );
-  const titleId = `tv-library-card-${encodeURIComponent(item.title)}`;
+  const titleId = `tv-library-card-${encodeURIComponent(item.id)}`;
 
   return (
     <LibraryProviderCard
@@ -7464,6 +7515,7 @@ function TvLibraryCard({
         </>
       }
       explicitMatch={item.association != null}
+      libraryCategory="tv"
       presentation={null}
       ratio={ratio}
       secondary={
@@ -7789,7 +7841,7 @@ function AdultLibraryCard({
               presentation.metadata.status === "unavailable"
             ? "Presentation unavailable"
             : `${item.files.length} ${item.files.length === 1 ? "file" : "files"}`);
-  const titleId = `adult-library-card-${encodeURIComponent(item.title)}`;
+  const titleId = `adult-library-card-${encodeURIComponent(item.id)}`;
   return (
     <LibraryProviderCard
       actions={
@@ -7853,6 +7905,7 @@ function AdultLibraryCard({
           ))}
         </ul>
       }
+      libraryCategory="adult"
       presentation={item.code === null ? null : presentation}
       ratio={ratio}
       secondary={secondary}
@@ -16505,6 +16558,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         adultTrashReconciliationState === "pending" ||
                         adultTrashPendingPath !== null
                       }
+                      id="adult-library-refresh"
                       onClick={refreshAdultLibrary}
                       type="button"
                       variant="outline"
@@ -16583,6 +16637,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         vrTrashReconciliationState === "pending" ||
                         vrTrashPendingPath !== null
                       }
+                      id="vr-library-refresh"
                       onClick={refreshVrLibrary}
                       type="button"
                       variant="outline"

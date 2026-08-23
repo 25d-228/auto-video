@@ -9,7 +9,9 @@ use std::{
 use crate::{
     library_presentation::{LibraryItemAuthority, LibraryPresentationCategory},
     library_scan::{is_supported_library_media, scan_library_files},
-    vr_torrent::{hex_sha1, product_code_candidates},
+    vr_torrent::{
+        adult_library_product_code_prefix_is_supported, hex_sha1, product_code_candidates,
+    },
 };
 
 pub const ADULT_FOLDER_STORAGE_FAILED: &str = "adult_folder_storage_failed";
@@ -67,7 +69,10 @@ fn exact_file_product_code(path: &Path) -> Option<String> {
     let title = path.file_stem()?.to_str()?;
     let mut codes = product_code_candidates(title)
         .into_iter()
-        .filter(|(_, prefix)| !MULTIPART_IDENTITY_PREFIXES.contains(&prefix.as_str()))
+        .filter(|(_, prefix)| {
+            adult_library_product_code_prefix_is_supported(prefix)
+                && !MULTIPART_IDENTITY_PREFIXES.contains(&prefix.as_str())
+        })
         .map(|(code, _)| code)
         .collect::<Vec<_>>();
     codes.sort();
@@ -503,6 +508,9 @@ mod tests {
             "adlt_00123 CD2.MKV",
             "ADLT-124.mp4",
             "ADLT-123 + XYZ-7.mp4",
+            "459TEN-00048-A.mp4",
+            "459ten_0048-B.MKV",
+            "3DSVR-01871-A.mp4",
             "unassociated.mp4",
         ] {
             fs::write(fixture.path.join(name), name.as_bytes())
@@ -519,12 +527,19 @@ mod tests {
         assert_eq!(authority.category, LibraryPresentationCategory::Adult);
         assert_eq!(authority.code, "ADLT-123");
         assert_eq!(authority.identity.len(), 40);
+        let maker = adult_library_presentation_authority(&state, generation, "459TEN-48")
+            .expect("an evidenced Adult maker prefix must authorize one exact group");
+        assert_eq!(maker.code, "459TEN-48");
         assert_eq!(
             adult_library_presentation_authority(&state, generation, "ADLT-125"),
             Err(ADULT_LIBRARY_STALE)
         );
         assert_eq!(
             adult_library_presentation_authority(&state, generation, "ADLT-123 + XYZ-7"),
+            Err(ADULT_LIBRARY_STALE)
+        );
+        assert_eq!(
+            adult_library_presentation_authority(&state, generation, "3DSVR-1871"),
             Err(ADULT_LIBRARY_STALE)
         );
 

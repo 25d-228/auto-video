@@ -49,7 +49,11 @@ use javdb_catalog::{
     JavdbCatalogState, JavdbDetailRequest,
 };
 use library_presentation::{
+    begin_cover_request as begin_library_cover_request,
+    cancel_cover_request as cancel_library_cover_request_with,
+    cover_request_is_current as library_cover_request_is_current,
     fetch_cover as fetch_library_presentation_cover_with,
+    invalidate_cover as invalidate_library_presentation_cover_with,
     resolve_cover as resolve_library_cover_with, resolve_metadata as resolve_library_metadata_with,
     LibraryItemAuthority, LibraryPresentationCategory, LibraryPresentationState,
     LIBRARY_PRESENTATION_FAILED, LIBRARY_PRESENTATION_STALE,
@@ -1514,17 +1518,7 @@ fn clear_tmdb_token_file(path: &Path) -> Result<(), &'static str> {
 }
 
 fn is_canonical_product_code(code: &str) -> bool {
-    let Some((prefix, number)) = code.split_once('-') else {
-        return false;
-    };
-
-    (2..=16).contains(&prefix.len())
-        && prefix
-            .bytes()
-            .all(|character| character.is_ascii_uppercase())
-        && (1..=10).contains(&number.len())
-        && !number.starts_with('0')
-        && number.bytes().all(|character| character.is_ascii_digit())
+    crate::vr_torrent::canonical_product_code(code).as_deref() == Some(code)
 }
 
 fn provider_error_code(error: ProviderRequestError) -> &'static str {
@@ -2765,6 +2759,7 @@ async fn resolve_library_cover(
     category: String,
     item_id: String,
     scan_generation: String,
+    cover_request_generation: String,
     adult_state: tauri::State<'_, AdultLibraryState>,
     download_state: tauri::State<'_, VrDownloadState>,
     vr_state: tauri::State<'_, VrLibraryState>,
@@ -2775,6 +2770,11 @@ async fn resolve_library_cover(
     let scan_generation = scan_generation
         .parse::<u64>()
         .map_err(|_| LIBRARY_PRESENTATION_STALE.to_owned())?;
+    let cover_request_generation = cover_request_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())?;
     let cache_path = library_presentation_cache_path(&app)?;
     let adult_state = adult_state.inner().clone();
     let download_state = download_state.inner().clone();
@@ -2789,9 +2789,25 @@ async fn resolve_library_cover(
             &download_state,
             &vr_state,
         )?;
-        let response =
-            resolve_library_cover_with(&presentation_state, &cache_path, &authority, || {
-                current_library_presentation_authority(
+        begin_library_cover_request(
+            &presentation_state,
+            category,
+            &item_id,
+            cover_request_generation,
+        )
+        .map_err(str::to_owned)?;
+        let response = resolve_library_cover_with(
+            &presentation_state,
+            &cache_path,
+            &authority,
+            cover_request_generation,
+            || {
+                library_cover_request_is_current(
+                    &presentation_state,
+                    category,
+                    &item_id,
+                    cover_request_generation,
+                ) && current_library_presentation_authority(
                     category,
                     &item_id,
                     scan_generation,
@@ -2800,8 +2816,9 @@ async fn resolve_library_cover(
                     &vr_state,
                 )
                 .is_ok_and(|current| current == authority)
-            })
-            .map_err(str::to_owned)?;
+            },
+        )
+        .map_err(str::to_owned)?;
         let current = current_library_presentation_authority(
             category,
             &item_id,
@@ -2809,10 +2826,24 @@ async fn resolve_library_cover(
             &adult_state,
             &download_state,
             &vr_state,
-        )?;
-        (current == authority)
-            .then_some(response)
-            .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())
+        );
+        if current.as_ref().is_ok_and(|current| current == &authority)
+            && library_cover_request_is_current(
+                &presentation_state,
+                category,
+                &item_id,
+                cover_request_generation,
+            )
+        {
+            return Ok(response);
+        }
+        let _ = cancel_library_cover_request_with(
+            &presentation_state,
+            category,
+            &item_id,
+            cover_request_generation,
+        );
+        Err(LIBRARY_PRESENTATION_STALE.to_owned())
     })
     .await
     .map_err(|_| LIBRARY_PRESENTATION_FAILED.to_owned())?
@@ -2907,7 +2938,8 @@ async fn fetch_library_cover(
             &adult_state,
             &download_state,
             &vr_state,
-        )?;
+        );
+        let authority = authority?;
         let bytes = fetch_library_presentation_cover_with(
             &presentation_state,
             &authority,
@@ -2925,6 +2957,91 @@ async fn fetch_library_cover(
         (current == authority)
             .then_some(bytes)
             .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())
+    })
+    .await
+    .map_err(|_| LIBRARY_PRESENTATION_FAILED.to_owned())?
+}
+
+#[tauri::command]
+fn cancel_library_cover_request(
+    category: String,
+    item_id: String,
+    cover_request_generation: String,
+    presentation_state: tauri::State<'_, LibraryPresentationState>,
+) -> Result<(), String> {
+    let category = LibraryPresentationCategory::parse(&category)
+        .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())?;
+    if !is_canonical_product_code(&item_id) {
+        return Err(LIBRARY_PRESENTATION_STALE.to_owned());
+    }
+    let cover_request_generation = cover_request_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())?;
+    cancel_library_cover_request_with(
+        presentation_state.inner(),
+        category,
+        &item_id,
+        cover_request_generation,
+    )
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn invalidate_library_cover(
+    app: tauri::AppHandle,
+    category: String,
+    item_id: String,
+    scan_generation: String,
+    cover_request_generation: String,
+    cover_authority_id: String,
+    adult_state: tauri::State<'_, AdultLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
+    vr_state: tauri::State<'_, VrLibraryState>,
+    presentation_state: tauri::State<'_, LibraryPresentationState>,
+) -> Result<(), String> {
+    let category = LibraryPresentationCategory::parse(&category)
+        .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())?;
+    let scan_generation = scan_generation
+        .parse::<u64>()
+        .map_err(|_| LIBRARY_PRESENTATION_STALE.to_owned())?;
+    let cover_request_generation = cover_request_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())?;
+    let cache_path = library_presentation_cache_path(&app)?;
+    let adult_state = adult_state.inner().clone();
+    let download_state = download_state.inner().clone();
+    let vr_state = vr_state.inner().clone();
+    let presentation_state = presentation_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if !library_cover_request_is_current(
+            &presentation_state,
+            category,
+            &item_id,
+            cover_request_generation,
+        ) {
+            return Err(LIBRARY_PRESENTATION_STALE.to_owned());
+        }
+        let authority = current_library_presentation_authority(
+            category,
+            &item_id,
+            scan_generation,
+            &adult_state,
+            &download_state,
+            &vr_state,
+        )?;
+        invalidate_library_presentation_cover_with(
+            &presentation_state,
+            &cache_path,
+            &authority,
+            cover_request_generation,
+            &cover_authority_id,
+        )
+        .map_err(str::to_owned)
     })
     .await
     .map_err(|_| LIBRARY_PRESENTATION_FAILED.to_owned())?
@@ -4477,6 +4594,8 @@ fn main() {
             resolve_library_cover,
             resolve_library_metadata,
             fetch_library_cover,
+            cancel_library_cover_request,
+            invalidate_library_cover,
             open_adult_file,
             reveal_adult_file,
             trash_adult_file,
