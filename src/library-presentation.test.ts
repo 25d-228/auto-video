@@ -230,25 +230,27 @@ describe("Library presentation boundary", () => {
 
   it("shows a validated cover before optional metadata finishes", async () => {
     const metadata = deferred<unknown>();
-    const invoke = vi.fn((command: string) => {
-      if (command === "resolve_library_cover") {
-        return Promise.resolve([
-          "library-cover-v2",
-          "vr",
-          "ready",
-          "JavDB",
-          "item",
-          "MDVR-419",
-          `library-cover-${"a".repeat(40)}`,
-          "1.7777777777777777",
-        ]);
-      }
-      if (command === "fetch_library_cover") {
-        return Promise.resolve([0xff, 0xd8]);
-      }
-      if (command === "resolve_library_metadata") return metadata.promise;
-      return Promise.reject(new Error(`Unexpected command ${command}`));
-    });
+    const invoke = vi.fn(
+      (command: string, _parameters?: Record<string, unknown>) => {
+        if (command === "resolve_library_cover") {
+          return Promise.resolve([
+            "library-cover-v2",
+            "vr",
+            "ready",
+            "JavDB",
+            "item",
+            "MDVR-419",
+            `library-cover-${"a".repeat(40)}`,
+            "1.7777777777777777",
+          ]);
+        }
+        if (command === "fetch_library_cover") {
+          return Promise.resolve([0xff, 0xd8]);
+        }
+        if (command === "resolve_library_metadata") return metadata.promise;
+        return Promise.reject(new Error(`Unexpected command ${command}`));
+      },
+    );
     const createObjectURL = vi.fn(() => "blob:wide-cover");
     vi.stubGlobal("__TAURI__", { core: { invoke } });
     Object.defineProperty(URL, "createObjectURL", {
@@ -276,6 +278,18 @@ describe("Library presentation boundary", () => {
       "fetch_library_cover",
       "resolve_library_metadata",
     ]);
+    const coverArguments = invoke.mock.calls.find(
+      ([command]) => command === "resolve_library_cover",
+    )?.[1];
+    const metadataArguments = invoke.mock.calls.find(
+      ([command]) => command === "resolve_library_metadata",
+    )?.[1];
+    expect(metadataArguments).toMatchObject({
+      category: "vr",
+      itemId: "MDVR-419",
+      scanGeneration: "7",
+      coverRequestGeneration: coverArguments?.coverRequestGeneration,
+    });
 
     await act(async () => {
       metadata.resolve([

@@ -320,10 +320,13 @@ async function invalidateCover(
   });
 }
 
-async function resolveMetadata(request: LibraryPresentationRequest) {
+async function resolveMetadata(
+  request: LibraryPresentationRequest,
+  coverRequestGeneration: string,
+) {
   const value = await window.__TAURI__.core.invoke<unknown>(
     "resolve_library_metadata",
-    requestArguments(request),
+    { ...requestArguments(request), coverRequestGeneration },
   );
   const metadata = parseLibraryMetadata(value, request.category);
   if (metadata === null) {
@@ -357,18 +360,21 @@ export function useLibraryPresentation(
   );
   const [coverRetry, setCoverRetry] = useState(0);
   const [metadataRetry, setMetadataRetry] = useState(0);
-  const [coverCompletedRequestKey, setCoverCompletedRequestKey] = useState("");
+  const [completedCover, setCompletedCover] = useState<{
+    requestKey: string;
+    requestGeneration: string;
+  } | null>(null);
   const [state, setState] = useState<LibraryPresentationState>(initialState);
   const currentObjectUrl = useRef<string | null>(null);
 
   useEffect(() => {
     if (stableRequest === null) {
       setState(initialState());
-      setCoverCompletedRequestKey("");
+      setCompletedCover(null);
       return;
     }
     setState(initialState());
-    setCoverCompletedRequestKey("");
+    setCompletedCover(null);
   }, [stableRequest]);
 
   useEffect(() => {
@@ -407,7 +413,12 @@ export function useLibraryPresentation(
       },
     }));
     const completeCover = () => {
-      if (current) setCoverCompletedRequestKey(requestKey);
+      if (current) {
+        setCompletedCover({
+          requestKey,
+          requestGeneration: coverRequestGeneration,
+        });
+      }
     };
 
     void scheduleLibraryPresentation(
@@ -538,7 +549,7 @@ export function useLibraryPresentation(
   useEffect(() => {
     if (
       stableRequest === null ||
-      coverCompletedRequestKey !== requestKey
+      completedCover?.requestKey !== requestKey
     ) {
       return;
     }
@@ -549,7 +560,7 @@ export function useLibraryPresentation(
     }));
     void scheduleLibraryPresentation(
       "metadata",
-      () => resolveMetadata(stableRequest),
+      () => resolveMetadata(stableRequest, completedCover.requestGeneration),
       () => current,
     )
       .then((metadata) => {
@@ -581,7 +592,7 @@ export function useLibraryPresentation(
     return () => {
       current = false;
     };
-  }, [coverCompletedRequestKey, metadataRetry, requestKey, stableRequest]);
+  }, [completedCover, metadataRetry, requestKey, stableRequest]);
 
   return state;
 }

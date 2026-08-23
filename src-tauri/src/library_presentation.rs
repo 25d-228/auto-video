@@ -32,6 +32,7 @@ const MAX_RETAINED_COVER_AUTHORITIES: usize = 8;
 const MAX_RETAINED_COVER_BYTES: usize = 4;
 const MAX_RETAINED_COVER_REQUESTS: usize = 128;
 const MAX_RETAINED_FAILED_COVER_ITEMS: usize = 128;
+const MAX_RETAINED_METADATA_SEEDS: usize = 128;
 const HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
 #[cfg(target_os = "macos")]
 const HTTP_STATUS_WRITE_OUT: &str = "\nAUTO_VIDEO_HTTP_STATUS:%{http_code}";
@@ -129,6 +130,19 @@ struct FailedCoverSources {
     sequence: u64,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct MetadataSeedKey {
+    category: LibraryPresentationCategory,
+    code: String,
+    item_identity: String,
+    request_generation: u64,
+}
+
+struct MetadataSeed {
+    metadata: PresentationMetadata,
+    sequence: u64,
+}
+
 #[derive(Clone, Debug)]
 struct CacheEntry {
     identity: String,
@@ -147,8 +161,45 @@ struct LibraryPresentationContext {
     covers: HashMap<String, CoverAuthority>,
     cover_requests: HashMap<(LibraryPresentationCategory, String), CoverRequestAuthority>,
     failed_cover_sources: HashMap<String, FailedCoverSources>,
-    metadata_seeds: HashMap<String, PresentationMetadata>,
+    metadata_seeds: HashMap<MetadataSeedKey, MetadataSeed>,
     next_cover_sequence: u64,
+}
+
+fn metadata_seed_key(authority: &LibraryItemAuthority, request_generation: u64) -> MetadataSeedKey {
+    MetadataSeedKey {
+        category: authority.category,
+        code: authority.code.clone(),
+        item_identity: authority.identity.clone(),
+        request_generation,
+    }
+}
+
+fn retire_metadata_seed(
+    context: &mut LibraryPresentationContext,
+    category: LibraryPresentationCategory,
+    code: &str,
+    request_generation: u64,
+) {
+    context.metadata_seeds.retain(|key, _| {
+        key.category != category || key.code != code || key.request_generation != request_generation
+    });
+}
+
+fn bound_metadata_seeds(context: &mut LibraryPresentationContext) {
+    while context.metadata_seeds.len() > MAX_RETAINED_METADATA_SEEDS {
+        let oldest_obsolete = context
+            .metadata_seeds
+            .iter()
+            .filter(|(key, _)| {
+                !cover_request_matches(context, key.category, &key.code, key.request_generation)
+            })
+            .min_by_key(|(_, seed)| seed.sequence)
+            .map(|(key, _)| key.clone());
+        let Some(oldest_obsolete) = oldest_obsolete else {
+            break;
+        };
+        context.metadata_seeds.remove(&oldest_obsolete);
+    }
 }
 
 fn cover_request_matches(
@@ -1077,9 +1128,13 @@ fn resolve_cover_at_with_request(
             ) {
                 return Err(LIBRARY_PRESENTATION_STALE);
             }
-            context
-                .metadata_seeds
-                .insert(authority.identity.clone(), metadata);
+            context.next_cover_sequence = context.next_cover_sequence.wrapping_add(1);
+            let sequence = context.next_cover_sequence;
+            context.metadata_seeds.insert(
+                metadata_seed_key(authority, request_generation),
+                MetadataSeed { metadata, sequence },
+            );
+            bound_metadata_seeds(&mut context);
         }
     }
     let (cover_state, source, bytes) = match cover {
@@ -1132,8 +1187,21 @@ pub(crate) fn resolve_metadata(
     state: &LibraryPresentationState,
     cache_path: &Path,
     authority: &LibraryItemAuthority,
+    request_generation: u64,
     is_current: impl Fn() -> bool,
 ) -> Result<Vec<String>, &'static str> {
+    if request_generation == 0
+        || !state.0.lock().is_ok_and(|context| {
+            cover_request_matches(
+                &context,
+                authority.category,
+                &authority.code,
+                request_generation,
+            )
+        })
+    {
+        return Err(LIBRARY_PRESENTATION_STALE);
+    }
     resolve_metadata_at_with(
         state,
         cache_path,
@@ -1146,9 +1214,12 @@ pub(crate) fn resolve_metadata(
                 .lock()
                 .map_err(|_| ProviderRequestError::Provider)?
                 .metadata_seeds
-                .remove(&authority.identity);
-            match seed.filter(PresentationMetadata::is_ready) {
-                Some(seed) => Ok(Some(seed)),
+                .remove(&metadata_seed_key(authority, request_generation));
+            match seed
+                .map(|seed| seed.metadata)
+                .filter(PresentationMetadata::is_ready)
+            {
+                Some(metadata) => Ok(Some(metadata)),
                 None => resolve_metadata_with(
                     authority,
                     javdb_catalog::fetch_api_document,
@@ -1309,6 +1380,9 @@ pub(crate) fn begin_cover_request(
     context
         .covers
         .retain(|_, cover| cover.category != category || cover.code != code);
+    context
+        .metadata_seeds
+        .retain(|seed, _| seed.category != category || seed.code != code);
     context.cover_requests.insert(
         key,
         CoverRequestAuthority {
@@ -1332,10 +1406,19 @@ pub(crate) fn begin_cover_request(
         }) else {
             break;
         };
+        let removed_request = context.cover_requests.get(&oldest).copied();
         context
             .covers
             .retain(|_, cover| cover.category != oldest.0 || cover.code != oldest.1);
         context.cover_requests.remove(&oldest);
+        if let Some(removed_request) = removed_request {
+            retire_metadata_seed(
+                &mut context,
+                oldest.0,
+                &oldest.1,
+                removed_request.generation,
+            );
+        }
     }
     Ok(())
 }
@@ -1363,13 +1446,14 @@ pub(crate) fn cancel_cover_request(
     if let Some(request) = context.cover_requests.get_mut(&key) {
         if request.generation == request_generation {
             request.active = false;
-            context.covers.retain(|_, cover| {
-                cover.category != category
-                    || cover.code != code
-                    || cover.request_generation != request_generation
-            });
         }
     }
+    context.covers.retain(|_, cover| {
+        cover.category != category
+            || cover.code != code
+            || cover.request_generation != request_generation
+    });
+    retire_metadata_seed(&mut context, category, code, request_generation);
     Ok(())
 }
 
@@ -1396,6 +1480,9 @@ pub(crate) fn invalidate_cover(
     }) {
         context.covers.remove(cover_authority_id);
     }
+    context
+        .metadata_seeds
+        .remove(&metadata_seed_key(authority, request_generation));
     let mut entries = load_cache(cache_path);
     let entry = entries
         .iter_mut()
@@ -1706,7 +1793,12 @@ mod tests {
 
     #[test]
     fn exact_cover_order_is_javdb_then_fanza_then_bounded_legacy() {
-        let authority = authority(LibraryPresentationCategory::Adult);
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "c".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
         let events = std::cell::RefCell::new(Vec::new());
         let (cover, metadata, transient) = resolve_cover_with(
             &authority,
@@ -1724,7 +1816,7 @@ mod tests {
             },
             |body| {
                 events.borrow_mut().push(format!("fanza:{body}"));
-                Ok(r#"{"data":{"c0":{"id":"adlt00123","contentType":"TWO_DIMENSION","title":"Exact","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/adlt00123/adlt00123pl.jpg"}}}}"#.to_owned())
+                Ok(r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Exact","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001pl.jpg"}}}}"#.to_owned())
             },
             |url| {
                 events.borrow_mut().push(format!("fanza-image:{url}"));
@@ -1758,7 +1850,12 @@ mod tests {
 
     #[test]
     fn failed_javdb_source_is_skipped_when_retry_advances_to_fanza() {
-        let authority = authority(LibraryPresentationCategory::Adult);
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "d".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
         let failed_url = "https://tp.cmastd.com/exact.jpg".to_owned();
         let failed_urls = HashSet::from([failed_url]);
         let javdb_image_calls = Cell::new(0);
@@ -1778,7 +1875,7 @@ mod tests {
                 })
             },
             |_| {
-                Ok(r#"{"data":{"c0":{"id":"adlt00123","contentType":"TWO_DIMENSION","title":"Exact","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/adlt00123/adlt00123pl.jpg"}}}}"#.to_owned())
+                Ok(r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Exact","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001pl.jpg"}}}}"#.to_owned())
             },
             |_| Ok(jpeg(600, 800)),
             |_| panic!("legacy must not run after exact FANZA success"),
@@ -1913,10 +2010,15 @@ mod tests {
     #[test]
     fn mismatched_fanza_category_and_code_cannot_supply_a_cover() {
         for document in [
-            r#"{"data":{"c0":{"id":"abc00123","contentType":"TWO_DIMENSION","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
-            r#"{"data":{"c0":{"id":"adlt00123","contentType":"VR","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00002","contentType":"TWO_DIMENSION","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":"VR","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
         ] {
-            let authority = authority(LibraryPresentationCategory::Adult);
+            let authority = LibraryItemAuthority {
+                category: LibraryPresentationCategory::Adult,
+                identity: "e".repeat(40),
+                code: "CAWB-1".to_owned(),
+                product_identity: "CAWB-1".to_owned(),
+            };
             let image_calls = std::cell::Cell::new(0);
             let (cover, _, _) = resolve_cover_with(
                 &authority,
@@ -1933,6 +2035,86 @@ mod tests {
             assert!(cover.is_none());
             assert_eq!(image_calls.get(), 0);
         }
+    }
+
+    #[test]
+    fn failed_fanza_identity_contributes_nothing_and_later_exact_source_can_succeed() {
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "a".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
+        let fanza_image_calls = Cell::new(0);
+        let (cover, metadata, transient) = resolve_cover_with(
+            &authority,
+            |_| Err(ProviderRequestError::SourceUnavailable),
+            |_| panic!("missing JavDB item has no image"),
+            |_| {
+                Ok(r#"{"data":{"c0":{"id":"cawb001","contentType":"TWO_DIMENSION","title":"Conflicting FANZA title","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb001/cawb001pl.jpg"}}}}"#.to_owned())
+            },
+            |_| {
+                fanza_image_calls.set(fanza_image_calls.get() + 1);
+                Ok(jpeg(600, 800))
+            },
+            |_| {
+                Ok(r#"{"content_id":"CAWB-1","title_ja":"Legacy title","images":{"jacket_image":{"large":"https://pics.dmm.co.jp/digital/video/cawb00001/cawb00001pl.jpg"}}}"#.to_owned())
+            },
+            |_| Ok(jpeg(600, 800)),
+        );
+        let source = cover
+            .expect("the later exact legacy source must remain eligible")
+            .0;
+        assert_eq!(source.provider, "r18.dev");
+        assert_eq!(source.display_code, "CAWB-1");
+        assert_eq!(fanza_image_calls.get(), 0);
+        assert_eq!(
+            metadata.and_then(|value| value.title),
+            Some("Legacy title".to_owned())
+        );
+        assert!(transient);
+    }
+
+    #[test]
+    fn failed_fanza_identity_without_later_success_is_unavailable_and_not_cached() {
+        let fixture = CacheFixture::new("fanza-conflict");
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "b".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
+        let fanza_image_calls = Cell::new(0);
+        let response = resolve_cover_at_with(
+            &LibraryPresentationState::default(),
+            &fixture.path,
+            &authority,
+            100,
+            || true,
+            || {
+                resolve_cover_with(
+                    &authority,
+                    |_| Err(ProviderRequestError::SourceUnavailable),
+                    |_| panic!("missing JavDB item has no image"),
+                    |_| {
+                        Ok(r#"{"data":{"c0":{"id":"cawb00002","contentType":"TWO_DIMENSION","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00002/cawb00002pl.jpg"}}}}"#.to_owned())
+                    },
+                    |_| {
+                        fanza_image_calls.set(fanza_image_calls.get() + 1);
+                        Ok(jpeg(600, 800))
+                    },
+                    |_| Err(ProviderRequestError::SourceUnavailable),
+                    |_| panic!("missing legacy item has no image"),
+                )
+            },
+        )
+        .expect("a current provider conflict must remain a local state");
+        assert_eq!(response[2], "unavailable");
+        assert_eq!(response[3], "");
+        assert_eq!(response[4], "");
+        assert_eq!(response[5], "");
+        assert_eq!(fanza_image_calls.get(), 0);
+        assert!(!fixture.path.exists());
     }
 
     #[test]
@@ -2107,6 +2289,151 @@ mod tests {
             }),
             Err(LIBRARY_PRESENTATION_STALE)
         );
+    }
+
+    #[test]
+    fn metadata_seed_is_retired_when_the_cover_request_unmounts_before_metadata() {
+        let fixture = CacheFixture::new("metadata-seed-unmount");
+        let authority = authority(LibraryPresentationCategory::Adult);
+        let state = LibraryPresentationState::default();
+        begin_cover_request(&state, authority.category, &authority.code, 1)
+            .expect("cover request must begin");
+        resolve_cover_at_with_request(
+            &state,
+            &fixture.path,
+            &authority,
+            1,
+            100,
+            || true,
+            || {
+                (
+                    None,
+                    Some(PresentationMetadata {
+                        source: Some("JavDB".to_owned()),
+                        provider_id: Some("old-item".to_owned()),
+                        display_code: Some(authority.code.clone()),
+                        title: Some("Old metadata".to_owned()),
+                        ..PresentationMetadata::default()
+                    }),
+                    true,
+                )
+            },
+        )
+        .expect("cover-first metadata may be retained for the current request");
+        assert_eq!(state.0.lock().unwrap().metadata_seeds.len(), 1);
+
+        cancel_cover_request(&state, authority.category, &authority.code, 1)
+            .expect("unmount cancellation must retire the matching seed");
+        assert!(state.0.lock().unwrap().metadata_seeds.is_empty());
+    }
+
+    #[test]
+    fn metadata_seed_cannot_cross_replacement_or_obsolete_cancellation() {
+        let fixture = CacheFixture::new("metadata-seed-replacement");
+        let authority = authority(LibraryPresentationCategory::Adult);
+        let state = LibraryPresentationState::default();
+        begin_cover_request(&state, authority.category, &authority.code, 1)
+            .expect("old cover request must begin");
+        resolve_cover_at_with_request(
+            &state,
+            &fixture.path,
+            &authority,
+            1,
+            100,
+            || true,
+            || {
+                (
+                    None,
+                    Some(PresentationMetadata {
+                        source: Some("JavDB".to_owned()),
+                        provider_id: Some("old-item".to_owned()),
+                        display_code: Some(authority.code.clone()),
+                        title: Some("Old metadata".to_owned()),
+                        ..PresentationMetadata::default()
+                    }),
+                    true,
+                )
+            },
+        )
+        .expect("old cover request may retain one seed");
+
+        begin_cover_request(&state, authority.category, &authority.code, 2)
+            .expect("replacement cover request must begin");
+        assert!(state.0.lock().unwrap().metadata_seeds.is_empty());
+        resolve_cover_at_with_request(
+            &state,
+            &fixture.path,
+            &authority,
+            2,
+            101,
+            || true,
+            || {
+                (
+                    None,
+                    Some(PresentationMetadata {
+                        source: Some("JavDB".to_owned()),
+                        provider_id: Some("new-item".to_owned()),
+                        display_code: Some(authority.code.clone()),
+                        title: Some("New metadata".to_owned()),
+                        ..PresentationMetadata::default()
+                    }),
+                    true,
+                )
+            },
+        )
+        .expect("replacement request must retain its own seed");
+
+        cancel_cover_request(&state, authority.category, &authority.code, 1)
+            .expect("obsolete cancellation must be harmless");
+        assert_eq!(state.0.lock().unwrap().metadata_seeds.len(), 1);
+        let metadata = resolve_metadata(&state, &fixture.path, &authority, 2, || true)
+            .expect("the current request must consume only its own seed");
+        assert_eq!(metadata[4], "new-item");
+        assert_eq!(metadata[6], "New metadata");
+        assert!(state.0.lock().unwrap().metadata_seeds.is_empty());
+    }
+
+    #[test]
+    fn repeated_scan_replacements_do_not_accumulate_metadata_seeds() {
+        let fixture = CacheFixture::new("metadata-seed-scans");
+        let state = LibraryPresentationState::default();
+        for generation in 1..=32 {
+            let authority = LibraryItemAuthority {
+                category: LibraryPresentationCategory::Vr,
+                identity: format!("{generation:040x}"),
+                code: "3DSVR-01871".to_owned(),
+                product_identity: "3DSVR-1871".to_owned(),
+            };
+            begin_cover_request(&state, authority.category, &authority.code, generation)
+                .expect("replacement scan request must begin");
+            resolve_cover_at_with_request(
+                &state,
+                &fixture.path,
+                &authority,
+                generation,
+                100 + generation,
+                || true,
+                || {
+                    (
+                        None,
+                        Some(PresentationMetadata {
+                            source: Some("JavDB".to_owned()),
+                            provider_id: Some(format!("item-{generation}")),
+                            display_code: Some(authority.code.clone()),
+                            title: Some(format!("Metadata {generation}")),
+                            ..PresentationMetadata::default()
+                        }),
+                        true,
+                    )
+                },
+            )
+            .expect("current scan may retain one seed");
+            let context = state.0.lock().unwrap();
+            assert_eq!(context.metadata_seeds.len(), 1);
+            assert!(context.metadata_seeds.keys().all(|seed| {
+                seed.item_identity == authority.identity && seed.request_generation == generation
+            }));
+        }
     }
 
     #[test]

@@ -478,6 +478,12 @@ fn graphql_body(category: Category, feed: &str, count: u16) -> String {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExactContentRequest {
+    alias: String,
+    content_id: String,
+}
+
 fn exact_content_id_candidates(code: &str) -> Vec<String> {
     let Some(forms) = product_code_forms(code) else {
         return Vec::new();
@@ -496,48 +502,54 @@ fn exact_content_id_candidates(code: &str) -> Vec<String> {
     if forms.prefix == "3DSVR" {
         return vec![format!("13dsvr{number:0>5}")];
     }
-    let prefix = match forms.prefix.to_ascii_lowercase().as_str() {
-        "ebon" => "ebod".to_owned(),
-        value => value.to_owned(),
-    };
-    let mut candidates = vec![
-        format!("{prefix}{number:0>5}"),
-        format!("{prefix}{number:0>3}"),
-        format!("{prefix}{number}"),
-        format!("1{prefix}{number:0>5}"),
-        format!("1{prefix}{number:0>3}"),
-        format!("13{prefix}{number:0>5}"),
-        format!("13{prefix}{number:0>3}"),
-    ];
-    let mut unique = std::collections::HashSet::new();
-    candidates.retain(|candidate| unique.insert(candidate.clone()));
-    candidates
+    Vec::new()
 }
 
-fn exact_content_body(code: &str) -> Option<String> {
-    let fields = exact_content_id_candidates(code)
+fn exact_content_requests(code: &str) -> Vec<ExactContentRequest> {
+    exact_content_id_candidates(code)
         .into_iter()
         .enumerate()
-        .map(|(index, content_id)| {
+        .map(|(index, content_id)| ExactContentRequest {
+            alias: format!("c{index}"),
+            content_id,
+        })
+        .collect()
+}
+
+fn exact_content_body(requests: &[ExactContentRequest]) -> String {
+    let fields = requests
+        .iter()
+        .map(|request| {
             format!(
-                "c{index}:ppvContent(id:\"{content_id}\"){{id contentType title packageImage{{largeUrl}}}}"
+                "{}:ppvContent(id:\"{}\"){{id contentType title packageImage{{largeUrl}}}}",
+                request.alias, request.content_id
             )
         })
         .collect::<String>();
-    (!fields.is_empty()).then(|| format!(r#"{{"query":"query{{{fields}}}","variables":{{}}}}"#))
+    format!(r#"{{"query":"query{{{fields}}}","variables":{{}}}}"#)
 }
 
 fn parse_exact_content(
     document: &str,
     category: Category,
     code: &str,
+    requests: &[ExactContentRequest],
 ) -> Result<Option<ExactLibraryItem>, DocumentError> {
     let root = parse_root(document)?;
     let Some(JsonValue::Object(data)) = root.get("data") else {
         return Err(DocumentError::Malformed);
     };
+    if data
+        .keys()
+        .any(|alias| !requests.iter().any(|request| request.alias == *alias))
+    {
+        return Err(DocumentError::Malformed);
+    }
     let mut accepted = Vec::new();
-    for value in data.values() {
+    for request in requests {
+        let Some(value) = data.get(&request.alias) else {
+            continue;
+        };
         let JsonValue::Object(content) = value else {
             if matches!(value, JsonValue::Null) {
                 continue;
@@ -548,10 +560,11 @@ fn parse_exact_content(
         let Some(item) = parse_content(value) else {
             return Err(DocumentError::Malformed);
         };
-        if canonical_product_code(&item.display_code) != canonical_product_code(code)
+        if item.content_id != request.content_id
+            || canonical_product_code(&item.display_code) != canonical_product_code(code)
             || content_type != category.content_type()
         {
-            continue;
+            return Err(DocumentError::Conflicting);
         }
         accepted.push(ExactLibraryItem {
             content_id: item.content_id,
@@ -575,9 +588,15 @@ pub(crate) fn fetch_exact_library_item_with(
     fetch: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
 ) -> Result<Option<ExactLibraryItem>, ProviderRequestError> {
     let category = Category::parse(category).ok_or(ProviderRequestError::Provider)?;
-    let body = exact_content_body(code).ok_or(ProviderRequestError::Provider)?;
+    product_code_forms(code).ok_or(ProviderRequestError::Provider)?;
+    let requests = exact_content_requests(code);
+    if requests.is_empty() {
+        return Ok(None);
+    }
+    let body = exact_content_body(&requests);
     let document = fetch(&body)?;
-    parse_exact_content(&document, category, code).map_err(|_| ProviderRequestError::Provider)
+    parse_exact_content(&document, category, code, &requests)
+        .map_err(|_| ProviderRequestError::Provider)
 }
 
 fn authority(context: &CatalogContext, category: Category) -> Option<&CatalogAuthority> {
@@ -1034,15 +1053,15 @@ mod tests {
     }
 
     #[test]
-    fn exact_library_content_requires_the_returned_code_and_category() {
-        let accepted = fetch_exact_library_item_with("vr", "MDVR-419", |body| {
+    fn exact_library_content_requires_the_requested_transport_code_and_category() {
+        let accepted = fetch_exact_library_item_with("vr", "3DSVR-01871", |body| {
             assert!(body.contains("ppvContent"));
-            assert!(body.contains("mdvr00419"));
-            Ok(r#"{"data":{"c0":{"id":"mdvr00419","contentType":"VR","title":"Exact VR","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/mdvr00419/mdvr00419pl.jpg"}},"c1":null}}"#.to_owned())
+            assert!(body.contains("c0:ppvContent(id:\"13dsvr01871\")"));
+            Ok(r#"{"data":{"c0":{"id":"13dsvr01871","contentType":"VR","title":"Exact VR","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/13dsvr01871/13dsvr01871pl.jpg"}}}}"#.to_owned())
         })
         .expect("the exact FANZA response must parse")
         .expect("the exact item must be retained");
-        assert_eq!(accepted.content_id, "mdvr00419");
+        assert_eq!(accepted.content_id, "13dsvr01871");
         assert_eq!(accepted.title.as_deref(), Some("Exact VR"));
         assert!(accepted
             .cover_url
@@ -1060,11 +1079,66 @@ mod tests {
         assert_eq!(cawb.display_code, "CAWB-001");
 
         for document in [
-            r#"{"data":{"c0":{"id":"abc00419","contentType":"VR","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
-            r#"{"data":{"c0":{"id":"mdvr00419","contentType":"TWO_DIMENSION","title":"Wrong","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/wrong.jpg"}}}}"#,
+            r#"{"data":{"c0":{"id":"cawb001","contentType":"TWO_DIMENSION","title":"Wrong transport","packageImage":null}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00002","contentType":"TWO_DIMENSION","title":"Wrong code","packageImage":null}}}"#,
+            r#"{"data":{"c0":{"id":"cawb00001","contentType":"VR","title":"Wrong category","packageImage":null}}}"#,
+            r#"{"data":{"c0":{"id":"unsafe-id","contentType":"TWO_DIMENSION","title":"Malformed identity","packageImage":null}}}"#,
+            r#"{"data":{"c0":{"contentType":"TWO_DIMENSION","title":"Missing identity","packageImage":null}}}"#,
+            r#"{"data":{"c1":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"Unrequested alias","packageImage":null}}}"#,
         ] {
             assert_eq!(
-                fetch_exact_library_item_with("vr", "MDVR-419", |_| Ok(document.to_owned())),
+                fetch_exact_library_item_with("adult", "CAWB-1", |_| Ok(document.to_owned())),
+                Err(ProviderRequestError::Provider)
+            );
+        }
+
+        assert_eq!(
+            fetch_exact_library_item_with("adult", "CAWB-1", |_| {
+                Ok(r#"{"data":{"c0":null}}"#.to_owned())
+            }),
+            Ok(None)
+        );
+        assert_eq!(
+            fetch_exact_library_item_with("adult", "CAWB-1", |_| {
+                Ok(r#"{"data":{}}"#.to_owned())
+            }),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn exact_library_content_rejects_conflicting_alias_responses() {
+        let requests = vec![
+            ExactContentRequest {
+                alias: "c0".to_owned(),
+                content_id: "cawb00001".to_owned(),
+            },
+            ExactContentRequest {
+                alias: "c1".to_owned(),
+                content_id: "cawb001".to_owned(),
+            },
+        ];
+        assert_eq!(
+            parse_exact_content(
+                r#"{"data":{"c0":{"id":"cawb00001","contentType":"TWO_DIMENSION","title":"First","packageImage":null},"c1":{"id":"cawb001","contentType":"TWO_DIMENSION","title":"Second","packageImage":null}}}"#,
+                Category::Adult,
+                "CAWB-1",
+                &requests,
+            ),
+            Err(DocumentError::Conflicting)
+        );
+    }
+
+    #[test]
+    fn exact_content_candidates_are_limited_to_evidence_backed_prefixes() {
+        assert_eq!(exact_content_id_candidates("CAWB-001"), ["cawb00001"]);
+        assert_eq!(exact_content_id_candidates("3DSVR-01871"), ["13dsvr01871"]);
+        for unsupported in ["ADLT-123", "MDVR-419", "EBON-123", "VRKM-1577"] {
+            assert!(exact_content_id_candidates(unsupported).is_empty());
+            assert_eq!(
+                fetch_exact_library_item_with("vr", unsupported, |_| {
+                    panic!("unsupported prefixes must not dispatch speculative aliases")
+                }),
                 Ok(None)
             );
         }

@@ -2863,6 +2863,7 @@ async fn resolve_library_metadata(
     category: String,
     item_id: String,
     scan_generation: String,
+    cover_request_generation: String,
     adult_state: tauri::State<'_, AdultLibraryState>,
     download_state: tauri::State<'_, VrDownloadState>,
     vr_state: tauri::State<'_, VrLibraryState>,
@@ -2873,6 +2874,11 @@ async fn resolve_library_metadata(
     let scan_generation = scan_generation
         .parse::<u64>()
         .map_err(|_| LIBRARY_PRESENTATION_STALE.to_owned())?;
+    let cover_request_generation = cover_request_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())?;
     let cache_path = library_presentation_cache_path(&app)?;
     let adult_state = adult_state.inner().clone();
     let download_state = download_state.inner().clone();
@@ -2887,9 +2893,18 @@ async fn resolve_library_metadata(
             &download_state,
             &vr_state,
         )?;
-        let response =
-            resolve_library_metadata_with(&presentation_state, &cache_path, &authority, || {
-                current_library_presentation_authority(
+        let response = resolve_library_metadata_with(
+            &presentation_state,
+            &cache_path,
+            &authority,
+            cover_request_generation,
+            || {
+                library_cover_request_is_current(
+                    &presentation_state,
+                    category,
+                    &item_id,
+                    cover_request_generation,
+                ) && current_library_presentation_authority(
                     category,
                     &item_id,
                     scan_generation,
@@ -2898,8 +2913,9 @@ async fn resolve_library_metadata(
                     &vr_state,
                 )
                 .is_ok_and(|current| current == authority)
-            })
-            .map_err(str::to_owned)?;
+            },
+        )
+        .map_err(str::to_owned)?;
         let current = current_library_presentation_authority(
             category,
             &item_id,
@@ -2908,9 +2924,15 @@ async fn resolve_library_metadata(
             &download_state,
             &vr_state,
         )?;
-        (current == authority)
-            .then_some(response)
-            .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())
+        (current == authority
+            && library_cover_request_is_current(
+                &presentation_state,
+                category,
+                &item_id,
+                cover_request_generation,
+            ))
+        .then_some(response)
+        .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())
     })
     .await
     .map_err(|_| LIBRARY_PRESENTATION_FAILED.to_owned())?
