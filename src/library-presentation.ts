@@ -365,12 +365,38 @@ export function useLibraryPresentation(
 
     void scheduleLibraryPresentation(
       "cover",
-      () => resolveCover(stableRequest, coverRequestGeneration),
-      () => current,
-    )
-      .then(async (cover) => {
+      async () => {
+        const cover = await resolveCover(stableRequest, coverRequestGeneration);
         coverAuthorityId = cover.authorityId;
         if (!current) {
+          return { cover, objectUrl: null, fetchFailed: false };
+        }
+        if (cover.state !== "ready" || cover.authorityId === null) {
+          return { cover, objectUrl: null, fetchFailed: false };
+        }
+        setState((value) => ({
+          ...value,
+          cover: {
+            status: "loading",
+            objectUrl: null,
+            aspectRatio: cover.aspectRatio,
+            source: cover.source,
+            retry: null,
+            reportDecodeFailure: null,
+          },
+        }));
+        try {
+          const objectUrl = await fetchCover(stableRequest, cover.authorityId);
+          return { cover, objectUrl, fetchFailed: false };
+        } catch {
+          return { cover, objectUrl: null, fetchFailed: true };
+        }
+      },
+      () => current,
+    )
+      .then(({ cover, objectUrl, fetchFailed }) => {
+        if (!current) {
+          if (objectUrl !== null) URL.revokeObjectURL(objectUrl);
           return;
         }
         if (cover.state !== "ready" || cover.authorityId === null) {
@@ -391,27 +417,7 @@ export function useLibraryPresentation(
           completeCover();
           return;
         }
-        setState((value) => ({
-          ...value,
-          cover: {
-            status: "loading",
-            objectUrl: null,
-            aspectRatio: cover.aspectRatio,
-            source: cover.source,
-            retry: null,
-            reportDecodeFailure: null,
-          },
-        }));
-        try {
-          const objectUrl = await scheduleLibraryPresentation(
-            "cover",
-            () => fetchCover(stableRequest, cover.authorityId as string),
-            () => current,
-          );
-          if (!current) {
-            URL.revokeObjectURL(objectUrl);
-            return;
-          }
+        if (!fetchFailed && objectUrl !== null) {
           currentObjectUrl.current = objectUrl;
           setState((value) => ({
             ...value,
@@ -438,8 +444,7 @@ export function useLibraryPresentation(
               },
             },
           }));
-        } catch {
-          if (!current) return;
+        } else {
           setState((value) => ({
             ...value,
             cover: {

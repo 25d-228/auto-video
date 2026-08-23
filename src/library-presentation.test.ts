@@ -96,6 +96,133 @@ describe("Library presentation boundary", () => {
     await expect(obsoleteResult).resolves.toBeInstanceOf(Error);
   });
 
+  it("fetches all fourteen current cover authorities before the native bound can evict one", async () => {
+    const pendingResolutions = new Map<
+      string,
+      ReturnType<typeof deferred<unknown>>
+    >();
+    const retainedAuthorityOrder: string[] = [];
+    const retainedAuthorities = new Set<string>();
+    let maximumRetainedAuthorities = 0;
+    let staleFetches = 0;
+    const invoke = vi.fn(
+      (command: string, parameters?: Record<string, unknown>) => {
+        if (command === "resolve_library_cover") {
+          const itemId = String(parameters?.itemId);
+          const resolution = deferred<unknown>();
+          pendingResolutions.set(itemId, resolution);
+          return resolution.promise;
+        }
+        if (command === "fetch_library_cover") {
+          const authorityId = String(parameters?.coverAuthorityId);
+          if (!retainedAuthorities.delete(authorityId)) {
+            staleFetches += 1;
+            return Promise.reject(new Error("cover authority was evicted"));
+          }
+          retainedAuthorityOrder.splice(
+            retainedAuthorityOrder.indexOf(authorityId),
+            1,
+          );
+          return Promise.resolve([0xff, 0xd8]);
+        }
+        if (command === "resolve_library_metadata") {
+          return Promise.resolve([
+            "library-metadata-v1",
+            "adult",
+            "local-only",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "0",
+          ]);
+        }
+        if (command === "cancel_library_cover_request") return Promise.resolve();
+        return Promise.reject(new Error(`Unexpected command ${command}`));
+      },
+    );
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => `blob:cover-${retainedAuthorities.size}`),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    const hooks = Array.from({ length: 14 }, (_, index) =>
+      renderHook(() =>
+        useLibraryPresentation({
+          category: "adult",
+          itemId: `ADLT-${index + 1}`,
+          scanGeneration: "14-card-page",
+        }),
+      ),
+    );
+
+    let resolvedCount = 0;
+    while (resolvedCount < hooks.length) {
+      const batchSize = Math.min(4, hooks.length - resolvedCount);
+      await waitFor(() => expect(pendingResolutions.size).toBe(batchSize));
+      const batch = Array.from(pendingResolutions.entries());
+      pendingResolutions.clear();
+      for (const [itemId, resolution] of batch) {
+        const itemNumber = Number(itemId.slice("ADLT-".length));
+        const authorityId = `library-cover-${itemNumber.toString(16).padStart(40, "0")}`;
+        retainedAuthorityOrder.push(authorityId);
+        retainedAuthorities.add(authorityId);
+        if (retainedAuthorityOrder.length > 8) {
+          const evictedAuthority = retainedAuthorityOrder.shift();
+          if (evictedAuthority !== undefined) {
+            retainedAuthorities.delete(evictedAuthority);
+          }
+        }
+        maximumRetainedAuthorities = Math.max(
+          maximumRetainedAuthorities,
+          retainedAuthorities.size,
+        );
+        resolution.resolve([
+          "library-cover-v1",
+          "adult",
+          "ready",
+          "JavDB",
+          `item-${itemNumber}`,
+          authorityId,
+          "0.72",
+        ]);
+      }
+      resolvedCount += batchSize;
+      await waitFor(() =>
+        expect(
+          invoke.mock.calls.filter(
+            ([command]) => command === "fetch_library_cover",
+          ),
+        ).toHaveLength(resolvedCount),
+      );
+    }
+
+    await waitFor(() =>
+      expect(hooks.map(({ result }) => result.current.cover.status)).toEqual(
+        Array.from({ length: 14 }, () => "ready"),
+      ),
+    );
+    expect(maximumRetainedAuthorities).toBeLessThanOrEqual(4);
+    expect(staleFetches).toBe(0);
+    expect(retainedAuthorities.size).toBe(0);
+    expect(
+      invoke.mock.calls.filter(
+        ([command]) => command === "resolve_library_cover",
+      ),
+    ).toHaveLength(14);
+    expect(
+      invoke.mock.calls.filter(
+        ([command]) => command === "fetch_library_cover",
+      ),
+    ).toHaveLength(14);
+  });
+
   it("shows a validated cover before optional metadata finishes", async () => {
     const metadata = deferred<unknown>();
     const invoke = vi.fn((command: string) => {
