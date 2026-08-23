@@ -1657,7 +1657,13 @@ function AppIcon({ name }: { name: IconName }) {
   );
 }
 
-function CopyTitleAction({ title }: { title: string }) {
+function CopyTitleAction({
+  compact = false,
+  title,
+}: {
+  compact?: boolean;
+  title: string;
+}) {
   const [copyState, setCopyState] = useState<CopyTitleState>("idle");
   const resetFeedbackTimeout = useRef<number | null>(null);
 
@@ -1723,12 +1729,13 @@ function CopyTitleAction({ title }: { title: string }) {
     <>
       <Button
         aria-label={accessibleLabel}
-        className="title-copy-button"
+        className={`title-copy-button${compact ? " title-copy-button--compact" : ""}`}
         data-copy-state={copyState}
         onClick={copyTitle}
         onKeyDown={(event) => event.stopPropagation()}
         onPointerDown={(event) => event.stopPropagation()}
         size="xs"
+        title={compact ? visibleLabel : undefined}
         type="button"
         variant="ghost"
       >
@@ -6124,6 +6131,7 @@ function LibraryPresentationSurface({
   );
   const triggerId = useId();
   const [imageFailed, setImageFailed] = useState(false);
+  const [explicitCoverAttempt, setExplicitCoverAttempt] = useState(0);
   const unmount = useRef(onUnmount);
   const detailsUpdate = useRef(onDetailsUpdate);
   const reportRatio = useRef(onRatioChange);
@@ -6167,15 +6175,23 @@ function LibraryPresentationSurface({
     (automaticState.status === "ready" ? automaticState.coverUrl : null);
   const coverUrl = imageFailed ? null : resolvedCoverUrl;
   const coverAccessibleTitle =
-    explicitPresentation !== null && explicitPresentation.coverUrl === null
+    explicitPresentation !== null &&
+    (explicitPresentation.coverUrl === null || imageFailed)
       ? primaryTitle
       : localTitle;
   const retry =
-    automaticState.status === "error"
-      ? automaticState.retry
-      : automaticState.status === "ready"
-        ? automaticState.retryCover
-        : null;
+    explicitPresentation !== null &&
+    explicitPresentation.coverUrl !== null &&
+    imageFailed
+      ? () => {
+          setExplicitCoverAttempt((current) => current + 1);
+          setImageFailed(false);
+        }
+      : automaticState.status === "error"
+        ? automaticState.retry
+        : automaticState.status === "ready"
+          ? automaticState.retryCover
+          : null;
   const automaticFacts =
     presentationState === "automatic" && presentation !== null
       ? [
@@ -6224,6 +6240,7 @@ function LibraryPresentationSurface({
 
   useEffect(() => {
     setImageFailed(false);
+    setExplicitCoverAttempt(0);
   }, [resolvedCoverUrl]);
 
   useEffect(() => {
@@ -6257,6 +6274,7 @@ function LibraryPresentationSurface({
         ) : (
           <img
             alt=""
+            key={`${coverUrl}:${explicitCoverAttempt}`}
             onError={() => {
               setImageFailed(true);
               if (automaticState.status === "ready") {
@@ -6693,12 +6711,12 @@ function LibraryMovieCard({
             onClick={openMovie}
             onKeyDown={(event) => event.stopPropagation()}
             onPointerDown={(event) => event.stopPropagation()}
-            size="xs"
+            size="icon-xs"
+            title="Open movie"
             type="button"
             variant="outline"
           >
             <AppIcon name="open" />
-            {isOpening ? "Opening" : "Open"}
           </Button>
           <Button
             aria-label={`${isRevealing ? "Revealing" : "Reveal"} movie: ${primaryTitle}`}
@@ -6706,12 +6724,12 @@ function LibraryMovieCard({
             onClick={revealMovie}
             onKeyDown={(event) => event.stopPropagation()}
             onPointerDown={(event) => event.stopPropagation()}
-            size="xs"
+            size="icon-xs"
+            title="Reveal movie"
             type="button"
             variant="outline"
           >
             <AppIcon name="reveal" />
-            {isRevealing ? "Revealing" : "Reveal"}
           </Button>
         </div>
       </div>
@@ -6857,7 +6875,7 @@ function LibraryMovieCard({
               </AlertDialog.Viewport>
             </AlertDialog.Portal>
           </AlertDialog.Root>
-          <CopyTitleAction title={primaryTitle} />
+          <CopyTitleAction compact title={primaryTitle} />
         </div>
       </div>
       <div className="movie-card__file-action-errors">
@@ -7209,7 +7227,9 @@ function VrLibraryCard({
           </p>
           <h3>{item.title}</h3>
         </div>
-        <CopyTitleAction title={item.title} />
+        <div className="movie-card__title-actions">
+          <CopyTitleAction compact title={item.title} />
+        </div>
       </div>
       <ul aria-label={`Files for ${item.title}`} className="vr-library-card__files">
         {item.files.map((file) => (
@@ -7608,7 +7628,7 @@ function TvLibraryCard({
           )}
         </div>
         <div className="movie-card__title-actions">
-          <CopyTitleAction title={item.title} />
+          <CopyTitleAction compact title={item.title} />
           {item.groupId === undefined || item.showTitle === null ? null : item.association == null ? (
             <Button
               aria-label={`Match show metadata: ${item.showTitle}`}
@@ -8001,7 +8021,9 @@ function AdultLibraryCard({
           </p>
           <h3>{item.title}</h3>
         </div>
-        <CopyTitleAction title={item.title} />
+        <div className="movie-card__title-actions">
+          <CopyTitleAction compact title={item.title} />
+        </div>
       </div>
       <ul
         aria-label={

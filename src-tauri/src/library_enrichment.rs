@@ -1420,7 +1420,7 @@ fn javdatabase_romanized_cast(document: &str, code: &str) -> Option<String> {
     let identity_and_cast = &title[..title.len() - suffix.len()];
     let (title_code, cast) = identity_and_cast.split_once(" - ")?;
     let cast = cast.trim();
-    (title_code.trim().eq_ignore_ascii_case(code)
+    (exact_product_code_in(title_code.trim(), code)
         && !cast.is_empty()
         && cast.len() <= 16 * 1024
         && !cast.bytes().any(|byte| byte.is_ascii_control())
@@ -3711,7 +3711,7 @@ mod tests {
                 if request.url.contains("r18.dev") {
                     Ok(r#"{"content_id":"adlt00123","title_ja":"日本語題名","actresses":[]}"#.to_owned())
                 } else if request.url.contains("javdatabase.com") {
-                    Ok("<title>ADLT-123 - Romanized Actor - JAV Database</title>".to_owned())
+                    Ok("<title>ADLT-00123 - Romanized Actor - JAV Database</title>".to_owned())
                 } else {
                     Err(ProviderRequestError::SourceUnavailable)
                 }
@@ -3732,9 +3732,34 @@ mod tests {
         assert_eq!(presentation.cast, ["Romanized Actor"]);
         assert!(bytes.is_none());
         assert!(cache_cover);
+        assert!(javdatabase_document_matches(
+            "<title>ADLT-00123 - Romanized Actor - JAV Database</title>",
+            "ADLT-123"
+        ));
+        assert_eq!(
+            javdatabase_romanized_cast(
+                "<title>ADLT-00123 - Romanized Actor - JAV Database</title>",
+                "ADLT-123"
+            ),
+            Some("Romanized Actor".to_owned())
+        );
         assert_eq!(
             javdatabase_romanized_cast(
                 "<title>OTHER-123 - Wrong Actor - JAV Database</title>",
+                "ADLT-123"
+            ),
+            None
+        );
+        assert_eq!(
+            javdatabase_romanized_cast(
+                "<title>ADLT-00123 ADLT-124 - Mixed Actor - JAV Database</title>",
+                "ADLT-123"
+            ),
+            None
+        );
+        assert_eq!(
+            javdatabase_romanized_cast(
+                "<title>ADLT-00123 - Invalid\nActor - JAV Database</title>",
                 "ADLT-123"
             ),
             None

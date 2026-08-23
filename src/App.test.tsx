@@ -1787,9 +1787,172 @@ describe("automatic Library presentation", () => {
       pendingCover.reject("library_enrichment_failed");
       await pendingCover.promise.catch(() => undefined);
     });
-    expect(await within(card).findByRole("button", { name: "Retry" })).toBeTruthy();
+    const retry = await within(card).findByRole("button", { name: "Retry" });
+    expect(retry.parentElement?.classList.contains("library-card__cover")).toBe(
+      true,
+    );
+    retry.focus();
+    expect(document.activeElement).toBe(retry);
     expect(card.style.width).toBe("90px");
   });
+
+  it.each([
+    {
+      actionCount: 6,
+      category: "movies",
+      categoryLabel: "Movies",
+      ratio: 0.5,
+      ratioSource: "retained",
+      title: "Layout movie",
+    },
+    {
+      actionCount: 6,
+      category: "movies",
+      categoryLabel: "Movies",
+      ratio: 0.72,
+      ratioSource: "fallback",
+      title: "Layout movie",
+    },
+    {
+      actionCount: 6,
+      category: "tv",
+      categoryLabel: "TV",
+      ratio: 0.5,
+      ratioSource: "retained",
+      title: "Layout Show",
+    },
+    {
+      actionCount: 6,
+      category: "tv",
+      categoryLabel: "TV",
+      ratio: 0.72,
+      ratioSource: "fallback",
+      title: "Layout Show",
+    },
+    {
+      actionCount: 5,
+      category: "adult",
+      categoryLabel: "Adult",
+      ratio: 0.5,
+      ratioSource: "retained",
+      title: "ADLT-123",
+    },
+    {
+      actionCount: 5,
+      category: "adult",
+      categoryLabel: "Adult",
+      ratio: 0.72,
+      ratioSource: "fallback",
+      title: "ADLT-123",
+    },
+    {
+      actionCount: 5,
+      category: "vr",
+      categoryLabel: "VR",
+      ratio: 0.5,
+      ratioSource: "retained",
+      title: "MDVR-419",
+    },
+    {
+      actionCount: 5,
+      category: "vr",
+      categoryLabel: "VR",
+      ratio: 0.72,
+      ratioSource: "fallback",
+      title: "MDVR-419",
+    },
+  ] as const)(
+    "keeps every $category Library action contained at $ratioSource ratio $ratio",
+    async ({ actionCount, category, categoryLabel, ratio, title }) => {
+      gallerySizes.library = { width: 446, height: 284 };
+      if (category === "movies") {
+        savedMoviesFolder = "/Movies";
+        scanMoviesMock.mockResolvedValue(["/Movies/Layout movie.mp4"]);
+      } else if (category === "tv") {
+        savedTvFolder = "/TV";
+        scanTvLibraryMock.mockResolvedValue(
+          fixtureTvMetadataScan({
+            members: [
+              {
+                path: "/TV/Layout Show.S01E01.mp4",
+                relativePath: "Layout Show.S01E01.mp4",
+              },
+            ],
+            showTitle: "Layout Show",
+          }),
+        );
+      } else if (category === "adult") {
+        savedAdultFolder = "/Adult";
+        scanAdultLibraryMock.mockResolvedValue([
+          "/Adult/ADLT-123.mp4",
+          "ADLT-123.mp4",
+          "5",
+        ]);
+      } else {
+        savedVrFolder = "/VR";
+        scanVrLibraryMock.mockResolvedValue(["/VR/MDVR-419.mp4", "5"]);
+      }
+      if (ratio === 0.5) {
+        fetchLibraryPresentationMock.mockResolvedValue(
+          automaticLibraryPresentation(
+            category === "movies" ? "movie" : category,
+          ),
+        );
+      }
+
+      render(<App />);
+      selectLibrary();
+      if (category !== "movies") {
+        fireEvent.click(screen.getByRole("radio", { name: categoryLabel }));
+      }
+      const card = (
+        await screen.findByRole("heading", { name: title })
+      ).closest("article") as HTMLElement;
+      await waitFor(() =>
+        expect(card.style.width).toBe(
+          `${Math.round(180 * ratio)}px`,
+        ),
+      );
+
+      const actions = within(card).getAllByRole("button");
+      expect(actions).toHaveLength(actionCount);
+      expect(
+        card.contains(card.querySelector(".library-card__details-trigger")),
+      ).toBe(true);
+      const titleActions = card.querySelector(
+        ".movie-card__title-actions",
+      ) as HTMLElement;
+      expect(card.contains(titleActions)).toBe(true);
+      const fileActions = card.querySelector(
+        ".vr-library-file__actions",
+      ) as HTMLElement | null;
+      if (fileActions !== null) {
+        expect(fileActions.parentElement?.parentElement).toBe(
+          card.querySelector("ul"),
+        );
+      }
+      const capacity = document
+        .querySelector('[data-gallery="library"]')
+        ?.getAttribute("data-page-capacity");
+      for (const action of actions) {
+        expect(card.contains(action)).toBe(true);
+        expect(action.tabIndex).toBe(0);
+        action.focus();
+        expect(document.activeElement).toBe(action);
+      }
+      fireEvent.click(
+        within(card).getByRole("button", { name: `Copy title: ${title}` }),
+      );
+      expect(card.style.width).toBe(`${Math.round(180 * ratio)}px`);
+      expect(
+        document
+          .querySelector('[data-gallery="library"]')
+          ?.getAttribute("data-page-capacity"),
+      ).toBe(capacity);
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(clipboardWriteMock).toHaveBeenCalledWith(title);
+    },
+  );
 
   it("starts work only for the visible natural-width page and reuses unchanged identities", async () => {
     savedMoviesFolder = "/Movies";
@@ -2096,7 +2259,9 @@ describe("automatic Library presentation", () => {
     ).toBe("Explicit provider title");
     fireEvent.click(trigger);
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getAllByText("Exact local title").length).toBeGreaterThan(0);
+    expect(
+      within(dialog).getAllByText("Exact local title").length,
+    ).toBeGreaterThan(0);
     expect(within(dialog).getByText("Explicit provider title")).toBeTruthy();
     expect(fetchLibraryPresentationMock).not.toHaveBeenCalled();
   });
@@ -2137,6 +2302,124 @@ describe("automatic Library presentation", () => {
     expect(within(dialog).getAllByText("Exact Local Show").length).toBeGreaterThan(0);
     expect(within(dialog).getByText("Explicit TV title")).toBeTruthy();
     expect(fetchLibraryPresentationMock).not.toHaveBeenCalled();
+  });
+
+  it("retries an explicit Movie poster decode failure without changing its association", async () => {
+    const path = "/Movies/Exact local title.mp4";
+    savedMoviesFolder = "/Movies";
+    movieMetadataAssociations.set(path, {
+      generation: "4",
+      imdbId: "tt0123456",
+      posterPath: "/explicit.jpg",
+      title: "Explicit provider title",
+      tmdbMovieId: "419",
+    });
+    scanMoviesMock.mockResolvedValue([path]);
+
+    render(<App />);
+    selectLibrary();
+    const card = (
+      await screen.findByRole("heading", { name: "Explicit provider title" })
+    ).closest("article") as HTMLElement;
+    const failedImage = card.querySelector("img") as HTMLImageElement;
+    expect(failedImage).not.toBeNull();
+    fireEvent.error(failedImage);
+
+    const failedTrigger = within(card).getByRole("button", {
+      name: "View Library details: Explicit provider title",
+    });
+    expect(
+      within(failedTrigger)
+        .getByLabelText("Cover unavailable for Explicit provider title")
+        .getAttribute("data-placeholder-title"),
+    ).toBe("Explicit provider title");
+    fireEvent.click(within(card).getByRole("button", { name: "Retry" }));
+
+    const replacement = await waitFor(() => {
+      const image = card.querySelector("img");
+      expect(image).not.toBeNull();
+      expect(image).not.toBe(failedImage);
+      return image as HTMLImageElement;
+    });
+    fireEvent.load(replacement);
+    expect(within(card).queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(scanMoviesMock).toHaveBeenCalledTimes(1);
+    expect(fetchLibraryPresentationMock).not.toHaveBeenCalled();
+    expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      within(card).getByRole("button", {
+        name: "View Library details: Exact local title",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getAllByText("Exact local title").length).toBeGreaterThan(0);
+    expect(within(dialog).getByText("Explicit provider title")).toBeTruthy();
+  });
+
+  it("retries an explicit grouped TV poster decode failure without automatic work", async () => {
+    savedTvFolder = "/TV";
+    scanTvLibraryMock.mockResolvedValue(
+      fixtureTvMetadataScan({
+        association: {
+          imdbId: "tt1234567",
+          name: "Explicit TV title",
+          posterPath: "/explicit-tv.jpg",
+          tmdbTvId: "701",
+        },
+        members: [
+          {
+            path: "/TV/Exact Local Show.S01E01.mp4",
+            relativePath: "Exact Local Show.S01E01.mp4",
+          },
+        ],
+        metadataState: "ready",
+        showTitle: "Exact Local Show",
+      }),
+    );
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "TV" }));
+    const card = (
+      await screen.findByRole("heading", { name: "Explicit TV title" })
+    ).closest("article") as HTMLElement;
+    const failedImage = card.querySelector("img") as HTMLImageElement;
+    expect(failedImage).not.toBeNull();
+    fireEvent.error(failedImage);
+
+    const failedTrigger = within(card).getByRole("button", {
+      name: "View Library details: Explicit TV title",
+    });
+    expect(
+      within(failedTrigger)
+        .getByLabelText("Cover unavailable for Explicit TV title")
+        .getAttribute("data-placeholder-title"),
+    ).toBe("Explicit TV title");
+    fireEvent.click(within(card).getByRole("button", { name: "Retry" }));
+
+    const replacement = await waitFor(() => {
+      const image = card.querySelector("img");
+      expect(image).not.toBeNull();
+      expect(image).not.toBe(failedImage);
+      return image as HTMLImageElement;
+    });
+    fireEvent.load(replacement);
+    expect(within(card).queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(scanTvLibraryMock).toHaveBeenCalledTimes(1);
+    expect(fetchLibraryPresentationMock).not.toHaveBeenCalled();
+    expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      within(card).getByRole("button", {
+        name: "View Library details: Exact Local Show",
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getAllByText("Exact Local Show").length,
+    ).toBeGreaterThan(0);
+    expect(within(dialog).getByText("Explicit TV title")).toBeTruthy();
   });
 
   it.each([
@@ -12046,9 +12329,11 @@ describe("native-owned FANZA Adult and VR catalogs", () => {
     const adultCard = (
       await screen.findByRole("heading", { name: "ADLT-123" })
     ).closest("article") as HTMLElement;
-    const adultCover = await waitFor(
-      () => adultCard.querySelector("img") as HTMLImageElement,
-    );
+    const adultCover = await waitFor(() => {
+      const image = adultCard.querySelector("img");
+      expect(image).not.toBeNull();
+      return image as HTMLImageElement;
+    });
     Object.defineProperties(adultCover, {
       naturalHeight: { configurable: true, value: 180 },
       naturalWidth: { configurable: true, value: 360 },
