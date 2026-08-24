@@ -11314,9 +11314,11 @@ describe("native-owned FANZA Adult and VR catalogs", () => {
     const adultCard = (
       await screen.findByRole("heading", { name: "ADLT-123" })
     ).closest("article") as HTMLElement;
-    const adultCover = await waitFor(
-      () => adultCard.querySelector("img") as HTMLImageElement,
-    );
+    const adultCover = await waitFor(() => {
+      const image = adultCard.querySelector("img");
+      expect(image).not.toBeNull();
+      return image as HTMLImageElement;
+    });
     Object.defineProperties(adultCover, {
       naturalHeight: { configurable: true, value: 180 },
       naturalWidth: { configurable: true, value: 360 },
