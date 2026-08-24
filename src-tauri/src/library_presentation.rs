@@ -87,6 +87,7 @@ struct VerifiedDisplayIdentity {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PresentationMetadata {
     verified_identity: Option<VerifiedDisplayIdentity>,
+    identity_conflict: bool,
     source: Option<String>,
     provider_id: Option<String>,
     display_code: Option<String>,
@@ -103,14 +104,20 @@ type CoverResolution = (
 );
 
 impl PresentationMetadata {
+    fn has_provider_fields(&self) -> bool {
+        self.source.is_some() && self.provider_id.is_some() && self.display_code.is_some()
+    }
+
+    fn has_descriptive_fields(&self) -> bool {
+        self.title.is_some()
+            || self.date.is_some()
+            || self.runtime.is_some()
+            || !self.cast.is_empty()
+    }
+
     fn is_ready(&self) -> bool {
-        self.source.is_some()
-            && self.provider_id.is_some()
-            && self.display_code.is_some()
-            && (self.title.is_some()
-                || self.date.is_some()
-                || self.runtime.is_some()
-                || !self.cast.is_empty())
+        self.has_provider_fields()
+            && (self.has_descriptive_fields() || self.verified_identity.is_some())
     }
 }
 
@@ -235,6 +242,21 @@ fn bound_metadata_seeds(context: &mut LibraryPresentationContext) {
     }
 }
 
+fn retain_metadata_seed(
+    context: &mut LibraryPresentationContext,
+    authority: &LibraryItemAuthority,
+    request_generation: u64,
+    metadata: PresentationMetadata,
+) {
+    context.next_cover_sequence = context.next_cover_sequence.wrapping_add(1);
+    let sequence = context.next_cover_sequence;
+    context.metadata_seeds.insert(
+        metadata_seed_key(authority, request_generation),
+        MetadataSeed { metadata, sequence },
+    );
+    bound_metadata_seeds(context);
+}
+
 fn cover_request_matches(
     context: &LibraryPresentationContext,
     category: LibraryPresentationCategory,
@@ -343,6 +365,7 @@ fn validate_cover(bytes: Vec<u8>) -> Result<(Vec<u8>, f64), ProviderRequestError
 fn metadata_from_javdb(item: &javdb_catalog::ExactLibraryItem) -> PresentationMetadata {
     PresentationMetadata {
         verified_identity: Some(javdb_verified_identity(item)),
+        identity_conflict: false,
         source: Some("JavDB".to_owned()),
         provider_id: Some(item.provider_item_id.clone()),
         display_code: Some(item.display_code.clone()),
@@ -455,6 +478,7 @@ fn metadata_from_legacy(
         .unwrap_or_default();
     let metadata = PresentationMetadata {
         verified_identity: None,
+        identity_conflict: false,
         source: Some("r18.dev".to_owned()),
         provider_id: Some(content_id.clone()),
         display_code: Some(display_code.to_owned()),
@@ -594,6 +618,104 @@ fn verified_identity_from_cover(source: &CoverSource) -> Option<VerifiedDisplayI
     })
 }
 
+fn reconcile_verified_identities(
+    current: Option<VerifiedDisplayIdentity>,
+    candidate: Option<VerifiedDisplayIdentity>,
+) -> Result<Option<VerifiedDisplayIdentity>, ()> {
+    let (current, candidate) = match (current, candidate) {
+        (Some(current), Some(candidate)) => (current, candidate),
+        (current, candidate) => return Ok(current.or(candidate)),
+    };
+    if current.provider == candidate.provider {
+        return (current.provider_id == candidate.provider_id
+            && current.display_code == candidate.display_code)
+            .then_some(Some(current))
+            .ok_or(());
+    }
+    if current.display_code != candidate.display_code {
+        return Err(());
+    }
+    if current.provider == "JavDB" {
+        Ok(Some(current))
+    } else if candidate.provider == "JavDB" {
+        Ok(Some(candidate))
+    } else {
+        Err(())
+    }
+}
+
+fn cover_identity_consistent(
+    source: &CoverSource,
+    identity: Option<&VerifiedDisplayIdentity>,
+    category: LibraryPresentationCategory,
+    code: &str,
+) -> bool {
+    if !cover_source_valid(source, category, code) {
+        return false;
+    }
+    match source.provider {
+        "JavDB" => identity.is_some_and(|identity| {
+            identity.provider == "JavDB"
+                && identity.provider_id == source.provider_id
+                && identity.display_code == source.display_code
+        }),
+        "FANZA" => identity.is_some_and(|identity| {
+            identity.display_code == source.display_code
+                && (identity.provider == "JavDB"
+                    || (identity.provider == "FANZA" && identity.provider_id == source.provider_id))
+        }),
+        "r18.dev" => identity.map_or_else(
+            || source.display_code == code,
+            |identity| identity.display_code == source.display_code,
+        ),
+        _ => false,
+    }
+}
+
+fn metadata_identity_consistent(
+    metadata: &PresentationMetadata,
+    identity: Option<&VerifiedDisplayIdentity>,
+    code: &str,
+) -> bool {
+    if metadata.identity_conflict {
+        return false;
+    }
+    if metadata
+        .verified_identity
+        .as_ref()
+        .is_some_and(|metadata_identity| Some(metadata_identity) != identity)
+    {
+        return false;
+    }
+    let expected_display = identity.map_or(code, |identity| identity.display_code.as_str());
+    if metadata.display_code.as_deref() != Some(expected_display) {
+        return false;
+    }
+    if metadata
+        .source
+        .as_deref()
+        .is_some_and(|source| source.starts_with("JavDB"))
+    {
+        return identity.is_some_and(|identity| {
+            identity.provider == "JavDB"
+                && metadata.provider_id.as_deref() == Some(identity.provider_id.as_str())
+        });
+    }
+    true
+}
+
+fn attach_verified_identity(
+    metadata: &mut PresentationMetadata,
+    identity: Option<VerifiedDisplayIdentity>,
+) {
+    if let Some(identity) = identity {
+        metadata.display_code = Some(identity.display_code.clone());
+        metadata.verified_identity = Some(identity);
+    } else {
+        metadata.verified_identity = None;
+    }
+}
+
 fn fetch_source_bytes(source: &CoverSource) -> Result<Vec<u8>, ProviderRequestError> {
     match source.provider {
         "JavDB" => javdb_catalog::fetch_cover_bytes(&source.url),
@@ -700,48 +822,45 @@ fn resolve_cover_with(
     ) {
         Ok(Some(item)) => {
             let fanza_identity = fanza_verified_identity(&item);
-            let identity_conflicts = verified_identity.as_ref().is_some_and(|current| {
-                crate::vr_torrent::canonical_product_code(&current.display_code)
-                    != crate::vr_torrent::canonical_product_code(&fanza_identity.display_code)
-            });
-            if identity_conflicts {
-                transient = true;
-                verified_identity = None;
-                if let Some(metadata) = &mut metadata {
-                    metadata.verified_identity = None;
-                }
-            } else if verified_identity
-                .as_ref()
-                .is_none_or(|identity| identity.display_code == authority.code)
-            {
-                verified_identity = Some(fanza_identity);
-            }
-            if let Some(identity) = &verified_identity {
-                metadata
-                    .get_or_insert_with(PresentationMetadata::default)
-                    .verified_identity = Some(identity.clone());
-            }
-            if !identity_conflicts {
-                if let Some(url) = item.cover_url {
-                    match fanza_image(&url).and_then(validate_cover) {
-                        Ok((bytes, ratio)) => {
-                            return (
-                                Some((
-                                    CoverSource {
-                                        provider: "FANZA",
-                                        provider_id: item.content_id,
-                                        display_code: item.display_code,
-                                        url,
-                                        aspect_ratio: ratio,
-                                    },
-                                    bytes,
-                                )),
-                                metadata,
-                                transient,
-                            );
-                        }
-                        Err(_) => transient = true,
+            verified_identity =
+                match reconcile_verified_identities(verified_identity, Some(fanza_identity)) {
+                    Ok(identity) => identity,
+                    Err(()) => {
+                        return (
+                            None,
+                            Some(PresentationMetadata {
+                                identity_conflict: true,
+                                ..PresentationMetadata::default()
+                            }),
+                            true,
+                        )
                     }
+                };
+            if let Some(identity) = verified_identity.clone() {
+                attach_verified_identity(
+                    metadata.get_or_insert_with(PresentationMetadata::default),
+                    Some(identity),
+                );
+            }
+            if let Some(url) = item.cover_url {
+                match fanza_image(&url).and_then(validate_cover) {
+                    Ok((bytes, ratio)) => {
+                        return (
+                            Some((
+                                CoverSource {
+                                    provider: "FANZA",
+                                    provider_id: item.content_id,
+                                    display_code: item.display_code,
+                                    url,
+                                    aspect_ratio: ratio,
+                                },
+                                bytes,
+                            )),
+                            metadata,
+                            transient,
+                        );
+                    }
+                    Err(_) => transient = true,
                 }
             }
         }
@@ -785,9 +904,10 @@ fn resolve_cover_with(
         Err(_) => transient = true,
     }
     if let Some(identity) = verified_identity {
-        metadata
-            .get_or_insert_with(PresentationMetadata::default)
-            .verified_identity = Some(identity);
+        attach_verified_identity(
+            metadata.get_or_insert_with(PresentationMetadata::default),
+            Some(identity),
+        );
     }
     (None, metadata, transient)
 }
@@ -907,21 +1027,27 @@ fn cache_entry_valid(entry: &CacheEntry) -> bool {
         && entry.verified_identity.as_ref().is_none_or(|identity| {
             verified_display_identity_valid(identity, entry.category, &entry.code)
         })
-        && entry.cover.as_ref().is_none_or(|source| {
-            crate::vr_torrent::canonical_product_code(&source.display_code)
-                == crate::vr_torrent::canonical_product_code(&entry.code)
-        })
-        && entry.metadata.display_code.as_ref().is_none_or(|display| {
-            crate::vr_torrent::canonical_product_code(display)
-                == crate::vr_torrent::canonical_product_code(&entry.code)
-        })
         && match (entry.cover_state, entry.cover.as_ref()) {
-            ("ready", Some(source)) => cover_source_valid(source, entry.category, &entry.code),
+            ("ready", Some(source)) => cover_identity_consistent(
+                source,
+                entry.verified_identity.as_ref(),
+                entry.category,
+                &entry.code,
+            ),
             ("missing", None) => true,
             _ => false,
         }
         && match entry.metadata_state {
-            "ready" => entry.metadata.is_ready(),
+            "ready" => {
+                entry.metadata.has_provider_fields()
+                    && (entry.metadata.has_descriptive_fields()
+                        || entry.verified_identity.is_some())
+                    && metadata_identity_consistent(
+                        &entry.metadata,
+                        entry.verified_identity.as_ref(),
+                        &entry.code,
+                    )
+            }
             "missing" => entry.metadata == PresentationMetadata::default(),
             _ => false,
         }
@@ -984,6 +1110,7 @@ fn read_cache(path: &Path) -> Result<Vec<CacheEntry>, ()> {
         };
         let metadata = PresentationMetadata {
             verified_identity: None,
+            identity_conflict: false,
             source: optional_text(fields[16]),
             provider_id: optional_text(fields[17]),
             display_code: optional_text(fields[18]),
@@ -1098,6 +1225,16 @@ fn merge_cache_entry(path: &Path, entry: CacheEntry) -> Result<(), ()> {
     write_cache(path, &entries)
 }
 
+fn remove_cache_entry(path: &Path, identity: &str) -> Result<(), ()> {
+    let mut entries = load_cache(path);
+    let original_len = entries.len();
+    entries.retain(|entry| entry.identity != identity);
+    if entries.len() == original_len && !path.exists() {
+        return Ok(());
+    }
+    write_cache(path, &entries)
+}
+
 fn cover_response(
     state: &LibraryPresentationState,
     authority: &LibraryItemAuthority,
@@ -1110,6 +1247,21 @@ fn cover_response(
     if verified_identity.as_ref().is_some_and(|identity| {
         !verified_display_identity_valid(identity, authority.category, &authority.code)
     }) {
+        return Err(LIBRARY_PRESENTATION_FAILED);
+    }
+    let cover_contract_valid = match cover_state {
+        "ready" => cover.as_ref().is_some_and(|source| {
+            cover_identity_consistent(
+                source,
+                verified_identity.as_ref(),
+                authority.category,
+                &authority.code,
+            )
+        }),
+        "missing" | "unavailable" => cover.is_none(),
+        _ => false,
+    };
+    if !cover_contract_valid {
         return Err(LIBRARY_PRESENTATION_FAILED);
     }
     let mut cover_authority_id = None;
@@ -1346,15 +1498,76 @@ fn resolve_cover_at_with_request(
         );
     }
 
-    let (cover, metadata_seed, transient) = resolve();
-    let resolved_identity = metadata_seed
+    let (mut cover, mut metadata_seed, transient) = resolve();
+    let identity_conflict = metadata_seed
         .as_ref()
-        .and_then(|metadata| metadata.verified_identity.clone())
-        .or_else(|| {
-            cover
-                .as_ref()
-                .and_then(|(source, _)| verified_identity_from_cover(source))
-        });
+        .is_some_and(|metadata| metadata.identity_conflict);
+    if identity_conflict {
+        if !is_current() {
+            return Err(LIBRARY_PRESENTATION_STALE);
+        }
+        {
+            let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+            remove_cache_entry(cache_path, &authority.identity)
+                .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+            retain_metadata_seed(
+                &mut context,
+                authority,
+                request_generation,
+                PresentationMetadata {
+                    identity_conflict: true,
+                    ..PresentationMetadata::default()
+                },
+            );
+        }
+        return cover_response(
+            state,
+            authority,
+            request_generation,
+            "unavailable",
+            None,
+            None,
+            None,
+        );
+    }
+    let resolved_identity = match reconcile_verified_identities(
+        metadata_seed
+            .as_ref()
+            .and_then(|metadata| metadata.verified_identity.clone()),
+        cover
+            .as_ref()
+            .and_then(|(source, _)| verified_identity_from_cover(source)),
+    ) {
+        Ok(identity) => identity,
+        Err(()) => {
+            if !is_current() {
+                return Err(LIBRARY_PRESENTATION_STALE);
+            }
+            {
+                let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+                remove_cache_entry(cache_path, &authority.identity)
+                    .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+                retain_metadata_seed(
+                    &mut context,
+                    authority,
+                    request_generation,
+                    PresentationMetadata {
+                        identity_conflict: true,
+                        ..PresentationMetadata::default()
+                    },
+                );
+            }
+            return cover_response(
+                state,
+                authority,
+                request_generation,
+                "unavailable",
+                None,
+                None,
+                None,
+            );
+        }
+    };
     let (identity_saved_at, verified_identity) = match resolved_identity {
         Some(identity) => (now, Some(identity)),
         None if transient => cached_identity
@@ -1362,6 +1575,24 @@ fn resolve_cover_at_with_request(
             .unwrap_or((0, None)),
         None => (0, None),
     };
+    if let (Some((source, _)), Some(identity)) = (&mut cover, &verified_identity) {
+        if source.provider == "r18.dev" {
+            source.display_code = identity.display_code.clone();
+        }
+    }
+    if let Some(metadata) = &mut metadata_seed {
+        attach_verified_identity(metadata, verified_identity.clone());
+    }
+    if cover.as_ref().is_some_and(|(source, _)| {
+        !cover_identity_consistent(
+            source,
+            verified_identity.as_ref(),
+            authority.category,
+            &authority.code,
+        )
+    }) {
+        return Err(LIBRARY_PRESENTATION_FAILED);
+    }
     if !is_current() {
         return Err(LIBRARY_PRESENTATION_STALE);
     }
@@ -1375,13 +1606,7 @@ fn resolve_cover_at_with_request(
             ) {
                 return Err(LIBRARY_PRESENTATION_STALE);
             }
-            context.next_cover_sequence = context.next_cover_sequence.wrapping_add(1);
-            let sequence = context.next_cover_sequence;
-            context.metadata_seeds.insert(
-                metadata_seed_key(authority, request_generation),
-                MetadataSeed { metadata, sequence },
-            );
-            bound_metadata_seeds(&mut context);
+            retain_metadata_seed(&mut context, authority, request_generation, metadata);
         }
     }
     let (cover_state, source, bytes) = match cover {
@@ -1481,9 +1706,11 @@ pub(crate) fn resolve_metadata(
                 }
                 metadata
             });
-            match seeded_metadata.filter(PresentationMetadata::is_ready) {
-                Some(metadata) => Ok(Some(metadata)),
-                None => resolve_metadata_with(
+            match seeded_metadata {
+                Some(metadata) if metadata.identity_conflict || metadata.is_ready() => {
+                    Ok(Some(metadata))
+                }
+                _ => resolve_metadata_with(
                     authority,
                     javdb_catalog::fetch_api_document,
                     fetch_legacy_document,
@@ -1505,10 +1732,23 @@ fn resolve_metadata_at_with(
         let _guard = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
         load_cache(cache_path)
     };
-    if let Some(entry) = cache.iter().find(|entry| {
+    let current_entry = cache.iter().find(|entry| {
         entry.identity == authority.identity
             && entry.category == authority.category
             && entry.code == authority.code
+    });
+    let current_identity = current_entry
+        .filter(|entry| {
+            entry.identity_saved_at > 0
+                && entry.identity_saved_at <= now
+                && now.saturating_sub(entry.identity_saved_at) <= METADATA_TTL_SECONDS
+        })
+        .and_then(|entry| entry.verified_identity.clone());
+    if let Some(entry) = current_entry.filter(|entry| {
+        entry.identity == authority.identity
+            && entry.category == authority.category
+            && entry.code == authority.code
+            && entry.metadata_saved_at > 0
             && entry.metadata_saved_at <= now
             && now.saturating_sub(entry.metadata_saved_at) <= METADATA_TTL_SECONDS
     }) {
@@ -1523,23 +1763,67 @@ fn resolve_metadata_at_with(
                 "local-only"
             },
             &entry.metadata,
+            entry.verified_identity.as_ref(),
+            false,
         ));
     }
     let resolved = resolve();
     if !is_current() {
         return Err(LIBRARY_PRESENTATION_STALE);
     }
-    let (metadata_state, metadata) = match resolved {
-        Ok(Some(metadata)) => ("automatic", metadata),
-        Ok(None) => ("local-only", PresentationMetadata::default()),
+    if resolved.as_ref().is_ok_and(|metadata| {
+        metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.identity_conflict)
+    }) {
+        {
+            let _guard = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+            remove_cache_entry(cache_path, &authority.identity)
+                .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+        }
+        return Ok(metadata_response(
+            authority,
+            "unavailable",
+            &PresentationMetadata::default(),
+            None,
+            true,
+        ));
+    }
+    let (metadata_state, mut metadata, resolved_identity) = match resolved {
+        Ok(Some(metadata)) => {
+            let identity = metadata.verified_identity.clone();
+            ("automatic", metadata, identity)
+        }
+        Ok(None) => ("local-only", PresentationMetadata::default(), None),
         Err(_) => {
             return Ok(metadata_response(
                 authority,
                 "unavailable",
                 &PresentationMetadata::default(),
+                current_identity.as_ref(),
+                false,
             ))
         }
     };
+    let verified_identity =
+        match reconcile_verified_identities(current_identity.clone(), resolved_identity) {
+            Ok(identity) => identity,
+            Err(()) => {
+                {
+                    let _guard = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+                    remove_cache_entry(cache_path, &authority.identity)
+                        .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+                }
+                return Ok(metadata_response(
+                    authority,
+                    "unavailable",
+                    &PresentationMetadata::default(),
+                    None,
+                    true,
+                ));
+            }
+        };
+    attach_verified_identity(&mut metadata, verified_identity.clone());
     if metadata_state == "automatic" {
         let _guard = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
         let mut entry = cache
@@ -1560,23 +1844,69 @@ fn resolve_metadata_at_with(
             });
         entry.category = authority.category;
         entry.code = authority.code.clone();
+        if verified_identity != current_identity {
+            entry.identity_saved_at = now;
+        }
+        entry.verified_identity = verified_identity.clone();
+        if let (Some(source), Some(identity)) = (&mut entry.cover, &verified_identity) {
+            if source.provider == "r18.dev" {
+                source.display_code = identity.display_code.clone();
+            }
+        }
+        if entry.cover_state == "ready"
+            && !entry.cover.as_ref().is_some_and(|source| {
+                cover_identity_consistent(
+                    source,
+                    verified_identity.as_ref(),
+                    authority.category,
+                    &authority.code,
+                )
+            })
+        {
+            remove_cache_entry(cache_path, &authority.identity)
+                .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+            return Ok(metadata_response(
+                authority,
+                "unavailable",
+                &PresentationMetadata::default(),
+                None,
+                true,
+            ));
+        }
         entry.metadata_saved_at = now;
         entry.metadata_state = "ready";
         entry.metadata = metadata.clone();
-        let _ = merge_cache_entry(cache_path, entry);
+        merge_cache_entry(cache_path, entry).map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
     }
-    Ok(metadata_response(authority, metadata_state, &metadata))
+    Ok(metadata_response(
+        authority,
+        metadata_state,
+        &metadata,
+        verified_identity.as_ref(),
+        false,
+    ))
 }
 
 fn metadata_response(
     authority: &LibraryItemAuthority,
     state: &str,
     metadata: &PresentationMetadata,
+    verified_identity: Option<&VerifiedDisplayIdentity>,
+    identity_conflict: bool,
 ) -> Vec<String> {
     let mut response = vec![
-        "library-metadata-v2".to_owned(),
+        "library-metadata-v3".to_owned(),
         authority.category.value().to_owned(),
         state.to_owned(),
+        if identity_conflict {
+            "conflict"
+        } else {
+            "current"
+        }
+        .to_owned(),
+        verified_identity.map_or_else(String::new, |identity| identity.provider.to_owned()),
+        verified_identity.map_or_else(String::new, |identity| identity.provider_id.clone()),
+        verified_identity.map_or_else(String::new, |identity| identity.display_code.clone()),
         metadata.source.clone().unwrap_or_default(),
         metadata.provider_id.clone().unwrap_or_default(),
         metadata.display_code.clone().unwrap_or_default(),
@@ -2102,9 +2432,9 @@ mod tests {
             |url| {
                 events.borrow_mut().push(format!("javdb:{url}"));
                 if url.contains("search") {
-                    Ok(javdb_listing(&authority.code))
+                    Ok(javdb_listing("CAWB-001"))
                 } else {
-                    Ok(javdb_detail(&authority.code, authority.category))
+                    Ok(javdb_detail("CAWB-001", authority.category))
                 }
             },
             |url| {
@@ -2160,9 +2490,9 @@ mod tests {
             &authority,
             |url| {
                 if url.contains("search") {
-                    Ok(javdb_listing(&authority.code))
+                    Ok(javdb_listing("CAWB-001"))
                 } else {
-                    Ok(javdb_detail(&authority.code, authority.category))
+                    Ok(javdb_detail("CAWB-001", authority.category))
                 }
             },
             |url| {
@@ -2421,6 +2751,205 @@ mod tests {
         assert!(javdb_requests[1].contains("search?q=CAWB-001&"));
         assert!(javdb_requests[2].contains("/api/v4/movies/item?"));
         assert!(!transient);
+    }
+
+    #[test]
+    fn exact_cross_provider_display_agreement_keeps_javdb_identity_for_cawb_and_3dsvr() {
+        for (authority, display_code, content_id, content_type) in [
+            (
+                LibraryItemAuthority {
+                    category: LibraryPresentationCategory::Adult,
+                    identity: "1".repeat(40),
+                    code: "CAWB-1".to_owned(),
+                    product_identity: "CAWB-1".to_owned(),
+                },
+                "CAWB-001",
+                "cawb00001",
+                "TWO_DIMENSION",
+            ),
+            (
+                LibraryItemAuthority {
+                    category: LibraryPresentationCategory::Vr,
+                    identity: "2".repeat(40),
+                    code: "3DSVR-01871".to_owned(),
+                    product_identity: "3DSVR-1871".to_owned(),
+                },
+                "3DSVR-01871",
+                "13dsvr01871",
+                "VR",
+            ),
+        ] {
+            let (cover, metadata, transient) = resolve_cover_with(
+                &authority,
+                |url| {
+                    Ok(if url.contains("search") {
+                        javdb_listing(display_code).replace(
+                            r#""cover_url":"https://tp.cmastd.com/exact.jpg""#,
+                            r#""cover_url":null"#,
+                        )
+                    } else {
+                        javdb_detail(display_code, authority.category).replace(
+                            r#""cover_url":"https://tp.cmastd.com/exact.jpg""#,
+                            r#""cover_url":null"#,
+                        )
+                    })
+                },
+                |_| panic!("a null JavDB cover must not dispatch an image"),
+                |_| {
+                    Ok(format!(
+                        r#"{{"data":{{"c0":{{"id":"{content_id}","contentType":"{content_type}","title":"Exact","packageImage":{{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/{content_id}/{content_id}pl.jpg"}}}}}}}}"#
+                    ))
+                },
+                |_| Ok(jpeg(600, 800)),
+                |_| panic!("legacy must not run after exact FANZA cover success"),
+                |_| panic!("legacy image must not run"),
+            );
+            let source = cover.expect("the agreed FANZA cover must resolve").0;
+            assert_eq!(source.provider, "FANZA");
+            assert_eq!(source.display_code, display_code);
+            assert_eq!(
+                metadata.and_then(|metadata| metadata.verified_identity),
+                Some(verified_javdb("item", display_code))
+            );
+            assert!(!transient);
+        }
+    }
+
+    #[test]
+    fn canonical_only_cross_provider_agreement_is_a_durable_conflict() {
+        for (index, authority, javdb_display, content_id, content_type, fanza_display) in [
+            (
+                0,
+                LibraryItemAuthority {
+                    category: LibraryPresentationCategory::Adult,
+                    identity: "3".repeat(40),
+                    code: "CAWB-1".to_owned(),
+                    product_identity: "CAWB-1".to_owned(),
+                },
+                "CAWB-1",
+                "cawb00001",
+                "TWO_DIMENSION",
+                "CAWB-001",
+            ),
+            (
+                1,
+                LibraryItemAuthority {
+                    category: LibraryPresentationCategory::Vr,
+                    identity: "4".repeat(40),
+                    code: "3DSVR-01871".to_owned(),
+                    product_identity: "3DSVR-1871".to_owned(),
+                },
+                "3DSVR-1871",
+                "13dsvr01871",
+                "VR",
+                "3DSVR-01871",
+            ),
+        ] {
+            let fixture = CacheFixture::new(&format!("identity-conflict-{index}"));
+            write_cache(
+                &fixture.path,
+                &[CacheEntry {
+                    identity: authority.identity.clone(),
+                    category: authority.category,
+                    code: authority.code.clone(),
+                    identity_saved_at: 90,
+                    verified_identity: Some(verified_fanza(content_id, fanza_display)),
+                    cover_saved_at: 0,
+                    cover_state: "missing",
+                    cover: None,
+                    metadata_saved_at: 0,
+                    metadata_state: "missing",
+                    metadata: PresentationMetadata::default(),
+                }],
+            )
+            .expect("the previous exact identity must be durable");
+            let legacy_calls = Cell::new(0);
+            let state = LibraryPresentationState::default();
+            let response = resolve_cover_at_with(
+                &state,
+                &fixture.path,
+                &authority,
+                100,
+                || true,
+                || {
+                    resolve_cover_with(
+                        &authority,
+                        |url| {
+                            Ok(if url.contains("search") {
+                                javdb_listing(javdb_display).replace(
+                                    r#""cover_url":"https://tp.cmastd.com/exact.jpg""#,
+                                    r#""cover_url":null"#,
+                                )
+                            } else {
+                                javdb_detail(javdb_display, authority.category).replace(
+                                    r#""cover_url":"https://tp.cmastd.com/exact.jpg""#,
+                                    r#""cover_url":null"#,
+                                )
+                            })
+                        },
+                        |_| panic!("a null JavDB cover must not dispatch an image"),
+                        |_| {
+                            Ok(format!(
+                                r#"{{"data":{{"c0":{{"id":"{content_id}","contentType":"{content_type}","title":"Exact","packageImage":null}}}}}}"#
+                            ))
+                        },
+                        |_| panic!("a conflicting FANZA row must not dispatch an image"),
+                        |_| {
+                            legacy_calls.set(legacy_calls.get() + 1);
+                            Ok(r#"{"content_id":"ignored","images":null}"#.to_owned())
+                        },
+                        |_| panic!("legacy image must not run after an identity conflict"),
+                    )
+                },
+            )
+            .expect("an identity conflict must remain a current unavailable state");
+            assert_eq!(response[2], "unavailable");
+            assert_eq!(&response[8..], ["", "", ""]);
+            assert_eq!(legacy_calls.get(), 0);
+            assert!(read_cache(&fixture.path)
+                .expect("the conflict cleanup must leave a valid cache")
+                .is_empty());
+            let conflict_seed = state
+                .0
+                .lock()
+                .expect("the conflict seed must remain readable")
+                .metadata_seeds
+                .remove(&metadata_seed_key(&authority, 0))
+                .expect("the metadata phase must retain the cover conflict")
+                .metadata;
+            let metadata_response = resolve_metadata_at_with(
+                &state,
+                &fixture.path,
+                &authority,
+                100,
+                || true,
+                || Ok(Some(conflict_seed)),
+            )
+            .expect("metadata must expose the retained conflict without selecting one side");
+            assert_eq!(metadata_response[2], "unavailable");
+            assert_eq!(metadata_response[3], "conflict");
+            assert_eq!(&metadata_response[4..7], ["", "", ""]);
+            assert!(read_cache(&fixture.path)
+                .expect("metadata conflict cleanup must leave a valid cache")
+                .is_empty());
+
+            let restarted_resolution = Cell::new(false);
+            let restarted = resolve_cover_at_with(
+                &LibraryPresentationState::default(),
+                &fixture.path,
+                &authority,
+                101,
+                || true,
+                || {
+                    restarted_resolution.set(true);
+                    (None, None, false)
+                },
+            )
+            .expect("restart must not restore the conflicted identity");
+            assert!(restarted_resolution.get());
+            assert_eq!(restarted[2], "missing");
+            assert_eq!(&restarted[8..], ["", "", ""]);
+        }
     }
 
     #[test]
@@ -2727,10 +3256,10 @@ mod tests {
                         &authority,
                         |url| {
                             Ok(if url.contains("search") {
-                                r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"CAWB-1"$COVER}]}}"#
+                                r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"CAWB-001"$COVER}]}}"#
                                     .replace("$COVER", javdb_cover)
                             } else {
-                                r#"{"success":1,"data":{"movie":{"id":"Exact","number":"CAWB-1","tags":[]$COVER}}}"#
+                                r#"{"success":1,"data":{"movie":{"id":"Exact","number":"CAWB-001","tags":[]$COVER}}}"#
                                     .replace("$COVER", javdb_cover)
                             })
                         },
@@ -2750,7 +3279,7 @@ mod tests {
             )
             .expect("genuine absent cover data must establish a confirmed miss");
             assert_eq!(response[2], "missing");
-            assert_eq!(&response[8..], ["FANZA", "cawb00001", "CAWB-001"]);
+            assert_eq!(&response[8..], ["JavDB", "Exact", "CAWB-001"]);
             assert!(fixture.path.exists());
 
             let cached = resolve_cover_at_with(
@@ -2763,7 +3292,7 @@ mod tests {
             )
             .expect("the confirmed miss must remain reusable");
             assert_eq!(cached[2], "missing");
-            assert_eq!(&cached[8..], ["FANZA", "cawb00001", "CAWB-001"]);
+            assert_eq!(&cached[8..], ["JavDB", "Exact", "CAWB-001"]);
         }
     }
 
@@ -3195,8 +3724,8 @@ mod tests {
         assert_eq!(state.0.lock().unwrap().verified_identity_seeds.len(), 1);
         let metadata = resolve_metadata(&state, &fixture.path, &authority, 2, || true)
             .expect("the current request must consume only its own seed");
-        assert_eq!(metadata[4], "newitem");
-        assert_eq!(metadata[6], "New metadata");
+        assert_eq!(metadata[5], "newitem");
+        assert_eq!(metadata[10], "New metadata");
         assert!(state.0.lock().unwrap().metadata_seeds.is_empty());
         assert!(state.0.lock().unwrap().verified_identity_seeds.is_empty());
     }
@@ -3268,9 +3797,15 @@ mod tests {
                 &authority,
                 0,
                 "ready",
-                Some(cover(&format!("item-{index}"), 0.72)),
+                Some(CoverSource {
+                    provider: "JavDB",
+                    provider_id: format!("item{index}"),
+                    display_code: authority.code.clone(),
+                    url: format!("https://tp.cmastd.com/item-{index}.jpg"),
+                    aspect_ratio: 0.72,
+                }),
                 Some(jpeg(600, 800)),
-                None,
+                Some(verified_javdb(&format!("item{index}"), &authority.code)),
             )
             .expect("replacement authority must be retained");
             if !previous_id.is_empty() {
@@ -3292,9 +3827,15 @@ mod tests {
                 &authority,
                 0,
                 "ready",
-                Some(cover(&format!("adult-{index}"), 0.72)),
+                Some(CoverSource {
+                    provider: "JavDB",
+                    provider_id: format!("adult{index}"),
+                    display_code: authority.code.clone(),
+                    url: format!("https://tp.cmastd.com/adult-{index}.jpg"),
+                    aspect_ratio: 0.72,
+                }),
                 Some(jpeg(600, 800)),
-                None,
+                Some(verified_javdb(&format!("adult{index}"), &authority.code)),
             );
             if index + 1 < MAX_RETAINED_COVER_AUTHORITIES {
                 response.expect("capacity must retain current authorities");
@@ -3329,7 +3870,7 @@ mod tests {
                 };
                 let source = CoverSource {
                     provider: "JavDB",
-                    provider_id: format!("item-{index}"),
+                    provider_id: format!("item{index}"),
                     display_code: code,
                     url: format!("https://tp.cmastd.com/item-{index}.jpg"),
                     aspect_ratio: 0.72,
@@ -3341,7 +3882,7 @@ mod tests {
                     "ready",
                     Some(source),
                     Some(jpeg(600, 800)),
-                    None,
+                    Some(verified_javdb(&format!("item{index}"), &authority.code)),
                 )
                 .expect("each current card must retain its cover authority");
                 current.push((authority, response[6].clone()));
@@ -3388,7 +3929,7 @@ mod tests {
                 "ready",
                 Some(cover("obsolete", 0.72)),
                 Some(jpeg(600, 800)),
-                None,
+                Some(verified_javdb("obsolete", &authority.code)),
             ),
             Err(LIBRARY_PRESENTATION_STALE)
         );
@@ -3399,7 +3940,7 @@ mod tests {
             "ready",
             Some(cover("current", 0.72)),
             Some(jpeg(600, 800)),
-            None,
+            Some(verified_javdb("current", &authority.code)),
         )
         .expect("latest request must retain its authority");
         cancel_cover_request(&state, authority.category, &authority.code, 1)
@@ -3529,7 +4070,8 @@ mod tests {
         let authority = authority(LibraryPresentationCategory::Adult);
         let calls = Cell::new(0);
         let metadata = PresentationMetadata {
-            verified_identity: None,
+            verified_identity: Some(verified_javdb("item", "ADLT-123")),
+            identity_conflict: false,
             source: Some("JavDB".to_owned()),
             provider_id: Some("item".to_owned()),
             display_code: Some("ADLT-123".to_owned()),
@@ -3587,6 +4129,199 @@ mod tests {
             .expect("cache must remain valid")
             .iter()
             .all(|entry| entry.identity != stale_authority.identity));
+    }
+
+    #[test]
+    fn metadata_without_a_cover_establishes_exact_identity_and_survives_restart() {
+        for (index, authority, display_code) in [
+            (
+                0,
+                LibraryItemAuthority {
+                    category: LibraryPresentationCategory::Adult,
+                    identity: "5".repeat(40),
+                    code: "CAWB-1".to_owned(),
+                    product_identity: "CAWB-1".to_owned(),
+                },
+                "CAWB-001",
+            ),
+            (
+                1,
+                LibraryItemAuthority {
+                    category: LibraryPresentationCategory::Vr,
+                    identity: "6".repeat(40),
+                    code: "3DSVR-01871".to_owned(),
+                    product_identity: "3DSVR-1871".to_owned(),
+                },
+                "3DSVR-01871",
+            ),
+        ] {
+            let fixture = CacheFixture::new(&format!("metadata-identity-{index}"));
+            let metadata = PresentationMetadata {
+                verified_identity: Some(verified_javdb("metadataitem", display_code)),
+                source: Some("JavDB".to_owned()),
+                provider_id: Some("metadataitem".to_owned()),
+                display_code: Some(display_code.to_owned()),
+                ..PresentationMetadata::default()
+            };
+            let response = resolve_metadata_at_with(
+                &LibraryPresentationState::default(),
+                &fixture.path,
+                &authority,
+                100,
+                || true,
+                || Ok(Some(metadata)),
+            )
+            .expect("metadata identity must resolve without a cover");
+            assert_eq!(response[2], "automatic");
+            assert_eq!(
+                &response[3..7],
+                ["current", "JavDB", "metadataitem", display_code]
+            );
+            assert_eq!(response[10], "");
+
+            let restarted = resolve_metadata_at_with(
+                &LibraryPresentationState::default(),
+                &fixture.path,
+                &authority,
+                101,
+                || true,
+                || panic!("restart must use the durable metadata identity"),
+            )
+            .expect("metadata identity must survive restart");
+            assert_eq!(restarted, response);
+            assert_eq!(
+                read_cache(&fixture.path).expect("metadata cache must remain valid")[0]
+                    .verified_identity,
+                Some(verified_javdb("metadataitem", display_code))
+            );
+        }
+    }
+
+    #[test]
+    fn cover_and_metadata_identity_conflicts_clear_durable_presentation() {
+        for (index, current_identity, metadata_identity) in [
+            (
+                0,
+                verified_javdb("coveritem", "CAWB-001"),
+                verified_javdb("metadataitem", "CAWB-001"),
+            ),
+            (
+                1,
+                verified_fanza("cawb00001", "CAWB-001"),
+                verified_javdb("metadataitem", "CAWB-1"),
+            ),
+        ] {
+            let fixture = CacheFixture::new(&format!("metadata-conflict-{index}"));
+            let authority = LibraryItemAuthority {
+                category: LibraryPresentationCategory::Adult,
+                identity: format!("7{index:039x}"),
+                code: "CAWB-1".to_owned(),
+                product_identity: "CAWB-1".to_owned(),
+            };
+            write_cache(
+                &fixture.path,
+                &[CacheEntry {
+                    identity: authority.identity.clone(),
+                    category: authority.category,
+                    code: authority.code.clone(),
+                    identity_saved_at: 90,
+                    verified_identity: Some(current_identity),
+                    cover_saved_at: 90,
+                    cover_state: "missing",
+                    cover: None,
+                    metadata_saved_at: 0,
+                    metadata_state: "missing",
+                    metadata: PresentationMetadata::default(),
+                }],
+            )
+            .expect("the cover-phase identity must be durable");
+            let metadata = PresentationMetadata {
+                verified_identity: Some(metadata_identity.clone()),
+                source: Some("JavDB".to_owned()),
+                provider_id: Some(metadata_identity.provider_id),
+                display_code: Some(metadata_identity.display_code),
+                title: Some("Conflicting metadata".to_owned()),
+                ..PresentationMetadata::default()
+            };
+            let response = resolve_metadata_at_with(
+                &LibraryPresentationState::default(),
+                &fixture.path,
+                &authority,
+                100,
+                || true,
+                || Ok(Some(metadata)),
+            )
+            .expect("the conflict must be returned as local unavailable state");
+            assert_eq!(&response[2..7], ["unavailable", "conflict", "", "", ""]);
+            assert!(read_cache(&fixture.path)
+                .expect("conflicting presentation must not survive restart")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn exact_javdb_metadata_can_replace_agreeing_fanza_identity_without_losing_cover() {
+        let fixture = CacheFixture::new("metadata-exact-agreement");
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "9".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
+        write_cache(
+            &fixture.path,
+            &[CacheEntry {
+                identity: authority.identity.clone(),
+                category: authority.category,
+                code: authority.code.clone(),
+                identity_saved_at: 90,
+                verified_identity: Some(verified_fanza("cawb00001", "CAWB-001")),
+                cover_saved_at: 90,
+                cover_state: "ready",
+                cover: Some(CoverSource {
+                    provider: "FANZA",
+                    provider_id: "cawb00001".to_owned(),
+                    display_code: "CAWB-001".to_owned(),
+                    url: "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001ps.jpg".to_owned(),
+                    aspect_ratio: 0.75,
+                }),
+                metadata_saved_at: 0,
+                metadata_state: "missing",
+                metadata: PresentationMetadata::default(),
+            }],
+        )
+        .expect("the exact FANZA cover identity must be durable");
+        let response = resolve_metadata_at_with(
+            &LibraryPresentationState::default(),
+            &fixture.path,
+            &authority,
+            100,
+            || true,
+            || {
+                Ok(Some(PresentationMetadata {
+                    verified_identity: Some(verified_javdb("javdbitem", "CAWB-001")),
+                    source: Some("JavDB".to_owned()),
+                    provider_id: Some("javdbitem".to_owned()),
+                    display_code: Some("CAWB-001".to_owned()),
+                    title: Some("Exact metadata".to_owned()),
+                    ..PresentationMetadata::default()
+                }))
+            },
+        )
+        .expect("exact cross-provider agreement must remain usable");
+        assert_eq!(
+            &response[3..7],
+            ["current", "JavDB", "javdbitem", "CAWB-001"]
+        );
+        let entry = &read_cache(&fixture.path).expect("the reconciled cache must remain valid")[0];
+        assert_eq!(
+            entry.verified_identity,
+            Some(verified_javdb("javdbitem", "CAWB-001"))
+        );
+        assert_eq!(
+            entry.cover.as_ref().map(|source| source.provider),
+            Some("FANZA")
+        );
     }
 
     #[test]
@@ -3883,6 +4618,154 @@ mod tests {
         )
         .expect("the exact FANZA cache must remain reusable");
         assert_eq!(&response[2..6], ["ready", "FANZA", "cawb00001", "CAWB-001"]);
+    }
+
+    #[test]
+    fn ready_cover_cache_requires_a_complete_consistent_verified_identity() {
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "8".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
+        let javdb_cover = CoverSource {
+            provider: "JavDB",
+            provider_id: "coveritem".to_owned(),
+            display_code: "CAWB-001".to_owned(),
+            url: "https://tp.cmastd.com/cover.jpg".to_owned(),
+            aspect_ratio: 0.75,
+        };
+        let fanza_cover = CoverSource {
+            provider: "FANZA",
+            provider_id: "cawb00001".to_owned(),
+            display_code: "CAWB-001".to_owned(),
+            url: "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/cawb00001/cawb00001ps.jpg"
+                .to_owned(),
+            aspect_ratio: 0.75,
+        };
+        for (index, source, identity) in [
+            (0, javdb_cover.clone(), None),
+            (1, fanza_cover.clone(), None),
+            (
+                2,
+                javdb_cover.clone(),
+                Some(verified_javdb("anotheritem", "CAWB-001")),
+            ),
+            (
+                3,
+                javdb_cover.clone(),
+                Some(verified_javdb("coveritem", "CAWB-1")),
+            ),
+            (
+                4,
+                fanza_cover.clone(),
+                Some(verified_fanza("cawb00001", "CAWB-1")),
+            ),
+        ] {
+            let fixture = CacheFixture::new(&format!("invalid-cover-identity-{index}"));
+            write_cache(
+                &fixture.path,
+                &[CacheEntry {
+                    identity: authority.identity.clone(),
+                    category: authority.category,
+                    code: authority.code.clone(),
+                    identity_saved_at: identity.as_ref().map_or(0, |_| 100),
+                    verified_identity: identity,
+                    cover_saved_at: 100,
+                    cover_state: "ready",
+                    cover: Some(source),
+                    metadata_saved_at: 0,
+                    metadata_state: "missing",
+                    metadata: PresentationMetadata::default(),
+                }],
+            )
+            .expect("the invalid combination fixture must be written");
+            assert_invalid_cache_refreshes(&fixture.path, &authority);
+        }
+
+        for (index, source, identity) in [
+            (0, javdb_cover, verified_javdb("coveritem", "CAWB-001")),
+            (
+                1,
+                fanza_cover.clone(),
+                verified_fanza("cawb00001", "CAWB-001"),
+            ),
+            (2, fanza_cover, verified_javdb("metadataitem", "CAWB-001")),
+            (
+                3,
+                CoverSource {
+                    provider: "r18.dev",
+                    provider_id: "CAWB-1".to_owned(),
+                    display_code: "CAWB-001".to_owned(),
+                    url: "https://pics.dmm.co.jp/digital/video/runtime/runtimepl.jpg".to_owned(),
+                    aspect_ratio: 0.75,
+                },
+                verified_javdb("metadataitem", "CAWB-001"),
+            ),
+        ] {
+            let fixture = CacheFixture::new(&format!("valid-cover-identity-{index}"));
+            write_cache(
+                &fixture.path,
+                &[CacheEntry {
+                    identity: authority.identity.clone(),
+                    category: authority.category,
+                    code: authority.code.clone(),
+                    identity_saved_at: 100,
+                    verified_identity: Some(identity),
+                    cover_saved_at: 100,
+                    cover_state: "ready",
+                    cover: Some(source),
+                    metadata_saved_at: 0,
+                    metadata_state: "missing",
+                    metadata: PresentationMetadata::default(),
+                }],
+            )
+            .expect("the valid combination fixture must be written");
+            let response = resolve_cover_at_with(
+                &LibraryPresentationState::default(),
+                &fixture.path,
+                &authority,
+                101,
+                || true,
+                || panic!("a valid cover and identity cache must be reused"),
+            )
+            .expect("the valid cover and identity cache must resolve");
+            assert_eq!(response[2], "ready");
+        }
+
+        let fixture = CacheFixture::new("valid-local-legacy-cover");
+        write_cache(
+            &fixture.path,
+            &[CacheEntry {
+                identity: authority.identity.clone(),
+                category: authority.category,
+                code: authority.code.clone(),
+                identity_saved_at: 0,
+                verified_identity: None,
+                cover_saved_at: 100,
+                cover_state: "ready",
+                cover: Some(CoverSource {
+                    provider: "r18.dev",
+                    provider_id: "CAWB-1".to_owned(),
+                    display_code: "CAWB-1".to_owned(),
+                    url: "https://pics.dmm.co.jp/digital/video/runtime/runtimepl.jpg".to_owned(),
+                    aspect_ratio: 0.75,
+                }),
+                metadata_saved_at: 0,
+                metadata_state: "missing",
+                metadata: PresentationMetadata::default(),
+            }],
+        )
+        .expect("the local-only legacy fixture must be written");
+        resolve_cover_at_with(
+            &LibraryPresentationState::default(),
+            &fixture.path,
+            &authority,
+            101,
+            || true,
+            || panic!("a valid local-only legacy cover must be reused"),
+        )
+        .expect("the local-only legacy cover must resolve");
     }
 
     #[test]

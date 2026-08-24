@@ -114,9 +114,13 @@ describe("Library presentation boundary", () => {
     expect(
       parseLibraryMetadata(
         [
-          "library-metadata-v2",
+          "library-metadata-v3",
           "adult",
           "automatic",
+          "current",
+          "JavDB",
+          "item",
+          "ADLT-123",
           "JavDB",
           "item",
           "ADLT-123",
@@ -128,7 +132,134 @@ describe("Library presentation boundary", () => {
         ],
         "adult",
       ),
-    ).toMatchObject({ state: "automatic", cast: ["Actor"] });
+    ).toMatchObject({
+      state: "automatic",
+      cast: ["Actor"],
+      verifiedIdentity: {
+        provider: "JavDB",
+        providerId: "item",
+        displayCode: "ADLT-123",
+      },
+    });
+  });
+
+  it("rejects exact-provider cover responses without the matching verified identity", () => {
+    const authority = `library-cover-${"b".repeat(40)}`;
+    expect(
+      parseLibraryCover(
+        [
+          "library-cover-v3",
+          "adult",
+          "ready",
+          "JavDB",
+          "coveritem",
+          "CAWB-001",
+          authority,
+          "0.72",
+          "",
+          "",
+          "",
+        ],
+        "adult",
+      ),
+    ).toBeNull();
+    expect(
+      parseLibraryCover(
+        [
+          "library-cover-v3",
+          "adult",
+          "ready",
+          "FANZA",
+          "cawb00001",
+          "CAWB-001",
+          authority,
+          "0.72",
+          "",
+          "",
+          "",
+        ],
+        "adult",
+      ),
+    ).toBeNull();
+    expect(
+      parseLibraryCover(
+        [
+          "library-cover-v3",
+          "adult",
+          "ready",
+          "JavDB",
+          "coveritem",
+          "CAWB-001",
+          authority,
+          "0.72",
+          "JavDB",
+          "anotheritem",
+          "CAWB-001",
+        ],
+        "adult",
+      ),
+    ).toBeNull();
+    expect(
+      parseLibraryCover(
+        [
+          "library-cover-v3",
+          "adult",
+          "ready",
+          "FANZA",
+          "cawb00001",
+          "CAWB-001",
+          authority,
+          "0.72",
+          "FANZA",
+          "cawb00001",
+          "CAWB-1",
+        ],
+        "adult",
+      ),
+    ).toBeNull();
+    expect(
+      parseLibraryCover(
+        [
+          "library-cover-v3",
+          "adult",
+          "ready",
+          "FANZA",
+          "cawb00001",
+          "CAWB-001",
+          authority,
+          "0.72",
+          "JavDB",
+          "coveritem",
+          "CAWB-001",
+        ],
+        "adult",
+      ),
+    ).toMatchObject({
+      source: "FANZA",
+      verifiedIdentity: {
+        provider: "JavDB",
+        providerId: "coveritem",
+        displayCode: "CAWB-001",
+      },
+    });
+    expect(
+      parseLibraryCover(
+        [
+          "library-cover-v3",
+          "adult",
+          "ready",
+          "r18.dev",
+          "CAWB-1",
+          "CAWB-1",
+          authority,
+          "0.72",
+          "",
+          "",
+          "",
+        ],
+        "adult",
+      ),
+    ).toMatchObject({ source: "r18.dev", verifiedIdentity: null });
   });
 
   it("prioritizes visible cover work and discards obsolete queued work before a slot", async () => {
@@ -188,9 +319,13 @@ describe("Library presentation boundary", () => {
         }
         if (command === "resolve_library_metadata") {
           return Promise.resolve([
-            "library-metadata-v2",
+            "library-metadata-v3",
             "adult",
             "local-only",
+            "current",
+            "",
+            "",
+            "",
             "",
             "",
             "",
@@ -357,9 +492,13 @@ describe("Library presentation boundary", () => {
 
     await act(async () => {
       metadata.resolve([
-        "library-metadata-v2",
+        "library-metadata-v3",
         "vr",
         "automatic",
+        "current",
+        "JavDB",
+        "item",
+        "MDVR-419",
         "JavDB",
         "item",
         "MDVR-419",
@@ -397,9 +536,13 @@ describe("Library presentation boundary", () => {
       if (command === "invalidate_library_cover") return Promise.resolve();
       if (command === "resolve_library_metadata") {
         return Promise.resolve([
-          "library-metadata-v2",
+          "library-metadata-v3",
           "adult",
           "local-only",
+          "current",
+          "",
+          "",
+          "",
           "",
           "",
           "",
@@ -526,9 +669,13 @@ describe("Library presentation boundary", () => {
       if (command === "invalidate_library_cover") return Promise.resolve();
       if (command === "resolve_library_metadata") {
         return Promise.resolve([
-          "library-metadata-v2",
+          "library-metadata-v3",
           "adult",
           "local-only",
+          "current",
+          "",
+          "",
+          "",
           "",
           "",
           "",
@@ -596,9 +743,13 @@ describe("Library presentation boundary", () => {
         ).length;
         if (metadataAttempt === 1) return Promise.reject(new Error("offline"));
         return Promise.resolve([
-          "library-metadata-v2",
+          "library-metadata-v3",
           "adult",
           "local-only",
+          "current",
+          "",
+          "",
+          "",
           "",
           "",
           "",
@@ -631,6 +782,215 @@ describe("Library presentation boundary", () => {
     ).toHaveLength(2);
   });
 
+  it("lets metadata Retry establish first-class identity without a cover", async () => {
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") {
+        return Promise.resolve([
+          "library-cover-v3",
+          "adult",
+          "unavailable",
+          "",
+          "",
+          "",
+          "",
+          "0.72",
+          "",
+          "",
+          "",
+        ]);
+      }
+      if (command === "resolve_library_metadata") {
+        const attempt = invoke.mock.calls.filter(
+          ([calledCommand]) => calledCommand === "resolve_library_metadata",
+        ).length;
+        return Promise.resolve(
+          attempt === 1
+            ? [
+                "library-metadata-v3",
+                "adult",
+                "unavailable",
+                "current",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "0",
+              ]
+            : [
+                "library-metadata-v3",
+                "adult",
+                "automatic",
+                "current",
+                "JavDB",
+                "metadataitem",
+                "CAWB-001",
+                "JavDB",
+                "metadataitem",
+                "CAWB-001",
+                "",
+                "",
+                "",
+                "0",
+              ],
+        );
+      }
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+
+    const { result } = renderHook(() =>
+      useLibraryPresentation({
+        category: "adult",
+        itemId: "CAWB-1",
+        scanGeneration: "metadata-identity",
+      }),
+    );
+    await waitFor(() => expect(result.current.metadata.status).toBe("unavailable"));
+    expect(result.current.verifiedIdentity).toBeNull();
+
+    act(() => result.current.metadata.retry?.());
+    await waitFor(() =>
+      expect(result.current.verifiedIdentity).toEqual({
+        provider: "JavDB",
+        providerId: "metadataitem",
+        displayCode: "CAWB-001",
+      }),
+    );
+    expect(result.current.metadata.status).toBe("automatic");
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "resolve_library_cover"),
+    ).toHaveLength(1);
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "resolve_library_metadata"),
+    ).toHaveLength(2);
+  });
+
+  it("lets VR metadata establish the exact 3DSVR display identity without a cover", async () => {
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") {
+        return Promise.resolve([
+          "library-cover-v3",
+          "vr",
+          "unavailable",
+          "",
+          "",
+          "",
+          "",
+          "0.72",
+          "",
+          "",
+          "",
+        ]);
+      }
+      if (command === "resolve_library_metadata") {
+        return Promise.resolve([
+          "library-metadata-v3",
+          "vr",
+          "automatic",
+          "current",
+          "JavDB",
+          "vrmetadataitem",
+          "3DSVR-01871",
+          "JavDB",
+          "vrmetadataitem",
+          "3DSVR-01871",
+          "",
+          "",
+          "",
+          "0",
+        ]);
+      }
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+
+    const { result } = renderHook(() =>
+      useLibraryPresentation({
+        category: "vr",
+        itemId: "3DSVR-01871",
+        scanGeneration: "vr-metadata-identity",
+      }),
+    );
+    await waitFor(() =>
+      expect(result.current.verifiedIdentity).toEqual({
+        provider: "JavDB",
+        providerId: "vrmetadataitem",
+        displayCode: "3DSVR-01871",
+      }),
+    );
+    expect(result.current.cover.status).toBe("unavailable");
+    expect(result.current.metadata.status).toBe("automatic");
+  });
+
+  it("clears a ready cover when metadata reports an exact identity conflict", async () => {
+    const revokeObjectURL = vi.fn();
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") {
+        return Promise.resolve([
+          "library-cover-v3",
+          "adult",
+          "ready",
+          "FANZA",
+          "cawb00001",
+          "CAWB-001",
+          `library-cover-${"c".repeat(40)}`,
+          "0.72",
+          "FANZA",
+          "cawb00001",
+          "CAWB-001",
+        ]);
+      }
+      if (command === "fetch_library_cover") return Promise.resolve([0xff, 0xd8]);
+      if (command === "resolve_library_metadata") {
+        return Promise.resolve([
+          "library-metadata-v3",
+          "adult",
+          "unavailable",
+          "conflict",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "0",
+        ]);
+      }
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:conflicted"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectURL,
+    });
+
+    const { result } = renderHook(() =>
+      useLibraryPresentation({
+        category: "adult",
+        itemId: "CAWB-1",
+        scanGeneration: "metadata-conflict",
+      }),
+    );
+    await waitFor(() => expect(result.current.metadata.status).toBe("unavailable"));
+    expect(result.current.verifiedIdentity).toBeNull();
+    expect(result.current.cover.status).toBe("unavailable");
+    expect(result.current.cover.objectUrl).toBeNull();
+    expect(result.current.cover.retry).not.toBeNull();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:conflicted");
+  });
+
   it("rejects a late cover result after the exact item authority changes", async () => {
     const oldCover = deferred<unknown>();
     const invoke = vi.fn(
@@ -653,9 +1013,13 @@ describe("Library presentation boundary", () => {
         }
         if (command === "resolve_library_metadata") {
           return Promise.resolve([
-            "library-metadata-v2",
+            "library-metadata-v3",
             "vr",
             "local-only",
+            "current",
+            "",
+            "",
+            "",
             "",
             "",
             "",

@@ -1159,9 +1159,13 @@ beforeEach(() => {
   );
   resolveLibraryMetadataMock = vi.fn().mockImplementation((parameters) =>
     Promise.resolve([
-      "library-metadata-v2",
+      "library-metadata-v3",
       parameters?.category as string,
       "local-only",
+      "current",
+      "",
+      "",
+      "",
       "",
       "",
       "",
@@ -17475,11 +17479,15 @@ describe("explicit Library cover recovery", () => {
       "CAWB-001",
     ]);
     resolveLibraryMetadataMock.mockResolvedValue([
-      "library-metadata-v2",
+      "library-metadata-v3",
       "adult",
       "automatic",
+      "current",
       "JavDB",
-      "item-cawb",
+      "itemcawb",
+      "CAWB-001",
+      "JavDB",
+      "itemcawb",
       "CAWB-001",
       "Exact provider title",
       "",
@@ -17544,9 +17552,13 @@ describe("explicit Library cover recovery", () => {
       "CAWB-001",
     ]);
     resolveLibraryMetadataMock.mockResolvedValue([
-      "library-metadata-v2",
+      "library-metadata-v3",
       "adult",
       "local-only",
+      "current",
+      "FANZA",
+      "cawb00001",
+      "CAWB-001",
       "",
       "",
       "",
@@ -17583,6 +17595,76 @@ describe("explicit Library cover recovery", () => {
     expect(within(dialog).getByText("CAWB-1")).toBeTruthy();
     expect(within(dialog).getAllByText("CAWB-001")).not.toHaveLength(0);
     expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
+  });
+
+  it("updates an open Adult Library details surface when metadata establishes display identity", async () => {
+    const metadata = createDeferred<string[]>();
+    savedAdultFolder = "/Adult";
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/cawb-1.mp4",
+      "cawb-1.mp4",
+      "5",
+    ]);
+    resolveLibraryCoverMock.mockResolvedValue([
+      "library-cover-v3",
+      "adult",
+      "unavailable",
+      "",
+      "",
+      "",
+      "",
+      "0.72",
+      "",
+      "",
+      "",
+    ]);
+    resolveLibraryMetadataMock.mockReturnValue(metadata.promise);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+
+    const localHeading = await screen.findByRole("heading", {
+      level: 3,
+      name: "CAWB-1",
+    });
+    const card = localHeading.closest("article") as HTMLElement;
+    fireEvent.click(
+      within(card).getByRole("button", { name: "Details: CAWB-1" }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("heading", { name: "CAWB-1" })).toBeTruthy();
+
+    await act(async () => {
+      metadata.resolve([
+        "library-metadata-v3",
+        "adult",
+        "automatic",
+        "current",
+        "JavDB",
+        "metadataitem",
+        "CAWB-001",
+        "JavDB",
+        "metadataitem",
+        "CAWB-001",
+        "Provider title",
+        "",
+        "",
+        "0",
+      ]);
+      await metadata.promise;
+    });
+
+    await waitFor(() =>
+      expect(card.querySelector("h3")?.textContent).toBe("CAWB-001"),
+    );
+    expect(within(dialog).getByRole("heading", { name: "CAWB-001" })).toBeTruthy();
+    expect(
+      card.querySelector('[aria-label="Copy title: CAWB-001"]'),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText("Display identity").parentElement?.textContent,
+    ).toBe("Display identityJavDB");
   });
 
   it("retries Movie and grouped-TV posters without changing explicit authority", async () => {

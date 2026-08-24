@@ -28,6 +28,8 @@ export type VerifiedDisplayIdentity = {
 
 export type LibraryMetadata = {
   state: "automatic" | "local-only" | "unavailable";
+  verifiedIdentity: VerifiedDisplayIdentity | null;
+  identityConflict: boolean;
   source: string | null;
   providerId: string | null;
   displayCode: string | null;
@@ -149,8 +151,10 @@ export function parseLibraryCover(
     ratio <= 0 ||
     ratio > 4 ||
     (state === "ready" &&
-      (source === "" ||
+      (!(["JavDB", "FANZA", "r18.dev"] as string[]).includes(source) ||
         providerId === "" ||
+        (source !== "r18.dev" && !/^[A-Za-z0-9]{1,64}$/.test(providerId)) ||
+        (source === "r18.dev" && productCodeDisplayForm(providerId) === null) ||
         displayCode === "" ||
         productCodeDisplayForm(displayCode) !== displayCode ||
         !coverAuthorityPattern.test(authorityId))) ||
@@ -167,8 +171,21 @@ export function parseLibraryCover(
         verifiedDisplayCode !== "")) ||
     (verificationProvider !== "" &&
       (!(["JavDB", "FANZA"] as string[]).includes(verificationProvider) ||
-        !/^[A-Za-z0-9_]{1,64}$/.test(verificationProviderId) ||
-        productCodeDisplayForm(verifiedDisplayCode) !== verifiedDisplayCode))
+        !/^[A-Za-z0-9]{1,64}$/.test(verificationProviderId) ||
+        productCodeDisplayForm(verifiedDisplayCode) !== verifiedDisplayCode)) ||
+    (state === "ready" &&
+      ((source === "JavDB" &&
+        (verificationProvider !== "JavDB" ||
+          verificationProviderId !== providerId ||
+          verifiedDisplayCode !== displayCode)) ||
+        (source === "FANZA" &&
+          (verificationProvider === "" ||
+            verifiedDisplayCode !== displayCode ||
+            (verificationProvider === "FANZA" &&
+              verificationProviderId !== providerId))) ||
+        (source === "r18.dev" &&
+          verificationProvider !== "" &&
+          verifiedDisplayCode !== displayCode)))
   ) {
     return null;
   }
@@ -196,7 +213,7 @@ export function parseLibraryMetadata(
 ): LibraryMetadata | null {
   if (
     !Array.isArray(value) ||
-    value.length < 10 ||
+    value.length < 14 ||
     !value.every((field) => typeof field === "string")
   ) {
     return null;
@@ -206,6 +223,10 @@ export function parseLibraryMetadata(
     version,
     returnedCategory,
     state,
+    identityState,
+    verificationProvider,
+    verificationProviderId,
+    verifiedDisplayCode,
     source,
     providerId,
     displayCode,
@@ -216,19 +237,40 @@ export function parseLibraryMetadata(
   ] =
     fields;
   const castCount = Number(castCountText);
+  const hasCompleteIdentity =
+    verificationProvider !== "" &&
+    verificationProviderId !== "" &&
+    verifiedDisplayCode !== "";
   if (
-    version !== "library-metadata-v2" ||
+    version !== "library-metadata-v3" ||
     returnedCategory !== category ||
     !["automatic", "local-only", "unavailable"].includes(state) ||
+    !["current", "conflict"].includes(identityState) ||
     !/^\d{1,2}$/.test(castCountText) ||
     !Number.isSafeInteger(castCount) ||
-    fields.length !== 10 + castCount ||
-    fields.slice(10).some((entry) => entry.trim() === "") ||
+    fields.length !== 14 + castCount ||
+    fields.slice(14).some((entry) => entry.trim() === "") ||
+    ((verificationProvider === "" ||
+      verificationProviderId === "" ||
+      verifiedDisplayCode === "") &&
+      (verificationProvider !== "" ||
+        verificationProviderId !== "" ||
+        verifiedDisplayCode !== "")) ||
+    (hasCompleteIdentity &&
+      (!(["JavDB", "FANZA"] as string[]).includes(verificationProvider) ||
+        !/^[A-Za-z0-9]{1,64}$/.test(verificationProviderId) ||
+        productCodeDisplayForm(verifiedDisplayCode) !== verifiedDisplayCode)) ||
+    (identityState === "conflict" &&
+      (state !== "unavailable" || hasCompleteIdentity)) ||
     (state === "automatic" &&
       (source === "" ||
         providerId === "" ||
         displayCode === "" ||
-        productCodeDisplayForm(displayCode) !== displayCode)) ||
+        productCodeDisplayForm(displayCode) !== displayCode ||
+        (hasCompleteIdentity && displayCode !== verifiedDisplayCode) ||
+        (source.startsWith("JavDB") &&
+          (verificationProvider !== "JavDB" ||
+            verificationProviderId !== providerId)))) ||
     (state !== "automatic" &&
       [
         source,
@@ -237,7 +279,7 @@ export function parseLibraryMetadata(
         title,
         date,
         runtime,
-        ...fields.slice(10),
+        ...fields.slice(14),
       ].some(Boolean)) ||
     (date !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(date))
   ) {
@@ -245,13 +287,21 @@ export function parseLibraryMetadata(
   }
   return {
     state: state as LibraryMetadata["state"],
+    verifiedIdentity: hasCompleteIdentity
+      ? {
+          provider: verificationProvider as VerifiedDisplayIdentity["provider"],
+          providerId: verificationProviderId,
+          displayCode: verifiedDisplayCode,
+        }
+      : null,
+    identityConflict: identityState === "conflict",
     source: optionalText(source),
     providerId: optionalText(providerId),
     displayCode: optionalText(displayCode),
     title: optionalText(title),
     date: optionalText(date),
     runtime: optionalText(runtime),
-    cast: fields.slice(10),
+    cast: fields.slice(14),
   };
 }
 
@@ -591,17 +641,44 @@ export function useLibraryPresentation(
     )
       .then((metadata) => {
         if (!current) return;
-        setState((value) => ({
-          ...value,
-          metadata: {
-            status: metadata.state,
-            value: metadata,
-            retry:
-              metadata.state === "unavailable"
-                ? () => setMetadataRetry((generation) => generation + 1)
-                : null,
-          },
-        }));
+        setState((value) => {
+          if (metadata.identityConflict) {
+            if (currentObjectUrl.current !== null) {
+              URL.revokeObjectURL(currentObjectUrl.current);
+              currentObjectUrl.current = null;
+            }
+            return {
+              ...value,
+              verifiedIdentity: null,
+              cover: {
+                ...value.cover,
+                status: "unavailable",
+                objectUrl: null,
+                source: null,
+                retry: () => setCoverRetry((generation) => generation + 1),
+                reportDecodeFailure: null,
+              },
+              metadata: {
+                status: "unavailable",
+                value: metadata,
+                retry: () => setMetadataRetry((generation) => generation + 1),
+              },
+            };
+          }
+          return {
+            ...value,
+            verifiedIdentity:
+              metadata.verifiedIdentity ?? value.verifiedIdentity,
+            metadata: {
+              status: metadata.state,
+              value: metadata,
+              retry:
+                metadata.state === "unavailable"
+                  ? () => setMetadataRetry((generation) => generation + 1)
+                  : null,
+            },
+          };
+        });
       })
       .catch(() => {
         if (!current) return;
