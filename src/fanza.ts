@@ -47,7 +47,7 @@ const counts = new Set<FanzaResultCount>([10, 25, 50, 100]);
 const u64Pattern = /^(?:0|[1-9][0-9]{0,19})$/;
 const maximumU64 = 18_446_744_073_709_551_615n;
 const contentIdPattern = /^[a-z0-9_]{1,64}$/;
-const displayCodePattern = /^[A-Z0-9]{1,15}[A-Z]-[1-9][0-9]{0,9}$/;
+const displayCodePattern = /^([A-Z0-9]{1,15}[A-Z])-([0-9]{1,10})$/;
 const coverAuthorityPattern = /^fanza-cover-[1-9][0-9]{0,19}-[1-9][0-9]{0,2}$/;
 const sourceAspectRatio = 0.72;
 
@@ -57,6 +57,11 @@ function validGeneration(value: string) {
     BigInt(value) > 0n &&
     BigInt(value) <= maximumU64
   );
+}
+
+function validDisplayCode(value: string) {
+  const match = displayCodePattern.exec(value);
+  return match !== null && BigInt(match[2]) > 0n;
 }
 
 function validRequest(request: FanzaCatalogRequest) {
@@ -127,7 +132,7 @@ export function parseFanzaCatalogResponse(
       category !== request.category ||
       !contentIdPattern.test(contentId) ||
       contentIds.has(contentId) ||
-      !displayCodePattern.test(displayCode) ||
+      !validDisplayCode(displayCode) ||
       (coverAuthorityId !== "" &&
         (coverAuthorityId !== expectedCoverAuthorityId ||
           coverAuthorityIds.has(coverAuthorityId))) ||
@@ -227,7 +232,7 @@ export async function fetchFanzaCoverObjectUrl(item: FanzaCatalogItem) {
     !validGeneration(item.contextGeneration) ||
     !validGeneration(item.requestGeneration) ||
     !contentIdPattern.test(item.contentId) ||
-    !displayCodePattern.test(item.displayCode) ||
+    !validDisplayCode(item.displayCode) ||
     !coverAuthorityPattern.test(item.coverAuthorityId)
   ) {
     throw new Error("A current FANZA cover authority is required.");
