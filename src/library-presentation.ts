@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { productCodeDisplayForm } from "@/vr";
+import {
+  adultLibraryProductCodePrefixIsSupported,
+  canonicalizeProductCode,
+  productCodeDisplayForm,
+  vrLibraryProductCodePrefixIsSupported,
+} from "@/vr";
 
 export type AutomaticLibraryCategory = "adult" | "vr";
 
@@ -61,6 +66,100 @@ const maximumCoverBytes = 16 * 1024 * 1024;
 const maximumConcurrentWork = 4;
 const coverAuthorityPattern = /^library-cover-[a-f0-9]{40}$/;
 
+class LibraryIdentityResponseError extends Error {}
+
+type RequestProductIdentity = {
+  canonicalCode: string;
+  number: string;
+  prefix: string;
+};
+
+function requestProductIdentity(
+  request: LibraryPresentationRequest,
+): RequestProductIdentity | null {
+  const canonicalCode = canonicalizeProductCode(request.itemId);
+  if (canonicalCode === null) return null;
+  const match = canonicalCode.match(/^([A-Z0-9]{2,16})-([1-9][0-9]*)$/);
+  if (match === null) return null;
+  const [, prefix, number] = match;
+  const prefixIsSupported =
+    request.category === "adult"
+      ? adultLibraryProductCodePrefixIsSupported(prefix)
+      : vrLibraryProductCodePrefixIsSupported(prefix);
+  return prefixIsSupported ? { canonicalCode, number, prefix } : null;
+}
+
+function displayCodeMatchesRequest(
+  request: LibraryPresentationRequest,
+  displayCode: string,
+) {
+  const identity = requestProductIdentity(request);
+  return (
+    identity !== null &&
+    productCodeDisplayForm(displayCode) === displayCode &&
+    canonicalizeProductCode(displayCode) === identity.canonicalCode
+  );
+}
+
+function exactFanzaIdentityMatches(
+  request: LibraryPresentationRequest,
+  providerId: string,
+  displayCode: string,
+) {
+  const identity = requestProductIdentity(request);
+  if (identity === null) return false;
+  if (request.category === "adult" && identity.prefix === "CAWB") {
+    return (
+      providerId === `cawb${identity.number.padStart(5, "0")}` &&
+      displayCode === `CAWB-${identity.number.padStart(3, "0")}`
+    );
+  }
+  if (request.category === "vr" && identity.prefix === "3DSVR") {
+    return (
+      providerId === `13dsvr${identity.number.padStart(5, "0")}` &&
+      displayCode === `3DSVR-${identity.number.padStart(5, "0")}`
+    );
+  }
+  return false;
+}
+
+function verifiedIdentityMatchesRequest(
+  request: LibraryPresentationRequest,
+  identity: VerifiedDisplayIdentity,
+) {
+  if (!displayCodeMatchesRequest(request, identity.displayCode)) return false;
+  if (identity.provider === "FANZA") {
+    return exactFanzaIdentityMatches(
+      request,
+      identity.providerId,
+      identity.displayCode,
+    );
+  }
+  return /^[A-Za-z0-9]{1,64}$/.test(identity.providerId);
+}
+
+function reconcileVerifiedIdentities(
+  current: VerifiedDisplayIdentity | null,
+  candidate: VerifiedDisplayIdentity | null,
+): { identity: VerifiedDisplayIdentity | null; conflict: boolean } {
+  if (current === null || candidate === null) {
+    return { identity: current ?? candidate, conflict: false };
+  }
+  if (current.provider === candidate.provider) {
+    return current.providerId === candidate.providerId &&
+      current.displayCode === candidate.displayCode
+      ? { identity: current, conflict: false }
+      : { identity: null, conflict: true };
+  }
+  if (current.displayCode !== candidate.displayCode) {
+    return { identity: null, conflict: true };
+  }
+  return {
+    identity: current.provider === "JavDB" ? current : candidate,
+    conflict: false,
+  };
+}
+
 type Work = {
   priority: "cover" | "metadata";
   shouldStart: () => boolean;
@@ -119,7 +218,7 @@ function optionalText(value: string) {
 
 export function parseLibraryCover(
   value: unknown,
-  category: AutomaticLibraryCategory,
+  request: LibraryPresentationRequest,
 ): LibraryCover | null {
   if (
     !Array.isArray(value) ||
@@ -145,7 +244,8 @@ export function parseLibraryCover(
   const ratio = Number(ratioText);
   if (
     version !== "library-cover-v3" ||
-    returnedCategory !== category ||
+    requestProductIdentity(request) === null ||
+    returnedCategory !== request.category ||
     !["ready", "missing", "unavailable"].includes(state) ||
     !Number.isFinite(ratio) ||
     ratio <= 0 ||
@@ -171,8 +271,15 @@ export function parseLibraryCover(
         verifiedDisplayCode !== "")) ||
     (verificationProvider !== "" &&
       (!(["JavDB", "FANZA"] as string[]).includes(verificationProvider) ||
-        !/^[A-Za-z0-9]{1,64}$/.test(verificationProviderId) ||
-        productCodeDisplayForm(verifiedDisplayCode) !== verifiedDisplayCode)) ||
+        !verifiedIdentityMatchesRequest(request, {
+          provider: verificationProvider as VerifiedDisplayIdentity["provider"],
+          providerId: verificationProviderId,
+          displayCode: verifiedDisplayCode,
+        }))) ||
+    (state === "ready" &&
+      (source === "FANZA"
+        ? !exactFanzaIdentityMatches(request, providerId, displayCode)
+        : !displayCodeMatchesRequest(request, displayCode))) ||
     (state === "ready" &&
       ((source === "JavDB" &&
         (verificationProvider !== "JavDB" ||
@@ -209,7 +316,7 @@ export function parseLibraryCover(
 
 export function parseLibraryMetadata(
   value: unknown,
-  category: AutomaticLibraryCategory,
+  request: LibraryPresentationRequest,
 ): LibraryMetadata | null {
   if (
     !Array.isArray(value) ||
@@ -243,7 +350,8 @@ export function parseLibraryMetadata(
     verifiedDisplayCode !== "";
   if (
     version !== "library-metadata-v3" ||
-    returnedCategory !== category ||
+    requestProductIdentity(request) === null ||
+    returnedCategory !== request.category ||
     !["automatic", "local-only", "unavailable"].includes(state) ||
     !["current", "conflict"].includes(identityState) ||
     !/^\d{1,2}$/.test(castCountText) ||
@@ -258,15 +366,18 @@ export function parseLibraryMetadata(
         verifiedDisplayCode !== "")) ||
     (hasCompleteIdentity &&
       (!(["JavDB", "FANZA"] as string[]).includes(verificationProvider) ||
-        !/^[A-Za-z0-9]{1,64}$/.test(verificationProviderId) ||
-        productCodeDisplayForm(verifiedDisplayCode) !== verifiedDisplayCode)) ||
+        !verifiedIdentityMatchesRequest(request, {
+          provider: verificationProvider as VerifiedDisplayIdentity["provider"],
+          providerId: verificationProviderId,
+          displayCode: verifiedDisplayCode,
+        }))) ||
     (identityState === "conflict" &&
       (state !== "unavailable" || hasCompleteIdentity)) ||
     (state === "automatic" &&
       (source === "" ||
         providerId === "" ||
         displayCode === "" ||
-        productCodeDisplayForm(displayCode) !== displayCode ||
+        !displayCodeMatchesRequest(request, displayCode) ||
         (hasCompleteIdentity && displayCode !== verifiedDisplayCode) ||
         (source.startsWith("JavDB") &&
           (verificationProvider !== "JavDB" ||
@@ -346,8 +457,12 @@ async function resolveCover(
     "resolve_library_cover",
     { ...requestArguments(request), coverRequestGeneration },
   );
-  const cover = parseLibraryCover(value, request.category);
-  if (cover === null) throw new Error("The native Library cover response was invalid.");
+  const cover = parseLibraryCover(value, request);
+  if (cover === null) {
+    throw new LibraryIdentityResponseError(
+      "The native Library cover response was invalid.",
+    );
+  }
   return cover;
 }
 
@@ -406,9 +521,11 @@ async function resolveMetadata(
     "resolve_library_metadata",
     { ...requestArguments(request), coverRequestGeneration },
   );
-  const metadata = parseLibraryMetadata(value, request.category);
+  const metadata = parseLibraryMetadata(value, request);
   if (metadata === null) {
-    throw new Error("The native Library metadata response was invalid.");
+    throw new LibraryIdentityResponseError(
+      "The native Library metadata response was invalid.",
+    );
   }
   return metadata;
 }
@@ -444,13 +561,19 @@ export function useLibraryPresentation(
   } | null>(null);
   const [state, setState] = useState<LibraryPresentationState>(initialState);
   const currentObjectUrl = useRef<string | null>(null);
+  const verifiedIdentity = useRef<VerifiedDisplayIdentity | null>(null);
+  const identityConflict = useRef(false);
 
   useEffect(() => {
     if (stableRequest === null) {
+      verifiedIdentity.current = null;
+      identityConflict.current = false;
       setState(initialState());
       setCompletedCover(null);
       return;
     }
+    verifiedIdentity.current = null;
+    identityConflict.current = false;
     setState(initialState());
     setCompletedCover(null);
   }, [stableRequest]);
@@ -460,6 +583,9 @@ export function useLibraryPresentation(
     let current = true;
     nextCoverRequestGeneration += 1;
     const coverRequestGeneration = nextCoverRequestGeneration.toString();
+    verifiedIdentity.current = null;
+    identityConflict.current = false;
+    setCompletedCover(null);
     let coverAuthorityId: string | null = null;
     let invalidationPending = false;
     const retryUnavailableCover = () => {
@@ -480,6 +606,7 @@ export function useLibraryPresentation(
     };
     setState((value) => ({
       ...value,
+      verifiedIdentity: null,
       cover: {
         status: "loading",
         objectUrl: null,
@@ -502,12 +629,36 @@ export function useLibraryPresentation(
       "cover",
       async () => {
         const cover = await resolveCover(stableRequest, coverRequestGeneration);
+        const reconciledIdentity = reconcileVerifiedIdentities(
+          verifiedIdentity.current,
+          cover.verifiedIdentity,
+        );
+        if (reconciledIdentity.conflict) {
+          return {
+            cover,
+            objectUrl: null,
+            fetchFailed: false,
+            identityConflict: true,
+          };
+        }
+        verifiedIdentity.current = reconciledIdentity.identity;
+        cover.verifiedIdentity = reconciledIdentity.identity;
         coverAuthorityId = cover.authorityId;
         if (!current) {
-          return { cover, objectUrl: null, fetchFailed: false };
+          return {
+            cover,
+            objectUrl: null,
+            fetchFailed: false,
+            identityConflict: false,
+          };
         }
         if (cover.state !== "ready" || cover.authorityId === null) {
-          return { cover, objectUrl: null, fetchFailed: false };
+          return {
+            cover,
+            objectUrl: null,
+            fetchFailed: false,
+            identityConflict: false,
+          };
         }
         setState((value) => ({
           ...value,
@@ -522,19 +673,57 @@ export function useLibraryPresentation(
         }));
         try {
           const objectUrl = await fetchCover(stableRequest, cover.authorityId);
-          return { cover, objectUrl, fetchFailed: false };
+          return {
+            cover,
+            objectUrl,
+            fetchFailed: false,
+            identityConflict: false,
+          };
         } catch {
-          return { cover, objectUrl: null, fetchFailed: true };
+          return {
+            cover,
+            objectUrl: null,
+            fetchFailed: true,
+            identityConflict: false,
+          };
         }
       },
       () => current,
     )
-      .then(({ cover, objectUrl, fetchFailed }) => {
+      .then(({ cover, objectUrl, fetchFailed, identityConflict: hasConflict }) => {
         if (!current) {
           if (objectUrl !== null) URL.revokeObjectURL(objectUrl);
           return;
         }
+        if (hasConflict) {
+          identityConflict.current = true;
+          verifiedIdentity.current = null;
+          if (currentObjectUrl.current !== null) {
+            URL.revokeObjectURL(currentObjectUrl.current);
+            currentObjectUrl.current = null;
+          }
+          setState((value) => ({
+            ...value,
+            verifiedIdentity: null,
+            cover: {
+              ...value.cover,
+              status: "unavailable",
+              objectUrl: null,
+              source: null,
+              retry: () => setCoverRetry((generation) => generation + 1),
+              reportDecodeFailure: null,
+            },
+            metadata: {
+              status: "unavailable",
+              value: null,
+              retry: () => setMetadataRetry((generation) => generation + 1),
+            },
+          }));
+          completeCover();
+          return;
+        }
         if (cover.state !== "ready" || cover.authorityId === null) {
+          verifiedIdentity.current = cover.verifiedIdentity;
           setState((value) => ({
             ...value,
             verifiedIdentity: cover.verifiedIdentity,
@@ -555,6 +744,7 @@ export function useLibraryPresentation(
         }
         if (!fetchFailed && objectUrl !== null) {
           currentObjectUrl.current = objectUrl;
+          verifiedIdentity.current = cover.verifiedIdentity;
           setState((value) => ({
             ...value,
             verifiedIdentity: cover.verifiedIdentity,
@@ -582,6 +772,7 @@ export function useLibraryPresentation(
             },
           }));
         } else {
+          verifiedIdentity.current = cover.verifiedIdentity;
           setState((value) => ({
             ...value,
             verifiedIdentity: cover.verifiedIdentity,
@@ -597,13 +788,24 @@ export function useLibraryPresentation(
         }
         completeCover();
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!current) return;
+        verifiedIdentity.current = null;
+        identityConflict.current = error instanceof LibraryIdentityResponseError;
+        if (currentObjectUrl.current !== null) {
+          URL.revokeObjectURL(currentObjectUrl.current);
+          currentObjectUrl.current = null;
+        }
         setState((value) => ({
           ...value,
+          verifiedIdentity: null,
           cover: {
             ...value.cover,
             status: "unavailable",
+            source:
+              error instanceof LibraryIdentityResponseError
+                ? null
+                : value.cover.source,
             retry: () => setCoverRetry((generation) => generation + 1),
           },
         }));
@@ -642,7 +844,17 @@ export function useLibraryPresentation(
       .then((metadata) => {
         if (!current) return;
         setState((value) => {
-          if (metadata.identityConflict) {
+          const reconciledIdentity = reconcileVerifiedIdentities(
+            verifiedIdentity.current,
+            metadata.verifiedIdentity,
+          );
+          if (
+            identityConflict.current ||
+            metadata.identityConflict ||
+            reconciledIdentity.conflict
+          ) {
+            identityConflict.current = true;
+            verifiedIdentity.current = null;
             if (currentObjectUrl.current !== null) {
               URL.revokeObjectURL(currentObjectUrl.current);
               currentObjectUrl.current = null;
@@ -660,15 +872,15 @@ export function useLibraryPresentation(
               },
               metadata: {
                 status: "unavailable",
-                value: metadata,
+                value: null,
                 retry: () => setMetadataRetry((generation) => generation + 1),
               },
             };
           }
+          verifiedIdentity.current = reconciledIdentity.identity;
           return {
             ...value,
-            verifiedIdentity:
-              metadata.verifiedIdentity ?? value.verifiedIdentity,
+            verifiedIdentity: reconciledIdentity.identity,
             metadata: {
               status: metadata.state,
               value: metadata,
@@ -680,8 +892,34 @@ export function useLibraryPresentation(
           };
         });
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!current) return;
+        if (error instanceof LibraryIdentityResponseError) {
+          identityConflict.current = true;
+          verifiedIdentity.current = null;
+          if (currentObjectUrl.current !== null) {
+            URL.revokeObjectURL(currentObjectUrl.current);
+            currentObjectUrl.current = null;
+          }
+          setState((value) => ({
+            ...value,
+            verifiedIdentity: null,
+            cover: {
+              ...value.cover,
+              status: "unavailable",
+              objectUrl: null,
+              source: null,
+              retry: () => setCoverRetry((generation) => generation + 1),
+              reportDecodeFailure: null,
+            },
+            metadata: {
+              status: "unavailable",
+              value: null,
+              retry: () => setMetadataRetry((generation) => generation + 1),
+            },
+          }));
+          return;
+        }
         setState((value) => ({
           ...value,
           metadata: {

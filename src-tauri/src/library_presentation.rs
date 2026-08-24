@@ -88,6 +88,7 @@ struct VerifiedDisplayIdentity {
 struct PresentationMetadata {
     verified_identity: Option<VerifiedDisplayIdentity>,
     identity_conflict: bool,
+    complete_identity_agreement: bool,
     source: Option<String>,
     provider_id: Option<String>,
     display_code: Option<String>,
@@ -185,6 +186,8 @@ struct LibraryPresentationContext {
     failed_cover_sources: HashMap<String, FailedCoverSources>,
     metadata_seeds: HashMap<MetadataSeedKey, MetadataSeed>,
     verified_identity_seeds: HashMap<MetadataSeedKey, VerifiedIdentitySeed>,
+    identity_conflicts: HashSet<MetadataSeedKey>,
+    identity_recovery_required: HashSet<(LibraryPresentationCategory, String)>,
     next_cover_sequence: u64,
 }
 
@@ -207,6 +210,9 @@ fn retire_metadata_seed(
         key.category != category || key.code != code || key.request_generation != request_generation
     });
     context.verified_identity_seeds.retain(|key, _| {
+        key.category != category || key.code != code || key.request_generation != request_generation
+    });
+    context.identity_conflicts.retain(|key| {
         key.category != category || key.code != code || key.request_generation != request_generation
     });
 }
@@ -366,6 +372,7 @@ fn metadata_from_javdb(item: &javdb_catalog::ExactLibraryItem) -> PresentationMe
     PresentationMetadata {
         verified_identity: Some(javdb_verified_identity(item)),
         identity_conflict: false,
+        complete_identity_agreement: false,
         source: Some("JavDB".to_owned()),
         provider_id: Some(item.provider_item_id.clone()),
         display_code: Some(item.display_code.clone()),
@@ -479,6 +486,7 @@ fn metadata_from_legacy(
     let metadata = PresentationMetadata {
         verified_identity: None,
         identity_conflict: false,
+        complete_identity_agreement: false,
         source: Some("r18.dev".to_owned()),
         provider_id: Some(content_id.clone()),
         display_code: Some(display_code.to_owned()),
@@ -773,8 +781,8 @@ fn fetch_current_cover_source(
     fetch(url)
 }
 
-fn resolve_cover_with(
-    authority: &LibraryItemAuthority,
+fn resolve_cover_with_current_identity(
+    authority: (&LibraryItemAuthority, Option<VerifiedDisplayIdentity>, bool),
     mut javdb_document: impl FnMut(&str) -> Result<String, ProviderRequestError>,
     mut javdb_image: impl FnMut(&str) -> Result<Vec<u8>, ProviderRequestError>,
     fanza_document: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
@@ -782,30 +790,51 @@ fn resolve_cover_with(
     mut legacy_document: impl FnMut(&str) -> Result<String, ProviderRequestError>,
     legacy_image: impl FnOnce(&str) -> Result<Vec<u8>, ProviderRequestError>,
 ) -> CoverResolution {
+    let (authority, current_identity, require_complete_identity_agreement) = authority;
     let mut transient = false;
     let mut metadata = None;
     let mut verified_identity = None;
+    let mut javdb_identity_accepted = false;
+    let mut preferred_javdb_cover = None;
     match fetch_exact_javdb_item(authority, &mut javdb_document) {
         Ok(Some(item)) => {
-            verified_identity = Some(javdb_verified_identity(&item));
-            metadata = Some(metadata_from_javdb(&item));
+            javdb_identity_accepted = true;
+            verified_identity = match reconcile_verified_identities(
+                current_identity.clone(),
+                Some(javdb_verified_identity(&item)),
+            ) {
+                Ok(identity) => identity,
+                Err(()) => {
+                    return (
+                        None,
+                        Some(PresentationMetadata {
+                            identity_conflict: true,
+                            ..PresentationMetadata::default()
+                        }),
+                        true,
+                    )
+                }
+            };
+            let mut javdb_metadata = metadata_from_javdb(&item);
+            attach_verified_identity(&mut javdb_metadata, verified_identity.clone());
+            metadata = Some(javdb_metadata);
             if let Some(url) = item.cover_url {
                 match javdb_image(&url).and_then(validate_cover) {
                     Ok((bytes, ratio)) => {
-                        return (
-                            Some((
-                                CoverSource {
-                                    provider: "JavDB",
-                                    provider_id: item.provider_item_id,
-                                    display_code: item.display_code,
-                                    url,
-                                    aspect_ratio: ratio,
-                                },
-                                bytes,
-                            )),
-                            metadata,
-                            transient,
+                        let cover = (
+                            CoverSource {
+                                provider: "JavDB",
+                                provider_id: item.provider_item_id,
+                                display_code: item.display_code,
+                                url,
+                                aspect_ratio: ratio,
+                            },
+                            bytes,
                         );
+                        if !require_complete_identity_agreement {
+                            return (Some(cover), metadata, transient);
+                        }
+                        preferred_javdb_cover = Some(cover);
                     }
                     Err(_) => transient = true,
                 }
@@ -822,43 +851,53 @@ fn resolve_cover_with(
     ) {
         Ok(Some(item)) => {
             let fanza_identity = fanza_verified_identity(&item);
-            verified_identity =
-                match reconcile_verified_identities(verified_identity, Some(fanza_identity)) {
-                    Ok(identity) => identity,
-                    Err(()) => {
-                        return (
-                            None,
-                            Some(PresentationMetadata {
-                                identity_conflict: true,
-                                ..PresentationMetadata::default()
-                            }),
-                            true,
-                        )
-                    }
-                };
+            verified_identity = match reconcile_verified_identities(
+                verified_identity
+                    .clone()
+                    .or_else(|| current_identity.clone()),
+                Some(fanza_identity),
+            ) {
+                Ok(identity) => identity,
+                Err(()) => {
+                    return (
+                        None,
+                        Some(PresentationMetadata {
+                            identity_conflict: true,
+                            ..PresentationMetadata::default()
+                        }),
+                        true,
+                    )
+                }
+            };
             if let Some(identity) = verified_identity.clone() {
-                attach_verified_identity(
-                    metadata.get_or_insert_with(PresentationMetadata::default),
-                    Some(identity),
-                );
+                let metadata = metadata.get_or_insert_with(PresentationMetadata::default);
+                attach_verified_identity(metadata, Some(identity));
+                metadata.complete_identity_agreement = javdb_identity_accepted;
             }
             if let Some(url) = item.cover_url {
                 match fanza_image(&url).and_then(validate_cover) {
                     Ok((bytes, ratio)) => {
-                        return (
-                            Some((
-                                CoverSource {
-                                    provider: "FANZA",
-                                    provider_id: item.content_id,
-                                    display_code: item.display_code,
-                                    url,
-                                    aspect_ratio: ratio,
-                                },
-                                bytes,
-                            )),
-                            metadata,
-                            transient,
-                        );
+                        if require_complete_identity_agreement && !javdb_identity_accepted {
+                            transient = true;
+                        } else {
+                            if let Some(cover) = preferred_javdb_cover {
+                                return (Some(cover), metadata, transient);
+                            }
+                            return (
+                                Some((
+                                    CoverSource {
+                                        provider: "FANZA",
+                                        provider_id: item.content_id,
+                                        display_code: item.display_code,
+                                        url,
+                                        aspect_ratio: ratio,
+                                    },
+                                    bytes,
+                                )),
+                                metadata,
+                                transient,
+                            );
+                        }
                     }
                     Err(_) => transient = true,
                 }
@@ -866,6 +905,24 @@ fn resolve_cover_with(
         }
         Ok(None) => {}
         Err(_) => transient = true,
+    }
+
+    if require_complete_identity_agreement
+        && !metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.complete_identity_agreement)
+    {
+        return (
+            None,
+            Some(PresentationMetadata {
+                identity_conflict: true,
+                ..PresentationMetadata::default()
+            }),
+            true,
+        );
+    }
+    if let Some(cover) = preferred_javdb_cover {
+        return (Some(cover), metadata, transient);
     }
 
     match legacy_document(&legacy_url(&authority.product_identity)) {
@@ -882,10 +939,13 @@ fn resolve_cover_with(
                                 CoverSource {
                                     provider: "r18.dev",
                                     provider_id: authority.product_identity.clone(),
-                                    display_code: verified_identity.as_ref().map_or_else(
-                                        || authority.code.clone(),
-                                        |identity| identity.display_code.clone(),
-                                    ),
+                                    display_code: verified_identity
+                                        .as_ref()
+                                        .or(current_identity.as_ref())
+                                        .map_or_else(
+                                            || authority.code.clone(),
+                                            |identity| identity.display_code.clone(),
+                                        ),
                                     url,
                                     aspect_ratio: ratio,
                                 },
@@ -910,6 +970,27 @@ fn resolve_cover_with(
         );
     }
     (None, metadata, transient)
+}
+
+#[cfg(test)]
+fn resolve_cover_with(
+    authority: &LibraryItemAuthority,
+    javdb_document: impl FnMut(&str) -> Result<String, ProviderRequestError>,
+    javdb_image: impl FnMut(&str) -> Result<Vec<u8>, ProviderRequestError>,
+    fanza_document: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+    fanza_image: impl FnOnce(&str) -> Result<Vec<u8>, ProviderRequestError>,
+    legacy_document: impl FnMut(&str) -> Result<String, ProviderRequestError>,
+    legacy_image: impl FnOnce(&str) -> Result<Vec<u8>, ProviderRequestError>,
+) -> CoverResolution {
+    resolve_cover_with_current_identity(
+        (authority, None, false),
+        javdb_document,
+        javdb_image,
+        fanza_document,
+        fanza_image,
+        legacy_document,
+        legacy_image,
+    )
 }
 
 fn resolve_metadata_with(
@@ -1111,6 +1192,7 @@ fn read_cache(path: &Path) -> Result<Vec<CacheEntry>, ()> {
         let metadata = PresentationMetadata {
             verified_identity: None,
             identity_conflict: false,
+            complete_identity_agreement: false,
             source: optional_text(fields[16]),
             provider_id: optional_text(fields[17]),
             display_code: optional_text(fields[18]),
@@ -1402,14 +1484,21 @@ pub(crate) fn resolve_cover(
     request_generation: u64,
     is_current: impl Fn() -> bool,
 ) -> Result<Vec<String>, &'static str> {
-    let failed_urls = state
-        .0
-        .lock()
-        .map_err(|_| LIBRARY_PRESENTATION_FAILED)?
-        .failed_cover_sources
-        .get(&authority.identity)
-        .filter(|failed| failed.category == authority.category && failed.code == authority.code)
-        .map_or_else(HashSet::new, |failed| failed.urls.clone());
+    let (failed_urls, require_complete_identity_agreement) = {
+        let context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+        (
+            context
+                .failed_cover_sources
+                .get(&authority.identity)
+                .filter(|failed| {
+                    failed.category == authority.category && failed.code == authority.code
+                })
+                .map_or_else(HashSet::new, |failed| failed.urls.clone()),
+            context
+                .identity_recovery_required
+                .contains(&(authority.category, authority.code.clone())),
+        )
+    };
     resolve_cover_at_with_request(
         state,
         cache_path,
@@ -1417,9 +1506,13 @@ pub(crate) fn resolve_cover(
         request_generation,
         now_seconds(),
         is_current,
-        || {
-            resolve_cover_with(
-                authority,
+        |current_identity| {
+            resolve_cover_with_current_identity(
+                (
+                    authority,
+                    current_identity,
+                    require_complete_identity_agreement,
+                ),
                 javdb_catalog::fetch_api_document,
                 |url| {
                     fetch_current_cover_source(url, &failed_urls, javdb_catalog::fetch_cover_bytes)
@@ -1444,7 +1537,9 @@ fn resolve_cover_at_with(
     is_current: impl Fn() -> bool,
     resolve: impl FnOnce() -> CoverResolution,
 ) -> Result<Vec<String>, &'static str> {
-    resolve_cover_at_with_request(state, cache_path, authority, 0, now, is_current, resolve)
+    resolve_cover_at_with_request(state, cache_path, authority, 0, now, is_current, |_| {
+        resolve()
+    })
 }
 
 fn resolve_cover_at_with_request(
@@ -1454,7 +1549,7 @@ fn resolve_cover_at_with_request(
     request_generation: u64,
     now: u64,
     is_current: impl Fn() -> bool,
-    resolve: impl FnOnce() -> CoverResolution,
+    resolve: impl FnOnce(Option<VerifiedDisplayIdentity>) -> CoverResolution,
 ) -> Result<Vec<String>, &'static str> {
     let cache = {
         let _guard = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
@@ -1498,7 +1593,11 @@ fn resolve_cover_at_with_request(
         );
     }
 
-    let (mut cover, mut metadata_seed, transient) = resolve();
+    let (mut cover, mut metadata_seed, transient) = resolve(
+        cached_identity
+            .as_ref()
+            .map(|(_, identity)| identity.clone()),
+    );
     let identity_conflict = metadata_seed
         .as_ref()
         .is_some_and(|metadata| metadata.identity_conflict);
@@ -1510,15 +1609,12 @@ fn resolve_cover_at_with_request(
             let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
             remove_cache_entry(cache_path, &authority.identity)
                 .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
-            retain_metadata_seed(
-                &mut context,
-                authority,
-                request_generation,
-                PresentationMetadata {
-                    identity_conflict: true,
-                    ..PresentationMetadata::default()
-                },
-            );
+            context
+                .identity_conflicts
+                .insert(metadata_seed_key(authority, request_generation));
+            context
+                .identity_recovery_required
+                .insert((authority.category, authority.code.clone()));
         }
         return cover_response(
             state,
@@ -1530,7 +1626,7 @@ fn resolve_cover_at_with_request(
             None,
         );
     }
-    let resolved_identity = match reconcile_verified_identities(
+    let fresh_identity = match reconcile_verified_identities(
         metadata_seed
             .as_ref()
             .and_then(|metadata| metadata.verified_identity.clone()),
@@ -1547,15 +1643,46 @@ fn resolve_cover_at_with_request(
                 let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
                 remove_cache_entry(cache_path, &authority.identity)
                     .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
-                retain_metadata_seed(
-                    &mut context,
-                    authority,
-                    request_generation,
-                    PresentationMetadata {
-                        identity_conflict: true,
-                        ..PresentationMetadata::default()
-                    },
-                );
+                context
+                    .identity_conflicts
+                    .insert(metadata_seed_key(authority, request_generation));
+                context
+                    .identity_recovery_required
+                    .insert((authority.category, authority.code.clone()));
+            }
+            return cover_response(
+                state,
+                authority,
+                request_generation,
+                "unavailable",
+                None,
+                None,
+                None,
+            );
+        }
+    };
+    let has_fresh_identity = fresh_identity.is_some();
+    let resolved_identity = match reconcile_verified_identities(
+        cached_identity
+            .as_ref()
+            .map(|(_, identity)| identity.clone()),
+        fresh_identity,
+    ) {
+        Ok(identity) => identity,
+        Err(()) => {
+            if !is_current() {
+                return Err(LIBRARY_PRESENTATION_STALE);
+            }
+            {
+                let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+                remove_cache_entry(cache_path, &authority.identity)
+                    .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+                context
+                    .identity_conflicts
+                    .insert(metadata_seed_key(authority, request_generation));
+                context
+                    .identity_recovery_required
+                    .insert((authority.category, authority.code.clone()));
             }
             return cover_response(
                 state,
@@ -1569,10 +1696,14 @@ fn resolve_cover_at_with_request(
         }
     };
     let (identity_saved_at, verified_identity) = match resolved_identity {
-        Some(identity) => (now, Some(identity)),
-        None if transient => cached_identity
-            .map(|(saved_at, identity)| (saved_at, Some(identity)))
-            .unwrap_or((0, None)),
+        Some(identity) if has_fresh_identity => (now, Some(identity)),
+        Some(identity) => (
+            cached_identity
+                .as_ref()
+                .map_or(now, |(saved_at, _)| *saved_at),
+            Some(identity),
+        ),
+        None if transient => (0, None),
         None => (0, None),
     };
     if let (Some((source, _)), Some(identity)) = (&mut cover, &verified_identity) {
@@ -1593,8 +1724,16 @@ fn resolve_cover_at_with_request(
     }) {
         return Err(LIBRARY_PRESENTATION_FAILED);
     }
+    let complete_identity_agreement = metadata_seed
+        .as_ref()
+        .is_some_and(|metadata| metadata.complete_identity_agreement);
     if !is_current() {
         return Err(LIBRARY_PRESENTATION_STALE);
+    }
+    if complete_identity_agreement {
+        if let Some(metadata) = &mut metadata_seed {
+            metadata.complete_identity_agreement = false;
+        }
     }
     if let Some(metadata) = metadata_seed {
         if let Ok(mut context) = state.0.lock() {
@@ -1651,7 +1790,7 @@ fn resolve_cover_at_with_request(
         }
         merge_cache_entry(cache_path, entry).map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
     }
-    cover_response(
+    let response = cover_response(
         state,
         authority,
         request_generation,
@@ -1659,7 +1798,16 @@ fn resolve_cover_at_with_request(
         source,
         bytes,
         verified_identity,
-    )
+    )?;
+    if complete_identity_agreement {
+        state
+            .0
+            .lock()
+            .map_err(|_| LIBRARY_PRESENTATION_FAILED)?
+            .identity_recovery_required
+            .remove(&(authority.category, authority.code.clone()));
+    }
+    Ok(response)
 }
 
 pub(crate) fn resolve_metadata(
@@ -1685,13 +1833,15 @@ pub(crate) fn resolve_metadata(
         state,
         cache_path,
         authority,
+        Some(request_generation),
         now_seconds(),
         is_current,
         || {
             let key = metadata_seed_key(authority, request_generation);
-            let (seed, verified_identity) = {
+            let (identity_conflict, seed, verified_identity) = {
                 let mut context = state.0.lock().map_err(|_| ProviderRequestError::Provider)?;
                 (
+                    context.identity_conflicts.contains(&key),
                     context.metadata_seeds.remove(&key),
                     context
                         .verified_identity_seeds
@@ -1699,6 +1849,12 @@ pub(crate) fn resolve_metadata(
                         .map(|seed| seed.identity),
                 )
             };
+            if identity_conflict {
+                return Ok(Some(PresentationMetadata {
+                    identity_conflict: true,
+                    ..PresentationMetadata::default()
+                }));
+            }
             let seeded_metadata = seed.map(|seed| {
                 let mut metadata = seed.metadata;
                 if metadata.verified_identity.is_none() {
@@ -1724,6 +1880,7 @@ fn resolve_metadata_at_with(
     state: &LibraryPresentationState,
     cache_path: &Path,
     authority: &LibraryItemAuthority,
+    request_generation: Option<u64>,
     now: u64,
     is_current: impl Fn() -> bool,
     resolve: impl FnOnce() -> Result<Option<PresentationMetadata>, ProviderRequestError>,
@@ -1777,9 +1934,19 @@ fn resolve_metadata_at_with(
             .is_some_and(|metadata| metadata.identity_conflict)
     }) {
         {
-            let _guard = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+            let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
             remove_cache_entry(cache_path, &authority.identity)
                 .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+            if let Some(request_generation) = request_generation.filter(|generation| {
+                cover_request_matches(&context, authority.category, &authority.code, *generation)
+            }) {
+                context
+                    .identity_conflicts
+                    .insert(metadata_seed_key(authority, request_generation));
+                context
+                    .identity_recovery_required
+                    .insert((authority.category, authority.code.clone()));
+            }
         }
         return Ok(metadata_response(
             authority,
@@ -1810,9 +1977,24 @@ fn resolve_metadata_at_with(
             Ok(identity) => identity,
             Err(()) => {
                 {
-                    let _guard = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+                    let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
                     remove_cache_entry(cache_path, &authority.identity)
                         .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+                    if let Some(request_generation) = request_generation.filter(|generation| {
+                        cover_request_matches(
+                            &context,
+                            authority.category,
+                            &authority.code,
+                            *generation,
+                        )
+                    }) {
+                        context
+                            .identity_conflicts
+                            .insert(metadata_seed_key(authority, request_generation));
+                        context
+                            .identity_recovery_required
+                            .insert((authority.category, authority.code.clone()));
+                    }
                 }
                 return Ok(metadata_response(
                     authority,
@@ -1990,6 +2172,9 @@ pub(crate) fn begin_cover_request(
     context
         .verified_identity_seeds
         .retain(|seed, _| seed.category != category || seed.code != code);
+    context
+        .identity_conflicts
+        .retain(|seed| seed.category != category || seed.code != code);
     context.cover_requests.insert(
         key,
         CoverRequestAuthority {
@@ -2012,6 +2197,7 @@ pub(crate) fn begin_cover_request(
             .covers
             .retain(|_, cover| cover.category != oldest.0 || cover.code != oldest.1);
         context.cover_requests.remove(&oldest);
+        context.identity_recovery_required.remove(&oldest);
         if let Some(removed_request) = removed_request {
             retire_metadata_seed(
                 &mut context,
@@ -2086,6 +2272,9 @@ pub(crate) fn invalidate_cover(
         .remove(&metadata_seed_key(authority, request_generation));
     context
         .verified_identity_seeds
+        .remove(&metadata_seed_key(authority, request_generation));
+    context
+        .identity_conflicts
         .remove(&metadata_seed_key(authority, request_generation));
     let mut entries = load_cache(cache_path);
     let entry = entries
@@ -2865,15 +3054,18 @@ mod tests {
             .expect("the previous exact identity must be durable");
             let legacy_calls = Cell::new(0);
             let state = LibraryPresentationState::default();
-            let response = resolve_cover_at_with(
+            begin_cover_request(&state, authority.category, &authority.code, 1)
+                .expect("the conflicting cover request must begin");
+            let response = resolve_cover_at_with_request(
                 &state,
                 &fixture.path,
                 &authority,
+                1,
                 100,
                 || true,
-                || {
-                    resolve_cover_with(
-                        &authority,
+                |current_identity| {
+                    resolve_cover_with_current_identity(
+                        (&authority, current_identity, false),
                         |url| {
                             Ok(if url.contains("search") {
                                 javdb_listing(javdb_display).replace(
@@ -2909,46 +3101,238 @@ mod tests {
             assert!(read_cache(&fixture.path)
                 .expect("the conflict cleanup must leave a valid cache")
                 .is_empty());
-            let conflict_seed = state
+            assert!(state
                 .0
                 .lock()
-                .expect("the conflict seed must remain readable")
-                .metadata_seeds
-                .remove(&metadata_seed_key(&authority, 0))
-                .expect("the metadata phase must retain the cover conflict")
-                .metadata;
-            let metadata_response = resolve_metadata_at_with(
-                &state,
-                &fixture.path,
-                &authority,
-                100,
-                || true,
-                || Ok(Some(conflict_seed)),
-            )
-            .expect("metadata must expose the retained conflict without selecting one side");
-            assert_eq!(metadata_response[2], "unavailable");
-            assert_eq!(metadata_response[3], "conflict");
-            assert_eq!(&metadata_response[4..7], ["", "", ""]);
+                .expect("the recovery requirement must remain readable")
+                .identity_recovery_required
+                .contains(&(authority.category, authority.code.clone())));
+            for attempt in 0..2 {
+                let metadata_response =
+                    resolve_metadata(&state, &fixture.path, &authority, 1, || true)
+                        .expect("metadata Retry must preserve the retained conflict");
+                assert_eq!(metadata_response[2], "unavailable", "attempt {attempt}");
+                assert_eq!(metadata_response[3], "conflict", "attempt {attempt}");
+                assert_eq!(&metadata_response[4..7], ["", "", ""]);
+            }
             assert!(read_cache(&fixture.path)
                 .expect("metadata conflict cleanup must leave a valid cache")
                 .is_empty());
+
+            begin_cover_request(&state, authority.category, &authority.code, 2)
+                .expect("a complete provider retry must begin");
+            let recovery_fanza_calls = Cell::new(0);
+            let recovered = resolve_cover_at_with_request(
+                &state,
+                &fixture.path,
+                &authority,
+                2,
+                101,
+                || true,
+                |current_identity| {
+                    resolve_cover_with_current_identity(
+                        (&authority, current_identity, true),
+                        |url| {
+                            Ok(if url.contains("search") {
+                                javdb_listing(fanza_display)
+                            } else {
+                                javdb_detail(fanza_display, authority.category)
+                            })
+                        },
+                        |_| Ok(jpeg(600, 800)),
+                        |_| {
+                            recovery_fanza_calls.set(recovery_fanza_calls.get() + 1);
+                            Ok(format!(
+                                r#"{{"data":{{"c0":{{"id":"{content_id}","contentType":"{content_type}","title":"Exact","packageImage":null}}}}}}"#
+                            ))
+                        },
+                        |_| panic!("the agreed null FANZA cover has no image request"),
+                        |_| {
+                            Ok(format!(
+                                r#"{{"content_id":"{}","images":null}}"#,
+                                authority.code
+                            ))
+                        },
+                        |_| panic!("an absent legacy cover has no image request"),
+                    )
+                },
+            )
+            .expect("exact agreement must recover only through a full cover retry");
+            assert_eq!(recovered[2], "ready");
+            assert_eq!(recovered[3], "JavDB");
+            assert_eq!(&recovered[8..], ["JavDB", "item", fanza_display]);
+            assert_eq!(recovery_fanza_calls.get(), 1);
+            let recovered_metadata =
+                resolve_metadata(&state, &fixture.path, &authority, 2, || true)
+                    .expect("agreed metadata must become current after full retry");
+            assert_eq!(recovered_metadata[2], "automatic");
+            assert_eq!(recovered_metadata[3], "current");
+            assert!(!state
+                .0
+                .lock()
+                .expect("the recovered authority must remain readable")
+                .identity_recovery_required
+                .contains(&(authority.category, authority.code.clone())));
 
             let restarted_resolution = Cell::new(false);
             let restarted = resolve_cover_at_with(
                 &LibraryPresentationState::default(),
                 &fixture.path,
                 &authority,
-                101,
+                102,
                 || true,
                 || {
                     restarted_resolution.set(true);
                     (None, None, false)
                 },
             )
-            .expect("restart must not restore the conflicted identity");
-            assert!(restarted_resolution.get());
-            assert_eq!(restarted[2], "missing");
-            assert_eq!(&restarted[8..], ["", "", ""]);
+            .expect("restart must restore only the later agreed identity");
+            assert!(!restarted_resolution.get());
+            assert_eq!(restarted[2], "ready");
+            assert_eq!(&restarted[8..], ["JavDB", "item", fanza_display]);
+        }
+    }
+
+    #[test]
+    fn fresh_provider_identity_reconciles_with_current_persistent_identity() {
+        let scenarios = [
+            (
+                "same-provider-item-cawb",
+                LibraryPresentationCategory::Adult,
+                "CAWB-1",
+                verified_javdb("olditem", "CAWB-001"),
+                verified_javdb("newitem", "CAWB-001"),
+                None,
+            ),
+            (
+                "same-provider-display-cawb",
+                LibraryPresentationCategory::Adult,
+                "CAWB-1",
+                verified_javdb("item", "CAWB-001"),
+                verified_javdb("item", "CAWB-0001"),
+                None,
+            ),
+            (
+                "cross-provider-display-cawb",
+                LibraryPresentationCategory::Adult,
+                "CAWB-1",
+                verified_fanza("cawb00001", "CAWB-001"),
+                verified_javdb("item", "CAWB-0001"),
+                None,
+            ),
+            (
+                "cross-provider-display-3dsvr",
+                LibraryPresentationCategory::Vr,
+                "3DSVR-01871",
+                verified_fanza("13dsvr01871", "3DSVR-01871"),
+                verified_javdb("item", "3DSVR-1871"),
+                None,
+            ),
+            (
+                "exact-agreement-cawb",
+                LibraryPresentationCategory::Adult,
+                "CAWB-1",
+                verified_fanza("cawb00001", "CAWB-001"),
+                verified_javdb("item", "CAWB-001"),
+                Some(verified_javdb("item", "CAWB-001")),
+            ),
+            (
+                "exact-agreement-3dsvr",
+                LibraryPresentationCategory::Vr,
+                "3DSVR-01871",
+                verified_fanza("13dsvr01871", "3DSVR-01871"),
+                verified_javdb("item", "3DSVR-01871"),
+                Some(verified_javdb("item", "3DSVR-01871")),
+            ),
+        ];
+        for (index, (label, category, code, current, candidate, expected)) in
+            scenarios.into_iter().enumerate()
+        {
+            let fixture = CacheFixture::new(label);
+            let authority = LibraryItemAuthority {
+                category,
+                identity: format!("8{index:039x}"),
+                code: code.to_owned(),
+                product_identity: crate::vr_torrent::canonical_product_code(code)
+                    .expect("fixture code must be canonicalizable"),
+            };
+            write_cache(
+                &fixture.path,
+                &[CacheEntry {
+                    identity: authority.identity.clone(),
+                    category,
+                    code: code.to_owned(),
+                    identity_saved_at: 90,
+                    verified_identity: Some(current.clone()),
+                    cover_saved_at: 0,
+                    cover_state: "missing",
+                    cover: None,
+                    metadata_saved_at: 0,
+                    metadata_state: "missing",
+                    metadata: PresentationMetadata::default(),
+                }],
+            )
+            .expect("the current identity fixture must be durable");
+            let state = LibraryPresentationState::default();
+            begin_cover_request(&state, category, code, 1)
+                .expect("the fresh provider request must begin");
+            let response = resolve_cover_at_with_request(
+                &state,
+                &fixture.path,
+                &authority,
+                1,
+                100,
+                || true,
+                |received_current| {
+                    assert_eq!(received_current, Some(current.clone()));
+                    (None, Some(identity_evidence(candidate.clone())), false)
+                },
+            )
+            .expect("identity reconciliation must return a current response");
+            match expected {
+                Some(expected) => {
+                    assert_eq!(response[2], "missing");
+                    assert_eq!(
+                        &response[8..],
+                        [
+                            expected.provider,
+                            expected.provider_id.as_str(),
+                            expected.display_code.as_str(),
+                        ]
+                    );
+                    let cache = read_cache(&fixture.path)
+                        .expect("the agreed identity cache must remain readable");
+                    assert_eq!(cache.len(), 1);
+                    assert_eq!(cache[0].verified_identity, Some(expected));
+                }
+                None => {
+                    assert_eq!(response[2], "unavailable");
+                    assert_eq!(&response[8..], ["", "", ""]);
+                    assert!(read_cache(&fixture.path)
+                        .expect("conflict cleanup must leave a valid cache")
+                        .is_empty());
+                    assert!(state
+                        .0
+                        .lock()
+                        .expect("conflict state must remain readable")
+                        .identity_conflicts
+                        .contains(&metadata_seed_key(&authority, 1)));
+                    let restarted_provider = Cell::new(false);
+                    resolve_cover_at_with(
+                        &LibraryPresentationState::default(),
+                        &fixture.path,
+                        &authority,
+                        101,
+                        || true,
+                        || {
+                            restarted_provider.set(true);
+                            (None, None, false)
+                        },
+                    )
+                    .expect("restart after conflict must require fresh provider work");
+                    assert!(restarted_provider.get());
+                }
+            }
         }
     }
 
@@ -3571,7 +3955,7 @@ mod tests {
             1,
             100,
             || true,
-            || {
+            |_| {
                 (
                     Some((cover("item", 16.0 / 9.0), jpeg(1600, 900))),
                     None,
@@ -3602,7 +3986,7 @@ mod tests {
             2,
             101,
             || true,
-            || panic!("fresh cached source must skip provider discovery"),
+            |_| panic!("fresh cached source must skip provider discovery"),
         )
         .expect("cached source must create one current authority");
         assert_eq!(
@@ -3634,13 +4018,13 @@ mod tests {
             1,
             100,
             || true,
-            || {
+            |_| {
                 (
                     None,
                     Some(PresentationMetadata {
-                        verified_identity: Some(verified_javdb("olditem", &authority.code)),
+                        verified_identity: Some(verified_javdb("currentitem", &authority.code)),
                         source: Some("JavDB".to_owned()),
-                        provider_id: Some("olditem".to_owned()),
+                        provider_id: Some("currentitem".to_owned()),
                         display_code: Some(authority.code.clone()),
                         title: Some("Old metadata".to_owned()),
                         ..PresentationMetadata::default()
@@ -3673,13 +4057,13 @@ mod tests {
             1,
             100,
             || true,
-            || {
+            |_| {
                 (
                     None,
                     Some(PresentationMetadata {
-                        verified_identity: Some(verified_javdb("olditem", &authority.code)),
+                        verified_identity: Some(verified_javdb("currentitem", &authority.code)),
                         source: Some("JavDB".to_owned()),
-                        provider_id: Some("olditem".to_owned()),
+                        provider_id: Some("currentitem".to_owned()),
                         display_code: Some(authority.code.clone()),
                         title: Some("Old metadata".to_owned()),
                         ..PresentationMetadata::default()
@@ -3701,13 +4085,13 @@ mod tests {
             2,
             101,
             || true,
-            || {
+            |_| {
                 (
                     None,
                     Some(PresentationMetadata {
-                        verified_identity: Some(verified_javdb("newitem", &authority.code)),
+                        verified_identity: Some(verified_javdb("currentitem", &authority.code)),
                         source: Some("JavDB".to_owned()),
-                        provider_id: Some("newitem".to_owned()),
+                        provider_id: Some("currentitem".to_owned()),
                         display_code: Some(authority.code.clone()),
                         title: Some("New metadata".to_owned()),
                         ..PresentationMetadata::default()
@@ -3724,7 +4108,7 @@ mod tests {
         assert_eq!(state.0.lock().unwrap().verified_identity_seeds.len(), 1);
         let metadata = resolve_metadata(&state, &fixture.path, &authority, 2, || true)
             .expect("the current request must consume only its own seed");
-        assert_eq!(metadata[5], "newitem");
+        assert_eq!(metadata[5], "currentitem");
         assert_eq!(metadata[10], "New metadata");
         assert!(state.0.lock().unwrap().metadata_seeds.is_empty());
         assert!(state.0.lock().unwrap().verified_identity_seeds.is_empty());
@@ -3750,7 +4134,7 @@ mod tests {
                 generation,
                 100 + generation,
                 || true,
-                || {
+                |_| {
                     (
                         None,
                         Some(PresentationMetadata {
@@ -3916,7 +4300,7 @@ mod tests {
                 1,
                 10,
                 || true,
-                || (None, None, false),
+                |_| (None, None, false),
             ),
             Err(LIBRARY_PRESENTATION_STALE)
         );
@@ -4039,7 +4423,7 @@ mod tests {
                     Some((
                         CoverSource {
                             provider: "JavDB",
-                            provider_id: "replacement".to_owned(),
+                            provider_id: "unusable".to_owned(),
                             display_code: "MDVR-419".to_owned(),
                             url: "https://tp.cmastd.com/replacement.jpg".to_owned(),
                             aspect_ratio: 0.72,
@@ -4072,6 +4456,7 @@ mod tests {
         let metadata = PresentationMetadata {
             verified_identity: Some(verified_javdb("item", "ADLT-123")),
             identity_conflict: false,
+            complete_identity_agreement: false,
             source: Some("JavDB".to_owned()),
             provider_id: Some("item".to_owned()),
             display_code: Some("ADLT-123".to_owned()),
@@ -4084,6 +4469,7 @@ mod tests {
             &LibraryPresentationState::default(),
             &fixture.path,
             &authority,
+            None,
             100,
             || true,
             || {
@@ -4098,6 +4484,7 @@ mod tests {
             &LibraryPresentationState::default(),
             &fixture.path,
             &authority,
+            None,
             100 + METADATA_TTL_SECONDS,
             || true,
             || panic!("fresh metadata must not repeat provider work after restart"),
@@ -4117,6 +4504,7 @@ mod tests {
             &LibraryPresentationState::default(),
             &fixture.path,
             &stale_authority,
+            None,
             200,
             || current.get(),
             || {
@@ -4167,6 +4555,7 @@ mod tests {
                 &LibraryPresentationState::default(),
                 &fixture.path,
                 &authority,
+                None,
                 100,
                 || true,
                 || Ok(Some(metadata)),
@@ -4183,6 +4572,7 @@ mod tests {
                 &LibraryPresentationState::default(),
                 &fixture.path,
                 &authority,
+                None,
                 101,
                 || true,
                 || panic!("restart must use the durable metadata identity"),
@@ -4243,10 +4633,14 @@ mod tests {
                 title: Some("Conflicting metadata".to_owned()),
                 ..PresentationMetadata::default()
             };
+            let state = LibraryPresentationState::default();
+            begin_cover_request(&state, authority.category, &authority.code, 1)
+                .expect("the metadata conflict request must begin");
             let response = resolve_metadata_at_with(
-                &LibraryPresentationState::default(),
+                &state,
                 &fixture.path,
                 &authority,
+                Some(1),
                 100,
                 || true,
                 || Ok(Some(metadata)),
@@ -4255,6 +4649,12 @@ mod tests {
             assert_eq!(&response[2..7], ["unavailable", "conflict", "", "", ""]);
             assert!(read_cache(&fixture.path)
                 .expect("conflicting presentation must not survive restart")
+                .is_empty());
+            let retry = resolve_metadata(&state, &fixture.path, &authority, 1, || true)
+                .expect("metadata Retry must retain the current hard conflict");
+            assert_eq!(&retry[2..7], ["unavailable", "conflict", "", "", ""]);
+            assert!(read_cache(&fixture.path)
+                .expect("metadata Retry must not recreate a successful cache")
                 .is_empty());
         }
     }
@@ -4295,6 +4695,7 @@ mod tests {
             &LibraryPresentationState::default(),
             &fixture.path,
             &authority,
+            None,
             100,
             || true,
             || {
