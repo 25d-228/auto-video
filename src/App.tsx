@@ -2678,6 +2678,9 @@ function javdbBrowseItemKey(item: JavdbBrowseItem) {
   return `${item.category}:${item.requestGeneration}:${item.providerItemId}`;
 }
 
+const stableLibraryPaginationRatios = new Map<string, number>();
+const unresolvedLibraryCoverPlanningRatio = 1.48;
+
 function NaturalWidthBrowseGallery<Item>({
   ariaLabel,
   gallery = "discover",
@@ -2732,7 +2735,7 @@ function NaturalWidthBrowseGallery<Item>({
     items,
     itemKey,
     sourceRatio,
-    ratios,
+    gallery === "library" ? stableLibraryPaginationRatios : ratios,
     bounds.width,
     bounds.height,
   );
@@ -17071,7 +17074,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           />
                         )}
                         selectedPage={adultLibrarySelectedPage}
-                        sourceRatio={() => 0.72}
+                        sourceRatio={() => unresolvedLibraryCoverPlanningRatio}
                       />
                     )}
                   </>
@@ -17147,7 +17150,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         />
                       )}
                       selectedPage={vrLibrarySelectedPage}
-                      sourceRatio={() => 0.72}
+                      sourceRatio={() => unresolvedLibraryCoverPlanningRatio}
                     />
                   )}
                 </>

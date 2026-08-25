@@ -83,6 +83,9 @@ function exactMultipartLabel(title: string) {
   return matches[0][2];
 }
 
+const olmLibrarySuffixPattern =
+  /(^|[^A-Za-z0-9])(OLM)[ _-]*([0-9]{1,10})E(?=$|[^A-Za-z0-9])/gi;
+
 function adultLibraryProductCode(title: string) {
   const candidates = productCodeCandidates(title)
     .filter(
@@ -90,6 +93,10 @@ function adultLibraryProductCode(title: string) {
         adultLibraryProductCodePrefixIsSupported(candidate.prefix) &&
         !multipartIdentityPrefixes.has(candidate.prefix),
     );
+  for (const match of title.matchAll(olmLibrarySuffixPattern)) {
+    const candidate = productCodeCandidates(`${match[2]}-${match[3]}`)[0];
+    if (candidate !== undefined) candidates.push(candidate);
+  }
   const identities = new Set(candidates.map((candidate) => candidate.code));
   return identities.size === 1 ? candidates[0] : null;
 }

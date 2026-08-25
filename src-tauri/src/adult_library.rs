@@ -66,9 +66,47 @@ pub struct AdultLibraryState(Arc<Mutex<AdultLibraryContext>>);
 
 const MULTIPART_IDENTITY_PREFIXES: &[&str] = &["PART", "CD", "DISC", "DISK"];
 
+fn olm_library_suffix_candidates(title: &str) -> Vec<(String, String)> {
+    let bytes = title.as_bytes();
+    let mut candidates = Vec::new();
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        if (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
+            && bytes[index..index + 3].eq_ignore_ascii_case(b"OLM")
+        {
+            let mut number_start = index + 3;
+            while number_start < bytes.len() && matches!(bytes[number_start], b' ' | b'_' | b'-') {
+                number_start += 1;
+            }
+            let mut number_end = number_start;
+            while number_end < bytes.len() && bytes[number_end].is_ascii_digit() {
+                number_end += 1;
+            }
+            let number_length = number_end - number_start;
+            if (1..=10).contains(&number_length)
+                && bytes
+                    .get(number_end)
+                    .is_some_and(|suffix| *suffix == b'E' || *suffix == b'e')
+                && bytes
+                    .get(number_end + 1)
+                    .is_none_or(|next| !next.is_ascii_alphanumeric())
+            {
+                let digits = &title[number_start..number_end];
+                if let Ok(number) = digits.parse::<u64>() {
+                    if number > 0 {
+                        candidates.push((format!("OLM-{number}"), format!("OLM-{digits}")));
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    candidates
+}
+
 fn exact_file_product_code(path: &Path) -> Option<(String, String)> {
     let title = path.file_stem()?.to_str()?;
-    let candidates = product_code_candidates_with_display(title)
+    let mut candidates = product_code_candidates_with_display(title)
         .into_iter()
         .filter(|(_, prefix, _)| {
             adult_library_product_code_prefix_is_supported(prefix)
@@ -76,6 +114,7 @@ fn exact_file_product_code(path: &Path) -> Option<(String, String)> {
         })
         .map(|(identity, _, display)| (identity, display))
         .collect::<Vec<_>>();
+    candidates.extend(olm_library_suffix_candidates(title));
     let mut identities = candidates
         .iter()
         .map(|(identity, _)| identity)
@@ -532,6 +571,12 @@ mod tests {
             "459ten_0048-B.MKV",
             "CAWB-001-A.mp4",
             "cawb_00001-B.MKV",
+            "OLM-332E.mp4",
+            "olm_00332e bonus.MKV",
+            "OLM-333X.mp4",
+            "OLM-334EE.mp4",
+            "OLM-335E + ADLT-123.mp4",
+            "300MIUM-1369.mp4",
             "3DSVR-01871-A.mp4",
             "unassociated.mp4",
         ] {
@@ -560,6 +605,20 @@ mod tests {
             .expect("the exact local CAWB display form must authorize its numeric identity");
         assert_eq!(cawb.code, "CAWB-001");
         assert_eq!(cawb.product_identity, "CAWB-1");
+        let olm = adult_library_presentation_authority(&state, generation, "OLM-332")
+            .expect("the evidenced OLM E suffix must retain the exact provider identity");
+        assert_eq!(olm.code, "OLM-332");
+        assert_eq!(olm.product_identity, "OLM-332");
+        for rejected in ["OLM-333", "OLM-334", "OLM-335"] {
+            assert_eq!(
+                adult_library_presentation_authority(&state, generation, rejected),
+                Err(ADULT_LIBRARY_STALE)
+            );
+        }
+        let mium = adult_library_presentation_authority(&state, generation, "300MIUM-1369")
+            .expect("the exact reported digit-leading Adult item must authorize presentation");
+        assert_eq!(mium.code, "300MIUM-1369");
+        assert_eq!(mium.product_identity, "300MIUM-1369");
         assert_eq!(
             adult_library_presentation_authority(&state, generation, "CAWB-1"),
             Err(ADULT_LIBRARY_STALE)

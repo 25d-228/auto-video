@@ -510,6 +510,7 @@ mod tests {
             "3DSVR-01871B.mp4",
             "459TEN-00048.mp4",
             "3DSVR-01871-A + MDVR-419.mp4",
+            "DSVR-00069.mp4",
         ] {
             fs::write(fixture.path.join(name), name.as_bytes()).expect("VR member must be written");
         }
@@ -525,6 +526,11 @@ mod tests {
         assert_eq!(authority.category, LibraryPresentationCategory::Vr);
         assert_eq!(authority.code, "3DSVR-01871");
         assert_eq!(authority.identity.len(), 40);
+        let dsvr =
+            vr_library_presentation_authority(&state, generation, &fixture.path, "DSVR-00069")
+                .expect("the exact reported DSVR group must authorize presentation");
+        assert_eq!(dsvr.code, "DSVR-00069");
+        assert_eq!(dsvr.product_identity, "DSVR-69");
         let neighbor =
             vr_library_presentation_authority(&state, generation, &fixture.path, "3DSVR-01872")
                 .expect("a neighboring exact code must remain a separate group");

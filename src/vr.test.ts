@@ -144,6 +144,7 @@ describe("parsed VR Library identity", () => {
     const extended = "/VR/3DSVR-01871B.mp4";
     const adultOnly = "/VR/459TEN-00048.mp4";
     const mixed = "/VR/3DSVR-01871-A + MDVR-419.mp4";
+    const dsvr = "/VR/DSVR-00069.mp4";
     invokeMock.mockResolvedValue([
       "12",
       first,
@@ -160,6 +161,8 @@ describe("parsed VR Library identity", () => {
       "38",
       mixed,
       "40",
+      dsvr,
+      "42",
       "/VR/3DSVR-01872-A.mp4",
       "45",
     ]);
@@ -176,6 +179,10 @@ describe("parsed VR Library identity", () => {
     expect(items.find((item) => item.id === `file:${extended}`)?.code).toBeNull();
     expect(items.find((item) => item.id === `file:${adultOnly}`)?.code).toBeNull();
     expect(items.find((item) => item.id === `file:${mixed}`)?.code).toBeNull();
+    expect(items.find((item) => item.code === "DSVR-00069")).toMatchObject({
+      id: "code:DSVR-69",
+      files: [{ path: dsvr }],
+    });
     expect(items.find((item) => item.code === "3DSVR-01872")?.files).toHaveLength(1);
   });
 

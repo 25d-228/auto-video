@@ -3463,16 +3463,16 @@ describe("parsed Adult Library and Dashboard", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
     await screen.findByRole("heading", { level: 3, name: "ADLT-101" });
     let gallery = document.querySelector('[data-gallery="library"]');
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("14");
-    expect(visibleCardCount("Adult titles and unassociated files")).toBe(14);
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("6");
+    expect(visibleCardCount("Adult titles and unassociated files")).toBe(6);
     fireEvent.click(screen.getByRole("button", { name: /Next Adult titles/ }));
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
 
     resizeGallery("library", 1528, 136);
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("10");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("5");
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
     resizeGallery("library", 1088, 284);
-    expect(gallery?.getAttribute("data-page-capacity")).toBe("7");
+    expect(gallery?.getAttribute("data-page-capacity")).toBe("3");
     expect(gallery?.getAttribute("data-current-page")).toBe("2");
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
@@ -4051,7 +4051,7 @@ describe("parsed Adult Library and Dashboard", () => {
 
   it("removing the final grouped Adult member clamps only an invalid page", async () => {
     savedAdultFolder = "/Adult";
-    const rows = Array.from({ length: 29 }, (_, index) => {
+    const rows = Array.from({ length: 31 }, (_, index) => {
       const code = `ADLT-${String(index + 101)}`;
       return [`/Adult/${code}.mp4`, `${code}.mp4`, "1"];
     }).flat();
@@ -4064,30 +4064,30 @@ describe("parsed Adult Library and Dashboard", () => {
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
     await screen.findByRole("heading", { level: 3, name: "ADLT-101" });
-    for (let page = 1; page < 5; page += 1) {
+    for (let page = 1; page < 11; page += 1) {
       fireEvent.click(
         screen.getByRole("button", {
           name: "Next Adult titles and unassociated files page",
         }),
       );
     }
-    expect(screen.getByText("Page 5 of 5")).toBeTruthy();
+    expect(screen.getByText("Page 11 of 11")).toBeTruthy();
     fireEvent.click(
       libraryDetailsAction(
-        "Move Adult file to Trash or Recycle Bin: ADLT-129.mp4",
+        "Move Adult file to Trash or Recycle Bin: ADLT-131.mp4",
       ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
       within(dialog).getByRole("button", {
-        name: "Confirm moving Adult file to Trash or Recycle Bin: ADLT-129.mp4",
+        name: "Confirm moving Adult file to Trash or Recycle Bin: ADLT-131.mp4",
       }),
     );
 
-    expect(await screen.findByText("Page 4 of 4")).toBeTruthy();
-    expect(screen.queryByRole("heading", { level: 3, name: "ADLT-129" }))
+    expect(await screen.findByText("Page 10 of 10")).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 3, name: "ADLT-131" }))
       .toBeNull();
-    expect(screen.getByRole("heading", { level: 3, name: "ADLT-128" }))
+    expect(screen.getByRole("heading", { level: 3, name: "ADLT-130" }))
       .toBeTruthy();
     expect(scanAdultLibraryMock).toHaveBeenCalledTimes(2);
     expect(queryAdultStorageMock).toHaveBeenCalledTimes(2);
@@ -4411,18 +4411,18 @@ describe("parsed VR Library and Dashboard", () => {
     await screen.findByRole("heading", { level: 3, name: "MDVR-101" });
 
     resizeGallery("library", 1088, 728);
-    expect(visibleCardCount("VR titles")).toBe(14);
+    expect(visibleCardCount("VR titles")).toBe(6);
     resizeGallery("library", 1528, 136);
-    expect(visibleCardCount("VR titles")).toBe(10);
-    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    expect(visibleCardCount("VR titles")).toBe(5);
+    expect(screen.getByText("Page 1 of 5")).toBeTruthy();
     fireEvent.click(
       screen.getByRole("button", { name: "Next VR titles page" }),
     );
-    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 5")).toBeTruthy();
     resizeGallery("library", 1088, 284);
-    expect(visibleCardCount("VR titles")).toBe(7);
-    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
-    expect(screen.getByRole("heading", { level: 3, name: "MDVR-108" }))
+    expect(visibleCardCount("VR titles")).toBe(3);
+    expect(screen.getByText("Page 2 of 9")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "MDVR-104" }))
       .toBeTruthy();
 
     fireEvent.change(screen.getByRole("textbox", { name: "Search titles" }), {
@@ -4879,7 +4879,7 @@ describe("parsed VR Library and Dashboard", () => {
 
   it("removing the final grouped VR member clamps only an invalid page", async () => {
     savedVrFolder = "/VR";
-    const rows = Array.from({ length: 29 }, (_, index) => {
+    const rows = Array.from({ length: 31 }, (_, index) => {
       const code = `MDVR-${String(index + 101)}`;
       return [`/VR/${code}.mp4`, "1"];
     }).flat();
@@ -4892,28 +4892,28 @@ describe("parsed VR Library and Dashboard", () => {
     selectLibrary();
     fireEvent.click(screen.getByRole("radio", { name: "VR" }));
     await screen.findByRole("heading", { level: 3, name: "MDVR-101" });
-    for (let page = 1; page < 5; page += 1) {
+    for (let page = 1; page < 11; page += 1) {
       fireEvent.click(
         screen.getByRole("button", { name: "Next VR titles page" }),
       );
     }
-    expect(screen.getByText("Page 5 of 5")).toBeTruthy();
+    expect(screen.getByText("Page 11 of 11")).toBeTruthy();
     fireEvent.click(
       libraryDetailsAction(
-        "Move VR file to Trash or Recycle Bin: MDVR-129.mp4",
+        "Move VR file to Trash or Recycle Bin: MDVR-131.mp4",
       ),
     );
     const dialog = await screen.findByRole("alertdialog");
     fireEvent.click(
       within(dialog).getByRole("button", {
-        name: "Confirm moving VR file to Trash or Recycle Bin: MDVR-129.mp4",
+        name: "Confirm moving VR file to Trash or Recycle Bin: MDVR-131.mp4",
       }),
     );
 
-    expect(await screen.findByText("Page 4 of 4")).toBeTruthy();
-    expect(screen.queryByRole("heading", { level: 3, name: "MDVR-129" }))
+    expect(await screen.findByText("Page 10 of 10")).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 3, name: "MDVR-131" }))
       .toBeNull();
-    expect(screen.getByRole("heading", { level: 3, name: "MDVR-128" }))
+    expect(screen.getByRole("heading", { level: 3, name: "MDVR-130" }))
       .toBeTruthy();
     expect(scanVrLibraryMock).toHaveBeenCalledTimes(2);
     expect(queryVrStorageMock).toHaveBeenCalledTimes(2);
@@ -17379,6 +17379,106 @@ describe("Movies Library title sorting", () => {
 });
 
 describe("explicit Library cover recovery", () => {
+  it.each([
+    ["Adult", "Adult titles and unassociated files", "ADLT", "adult"],
+    ["VR", "VR titles", "MDVR", "vr"],
+  ] as const)(
+    "keeps %s page totals and membership stable as later-page cover ratios arrive",
+    async (categoryLabel, listName, prefix, category) => {
+      const codes = Array.from(
+        { length: 14 },
+        (_, index) => `${prefix}-${501 + index}`,
+      );
+      if (category === "adult") {
+        savedAdultFolder = "/Adult";
+        scanAdultLibraryMock.mockResolvedValue(
+          codes.flatMap((code) => [
+            `/Adult/${code}.mp4`,
+            `${code}.mp4`,
+            "1",
+          ]),
+        );
+      } else {
+        savedVrFolder = "/VR";
+        scanVrLibraryMock.mockResolvedValue(
+          codes.flatMap((code) => [`/VR/${code}.mp4`, "1"]),
+        );
+      }
+      gallerySizes.library = { width: 600, height: 536 };
+      resolveLibraryCoverMock.mockImplementation((parameters) => {
+        const itemId = parameters?.itemId as string;
+        const itemIndex = codes.indexOf(itemId);
+        expect(itemIndex).toBeGreaterThanOrEqual(0);
+        return Promise.resolve([
+          "library-cover-v3",
+          category,
+          "ready",
+          "JavDB",
+          `item${itemIndex + 1}`,
+          itemId,
+          `library-cover-${itemIndex.toString(16).padStart(40, "0")}`,
+          itemIndex % 2 === 0 ? "0.5" : "1.48",
+          "JavDB",
+          `item${itemIndex + 1}`,
+          itemId,
+        ]);
+      });
+      fetchLibraryCoverMock.mockResolvedValue([0xff, 0xd8]);
+
+      render(<App />);
+      selectLibrary();
+      fireEvent.click(screen.getByRole("radio", { name: categoryLabel }));
+      await screen.findByRole("heading", { level: 3, name: codes[0] });
+
+      const gallery = document.querySelector('[data-gallery="library"]');
+      const visibleTitles = () =>
+        within(screen.getByRole("list", { name: listName }))
+          .getAllByRole("heading", { level: 3 })
+          .map((heading) => heading.textContent);
+      const expectContainedCards = () => {
+        const cards = within(screen.getByRole("list", { name: listName }))
+          .getAllByRole("article") as HTMLElement[];
+        expect(cards).toHaveLength(4);
+        expect(
+          cards.every((card) => Number.parseFloat(card.style.width) <= 266),
+        ).toBe(true);
+      };
+      await waitFor(() =>
+        expect(resolveLibraryCoverMock).toHaveBeenCalledTimes(4),
+      );
+      expect(gallery?.getAttribute("data-page-count")).toBe("4");
+      expect(gallery?.getAttribute("data-page-capacity")).toBe("4");
+      expect(visibleTitles()).toEqual(codes.slice(0, 4));
+      expectContainedCards();
+
+      fireEvent.click(
+        screen.getByRole("button", { name: `Next ${listName} page` }),
+      );
+      await waitFor(() =>
+        expect(resolveLibraryCoverMock).toHaveBeenCalledTimes(8),
+      );
+      expect(gallery?.getAttribute("data-page-count")).toBe("4");
+      expect(gallery?.getAttribute("data-page-capacity")).toBe("4");
+      expect(visibleTitles()).toEqual(codes.slice(4, 8));
+      expectContainedCards();
+
+      fireEvent.click(
+        screen.getByRole("button", { name: `Next ${listName} page` }),
+      );
+      await waitFor(() =>
+        expect(resolveLibraryCoverMock).toHaveBeenCalledTimes(12),
+      );
+      expect(gallery?.getAttribute("data-page-count")).toBe("4");
+      expect(visibleTitles()).toEqual(codes.slice(8, 12));
+      expectContainedCards();
+      expect(
+        category === "adult" ? scanAdultLibraryMock : scanVrLibraryMock,
+      ).toHaveBeenCalledTimes(1);
+      expect(fetchJavdbBrowseMock).not.toHaveBeenCalled();
+      expect(fetchFanzaCatalogMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("resolves one exact 3DSVR group without starting presentation for rejected digit-leading files", async () => {
     savedVrFolder = "/VR";
     scanVrLibraryMock.mockResolvedValue([

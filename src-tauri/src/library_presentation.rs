@@ -3499,6 +3499,112 @@ mod tests {
     }
 
     #[test]
+    fn reported_library_codes_use_only_exact_provider_evidence() {
+        let olm = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "o".repeat(40),
+            code: "OLM-332".to_owned(),
+            product_identity: "OLM-332".to_owned(),
+        };
+        let olm_queries = std::cell::RefCell::new(Vec::new());
+        let olm_cover = resolve_cover_with(
+            &olm,
+            |url| {
+                olm_queries.borrow_mut().push(url.to_owned());
+                Ok(if url.contains("search") {
+                    javdb_listing("OLM-332")
+                } else {
+                    javdb_detail("OLM-332", olm.category)
+                })
+            },
+            |_| Ok(jpeg(1600, 1080)),
+            |_| panic!("FANZA must not run after the exact OLM JavDB cover"),
+            |_| panic!("FANZA image must not run"),
+            |_| panic!("legacy must not run after the exact OLM JavDB cover"),
+            |_| panic!("legacy image must not run"),
+        )
+        .0
+        .expect("the OLM filename suffix must query its exact provider identity")
+        .0;
+        assert_eq!(olm_cover.provider, "JavDB");
+        assert_eq!(olm_cover.display_code, "OLM-332");
+        assert!(olm_queries.borrow().iter().all(|url| !url.contains("332E")));
+
+        let mium = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "m".repeat(40),
+            code: "300MIUM-1369".to_owned(),
+            product_identity: "300MIUM-1369".to_owned(),
+        };
+        let (mium_cover, _, mium_transient) = resolve_cover_with(
+            &mium,
+            |_| Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned()),
+            |_| panic!("a JavDB no-match has no image request"),
+            |_| panic!("an unsupported FANZA family has no speculative request"),
+            |_| panic!("an unsupported FANZA family has no image request"),
+            |_| Err(ProviderRequestError::SourceUnavailable),
+            |_| panic!("an unavailable legacy source has no image request"),
+        );
+        assert!(mium_cover.is_none());
+        assert!(mium_transient);
+
+        let dsvr = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Vr,
+            identity: "d".repeat(40),
+            code: "DSVR-00069".to_owned(),
+            product_identity: "DSVR-69".to_owned(),
+        };
+        let dsvr_image_dispatched = Cell::new(false);
+        let (dsvr_cover, _, dsvr_transient) = resolve_cover_with(
+            &dsvr,
+            |url| {
+                Ok(if url.contains("search?q=DSVR-69&") {
+                    r#"{"success":1,"data":{"movies":[{"id":"older","number":"DSVR-069","title":"Older exact identity","cover_url":"https://tp.cmastd.com/older.jpg"},{"id":"current","number":"DSVR-069","title":"Different exact identity","cover_url":"https://tp.cmastd.com/current.jpg"}]}}"#.to_owned()
+                } else {
+                    r#"{"success":1,"data":{"movies":[]}}"#.to_owned()
+                })
+            },
+            |_| {
+                dsvr_image_dispatched.set(true);
+                Ok(jpeg(600, 800))
+            },
+            |_| panic!("an unsupported FANZA family has no speculative request"),
+            |_| panic!("an unsupported FANZA family has no image request"),
+            |_| {
+                Ok(r#"{"content_id":"dsvr00069","images":{"jacket_image":{"large2":"https://pics.dmm.co.jp/digital/video/dsvr00069/dsvr00069pl.jpg"}}}"#.to_owned())
+            },
+            |_| panic!("legacy proof without provider display identity has no image request"),
+        );
+        assert!(dsvr_cover.is_none());
+        assert!(dsvr_transient);
+        assert!(!dsvr_image_dispatched.get());
+
+        let three_dsvr = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Vr,
+            identity: "3".repeat(40),
+            code: "3DSVR-01871".to_owned(),
+            product_identity: "3DSVR-1871".to_owned(),
+        };
+        let three_dsvr_cover = resolve_cover_with(
+            &three_dsvr,
+            |_| Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned()),
+            |_| panic!("a JavDB no-match has no image request"),
+            |body| {
+                assert!(body.contains("c0:ppvContent(id:\"13dsvr01871\")"));
+                Ok(r#"{"data":{"c0":{"id":"13dsvr01871","contentType":"VR","title":"Exact VR","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/13dsvr01871/13dsvr01871pl.jpg"}}}}"#.to_owned())
+            },
+            |_| Ok(jpeg(600, 800)),
+            |_| panic!("legacy must not run after the exact FANZA cover"),
+            |_| panic!("legacy image must not run"),
+        )
+        .0
+        .expect("the exact mapped 3DSVR cover must resolve")
+        .0;
+        assert_eq!(three_dsvr_cover.provider, "FANZA");
+        assert_eq!(three_dsvr_cover.display_code, "3DSVR-01871");
+    }
+
+    #[test]
     fn distinct_javdb_cover_alternatives_dispatch_only_the_preferred_cover() {
         let authority = authority(LibraryPresentationCategory::Vr);
         let image_calls = Cell::new(0);

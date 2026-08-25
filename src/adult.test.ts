@@ -46,11 +46,48 @@ describe("Adult folder and storage boundaries", () => {
 });
 
 describe("conservative parsed Adult Library identity", () => {
+  it("accepts only the evidenced OLM E filename suffix as the exact provider identity", async () => {
+    const suffixed = "/Adult/OLM-332E.mp4";
+    const padded = "/Adult/olm_00332e bonus.MKV";
+    const arbitrarySuffix = "/Adult/OLM-333X.mp4";
+    const extendedSuffix = "/Adult/OLM-334EE.mp4";
+    const mixed = "/Adult/OLM-335E + ADLT-123.mp4";
+    invokeMock.mockResolvedValue([
+      "17",
+      suffixed,
+      "OLM-332E.mp4",
+      "1",
+      padded,
+      "olm_00332e bonus.MKV",
+      "2",
+      arbitrarySuffix,
+      "OLM-333X.mp4",
+      "3",
+      extendedSuffix,
+      "OLM-334EE.mp4",
+      "4",
+      mixed,
+      "OLM-335E + ADLT-123.mp4",
+      "5",
+    ]);
+
+    const { items } = await scanAdultLibrary();
+
+    expect(items.find((item) => item.code === "OLM-332")).toMatchObject({
+      id: "code:OLM-332",
+      files: [{ path: suffixed }, { path: padded }],
+    });
+    for (const path of [arbitrarySuffix, extendedSuffix, mixed]) {
+      expect(items.find((item) => item.id === `file:${path}`)?.code).toBeNull();
+    }
+  });
+
   it("groups evidenced Adult maker prefixes without accepting the VR-only 3DSVR family", async () => {
     const first = "/Adult/459TEN-00048-A.mp4";
     const second = "/Adult/459ten_0048-B.MKV";
     const cawbFirst = "/Adult/CAWB-001-A.mp4";
     const cawbSecond = "/Adult/cawb_00001-B.MKV";
+    const mium = "/Adult/300MIUM-1369.mp4";
     const vrOnly = "/Adult/3DSVR-01871-A.mp4";
     invokeMock.mockResolvedValue([
       "13",
@@ -66,9 +103,12 @@ describe("conservative parsed Adult Library identity", () => {
       cawbSecond,
       "cawb_00001-B.MKV",
       "4",
+      mium,
+      "300MIUM-1369.mp4",
+      "5",
       vrOnly,
       "3DSVR-01871-A.mp4",
-      "5",
+      "6",
     ]);
 
     const { items } = await scanAdultLibrary();
@@ -80,6 +120,10 @@ describe("conservative parsed Adult Library identity", () => {
     expect(items.find((item) => item.code === "CAWB-001")).toMatchObject({
       id: "code:CAWB-1",
       files: [{ path: cawbFirst }, { path: cawbSecond }],
+    });
+    expect(items.find((item) => item.code === "300MIUM-1369")).toMatchObject({
+      id: "code:300MIUM-1369",
+      files: [{ path: mium }],
     });
     expect(items.find((item) => item.id === `file:${vrOnly}`)?.code).toBeNull();
   });
