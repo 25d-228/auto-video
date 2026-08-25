@@ -254,7 +254,7 @@ describe("Library presentation boundary", () => {
           "adult",
           "ready",
           "r18.dev",
-          "CAWB-1",
+          "cawb00001",
           "CAWB-1",
           exactLegacyAuthority,
           "0.72",
@@ -272,7 +272,7 @@ describe("Library presentation boundary", () => {
           "adult",
           "ready",
           "r18.dev",
-          "CAWB-1",
+          "cawb00001",
           "CAWB-1",
           `${authority}-cawb00002`,
           "0.72",
@@ -290,7 +290,7 @@ describe("Library presentation boundary", () => {
           "adult",
           "ready",
           "r18.dev",
-          "CAWB-2",
+          "cawb00002",
           "CAWB-1",
           exactLegacyAuthority,
           "0.72",
@@ -304,7 +304,7 @@ describe("Library presentation boundary", () => {
     expect(
       parseLibraryMetadata(
         [
-          "library-metadata-v4",
+          "library-metadata-v5",
           "adult",
           "automatic",
           "current",
@@ -312,12 +312,13 @@ describe("Library presentation boundary", () => {
           "",
           "",
           "r18.dev",
-          "CAWB-2",
+          "cawb00002",
           "CAWB-1",
           "Crossed title",
           "",
           "",
           "0",
+          "cawb00002",
           "CAWB-2",
         ],
         presentationRequest("adult", "CAWB-1"),
@@ -326,7 +327,7 @@ describe("Library presentation boundary", () => {
     expect(
       parseLibraryMetadata(
         [
-          "library-metadata-v4",
+          "library-metadata-v5",
           "adult",
           "automatic",
           "current",
@@ -334,25 +335,26 @@ describe("Library presentation boundary", () => {
           "",
           "",
           "r18.dev",
-          "CAWB-1",
+          "cawb00001",
           "CAWB-1",
           "Exact legacy title",
           "",
           "",
           "0",
+          "cawb00001",
           "CAWB-1",
         ],
         presentationRequest("adult", "CAWB-1"),
       ),
     ).toMatchObject({
       source: "r18.dev",
-      providerId: "CAWB-1",
-      legacyProviderId: "CAWB-1",
+      providerId: "cawb00001",
+      legacyProviderId: "cawb00001",
     });
     expect(
       parseLibraryMetadata(
         [
-          "library-metadata-v4",
+          "library-metadata-v5",
           "adult",
           "automatic",
           "current",
@@ -366,11 +368,57 @@ describe("Library presentation boundary", () => {
           "",
           "",
           "0",
+          "cawb00002",
           "CAWB-2",
         ],
         presentationRequest("adult", "CAWB-1"),
       ),
     ).toBeNull();
+  });
+
+  it("binds legacy cover authority to the exact raw content ID without FANZA mapping", () => {
+    for (const [itemId, contentId] of [
+      ["3DSVR-01871", "13dsvr01871"],
+      ["MDVR-419", "mdvr00419"],
+    ] as const) {
+      const authority = `library-cover-${"d".repeat(40)}-${contentId}`;
+      expect(
+        parseLibraryCover(
+          [
+            "library-cover-v3",
+            "vr",
+            "ready",
+            "r18.dev",
+            contentId,
+            itemId,
+            authority,
+            "0.75",
+            "",
+            "",
+            "",
+          ],
+          presentationRequest("vr", itemId),
+        ),
+      ).toMatchObject({ source: "r18.dev", providerId: contentId });
+      expect(
+        parseLibraryCover(
+          [
+            "library-cover-v3",
+            "vr",
+            "ready",
+            "r18.dev",
+            contentId,
+            itemId,
+            `${authority}x`,
+            "0.75",
+            "",
+            "",
+            "",
+          ],
+          presentationRequest("vr", itemId),
+        ),
+      ).toBeNull();
+    }
   });
 
   it("rejects responses for another local product or FANZA category authority", () => {

@@ -38,6 +38,7 @@ export type LibraryMetadata = {
   source: string | null;
   providerId: string | null;
   legacyProviderId: string | null;
+  legacyDisplayCode: string | null;
   displayCode: string | null;
   title: string | null;
   date: string | null;
@@ -103,21 +104,8 @@ function displayCodeMatchesRequest(
   );
 }
 
-function exactLegacyContentMatchesRequest(
-  request: LibraryPresentationRequest,
-  providerId: string,
-) {
-  const identity = requestProductIdentity(request);
-  const containsControlCharacter = Array.from(providerId).some((character) => {
-    const codePoint = character.codePointAt(0) ?? 0;
-    return codePoint <= 0x1f || codePoint === 0x7f;
-  });
-  return (
-    identity !== null &&
-    providerId.trim() === providerId &&
-    !containsControlCharacter &&
-    canonicalizeProductCode(providerId) === identity.canonicalCode
-  );
+function validLegacyContentId(providerId: string) {
+  return /^[a-z0-9_]{1,64}$/.test(providerId);
 }
 
 function exactFanzaIdentityMatches(
@@ -156,22 +144,11 @@ function exactFanzaTransportId(request: LibraryPresentationRequest) {
 }
 
 function legacyCoverAuthorityMatchesRequest(
-  request: LibraryPresentationRequest,
   providerId: string,
   authorityId: string,
 ) {
   const match = authorityId.match(legacyCoverAuthorityPattern);
-  const currentTransportId = exactFanzaTransportId(request);
-  const providerTransportId = exactFanzaTransportId({
-    ...request,
-    itemId: providerId,
-  });
-  return (
-    match !== null &&
-    currentTransportId !== null &&
-    providerTransportId === currentTransportId &&
-    match[1] === providerTransportId
-  );
+  return match !== null && validLegacyContentId(providerId) && match[1] === providerId;
 }
 
 function verifiedIdentityMatchesRequest(
@@ -305,16 +282,11 @@ export function parseLibraryCover(
       (!(["JavDB", "FANZA", "r18.dev"] as string[]).includes(source) ||
         providerId === "" ||
         (source !== "r18.dev" && !/^[A-Za-z0-9]{1,64}$/.test(providerId)) ||
-        (source === "r18.dev" &&
-          !exactLegacyContentMatchesRequest(request, providerId)) ||
+        (source === "r18.dev" && !validLegacyContentId(providerId)) ||
         displayCode === "" ||
         productCodeDisplayForm(displayCode) !== displayCode ||
         (source === "r18.dev"
-          ? !legacyCoverAuthorityMatchesRequest(
-              request,
-              providerId,
-              authorityId,
-            )
+          ? !legacyCoverAuthorityMatchesRequest(providerId, authorityId)
           : !coverAuthorityPattern.test(authorityId)))) ||
     (state !== "ready" &&
       (source !== "" ||
@@ -350,7 +322,7 @@ export function parseLibraryCover(
               verificationProviderId !== providerId))) ||
         (source === "r18.dev" &&
           verificationProvider !== "" &&
-          verifiedDisplayCode !== displayCode)))
+          !displayCodeMatchesRequest(request, displayCode))))
   ) {
     return null;
   }
@@ -387,6 +359,7 @@ function metadataProofMatchesRequest(
   source: string,
   providerId: string,
   legacyProviderId: string,
+  legacyDisplayCode: string,
   verificationProvider: string,
   verificationProviderId: string,
 ) {
@@ -394,9 +367,10 @@ function metadataProofMatchesRequest(
   const includesJavdb = source.split(" + ").includes("JavDB");
   const includesLegacy = source.split(" + ").includes("r18.dev");
   if (
-    includesLegacy !== (legacyProviderId !== "") ||
+    includesLegacy !== (legacyProviderId !== "" && legacyDisplayCode !== "") ||
     (includesLegacy &&
-      !exactLegacyContentMatchesRequest(request, legacyProviderId))
+      (!validLegacyContentId(legacyProviderId) ||
+        !displayCodeMatchesRequest(request, legacyDisplayCode)))
   ) {
     return false;
   }
@@ -408,12 +382,9 @@ function metadataProofMatchesRequest(
     );
   }
   if (source.startsWith("r18.dev")) {
-    return (
-      exactLegacyContentMatchesRequest(request, providerId) &&
-      providerId === legacyProviderId
-    );
+    return validLegacyContentId(providerId) && providerId === legacyProviderId;
   }
-  return source === "JavDatabase" && exactLegacyContentMatchesRequest(request, providerId);
+  return source === "JavDatabase" && displayCodeMatchesRequest(request, providerId);
 }
 
 export function parseLibraryMetadata(
@@ -448,19 +419,23 @@ export function parseLibraryMetadata(
   const castCount = Number(castCountText);
   const castEnd = 14 + castCount;
   const legacyProviderId = fields[castEnd] ?? "";
+  const legacyDisplayCode = fields[castEnd + 1] ?? "";
+  const currentResponseShape =
+    version === "library-metadata-v5" && fields.length === castEnd + 2;
+  const retainedNonLegacyShape =
+    version === "library-metadata-v4" && fields.length === castEnd;
   const hasCompleteIdentity =
     verificationProvider !== "" &&
     verificationProviderId !== "" &&
     verifiedDisplayCode !== "";
   if (
-    version !== "library-metadata-v4" ||
+    (!currentResponseShape && !retainedNonLegacyShape) ||
     requestProductIdentity(request) === null ||
     returnedCategory !== request.category ||
     !["automatic", "local-only", "unavailable"].includes(state) ||
     !["current", "conflict"].includes(identityState) ||
     !/^\d{1,2}$/.test(castCountText) ||
     !Number.isSafeInteger(castCount) ||
-    (fields.length !== castEnd && fields.length !== castEnd + 1) ||
     fields.slice(14, castEnd).some((entry) => entry.trim() === "") ||
     ((verificationProvider === "" ||
       verificationProviderId === "" ||
@@ -488,6 +463,7 @@ export function parseLibraryMetadata(
           source,
           providerId,
           legacyProviderId,
+          legacyDisplayCode,
           verificationProvider,
           verificationProviderId,
         ))) ||
@@ -496,6 +472,7 @@ export function parseLibraryMetadata(
         source,
         providerId,
         legacyProviderId,
+        legacyDisplayCode,
         displayCode,
         title,
         date,
@@ -519,6 +496,7 @@ export function parseLibraryMetadata(
     source: optionalText(source),
     providerId: optionalText(providerId),
     legacyProviderId: optionalText(legacyProviderId),
+    legacyDisplayCode: optionalText(legacyDisplayCode),
     displayCode: optionalText(displayCode),
     title: optionalText(title),
     date: optionalText(date),

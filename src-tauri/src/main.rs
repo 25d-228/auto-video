@@ -2941,6 +2941,7 @@ async fn resolve_library_metadata(
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn fetch_library_cover(
+    app: tauri::AppHandle,
     category: String,
     item_id: String,
     scan_generation: String,
@@ -2959,6 +2960,7 @@ async fn fetch_library_cover(
     let download_state = download_state.inner().clone();
     let vr_state = vr_state.inner().clone();
     let presentation_state = presentation_state.inner().clone();
+    let cache_path = library_presentation_cache_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let authority = current_library_presentation_authority(
             category,
@@ -2971,6 +2973,7 @@ async fn fetch_library_cover(
         let authority = authority?;
         let bytes = fetch_library_presentation_cover_with(
             &presentation_state,
+            &cache_path,
             &authority,
             &cover_authority_id,
         )
