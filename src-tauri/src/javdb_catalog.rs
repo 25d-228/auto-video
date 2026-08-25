@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
@@ -14,7 +14,7 @@ use std::process::Command;
 use std::process::Stdio;
 
 use crate::{
-    vr_torrent::{JsonParser, JsonValue},
+    vr_torrent::{product_code_display_form, product_code_forms, JsonParser, JsonValue},
     ProviderRequestError, ADULT_NETWORK_ERROR, ADULT_PROVIDER_ERROR, ADULT_SOURCE_UNAVAILABLE,
     VR_NETWORK_ERROR, VR_PROVIDER_ERROR, VR_SOURCE_UNAVAILABLE,
 };
@@ -231,6 +231,17 @@ struct ParsedDetail {
     preview_urls: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExactLibraryItem {
+    pub provider_item_id: String,
+    pub display_code: String,
+    pub title: Option<String>,
+    pub release_date: Option<String>,
+    pub duration: Option<String>,
+    pub actors: Vec<String>,
+    pub cover_url: Option<String>,
+}
+
 fn valid_provider_item_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -240,23 +251,7 @@ fn valid_provider_item_id(value: &str) -> bool {
 }
 
 fn canonical_product_code(value: &str) -> Option<String> {
-    let value = value.trim();
-    let prefix_end = value
-        .bytes()
-        .position(|character| !character.is_ascii_alphabetic())?;
-    let prefix = &value[..prefix_end];
-    if !(2..=16).contains(&prefix.len()) {
-        return None;
-    }
-    let number = value[prefix_end..].trim_start_matches([' ', '_', '-']);
-    if number.is_empty()
-        || number.len() > 10
-        || !number.bytes().all(|character| character.is_ascii_digit())
-    {
-        return None;
-    }
-    let number = number.parse::<u64>().ok()?;
-    (number > 0).then(|| format!("{}-{number}", prefix.to_ascii_uppercase()))
+    crate::vr_torrent::canonical_product_code(value)
 }
 
 fn optional_text(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<String> {
@@ -334,6 +329,10 @@ fn valid_cover_url(value: &str) -> bool {
             .is_some_and(u8::is_ascii_alphanumeric)
 }
 
+pub(crate) fn valid_library_cover_url(value: &str) -> bool {
+    valid_cover_url(value)
+}
+
 fn cover_url(movie: &BTreeMap<String, JsonValue>) -> Option<String> {
     ["cover_url", "thumb_url"].into_iter().find_map(|key| {
         let JsonValue::String(value) = movie.get(key)? else {
@@ -341,6 +340,114 @@ fn cover_url(movie: &BTreeMap<String, JsonValue>) -> Option<String> {
         };
         valid_cover_url(value).then(|| value.clone())
     })
+}
+
+fn exact_cover_url(
+    movie: &BTreeMap<String, JsonValue>,
+) -> Result<Option<String>, CatalogDocumentError> {
+    let mut accepted = None;
+    for key in ["cover_url", "thumb_url"] {
+        let url = match movie.get(key) {
+            None | Some(JsonValue::Null) => continue,
+            Some(JsonValue::String(url)) if valid_cover_url(url) => url,
+            Some(_) => return Err(CatalogDocumentError::Malformed),
+        };
+        if accepted.is_none() {
+            accepted = Some(url.clone());
+        }
+    }
+    Ok(accepted)
+}
+
+fn exact_listing_items(
+    document: &str,
+    requested_identity: &str,
+) -> Result<Vec<CatalogItem>, CatalogDocumentError> {
+    let JsonValue::Object(envelope) = JsonParser::new(document)
+        .parse()
+        .ok_or(CatalogDocumentError::Malformed)?
+    else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::Number(success)) = envelope.get("success") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    if success != "1" {
+        return Err(CatalogDocumentError::Provider);
+    }
+    let Some(JsonValue::Object(data)) = envelope.get("data") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::Array(movies)) = data.get("movies") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+
+    let relevant_ids = movies
+        .iter()
+        .filter_map(|value| match value {
+            JsonValue::Object(movie) => Some(movie),
+            _ => None,
+        })
+        .filter_map(|movie| {
+            let JsonValue::String(provider_item_id) = movie.get("id")? else {
+                return None;
+            };
+            let JsonValue::String(number) = movie.get("number")? else {
+                return None;
+            };
+            (valid_provider_item_id(provider_item_id)
+                && canonical_product_code(number).as_deref() == Some(requested_identity))
+            .then(|| provider_item_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let mut exact_items = HashMap::<String, CatalogItem>::new();
+    for movie in movies.iter().filter_map(|value| match value {
+        JsonValue::Object(movie) => Some(movie),
+        _ => None,
+    }) {
+        let Some(JsonValue::String(provider_item_id)) = movie.get("id") else {
+            continue;
+        };
+        if !relevant_ids.contains(provider_item_id) {
+            continue;
+        }
+        let Some(JsonValue::String(number)) = movie.get("number") else {
+            return Err(CatalogDocumentError::Malformed);
+        };
+        let forms = product_code_forms(number).ok_or(CatalogDocumentError::Malformed)?;
+        let item = CatalogItem {
+            provider_item_id: provider_item_id.clone(),
+            code: forms.display,
+            title: optional_text(movie, "title").or_else(|| optional_text(movie, "origin_title")),
+            release_date: optional_text(movie, "release_date"),
+            cover_url: exact_cover_url(movie)?,
+        };
+        if canonical_product_code(&item.code).as_deref() != Some(requested_identity) {
+            return Err(CatalogDocumentError::Conflicting);
+        }
+        if exact_items
+            .insert(provider_item_id.clone(), item.clone())
+            .is_some_and(|previous| previous != item)
+        {
+            return Err(CatalogDocumentError::Conflicting);
+        }
+    }
+    let mut exact_items = exact_items.into_values().collect::<Vec<_>>();
+    exact_items.sort_by(|left, right| left.provider_item_id.cmp(&right.provider_item_id));
+    Ok(exact_items)
+}
+
+fn exact_detail_cover_url(document: &str) -> Result<Option<String>, CatalogDocumentError> {
+    let Some(JsonValue::Object(envelope)) = JsonParser::new(document).parse() else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::Object(data)) = envelope.get("data") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    let Some(JsonValue::Object(movie)) = data.get("movie") else {
+        return Err(CatalogDocumentError::Malformed);
+    };
+    exact_cover_url(movie)
 }
 
 fn preview_urls(movie: &BTreeMap<String, JsonValue>) -> Vec<String> {
@@ -407,7 +514,7 @@ fn parse_detail(
     let Some(JsonValue::String(number)) = movie.get("number") else {
         return Err(CatalogDocumentError::Malformed);
     };
-    if canonical_product_code(number).as_deref() != Some(code) {
+    if canonical_product_code(number) != canonical_product_code(code) {
         return Err(CatalogDocumentError::Conflicting);
     }
 
@@ -463,6 +570,62 @@ fn parse_detail(
     })
 }
 
+pub(crate) fn fetch_exact_library_item_with(
+    category: &str,
+    code: &str,
+    fetch: &mut impl FnMut(&str) -> Result<String, ProviderRequestError>,
+) -> Result<Option<ExactLibraryItem>, ProviderRequestError> {
+    let category = CatalogCategory::parse(category).ok_or(ProviderRequestError::Provider)?;
+    let requested_identity = canonical_product_code(code).ok_or(ProviderRequestError::Provider)?;
+    if product_code_display_form(code).as_deref() != Some(code) {
+        return Err(ProviderRequestError::Provider);
+    }
+
+    let listing = fetch(&format!(
+        "{JAVDB_API_URL}/api/v2/search?q={code}&type=movie"
+    ))?;
+    let mut exact_items = exact_listing_items(&listing, &requested_identity)
+        .map_err(|_| ProviderRequestError::Provider)?;
+    if exact_items.is_empty() {
+        return Ok(None);
+    }
+    if exact_items.len() != 1 {
+        return Err(ProviderRequestError::Provider);
+    }
+    let item = exact_items
+        .pop()
+        .expect("one exact JavDB Library item was established");
+    let detail_document = fetch(&format!(
+        "{JAVDB_API_URL}/api/v4/movies/{}?from_rankings=false",
+        item.provider_item_id
+    ))?;
+    let mut detail = parse_detail(
+        &detail_document,
+        category,
+        &item.provider_item_id,
+        &item.code,
+    )
+    .map_err(|_| ProviderRequestError::Provider)?;
+    detail.cover_url =
+        exact_detail_cover_url(&detail_document).map_err(|_| ProviderRequestError::Provider)?;
+
+    Ok(Some(ExactLibraryItem {
+        provider_item_id: item.provider_item_id,
+        display_code: item.code,
+        title: detail.title.or(item.title),
+        release_date: detail.release_date.or(item.release_date),
+        duration: detail.duration.map(|duration| {
+            if duration.ends_with(" min") {
+                duration
+            } else {
+                format!("{duration} min")
+            }
+        }),
+        actors: detail.actors,
+        cover_url: detail.cover_url.or(item.cover_url),
+    }))
+}
+
 fn parse_listing(document: &str) -> Result<ParsedListing, CatalogDocumentError> {
     let JsonValue::Object(envelope) = JsonParser::new(document)
         .parse()
@@ -498,19 +661,19 @@ fn parse_listing(document: &str) -> Result<ParsedListing, CatalogDocumentError> 
         if !valid_provider_item_id(provider_item_id) {
             continue;
         }
-        let Some(code) = canonical_product_code(number) else {
+        let Some(forms) = product_code_forms(number) else {
             continue;
         };
         if let Some(previous_code) = accepted_codes.get(provider_item_id) {
-            if previous_code != &code {
+            if previous_code != &forms.display {
                 return Err(CatalogDocumentError::Conflicting);
             }
             continue;
         }
-        accepted_codes.insert(provider_item_id.clone(), code.clone());
+        accepted_codes.insert(provider_item_id.clone(), forms.display.clone());
         items.push(CatalogItem {
             provider_item_id: provider_item_id.clone(),
-            code,
+            code: forms.display,
             title: optional_text(movie, "title").or_else(|| optional_text(movie, "origin_title")),
             release_date: optional_text(movie, "release_date"),
             cover_url: cover_url(movie),
@@ -545,7 +708,7 @@ fn adult_item_category(
     match movie.get("number") {
         None | Some(JsonValue::Null) => {}
         Some(JsonValue::String(number)) => match canonical_product_code(number) {
-            Some(code) if code == retained_code => {}
+            Some(code) if Some(&code) == canonical_product_code(retained_code).as_ref() => {}
             Some(_) => return AdultCategoryCheck::Conflicting,
             None => return AdultCategoryCheck::Inconclusive,
         },
@@ -1037,7 +1200,7 @@ fn parsed_detail_request(
         .filter(|generation| *generation > 0)
         .ok_or_else(|| category.stale_error())?;
     if !valid_provider_item_id(&request.provider_item_id)
-        || canonical_product_code(&request.code).as_deref() != Some(&request.code)
+        || product_code_display_form(&request.code).as_deref() != Some(&request.code)
     {
         return Err(category.stale_error());
     }
@@ -2054,7 +2217,7 @@ mod tests {
         })
         .expect("unusable rows must not hide later provider pages");
         assert_eq!(response[1], "1");
-        assert_eq!(response[4], "MDVR-419");
+        assert_eq!(response[4], "MDVR-00419");
     }
 
     #[test]
@@ -2085,6 +2248,132 @@ mod tests {
                 Ok(r#"{"success":1,"data":{"movies":[{"id":"Same","number":"MDVR-419"},{"id":"Same","number":"MDVR-422"}]}}"#.to_owned())
             }),
             Err(VR_JAVDB_CONFLICTING)
+        );
+    }
+
+    #[test]
+    fn exact_library_rejects_conflicting_rows_for_one_provider_item() {
+        for (first_fields, second_fields) in [
+            (r#""title":"First title""#, r#""title":"Another title""#),
+            (
+                r#""release_date":"2024-01-01""#,
+                r#""release_date":"2024-02-01""#,
+            ),
+            (
+                r#""cover_url":"https://tp.cmastd.com/first.jpg""#,
+                r#""cover_url":"https://tp.cmastd.com/second.jpg""#,
+            ),
+        ] {
+            let rows = format!(
+                r#"{{"id":"Same","number":"MDVR-419",{first_fields}}},{{"id":"Same","number":"MDVR-419",{second_fields}}}"#
+            );
+            let calls = Cell::new(0);
+            assert_eq!(
+                fetch_exact_library_item_with("vr", "MDVR-419", &mut |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(format!(r#"{{"success":1,"data":{{"movies":[{rows}]}}}}"#))
+                }),
+                Err(ProviderRequestError::Provider)
+            );
+            assert_eq!(calls.get(), 1);
+        }
+
+        assert_eq!(
+            fetch_exact_library_item_with("vr", "MDVR-419", &mut |_| {
+                Ok(r#"{"success":1,"data":{"movies":[{"id":"Same","number":"MDVR-419","title":"Exact"},{"id":"Same","number":"MDVR-420","title":"Exact"}]}}"#.to_owned())
+            }),
+            Err(ProviderRequestError::Provider)
+        );
+    }
+
+    #[test]
+    fn exact_library_distinguishes_absent_cover_from_malformed_cover_data() {
+        for malformed_cover in [
+            r#""cover_url":42"#,
+            r#""cover_url":"https://tp.cmastd.com.evil.example/cover.jpg""#,
+            r#""cover_url":" https://tp.cmastd.com/cover.jpg ""#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":42"#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":"https://tp.cmastd.com.evil.example/thumb.jpg""#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":" https://tp.cmastd.com/thumb.jpg ""#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":"https://tp.cmastd.com/thumb.jpg\u0000""#,
+        ] {
+            let calls = Cell::new(0);
+            assert_eq!(
+                fetch_exact_library_item_with("adult", "CAWB-1", &mut |url| {
+                    calls.set(calls.get() + 1);
+                    assert!(url.contains("search"));
+                    Ok(format!(
+                        r#"{{"success":1,"data":{{"movies":[{{"id":"Exact","number":"CAWB-1",{malformed_cover}}}]}}}}"#
+                    ))
+                }),
+                Err(ProviderRequestError::Provider)
+            );
+            assert_eq!(calls.get(), 1);
+        }
+
+        let calls = Cell::new(0);
+        let accepted = fetch_exact_library_item_with("adult", "CAWB-1", &mut |url| {
+            calls.set(calls.get() + 1);
+            Ok(if url.contains("search") {
+                r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"CAWB-1","cover_url":null}]}}"#.to_owned()
+            } else {
+                r#"{"success":1,"data":{"movie":{"id":"Exact","number":"CAWB-1","tags":[],"cover_url":null}}}"#.to_owned()
+            })
+        })
+        .expect("an exact null cover must remain a valid provider response")
+        .expect("the exact item must remain accepted");
+        assert!(accepted.cover_url.is_none());
+        assert_eq!(calls.get(), 2);
+
+        for malformed_detail_cover in [
+            r#""cover_url":[]"#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":[]"#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":"https://tp.cmastd.com.evil.example/thumb.jpg""#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":" https://tp.cmastd.com/thumb.jpg ""#,
+            r#""cover_url":"https://tp.cmastd.com/cover.jpg","thumb_url":"https://tp.cmastd.com/thumb.jpg\u0000""#,
+        ] {
+            assert_eq!(
+                fetch_exact_library_item_with("adult", "CAWB-1", &mut |url| {
+                    Ok(if url.contains("search") {
+                        r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"CAWB-1","cover_url":null}]}}"#.to_owned()
+                    } else {
+                        r#"{"success":1,"data":{"movie":{"id":"Exact","number":"CAWB-1","tags":[],$COVER}}}"#
+                            .replace("$COVER", malformed_detail_cover)
+                    })
+                }),
+                Err(ProviderRequestError::Provider)
+            );
+        }
+    }
+
+    #[test]
+    fn exact_library_prefers_cover_url_over_a_distinct_valid_thumbnail() {
+        let listing_cover = fetch_exact_library_item_with("vr", "MDVR-419", &mut |url| {
+            Ok(if url.contains("search") {
+                r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"MDVR-419","cover_url":"https://tp.cmastd.com/listing-cover.jpg","thumb_url":"https://tp.cmastd.com/listing-thumb.jpg"}]}}"#.to_owned()
+            } else {
+                r#"{"success":1,"data":{"movie":{"id":"Exact","number":"MDVR-419","tags":[{"id":"212"}],"cover_url":null,"thumb_url":null}}}"#.to_owned()
+            })
+        })
+        .expect("distinct valid listing image alternatives must be accepted")
+        .expect("the exact listing item must remain accepted");
+        assert_eq!(
+            listing_cover.cover_url.as_deref(),
+            Some("https://tp.cmastd.com/listing-cover.jpg")
+        );
+
+        let detail_cover = fetch_exact_library_item_with("vr", "MDVR-419", &mut |url| {
+            Ok(if url.contains("search") {
+                r#"{"success":1,"data":{"movies":[{"id":"Exact","number":"MDVR-419","cover_url":null,"thumb_url":null}]}}"#.to_owned()
+            } else {
+                r#"{"success":1,"data":{"movie":{"id":"Exact","number":"MDVR-419","tags":[{"id":"212"}],"cover_url":"https://tp.cmastd.com/detail-cover.jpg","thumb_url":"https://tp.cmastd.com/detail-thumb.jpg"}}}"#.to_owned()
+            })
+        })
+        .expect("distinct valid detail image alternatives must be accepted")
+        .expect("the exact detail item must remain accepted");
+        assert_eq!(
+            detail_cover.cover_url.as_deref(),
+            Some("https://tp.cmastd.com/detail-cover.jpg")
         );
     }
 
