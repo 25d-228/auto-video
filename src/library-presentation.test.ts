@@ -149,6 +149,7 @@ describe("Library presentation boundary", () => {
 
   it("rejects exact-provider cover responses without the matching verified identity", () => {
     const authority = `library-cover-${"b".repeat(40)}`;
+    const exactLegacyAuthority = `${authority}-cawb00001`;
     expect(
       parseLibraryCover(
         [
@@ -255,7 +256,7 @@ describe("Library presentation boundary", () => {
           "r18.dev",
           "CAWB-1",
           "CAWB-1",
-          authority,
+          exactLegacyAuthority,
           "0.72",
           "",
           "",
@@ -271,9 +272,27 @@ describe("Library presentation boundary", () => {
           "adult",
           "ready",
           "r18.dev",
+          "CAWB-1",
+          "CAWB-1",
+          `${authority}-cawb00002`,
+          "0.72",
+          "",
+          "",
+          "",
+        ],
+        presentationRequest("adult", "CAWB-1"),
+      ),
+    ).toBeNull();
+    expect(
+      parseLibraryCover(
+        [
+          "library-cover-v3",
+          "adult",
+          "ready",
+          "r18.dev",
           "CAWB-2",
           "CAWB-1",
-          authority,
+          exactLegacyAuthority,
           "0.72",
           "",
           "",
@@ -431,6 +450,63 @@ describe("Library presentation boundary", () => {
         presentationRequest("vr", "3DSVR-01871"),
       ),
     ).toBeNull();
+  });
+
+  it("rejects crossed legacy image authority before native byte fetch", async () => {
+    const invoke = vi.fn((command: string) => {
+      if (command === "resolve_library_cover") {
+        return Promise.resolve([
+          "library-cover-v3",
+          "adult",
+          "ready",
+          "r18.dev",
+          "CAWB-1",
+          "CAWB-1",
+          `library-cover-${"e".repeat(40)}-cawb00002`,
+          "0.72",
+          "",
+          "",
+          "",
+        ]);
+      }
+      if (command === "resolve_library_metadata") {
+        return Promise.resolve([
+          "library-metadata-v4",
+          "adult",
+          "unavailable",
+          "conflict",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "0",
+        ]);
+      }
+      if (command === "cancel_library_cover_request") return Promise.resolve();
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+
+    const { result } = renderHook(() =>
+      useLibraryPresentation({
+        category: "adult",
+        itemId: "CAWB-1",
+        scanGeneration: "crossed-legacy",
+      }),
+    );
+
+    await waitFor(() => expect(result.current.cover.status).toBe("unavailable"));
+    expect(result.current.verifiedIdentity).toBeNull();
+    expect(
+      invoke.mock.calls.filter(
+        ([command]) => command === "fetch_library_cover",
+      ),
+    ).toHaveLength(0);
   });
 
   it("prioritizes visible cover work and discards obsolete queued work before a slot", async () => {

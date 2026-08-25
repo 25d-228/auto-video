@@ -357,19 +357,20 @@ pub(crate) fn valid_cached_exact_library_identity(
     content_id: &str,
     display_code: &str,
 ) -> bool {
-    let Some(category) = Category::parse(category) else {
-        return false;
-    };
+    exact_library_transport_id(category, code).as_deref() == Some(content_id)
+        && display_code_from_content_id(content_id).as_deref() == Some(display_code)
+        && canonical_product_code(display_code) == canonical_product_code(code)
+}
+
+pub(crate) fn exact_library_transport_id(category: &str, code: &str) -> Option<String> {
+    let category = Category::parse(category)?;
+    let candidates = exact_content_id_candidates(code);
+    let content_id = (candidates.len() == 1).then(|| candidates[0].clone())?;
     let category_matches = match category {
         Category::Adult => content_id.starts_with("cawb"),
         Category::Vr => content_id.starts_with("13dsvr"),
     };
-    let candidates = exact_content_id_candidates(code);
-    category_matches
-        && candidates.len() == 1
-        && candidates[0] == content_id
-        && display_code_from_content_id(content_id).as_deref() == Some(display_code)
-        && canonical_product_code(display_code) == canonical_product_code(code)
+    category_matches.then_some(content_id)
 }
 
 pub(crate) fn valid_cached_exact_library_cover(

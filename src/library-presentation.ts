@@ -66,6 +66,7 @@ const defaultAspectRatio = 0.72;
 const maximumCoverBytes = 16 * 1024 * 1024;
 const maximumConcurrentWork = 4;
 const coverAuthorityPattern = /^library-cover-[a-f0-9]{40}$/;
+const legacyCoverAuthorityPattern = /^library-cover-[a-f0-9]{40}-([a-z0-9_]{1,64})$/;
 
 class LibraryIdentityResponseError extends Error {}
 
@@ -126,19 +127,51 @@ function exactFanzaIdentityMatches(
 ) {
   const identity = requestProductIdentity(request);
   if (identity === null) return false;
+  const transportId = exactFanzaTransportId(request);
   if (request.category === "adult" && identity.prefix === "CAWB") {
     return (
-      providerId === `cawb${identity.number.padStart(5, "0")}` &&
+      providerId === transportId &&
       displayCode === `CAWB-${identity.number.padStart(3, "0")}`
     );
   }
   if (request.category === "vr" && identity.prefix === "3DSVR") {
     return (
-      providerId === `13dsvr${identity.number.padStart(5, "0")}` &&
+      providerId === transportId &&
       displayCode === `3DSVR-${identity.number.padStart(5, "0")}`
     );
   }
   return false;
+}
+
+function exactFanzaTransportId(request: LibraryPresentationRequest) {
+  const identity = requestProductIdentity(request);
+  if (identity === null) return null;
+  if (request.category === "adult" && identity.prefix === "CAWB") {
+    return `cawb${identity.number.padStart(5, "0")}`;
+  }
+  if (request.category === "vr" && identity.prefix === "3DSVR") {
+    return `13dsvr${identity.number.padStart(5, "0")}`;
+  }
+  return null;
+}
+
+function legacyCoverAuthorityMatchesRequest(
+  request: LibraryPresentationRequest,
+  providerId: string,
+  authorityId: string,
+) {
+  const match = authorityId.match(legacyCoverAuthorityPattern);
+  const currentTransportId = exactFanzaTransportId(request);
+  const providerTransportId = exactFanzaTransportId({
+    ...request,
+    itemId: providerId,
+  });
+  return (
+    match !== null &&
+    currentTransportId !== null &&
+    providerTransportId === currentTransportId &&
+    match[1] === providerTransportId
+  );
 }
 
 function verifiedIdentityMatchesRequest(
@@ -276,7 +309,13 @@ export function parseLibraryCover(
           !exactLegacyContentMatchesRequest(request, providerId)) ||
         displayCode === "" ||
         productCodeDisplayForm(displayCode) !== displayCode ||
-        !coverAuthorityPattern.test(authorityId))) ||
+        (source === "r18.dev"
+          ? !legacyCoverAuthorityMatchesRequest(
+              request,
+              providerId,
+              authorityId,
+            )
+          : !coverAuthorityPattern.test(authorityId)))) ||
     (state !== "ready" &&
       (source !== "" ||
         providerId !== "" ||
