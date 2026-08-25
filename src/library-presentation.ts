@@ -26,7 +26,7 @@ export type LibraryCover = {
 };
 
 export type VerifiedDisplayIdentity = {
-  provider: "JavDB" | "FANZA";
+  provider: "JavDB" | "FANZA" | "r18.dev";
   providerId: string;
   displayCode: string;
 };
@@ -162,6 +162,9 @@ function verifiedIdentityMatchesRequest(
       identity.providerId,
       identity.displayCode,
     );
+  }
+  if (identity.provider === "r18.dev") {
+    return validLegacyContentId(identity.providerId);
   }
   return /^[A-Za-z0-9]{1,64}$/.test(identity.providerId);
 }
@@ -300,7 +303,7 @@ export function parseLibraryCover(
         verificationProviderId !== "" ||
         verifiedDisplayCode !== "")) ||
     (verificationProvider !== "" &&
-      (!(["JavDB", "FANZA"] as string[]).includes(verificationProvider) ||
+      (!(["JavDB", "FANZA", "r18.dev"] as string[]).includes(verificationProvider) ||
         !verifiedIdentityMatchesRequest(request, {
           provider: verificationProvider as VerifiedDisplayIdentity["provider"],
           providerId: verificationProviderId,
@@ -321,8 +324,10 @@ export function parseLibraryCover(
             (verificationProvider === "FANZA" &&
               verificationProviderId !== providerId))) ||
         (source === "r18.dev" &&
-          verificationProvider !== "" &&
-          !displayCodeMatchesRequest(request, displayCode))))
+          (verificationProvider === "" ||
+            verifiedDisplayCode !== displayCode ||
+            (verificationProvider === "r18.dev" &&
+              verificationProviderId !== providerId)))))
   ) {
     return null;
   }
@@ -362,6 +367,7 @@ function metadataProofMatchesRequest(
   legacyDisplayCode: string,
   verificationProvider: string,
   verificationProviderId: string,
+  verifiedDisplayCode: string,
 ) {
   if (!automaticMetadataSources.has(source)) return false;
   const includesJavdb = source.split(" + ").includes("JavDB");
@@ -374,6 +380,15 @@ function metadataProofMatchesRequest(
   ) {
     return false;
   }
+  if (
+    includesLegacy &&
+    (verificationProvider === "" ||
+      legacyDisplayCode !== verifiedDisplayCode ||
+      (verificationProvider === "r18.dev" &&
+        verificationProviderId !== legacyProviderId))
+  ) {
+    return false;
+  }
   if (includesJavdb) {
     return (
       verificationProvider === "JavDB" &&
@@ -382,7 +397,10 @@ function metadataProofMatchesRequest(
     );
   }
   if (source.startsWith("r18.dev")) {
-    return validLegacyContentId(providerId) && providerId === legacyProviderId;
+    return (
+      validLegacyContentId(providerId) &&
+      providerId === legacyProviderId
+    );
   }
   return source === "JavDatabase" && displayCodeMatchesRequest(request, providerId);
 }
@@ -444,7 +462,7 @@ export function parseLibraryMetadata(
         verificationProviderId !== "" ||
         verifiedDisplayCode !== "")) ||
     (hasCompleteIdentity &&
-      (!(["JavDB", "FANZA"] as string[]).includes(verificationProvider) ||
+      (!(["JavDB", "FANZA", "r18.dev"] as string[]).includes(verificationProvider) ||
         !verifiedIdentityMatchesRequest(request, {
           provider: verificationProvider as VerifiedDisplayIdentity["provider"],
           providerId: verificationProviderId,
@@ -466,6 +484,7 @@ export function parseLibraryMetadata(
           legacyDisplayCode,
           verificationProvider,
           verificationProviderId,
+          verifiedDisplayCode,
         ))) ||
     (state !== "automatic" &&
       [

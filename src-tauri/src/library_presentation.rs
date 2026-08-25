@@ -22,8 +22,9 @@ use crate::{
 pub(crate) const LIBRARY_PRESENTATION_FAILED: &str = "library_presentation_failed";
 pub(crate) const LIBRARY_PRESENTATION_STALE: &str = "library_presentation_stale";
 
-const CACHE_VERSION: &str = "library-presentation-v6";
+const CACHE_VERSION: &str = "library-presentation-v7";
 const CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const CACHE_MAX_ENTRIES: usize = 256;
 const COVER_BYTES_CACHE_MAX_FILES: usize = 256;
 const COVER_BYTES_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const COVER_TTL_SECONDS: u64 = 24 * 60 * 60;
@@ -179,7 +180,7 @@ struct VerifiedIdentitySeed {
     sequence: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct CacheEntry {
     identity: String,
     category: LibraryPresentationCategory,
@@ -220,7 +221,8 @@ fn retain_identity_conflict(
     authority: &LibraryItemAuthority,
     request_generation: u64,
 ) -> Result<(), ()> {
-    persist_identity_conflict(cache_path, authority)?;
+    let protected = active_cover_request_keys(context);
+    merge_cache_entry_with_protected(cache_path, conflict_cache_entry(authority), &protected)?;
     context
         .identity_conflicts
         .insert(metadata_seed_key(authority, request_generation));
@@ -564,14 +566,18 @@ fn metadata_from_legacy(
         })
         .unwrap_or_default();
     let metadata = PresentationMetadata {
-        verified_identity: None,
+        verified_identity: Some(VerifiedDisplayIdentity {
+            provider: "r18.dev",
+            provider_id: proof.content_id.clone(),
+            display_code: proof.display_code.clone(),
+        }),
         identity_conflict: false,
         complete_identity_agreement: false,
         source: Some("r18.dev".to_owned()),
         provider_id: Some(proof.content_id.clone()),
         legacy_provider_id: Some(proof.content_id),
-        legacy_display_code: Some(proof.display_code),
-        display_code: Some(authority.code.clone()),
+        legacy_display_code: Some(proof.display_code.clone()),
+        display_code: Some(proof.display_code),
         title,
         date,
         runtime,
@@ -701,6 +707,7 @@ fn verified_display_identity_valid(
                 &identity.provider_id,
                 &identity.display_code,
             ),
+            "r18.dev" => exact_legacy_content_id(&identity.provider_id).is_some(),
             _ => false,
         }
 }
@@ -722,7 +729,7 @@ fn fanza_verified_identity(item: &fanza_catalog::ExactLibraryItem) -> VerifiedDi
 }
 
 fn verified_identity_from_cover(source: &CoverSource) -> Option<VerifiedDisplayIdentity> {
-    matches!(source.provider, "JavDB" | "FANZA").then(|| VerifiedDisplayIdentity {
+    matches!(source.provider, "JavDB" | "FANZA" | "r18.dev").then(|| VerifiedDisplayIdentity {
         provider: source.provider,
         provider_id: source.provider_id.clone(),
         display_code: source.display_code.clone(),
@@ -750,8 +757,12 @@ fn reconcile_verified_identities(
         Ok(Some(current))
     } else if candidate.provider == "JavDB" {
         Ok(Some(candidate))
+    } else if current.provider == "FANZA" {
+        Ok(Some(current))
+    } else if candidate.provider == "FANZA" {
+        Ok(Some(candidate))
     } else {
-        Err(())
+        Ok(Some(current))
     }
 }
 
@@ -775,13 +786,10 @@ fn cover_identity_consistent(
                 && (identity.provider == "JavDB"
                     || (identity.provider == "FANZA" && identity.provider_id == source.provider_id))
         }),
-        "r18.dev" => identity.map_or_else(
-            || source.display_code == code,
-            |identity| {
-                crate::vr_torrent::canonical_product_code(&identity.display_code)
-                    == crate::vr_torrent::canonical_product_code(&source.display_code)
-            },
-        ),
+        "r18.dev" => identity.is_some_and(|identity| {
+            identity.display_code == source.display_code
+                && (identity.provider != "r18.dev" || identity.provider_id == source.provider_id)
+        }),
         _ => false,
     }
 }
@@ -837,6 +845,16 @@ fn metadata_identity_consistent(
                 .legacy_display_code
                 .as_ref()
                 .is_some_and(|code| exact_product_code_value(code, &product_identity)))
+    {
+        return false;
+    }
+    if includes_legacy
+        && identity.is_some_and(|identity| {
+            metadata.legacy_display_code.as_deref() != Some(identity.display_code.as_str())
+                || (identity.provider == "r18.dev"
+                    && metadata.legacy_provider_id.as_deref()
+                        != Some(identity.provider_id.as_str()))
+        })
     {
         return false;
     }
@@ -1089,18 +1107,62 @@ fn resolve_cover_with_current_identity(
 
     match legacy_document(&legacy_url(&authority.product_identity)) {
         Ok(document) => {
-            if metadata.is_none() {
-                match metadata_from_legacy(&document, authority) {
-                    Ok(value) => metadata = value,
-                    Err(_) => transient = true,
+            let proof = match exact_legacy_cover(&document, authority) {
+                Ok(proof) => proof,
+                Err(_) => {
+                    transient = true;
+                    if let Some(identity) = verified_identity {
+                        attach_verified_identity(
+                            metadata.get_or_insert_with(PresentationMetadata::default),
+                            Some(identity),
+                        );
+                    }
+                    return (None, metadata, transient);
                 }
+            };
+            let legacy_identity = VerifiedDisplayIdentity {
+                provider: "r18.dev",
+                provider_id: proof.content_id.clone(),
+                display_code: proof.display_code.clone(),
+            };
+            verified_identity = match reconcile_verified_identities(
+                verified_identity
+                    .clone()
+                    .or_else(|| current_identity.clone()),
+                Some(legacy_identity),
+            ) {
+                Ok(identity) => identity,
+                Err(()) => {
+                    return (
+                        None,
+                        Some(PresentationMetadata {
+                            identity_conflict: true,
+                            ..PresentationMetadata::default()
+                        }),
+                        true,
+                    )
+                }
+            };
+            match metadata_from_legacy(&document, authority) {
+                Ok(Some(legacy_metadata)) if metadata.is_none() => {
+                    metadata = Some(legacy_metadata);
+                }
+                Ok(_) => {}
+                Err(_) => transient = true,
             }
-            match exact_legacy_cover(&document, authority) {
-                Ok(LegacyItemProof {
-                    content_id,
-                    display_code,
-                    cover_url: Some(url),
-                }) => match legacy_image(&url).and_then(validate_cover) {
+            if let Some(identity) = verified_identity.clone() {
+                attach_verified_identity(
+                    metadata.get_or_insert_with(PresentationMetadata::default),
+                    Some(identity),
+                );
+            }
+            if let LegacyItemProof {
+                content_id,
+                display_code,
+                cover_url: Some(url),
+            } = proof
+            {
+                match legacy_image(&url).and_then(validate_cover) {
                     Ok((bytes, ratio)) => {
                         return (
                             Some((
@@ -1118,11 +1180,7 @@ fn resolve_cover_with_current_identity(
                         );
                     }
                     Err(_) => transient = true,
-                },
-                Ok(LegacyItemProof {
-                    cover_url: None, ..
-                }) => {}
-                Err(_) => transient = true,
+                }
             }
         }
         Err(_) => transient = true,
@@ -1169,13 +1227,23 @@ fn resolve_metadata_with(
             let metadata = metadata_from_javdb(&item);
             accepted = metadata.is_ready().then_some(metadata);
         }
-        Ok(None) | Err(ProviderRequestError::SourceUnavailable) => {}
+        Ok(None) => {}
         Err(_) => transient = true,
     }
     match legacy_document(&legacy_url(&authority.product_identity)) {
         Ok(document) => match metadata_from_legacy(&document, authority) {
             Ok(Some(metadata)) => {
                 if let Some(current) = &mut accepted {
+                    let reconciled = reconcile_verified_identities(
+                        current.verified_identity.clone(),
+                        metadata.verified_identity.clone(),
+                    );
+                    let Ok(identity) = reconciled else {
+                        return Ok(Some(PresentationMetadata {
+                            identity_conflict: true,
+                            ..PresentationMetadata::default()
+                        }));
+                    };
                     current.title = current.title.take().or(metadata.title);
                     current.date = current.date.take().or(metadata.date);
                     current.runtime = current.runtime.take().or(metadata.runtime);
@@ -1185,6 +1253,7 @@ fn resolve_metadata_with(
                     current.legacy_provider_id = metadata.legacy_provider_id;
                     current.legacy_display_code = metadata.legacy_display_code;
                     current.source = Some("JavDB + r18.dev".to_owned());
+                    attach_verified_identity(current, identity);
                 } else {
                     accepted = Some(metadata);
                 }
@@ -1192,7 +1261,6 @@ fn resolve_metadata_with(
             Ok(None) => {}
             Err(_) => transient = true,
         },
-        Err(ProviderRequestError::SourceUnavailable) => {}
         Err(_) => transient = true,
     }
     if accepted
@@ -1222,7 +1290,6 @@ fn resolve_metadata_with(
                     }
                 }
             }
-            Err(ProviderRequestError::SourceUnavailable) => {}
             Err(_) => transient = true,
         }
     }
@@ -1343,6 +1410,7 @@ fn read_cache(path: &Path) -> Result<Vec<CacheEntry>, ()> {
                 provider: match fields[4] {
                     "JavDB" => "JavDB",
                     "FANZA" => "FANZA",
+                    "r18.dev" => "r18.dev",
                     _ => return Err(()),
                 },
                 provider_id: decode_text(fields[5]).ok_or(())?,
@@ -1409,6 +1477,9 @@ fn read_cache(path: &Path) -> Result<Vec<CacheEntry>, ()> {
             return Err(());
         }
         entries.push(entry);
+        if entries.len() > CACHE_MAX_ENTRIES {
+            return Err(());
+        }
     }
     Ok(entries)
 }
@@ -1469,6 +1540,12 @@ fn write_cache(path: &Path, entries: &[CacheEntry]) -> Result<(), ()> {
         writeln!(file, "{}", fields.join("\t")).map_err(|_| ())?;
     }
     file.sync_all().map_err(|_| ())?;
+    if file.metadata().map_err(|_| ())?.len() > CACHE_MAX_BYTES {
+        drop(file);
+        remove_cover_bytes_path(&replacement);
+        return Err(());
+    }
+    drop(file);
     #[cfg(target_os = "windows")]
     if path.exists() {
         fs::remove_file(path).map_err(|_| ())?;
@@ -1622,6 +1699,32 @@ fn write_cached_cover_bytes(
     bytes: &[u8],
     entries: &[CacheEntry],
     now: u64,
+    protected: &HashSet<(LibraryPresentationCategory, String)>,
+) -> Result<(), ()> {
+    write_cached_cover_bytes_with_limits(
+        cache_path,
+        authority,
+        source,
+        bytes,
+        entries,
+        now,
+        protected,
+        COVER_BYTES_CACHE_MAX_FILES,
+        COVER_BYTES_CACHE_MAX_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_cached_cover_bytes_with_limits(
+    cache_path: &Path,
+    authority: &LibraryItemAuthority,
+    source: &CoverSource,
+    bytes: &[u8],
+    entries: &[CacheEntry],
+    now: u64,
+    protected: &HashSet<(LibraryPresentationCategory, String)>,
+    maximum_files: usize,
+    maximum_bytes: u64,
 ) -> Result<(), ()> {
     let (_, ratio) = validate_cover(bytes.to_vec()).map_err(|_| ())?;
     if ratio.to_bits() != source.aspect_ratio.to_bits() {
@@ -1640,11 +1743,52 @@ fn write_cached_cover_bytes(
     if read_cached_cover_bytes(cache_path, authority, source).is_ok() {
         return Ok(());
     }
-    let (count, retained_bytes) = clean_cover_bytes_cache(cache_path, entries, now)?;
-    if count >= COVER_BYTES_CACHE_MAX_FILES
-        || retained_bytes.saturating_add(bytes.len() as u64) > COVER_BYTES_CACHE_MAX_BYTES
+    let mut bounded_entries = entries.to_vec();
+    let (mut count, mut retained_bytes) =
+        clean_cover_bytes_cache(cache_path, &bounded_entries, now)?;
+    while count.saturating_add(1) > maximum_files
+        || retained_bytes.saturating_add(bytes.len() as u64) > maximum_bytes
     {
-        return Err(());
+        let candidate = bounded_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.cover_state == "ready"
+                    && entry.identity != authority.identity
+                    && !protected.contains(&(entry.category, entry.code.clone()))
+            })
+            .filter_map(|(index, entry)| {
+                let source = entry.cover.as_ref()?;
+                let candidate_authority = LibraryItemAuthority {
+                    category: entry.category,
+                    identity: entry.identity.clone(),
+                    code: entry.code.clone(),
+                    product_identity: crate::vr_torrent::canonical_product_code(&entry.code)?,
+                };
+                let path = cover_bytes_path(cache_path, &candidate_authority, source).ok()?;
+                fs::symlink_metadata(&path).ok().map(|metadata| {
+                    (
+                        index,
+                        entry.cover_saved_at,
+                        entry.identity.clone(),
+                        path,
+                        metadata.len(),
+                    )
+                })
+            })
+            .min_by(|left, right| (left.1, &left.2).cmp(&(right.1, &right.2)));
+        let Some((index, _, _, path, length)) = candidate else {
+            return Err(());
+        };
+        remove_cover_bytes_path(&path);
+        bounded_entries[index].cover_saved_at = 0;
+        bounded_entries[index].cover_state = "missing";
+        bounded_entries[index].cover = None;
+        count = count.saturating_sub(1);
+        retained_bytes = retained_bytes.saturating_sub(length);
+    }
+    if bounded_entries != entries {
+        write_cache(cache_path, &bounded_entries)?;
     }
     let replacement_id = NEXT_CACHE_REPLACEMENT.fetch_add(1, Ordering::Relaxed);
     let replacement = directory.join(format!(
@@ -1680,7 +1824,18 @@ fn load_cache(path: &Path) -> Vec<CacheEntry> {
     read_cache(path).unwrap_or_default()
 }
 
-fn merge_cache_entry(path: &Path, entry: CacheEntry) -> Result<(), ()> {
+fn cache_entry_recency(entry: &CacheEntry) -> u64 {
+    entry
+        .identity_saved_at
+        .max(entry.cover_saved_at)
+        .max(entry.metadata_saved_at)
+}
+
+fn merge_cache_entry_with_protected(
+    path: &Path,
+    entry: CacheEntry,
+    protected: &HashSet<(LibraryPresentationCategory, String)>,
+) -> Result<(), ()> {
     let mut entries = load_cache(path);
     let replaced = entries
         .iter()
@@ -1688,6 +1843,23 @@ fn merge_cache_entry(path: &Path, entry: CacheEntry) -> Result<(), ()> {
         .cloned();
     entries.retain(|current| current.identity != entry.identity);
     entries.push(entry.clone());
+    let mut evicted = Vec::new();
+    while entries.len() > CACHE_MAX_ENTRIES {
+        let candidate = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, current)| {
+                current.identity != entry.identity
+                    && !protected.contains(&(current.category, current.code.clone()))
+            })
+            .min_by(|(_, left), (_, right)| {
+                (cache_entry_recency(left), &left.identity)
+                    .cmp(&(cache_entry_recency(right), &right.identity))
+            })
+            .map(|(index, _)| index)
+            .ok_or(())?;
+        evicted.push(entries.remove(candidate));
+    }
     entries.sort_by(|left, right| left.identity.cmp(&right.identity));
     write_cache(path, &entries)?;
     if let Some(replaced) = replaced {
@@ -1708,7 +1880,39 @@ fn merge_cache_entry(path: &Path, entry: CacheEntry) -> Result<(), ()> {
             }
         }
     }
+    for evicted in evicted {
+        if let Some(source) = &evicted.cover {
+            if let Some(product_identity) = crate::vr_torrent::canonical_product_code(&evicted.code)
+            {
+                remove_cached_cover_bytes(
+                    path,
+                    &LibraryItemAuthority {
+                        category: evicted.category,
+                        identity: evicted.identity,
+                        code: evicted.code,
+                        product_identity,
+                    },
+                    source,
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+fn merge_cache_entry(path: &Path, entry: CacheEntry) -> Result<(), ()> {
+    merge_cache_entry_with_protected(path, entry, &HashSet::new())
+}
+
+fn active_cover_request_keys(
+    context: &LibraryPresentationContext,
+) -> HashSet<(LibraryPresentationCategory, String)> {
+    context
+        .cover_requests
+        .iter()
+        .filter(|(_, request)| request.active)
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 fn remove_cache_entry(path: &Path, identity: &str) -> Result<(), ()> {
@@ -2294,7 +2498,9 @@ fn resolve_cover_at_with_request(
             entry.cover_state = cover_state;
             entry.cover = source.clone();
         }
-        merge_cache_entry(cache_path, entry).map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+        let protected = active_cover_request_keys(&_guard);
+        merge_cache_entry_with_protected(cache_path, entry, &protected)
+            .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
     }
     let response = cover_response(
         state,
@@ -2577,7 +2783,9 @@ fn resolve_metadata_at_with(
         entry.metadata_saved_at = now;
         entry.metadata_state = "ready";
         entry.metadata = metadata.clone();
-        merge_cache_entry(cache_path, entry).map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+        let protected = active_cover_request_keys(&context);
+        merge_cache_entry_with_protected(cache_path, entry, &protected)
+            .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
     }
     Ok(metadata_response(
         authority,
@@ -2662,7 +2870,7 @@ fn fetch_cover_with(
     }
     .map(|(bytes, _)| bytes)
     .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
-    let _guard = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+    let guard = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
     let entries =
         load_cache_for_authority(cache_path, authority).map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
     if entries.iter().any(|entry| {
@@ -2670,14 +2878,17 @@ fn fetch_cover_with(
             && entry.cover_state == "ready"
             && entry.cover.as_ref() == Some(&cover.source)
     }) {
-        let _ = write_cached_cover_bytes(
+        let protected = active_cover_request_keys(&guard);
+        write_cached_cover_bytes(
             cache_path,
             authority,
             &cover.source,
             &bytes,
             &entries,
             now_seconds(),
-        );
+            &protected,
+        )
+        .map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
     }
     Ok(bytes)
 }
@@ -3095,8 +3306,16 @@ mod tests {
             .find(|entry| cache_entry_matches_authority(entry, authority))
             .and_then(|entry| entry.cover.as_ref())
             .expect("the cache entry must contain a cover");
-        write_cached_cover_bytes(path, authority, source, &jpeg(600, 800), &entries, now)
-            .expect("the validated local cover bytes must be stored");
+        write_cached_cover_bytes(
+            path,
+            authority,
+            source,
+            &jpeg(600, 800),
+            &entries,
+            now,
+            &HashSet::new(),
+        )
+        .expect("the validated local cover bytes must be stored");
     }
 
     fn verified_javdb(provider_id: &str, display_code: &str) -> VerifiedDisplayIdentity {
@@ -3433,7 +3652,7 @@ mod tests {
                 |_| panic!("a null FANZA package image has no image request"),
                 |_| {
                     Ok(format!(
-                        r#"{{"content_id":"{content_id}","dvd_id":"{code}","images":null}}"#
+                        r#"{{"content_id":"{content_id}","dvd_id":"{display_code}","images":null}}"#
                     ))
                 },
                 |_| panic!("a null legacy image has no image request"),
@@ -4378,7 +4597,10 @@ mod tests {
         .expect("a failed exact source must remain a current local state");
         assert_eq!(response[2], "unavailable");
         assert_eq!(javdb_images.get(), 0);
-        assert!(!javdb_fixture.path.exists());
+        let retained = read_cache(&javdb_fixture.path)
+            .expect("a separately verified legacy display identity may remain");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].cover_saved_at, 0);
 
         for (index, legacy_cover) in [
             r#""images":[]"#,
@@ -4717,7 +4939,7 @@ mod tests {
                         },
                         |_| panic!("an absent FANZA cover has no image"),
                         |_| {
-                            Ok(r#"{"content_id":"cawb00001","dvd_id":"CAWB-1"$COVER}"#
+                            Ok(r#"{"content_id":"cawb00001","dvd_id":"CAWB-001"$COVER}"#
                                 .replace("$COVER", legacy_cover))
                         },
                         |_| panic!("an absent legacy cover has no image"),
@@ -4923,7 +5145,7 @@ mod tests {
     }
 
     #[test]
-    fn later_legacy_cover_does_not_replace_verified_provider_display_identity() {
+    fn later_legacy_cover_with_a_different_exact_display_is_a_conflict() {
         let fixture = CacheFixture::new("legacy-cover-verified-display");
         let authority = LibraryItemAuthority {
             category: LibraryPresentationCategory::Adult,
@@ -4952,9 +5174,9 @@ mod tests {
                 )
             },
         )
-        .expect("legacy image may accompany retained exact display identity");
-        assert_eq!(response[3], "r18.dev");
-        assert_eq!(&response[8..], ["FANZA", "cawb00001", "CAWB-001"]);
+        .expect("legacy display disagreement must remain a current response");
+        assert_eq!(response[2], "unavailable");
+        assert_eq!(&response[8..], ["", "", ""]);
     }
 
     #[test]
@@ -6469,7 +6691,7 @@ mod tests {
                 CoverSource {
                     provider: "r18.dev",
                     provider_id: "cawb00001".to_owned(),
-                    display_code: "CAWB-1".to_owned(),
+                    display_code: "CAWB-001".to_owned(),
                     url: "https://pics.dmm.co.jp/digital/video/cawb00001/cawb00001pl.jpg"
                         .to_owned(),
                     aspect_ratio: 0.75,
@@ -6515,14 +6737,18 @@ mod tests {
                 identity: authority.identity.clone(),
                 category: authority.category,
                 code: authority.code.clone(),
-                identity_saved_at: 0,
-                verified_identity: None,
+                identity_saved_at: 100,
+                verified_identity: Some(VerifiedDisplayIdentity {
+                    provider: "r18.dev",
+                    provider_id: "cawb00001".to_owned(),
+                    display_code: "CAWB-001".to_owned(),
+                }),
                 cover_saved_at: 100,
                 cover_state: "ready",
                 cover: Some(CoverSource {
                     provider: "r18.dev",
                     provider_id: "cawb00001".to_owned(),
-                    display_code: "CAWB-1".to_owned(),
+                    display_code: "CAWB-001".to_owned(),
                     url: "https://pics.dmm.co.jp/digital/video/cawb00001/cawb00001pl.jpg"
                         .to_owned(),
                     aspect_ratio: 0.75,
@@ -6621,8 +6847,13 @@ mod tests {
             source: Some("r18.dev".to_owned()),
             provider_id: Some("cawb00001".to_owned()),
             legacy_provider_id: Some("cawb00001".to_owned()),
-            legacy_display_code: Some("CAWB-1".to_owned()),
-            display_code: Some("CAWB-1".to_owned()),
+            verified_identity: Some(VerifiedDisplayIdentity {
+                provider: "r18.dev",
+                provider_id: "cawb00001".to_owned(),
+                display_code: "CAWB-001".to_owned(),
+            }),
+            legacy_display_code: Some("CAWB-001".to_owned()),
+            display_code: Some("CAWB-001".to_owned()),
             title: Some("Exact legacy title".to_owned()),
             ..PresentationMetadata::default()
         };
@@ -6632,14 +6863,18 @@ mod tests {
                 identity: authority.identity.clone(),
                 category: authority.category,
                 code: authority.code.clone(),
-                identity_saved_at: 0,
-                verified_identity: None,
+                identity_saved_at: 100,
+                verified_identity: Some(VerifiedDisplayIdentity {
+                    provider: "r18.dev",
+                    provider_id: "cawb00001".to_owned(),
+                    display_code: "CAWB-001".to_owned(),
+                }),
                 cover_saved_at: 100,
                 cover_state: "ready",
                 cover: Some(CoverSource {
                     provider: "r18.dev",
                     provider_id: "cawb00001".to_owned(),
-                    display_code: "CAWB-1".to_owned(),
+                    display_code: "CAWB-001".to_owned(),
                     url: legacy_url.to_owned(),
                     aspect_ratio: 0.75,
                 }),
@@ -6659,7 +6894,7 @@ mod tests {
             || panic!("an exact current legacy cover cache must skip provider resolution"),
         )
         .expect("the exact legacy cover proof must be reusable");
-        assert_eq!(&cover[2..6], ["ready", "r18.dev", "cawb00001", "CAWB-1"]);
+        assert_eq!(&cover[2..6], ["ready", "r18.dev", "cawb00001", "CAWB-001"]);
         assert!(cover[6].ends_with("-cawb00001"));
         let metadata = resolve_metadata_at_with(
             &LibraryPresentationState::default(),
@@ -6675,7 +6910,7 @@ mod tests {
         assert_eq!(metadata[7], "r18.dev");
         assert_eq!(metadata[8], "cawb00001");
         assert_eq!(metadata[metadata.len() - 2], "cawb00001");
-        assert_eq!(metadata.last().map(String::as_str), Some("CAWB-1"));
+        assert_eq!(metadata.last().map(String::as_str), Some("CAWB-001"));
     }
 
     #[test]
@@ -6787,5 +7022,312 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from(["ADLT-123", "ADLT-124"])
         );
+    }
+
+    #[test]
+    fn standalone_legacy_display_identity_survives_no_cover_cache_and_restart() {
+        let fixture = CacheFixture::new("legacy-display-no-cover");
+        let authority = LibraryItemAuthority {
+            category: LibraryPresentationCategory::Adult,
+            identity: "a".repeat(40),
+            code: "CAWB-1".to_owned(),
+            product_identity: "CAWB-1".to_owned(),
+        };
+        let resolve = || {
+            resolve_cover_with(
+                &authority,
+                |_| Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned()),
+                |_| panic!("a JavDB no-match has no image"),
+                |_| Ok(r#"{"data":{"c0":null}}"#.to_owned()),
+                |_| panic!("a FANZA no-match has no image"),
+                |_| {
+                    Ok(
+                        r#"{"content_id":"cawb00001","dvd_id":"CAWB-001","images":null}"#
+                            .to_owned(),
+                    )
+                },
+                |_| panic!("a legacy no-cover proof has no image"),
+            )
+        };
+        let first = resolve_cover_at_with(
+            &LibraryPresentationState::default(),
+            &fixture.path,
+            &authority,
+            100,
+            || true,
+            resolve,
+        )
+        .expect("the explicit padded legacy display must establish identity");
+        assert_eq!(first[2], "missing");
+        assert_eq!(&first[8..], ["r18.dev", "cawb00001", "CAWB-001"]);
+
+        let restarted = resolve_cover_at_with(
+            &LibraryPresentationState::default(),
+            &fixture.path,
+            &authority,
+            101,
+            || true,
+            || panic!("the exact no-cover identity must survive restart"),
+        )
+        .expect("the exact no-cover identity cache must be reusable");
+        assert_eq!(restarted, first);
+
+        let conflict_fixture = CacheFixture::new("legacy-display-conflict");
+        let conflicting = resolve_cover_at_with(
+            &LibraryPresentationState::default(),
+            &conflict_fixture.path,
+            &authority,
+            100,
+            || true,
+            || {
+                resolve_cover_with(
+                    &authority,
+                    |url| {
+                        Ok((if url.contains("search") {
+                            javdb_listing("CAWB-0001")
+                        } else {
+                            javdb_detail("CAWB-0001", authority.category)
+                        })
+                        .replace(
+                            r#""cover_url":"https://tp.cmastd.com/exact.jpg""#,
+                            r#""cover_url":null"#,
+                        ))
+                    },
+                    |_| panic!("the JavDB fixture has no cover"),
+                    |_| Ok(r#"{"data":{"c0":null}}"#.to_owned()),
+                    |_| panic!("the FANZA fixture has no cover"),
+                    |_| {
+                        Ok(
+                            r#"{"content_id":"cawb00001","dvd_id":"CAWB-001","images":null}"#
+                                .to_owned(),
+                        )
+                    },
+                    |_| panic!("the conflicting legacy proof has no cover"),
+                )
+            },
+        )
+        .expect("exact-display disagreement must become a current conflict");
+        assert_eq!(conflicting[2], "unavailable");
+        assert_eq!(&conflicting[8..], ["", "", ""]);
+        assert_eq!(
+            read_cache(&conflict_fixture.path).expect("the conflict cache must be valid")[0]
+                .cover_state,
+            "conflict"
+        );
+        let restarted_conflict = resolve_metadata_at_with(
+            &LibraryPresentationState::default(),
+            &conflict_fixture.path,
+            &authority,
+            None,
+            101,
+            || true,
+            || panic!("restart must not discard the durable display conflict"),
+        )
+        .expect("restart must retain the unavailable conflict");
+        assert_eq!(restarted_conflict[2], "unavailable");
+    }
+
+    #[test]
+    fn persistent_proofs_evict_only_obsolete_records_at_the_count_bound() {
+        let fixture = CacheFixture::new("proof-count-bound");
+        let mut entries = (1..=CACHE_MAX_ENTRIES)
+            .map(|number| CacheEntry {
+                identity: format!("{number:040x}"),
+                category: LibraryPresentationCategory::Adult,
+                code: format!("ADLT-{number}"),
+                identity_saved_at: 0,
+                verified_identity: None,
+                cover_saved_at: number as u64,
+                cover_state: "missing",
+                cover: None,
+                metadata_saved_at: 0,
+                metadata_state: "missing",
+                metadata: PresentationMetadata::default(),
+            })
+            .collect::<Vec<_>>();
+        write_cache(&fixture.path, &entries).expect("the full proof cache must be written");
+        let protected = HashSet::from([(LibraryPresentationCategory::Adult, "ADLT-1".to_owned())]);
+        let newest = CacheEntry {
+            identity: "f".repeat(40),
+            category: LibraryPresentationCategory::Adult,
+            code: "ADLT-999".to_owned(),
+            identity_saved_at: 0,
+            verified_identity: None,
+            cover_saved_at: 999,
+            cover_state: "missing",
+            cover: None,
+            metadata_saved_at: 0,
+            metadata_state: "missing",
+            metadata: PresentationMetadata::default(),
+        };
+        merge_cache_entry_with_protected(&fixture.path, newest, &protected)
+            .expect("an obsolete proof must be evicted for current work");
+        entries = read_cache(&fixture.path).expect("the bounded proof cache must remain valid");
+        assert_eq!(entries.len(), CACHE_MAX_ENTRIES);
+        assert!(entries.iter().any(|entry| entry.code == "ADLT-1"));
+        assert!(entries.iter().any(|entry| entry.code == "ADLT-999"));
+        assert!(!entries.iter().any(|entry| entry.code == "ADLT-2"));
+    }
+
+    #[test]
+    fn local_cover_bytes_evict_obsolete_records_for_count_and_total_byte_limits() {
+        for (label, maximum_files, maximum_bytes) in [
+            ("file-count", 1, u64::MAX),
+            ("total-bytes", 8, jpeg(600, 800).len() as u64 + 1),
+        ] {
+            let fixture = CacheFixture::new(&format!("cover-byte-{label}"));
+            let first = authority(LibraryPresentationCategory::Vr);
+            let second = LibraryItemAuthority {
+                identity: "b".repeat(40),
+                code: "MDVR-420".to_owned(),
+                product_identity: "MDVR-420".to_owned(),
+                ..first.clone()
+            };
+            let first_source = cover("firstitem", 0.75);
+            let second_source = CoverSource {
+                provider_id: "seconditem".to_owned(),
+                display_code: second.code.clone(),
+                url: "https://tp.cmastd.com/seconditem.jpg".to_owned(),
+                ..first_source.clone()
+            };
+            let entries = [
+                CacheEntry {
+                    identity: first.identity.clone(),
+                    category: first.category,
+                    code: first.code.clone(),
+                    identity_saved_at: 10,
+                    verified_identity: Some(verified_javdb("firstitem", &first.code)),
+                    cover_saved_at: 10,
+                    cover_state: "ready",
+                    cover: Some(first_source.clone()),
+                    metadata_saved_at: 0,
+                    metadata_state: "missing",
+                    metadata: PresentationMetadata::default(),
+                },
+                CacheEntry {
+                    identity: second.identity.clone(),
+                    category: second.category,
+                    code: second.code.clone(),
+                    identity_saved_at: 20,
+                    verified_identity: Some(verified_javdb("seconditem", &second.code)),
+                    cover_saved_at: 20,
+                    cover_state: "ready",
+                    cover: Some(second_source.clone()),
+                    metadata_saved_at: 0,
+                    metadata_state: "missing",
+                    metadata: PresentationMetadata::default(),
+                },
+            ];
+            write_cache(&fixture.path, &entries).expect("both exact proofs must be durable");
+            write_cached_cover_bytes_with_limits(
+                &fixture.path,
+                &first,
+                &first_source,
+                &jpeg(600, 800),
+                &entries,
+                20,
+                &HashSet::new(),
+                maximum_files,
+                maximum_bytes,
+            )
+            .expect("the first local cover must fit");
+            let current_entries = read_cache(&fixture.path).expect("proofs must remain readable");
+            write_cached_cover_bytes_with_limits(
+                &fixture.path,
+                &second,
+                &second_source,
+                &jpeg(600, 800),
+                &current_entries,
+                21,
+                &HashSet::from([(LibraryPresentationCategory::Vr, second.code.clone())]),
+                maximum_files,
+                maximum_bytes,
+            )
+            .expect("obsolete local bytes must make room for the displayed current cover");
+            assert!(read_cached_cover_bytes(&fixture.path, &first, &first_source).is_err());
+            assert!(read_cached_cover_bytes(&fixture.path, &second, &second_source).is_ok());
+        }
+    }
+
+    #[test]
+    fn failed_local_cover_write_fails_the_byte_fetch_instead_of_succeeding_silently() {
+        let fixture = CacheFixture::new("forced-cover-write-failure");
+        let authority = authority(LibraryPresentationCategory::Vr);
+        let state = LibraryPresentationState::default();
+        let response = resolve_cover_at_with(
+            &state,
+            &fixture.path,
+            &authority,
+            100,
+            || true,
+            || {
+                (
+                    Some((cover("item", 0.75), jpeg(600, 800))),
+                    Some(identity_evidence(verified_javdb("item", &authority.code))),
+                    false,
+                )
+            },
+        )
+        .expect("the current cover proof must resolve");
+        let entries = read_cache(&fixture.path).expect("the cover proof must be durable");
+        let source = entries[0]
+            .cover
+            .as_ref()
+            .expect("the cover source must exist");
+        let target = cover_bytes_path(&fixture.path, &authority, source)
+            .expect("the local byte target must be deterministic");
+        fs::create_dir_all(&target).expect("a deterministic write blocker must be created");
+        assert_eq!(
+            fetch_cover_with(&state, &fixture.path, &authority, &response[6], |_| {
+                panic!("resolved bytes must not be fetched remotely")
+            }),
+            Err(LIBRARY_PRESENTATION_FAILED)
+        );
+    }
+
+    #[test]
+    fn metadata_unavailability_is_not_a_local_only_miss_and_retry_can_succeed() {
+        let fixture = CacheFixture::new("metadata-unavailable-retry");
+        let authority = authority(LibraryPresentationCategory::Adult);
+        let unavailable = resolve_metadata_at_with(
+            &LibraryPresentationState::default(),
+            &fixture.path,
+            &authority,
+            None,
+            100,
+            || true,
+            || Err(ProviderRequestError::SourceUnavailable),
+        )
+        .expect("metadata source unavailability must remain a response state");
+        assert_eq!(unavailable[2], "unavailable");
+        assert!(!fixture.path.exists());
+
+        let mixed = resolve_metadata_with(
+            &authority,
+            |_| Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned()),
+            |_| Err(ProviderRequestError::Network),
+        );
+        assert!(mixed.is_err());
+
+        let metadata = PresentationMetadata {
+            verified_identity: Some(verified_javdb("retryitem", &authority.code)),
+            source: Some("JavDB".to_owned()),
+            provider_id: Some("retryitem".to_owned()),
+            display_code: Some(authority.code.clone()),
+            title: Some("Recovered metadata".to_owned()),
+            ..PresentationMetadata::default()
+        };
+        let recovered = resolve_metadata_at_with(
+            &LibraryPresentationState::default(),
+            &fixture.path,
+            &authority,
+            None,
+            101,
+            || true,
+            || Ok(Some(metadata)),
+        )
+        .expect("a later exact metadata retry must recover");
+        assert_eq!(recovered[2], "automatic");
+        assert_eq!(recovered[10], "Recovered metadata");
     }
 }

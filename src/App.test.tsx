@@ -17597,7 +17597,7 @@ describe("explicit Library cover recovery", () => {
     expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
   });
 
-  it("updates an open Adult Library details surface when metadata establishes display identity", async () => {
+  it("updates the Adult card and open details when unavailable metadata Retry establishes identity", async () => {
     const metadata = createDeferred<string[]>();
     savedAdultFolder = "/Adult";
     scanAdultLibraryMock.mockResolvedValue([
@@ -17618,7 +17618,24 @@ describe("explicit Library cover recovery", () => {
       "",
       "",
     ]);
-    resolveLibraryMetadataMock.mockReturnValue(metadata.promise);
+    resolveLibraryMetadataMock
+      .mockResolvedValueOnce([
+        "library-metadata-v4",
+        "adult",
+        "unavailable",
+        "current",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "0",
+      ])
+      .mockReturnValueOnce(metadata.promise);
 
     render(<App />);
     selectLibrary();
@@ -17634,6 +17651,11 @@ describe("explicit Library cover recovery", () => {
     );
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByRole("heading", { name: "CAWB-1" })).toBeTruthy();
+    const retry = card.querySelector(
+      '[aria-label="Retry presentation: CAWB-1"]',
+    ) as HTMLButtonElement;
+    expect(retry).toBeTruthy();
+    fireEvent.click(retry);
 
     await act(async () => {
       metadata.resolve([
