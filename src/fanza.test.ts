@@ -33,7 +33,7 @@ describe("FANZA catalog boundary", () => {
           "3",
           "vr",
           "13dsvr01947",
-          "3DSVR-1947",
+          "3DSVR-01947",
           "First title",
           "fanza-cover-8-1",
           "0.72",
@@ -58,7 +58,7 @@ describe("FANZA catalog boundary", () => {
       items: [
         expect.objectContaining({
           contentId: "13dsvr01947",
-          displayCode: "3DSVR-1947",
+          displayCode: "3DSVR-01947",
           title: "First title",
         }),
         expect.objectContaining({
@@ -203,7 +203,7 @@ describe("FANZA catalog boundary", () => {
       contextGeneration: "4",
       requestGeneration: "8",
       contentId: "13dsvr01947",
-      displayCode: "3DSVR-1947",
+      displayCode: "3DSVR-01947",
       title: null,
       coverAuthorityId: "fanza-cover-8-1",
       sourceAspectRatio: 0.72,
@@ -217,7 +217,7 @@ describe("FANZA catalog boundary", () => {
       contextGeneration: "4",
       requestGeneration: "8",
       contentId: "13dsvr01947",
-      displayCode: "3DSVR-1947",
+      displayCode: "3DSVR-01947",
       coverAuthorityId: "fanza-cover-8-1",
     });
     expect(invoke.mock.calls[0]?.[1]).not.toHaveProperty("url");
