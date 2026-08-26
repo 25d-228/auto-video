@@ -22,7 +22,8 @@ use crate::{
 pub(crate) const LIBRARY_PRESENTATION_FAILED: &str = "library_presentation_failed";
 pub(crate) const LIBRARY_PRESENTATION_STALE: &str = "library_presentation_stale";
 
-const CACHE_VERSION: &str = "library-presentation-v7";
+// Earlier issue-120 attempts reused v7 while their provider-conflict proof changed.
+const CACHE_VERSION: &str = "library-presentation-v8";
 const CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const CACHE_MAX_ENTRIES: usize = 256;
 const COVER_BYTES_CACHE_MAX_FILES: usize = 256;
@@ -2172,6 +2173,35 @@ pub(crate) fn resolve_cover(
     request_generation: u64,
     is_current: impl Fn() -> bool,
 ) -> Result<Vec<String>, &'static str> {
+    resolve_cover_with_providers(
+        state,
+        cache_path,
+        authority,
+        request_generation,
+        is_current,
+        javdb_catalog::fetch_api_document,
+        javdb_catalog::fetch_cover_bytes,
+        fanza_catalog::fetch_graphql_document,
+        fanza_catalog::fetch_cover_bytes,
+        fetch_legacy_document,
+        fetch_legacy_image,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_cover_with_providers(
+    state: &LibraryPresentationState,
+    cache_path: &Path,
+    authority: &LibraryItemAuthority,
+    request_generation: u64,
+    is_current: impl Fn() -> bool,
+    javdb_document: impl FnMut(&str) -> Result<String, ProviderRequestError>,
+    mut javdb_image: impl FnMut(&str) -> Result<Vec<u8>, ProviderRequestError>,
+    fanza_document: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+    fanza_image: impl FnOnce(&str) -> Result<Vec<u8>, ProviderRequestError>,
+    legacy_document: impl FnMut(&str) -> Result<String, ProviderRequestError>,
+    legacy_image: impl FnOnce(&str) -> Result<Vec<u8>, ProviderRequestError>,
+) -> Result<Vec<String>, &'static str> {
     let failed_urls = {
         let context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
         context
@@ -2197,16 +2227,18 @@ pub(crate) fn resolve_cover(
                     current_identity,
                     require_complete_identity_agreement,
                 ),
-                javdb_catalog::fetch_api_document,
+                javdb_document,
                 |url| {
-                    fetch_current_cover_source(url, &failed_urls, javdb_catalog::fetch_cover_bytes)
+                    if failed_urls.contains(url) {
+                        Err(ProviderRequestError::Provider)
+                    } else {
+                        javdb_image(url)
+                    }
                 },
-                fanza_catalog::fetch_graphql_document,
-                |url| {
-                    fetch_current_cover_source(url, &failed_urls, fanza_catalog::fetch_cover_bytes)
-                },
-                fetch_legacy_document,
-                |url| fetch_current_cover_source(url, &failed_urls, fetch_legacy_image),
+                fanza_document,
+                |url| fetch_current_cover_source(url, &failed_urls, fanza_image),
+                legacy_document,
+                |url| fetch_current_cover_source(url, &failed_urls, legacy_image),
             )
         },
     )

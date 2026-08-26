@@ -2759,6 +2759,131 @@ fn current_library_presentation_authority(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_library_cover_command_with(
+    category: LibraryPresentationCategory,
+    item_id: &str,
+    scan_generation: u64,
+    cover_request_generation: u64,
+    cache_path: &Path,
+    adult_state: &AdultLibraryState,
+    download_state: &VrDownloadState,
+    vr_state: &VrLibraryState,
+    presentation_state: &LibraryPresentationState,
+    resolve: impl FnOnce(
+        &LibraryPresentationState,
+        &Path,
+        &LibraryItemAuthority,
+        u64,
+        &dyn Fn() -> bool,
+    ) -> Result<Vec<String>, &'static str>,
+) -> Result<Vec<String>, String> {
+    let authority = current_library_presentation_authority(
+        category,
+        item_id,
+        scan_generation,
+        adult_state,
+        download_state,
+        vr_state,
+    )?;
+    begin_library_cover_request(
+        presentation_state,
+        category,
+        item_id,
+        cover_request_generation,
+    )
+    .map_err(str::to_owned)?;
+    let is_current = || {
+        library_cover_request_is_current(
+            presentation_state,
+            category,
+            item_id,
+            cover_request_generation,
+        ) && current_library_presentation_authority(
+            category,
+            item_id,
+            scan_generation,
+            adult_state,
+            download_state,
+            vr_state,
+        )
+        .is_ok_and(|current| current == authority)
+    };
+    let response = resolve(
+        presentation_state,
+        cache_path,
+        &authority,
+        cover_request_generation,
+        &is_current,
+    )
+    .map_err(str::to_owned)?;
+    let current = current_library_presentation_authority(
+        category,
+        item_id,
+        scan_generation,
+        adult_state,
+        download_state,
+        vr_state,
+    );
+    if current.as_ref().is_ok_and(|current| current == &authority)
+        && library_cover_request_is_current(
+            presentation_state,
+            category,
+            item_id,
+            cover_request_generation,
+        )
+    {
+        return Ok(response);
+    }
+    let _ = cancel_library_cover_request_with(
+        presentation_state,
+        category,
+        item_id,
+        cover_request_generation,
+    );
+    Err(LIBRARY_PRESENTATION_STALE.to_owned())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_library_cover_command_with(
+    category: LibraryPresentationCategory,
+    item_id: &str,
+    scan_generation: u64,
+    cover_authority_id: &str,
+    cache_path: &Path,
+    adult_state: &AdultLibraryState,
+    download_state: &VrDownloadState,
+    vr_state: &VrLibraryState,
+    presentation_state: &LibraryPresentationState,
+) -> Result<Vec<u8>, String> {
+    let authority = current_library_presentation_authority(
+        category,
+        item_id,
+        scan_generation,
+        adult_state,
+        download_state,
+        vr_state,
+    )?;
+    let bytes = fetch_library_presentation_cover_with(
+        presentation_state,
+        cache_path,
+        &authority,
+        cover_authority_id,
+    )
+    .map_err(str::to_owned)?;
+    let current = current_library_presentation_authority(
+        category,
+        item_id,
+        scan_generation,
+        adult_state,
+        download_state,
+        vr_state,
+    )?;
+    (current == authority)
+        .then_some(bytes)
+        .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn resolve_library_cover(
@@ -2788,69 +2913,20 @@ async fn resolve_library_cover(
     let vr_state = vr_state.inner().clone();
     let presentation_state = presentation_state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let authority = current_library_presentation_authority(
+        resolve_library_cover_command_with(
             category,
             &item_id,
             scan_generation,
+            cover_request_generation,
+            &cache_path,
             &adult_state,
             &download_state,
             &vr_state,
-        )?;
-        begin_library_cover_request(
             &presentation_state,
-            category,
-            &item_id,
-            cover_request_generation,
-        )
-        .map_err(str::to_owned)?;
-        let response = resolve_library_cover_with(
-            &presentation_state,
-            &cache_path,
-            &authority,
-            cover_request_generation,
-            || {
-                library_cover_request_is_current(
-                    &presentation_state,
-                    category,
-                    &item_id,
-                    cover_request_generation,
-                ) && current_library_presentation_authority(
-                    category,
-                    &item_id,
-                    scan_generation,
-                    &adult_state,
-                    &download_state,
-                    &vr_state,
-                )
-                .is_ok_and(|current| current == authority)
+            |state, path, authority, generation, is_current| {
+                resolve_library_cover_with(state, path, authority, generation, is_current)
             },
         )
-        .map_err(str::to_owned)?;
-        let current = current_library_presentation_authority(
-            category,
-            &item_id,
-            scan_generation,
-            &adult_state,
-            &download_state,
-            &vr_state,
-        );
-        if current.as_ref().is_ok_and(|current| current == &authority)
-            && library_cover_request_is_current(
-                &presentation_state,
-                category,
-                &item_id,
-                cover_request_generation,
-            )
-        {
-            return Ok(response);
-        }
-        let _ = cancel_library_cover_request_with(
-            &presentation_state,
-            category,
-            &item_id,
-            cover_request_generation,
-        );
-        Err(LIBRARY_PRESENTATION_STALE.to_owned())
     })
     .await
     .map_err(|_| LIBRARY_PRESENTATION_FAILED.to_owned())?
@@ -2962,33 +3038,17 @@ async fn fetch_library_cover(
     let presentation_state = presentation_state.inner().clone();
     let cache_path = library_presentation_cache_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let authority = current_library_presentation_authority(
+        fetch_library_cover_command_with(
             category,
             &item_id,
             scan_generation,
-            &adult_state,
-            &download_state,
-            &vr_state,
-        );
-        let authority = authority?;
-        let bytes = fetch_library_presentation_cover_with(
-            &presentation_state,
-            &cache_path,
-            &authority,
             &cover_authority_id,
-        )
-        .map_err(str::to_owned)?;
-        let current = current_library_presentation_authority(
-            category,
-            &item_id,
-            scan_generation,
+            &cache_path,
             &adult_state,
             &download_state,
             &vr_state,
-        )?;
-        (current == authority)
-            .then_some(bytes)
-            .ok_or_else(|| LIBRARY_PRESENTATION_STALE.to_owned())
+            &presentation_state,
+        )
     })
     .await
     .map_err(|_| LIBRARY_PRESENTATION_FAILED.to_owned())?
@@ -4697,7 +4757,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         fs, io,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
@@ -4711,26 +4771,35 @@ mod tests {
         begin_movie_metadata_client_operation, begin_movie_metadata_search,
         begin_movie_metadata_verification, clear_movie_metadata_match_with,
         clear_movies_folder_file, clear_tmdb_token_file, fetch_javdb_adult_catalog_with,
-        fetch_javdb_vr_catalog_with, fetch_sukebei_adult_releases_with,
-        fetch_sukebei_vr_releases_with, fetch_yts_movie_releases_with,
-        finish_movie_metadata_search, finish_movie_metadata_verification,
-        invalidate_movie_metadata_client_context, load_movies_folder_file, load_tmdb_token_file,
-        movie_metadata_error, open_movie_path_with, open_movie_request_with,
-        parse_movie_metadata_candidates, parse_movie_provider_response, parse_provider_response,
-        parse_verified_movie_metadata, query_movies_volume_storage_with, reveal_movie_path_with,
-        reveal_movie_request_with, save_movie_metadata_match_with, save_movies_folder_file,
-        save_tmdb_token_file, scan_movie_paths, scan_movies_library, trash_movie_path_with,
-        trash_movie_request_with, MoviePathValidationError, MovieProviderRequestError,
-        MovieTorrentState, MoviesLibraryContext, MoviesVolumeStorageQueryError,
-        ProviderRequestError, TrashMovieRequest, ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE,
-        MOVIES_STORAGE_FAILED, MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID,
-        MOVIE_METADATA_MALFORMED, MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE,
-        MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE,
-        MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
+        fetch_javdb_vr_catalog_with, fetch_library_cover_command_with,
+        fetch_sukebei_adult_releases_with, fetch_sukebei_vr_releases_with,
+        fetch_yts_movie_releases_with, finish_movie_metadata_search,
+        finish_movie_metadata_verification, invalidate_movie_metadata_client_context,
+        load_movies_folder_file, load_tmdb_token_file, movie_metadata_error, open_movie_path_with,
+        open_movie_request_with, parse_movie_metadata_candidates, parse_movie_provider_response,
+        parse_provider_response, parse_verified_movie_metadata, query_movies_volume_storage_with,
+        resolve_library_cover_command_with, reveal_movie_path_with, reveal_movie_request_with,
+        save_movie_metadata_match_with, save_movies_folder_file, save_tmdb_token_file,
+        scan_movie_paths, scan_movies_library, trash_movie_path_with, trash_movie_request_with,
+        MoviePathValidationError, MovieProviderRequestError, MovieTorrentState,
+        MoviesLibraryContext, MoviesVolumeStorageQueryError, ProviderRequestError,
+        TrashMovieRequest, ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
+        MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID, MOVIE_METADATA_MALFORMED,
+        MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE, MOVIE_OPEN_FAILED,
+        MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED,
+        MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
         MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED,
         MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND,
         MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE, MOVIE_TRASH_UNAVAILABLE,
         MOVIE_TRASH_UNSUPPORTED, TMDB_TOKEN_INVALID, VR_PROVIDER_ERROR,
+    };
+    use crate::{
+        adult_library::{scan_adult_library_with, set_adult_folder, AdultLibraryState},
+        library_presentation::{
+            resolve_cover_with_providers, LibraryPresentationCategory, LibraryPresentationState,
+        },
+        vr_download::{set_vr_folder, VrDownloadState},
+        vr_library::{scan_vr_library_with, VrLibraryState},
     };
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
@@ -4770,6 +4839,369 @@ mod tests {
         path.into_os_string()
             .into_string()
             .expect("fixture paths must be valid Unicode")
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReportedLibraryCode {
+        Olm,
+        Mium,
+        ThreeDsvr,
+        Dsvr,
+    }
+
+    impl ReportedLibraryCode {
+        fn category(self) -> LibraryPresentationCategory {
+            match self {
+                Self::Olm | Self::Mium => LibraryPresentationCategory::Adult,
+                Self::ThreeDsvr | Self::Dsvr => LibraryPresentationCategory::Vr,
+            }
+        }
+
+        fn filename(self) -> &'static str {
+            match self {
+                Self::Olm => "OLM-332E.mp4",
+                Self::Mium => "300MIUM-1369.mp4",
+                Self::ThreeDsvr => "3DSVR-01871-A.mp4",
+                Self::Dsvr => "DSVR-00069.mp4",
+            }
+        }
+
+        fn item_id(self) -> &'static str {
+            match self {
+                Self::Olm => "OLM-332",
+                Self::Mium => "300MIUM-1369",
+                Self::ThreeDsvr => "3DSVR-01871",
+                Self::Dsvr => "DSVR-00069",
+            }
+        }
+    }
+
+    fn reported_library_states(
+        fixture: &FilesystemFixture,
+        case: ReportedLibraryCode,
+    ) -> (AdultLibraryState, VrDownloadState, VrLibraryState, u64) {
+        let folder = fixture.path.join("Library");
+        fs::create_dir_all(&folder).expect("reported Library folder must be created");
+        let file = folder.join(case.filename());
+        if !file.exists() {
+            fs::write(&file, b"reported-library-item")
+                .expect("reported Library item must be created");
+        }
+        let adult_state = AdultLibraryState::default();
+        let download_state = VrDownloadState::default();
+        let vr_state = VrLibraryState::default();
+        let generation = match case.category() {
+            LibraryPresentationCategory::Adult => {
+                set_adult_folder(&adult_state, &fixture.path.join("adult-folder"), folder)
+                    .expect("the Adult fixture folder must be configured");
+                scan_adult_library_with(&adult_state).expect("the Adult fixture must scan")[0]
+                    .parse()
+                    .expect("the Adult scan generation must be valid")
+            }
+            LibraryPresentationCategory::Vr => {
+                set_vr_folder(&download_state, &fixture.path.join("vr-folder"), folder)
+                    .expect("the VR fixture folder must be configured");
+                scan_vr_library_with(&download_state, &vr_state).expect("the VR fixture must scan")
+                    [0]
+                .parse()
+                .expect("the VR scan generation must be valid")
+            }
+        };
+        (adult_state, download_state, vr_state, generation)
+    }
+
+    fn reported_cover_jpeg() -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xc0, 0, 17, 8];
+        bytes.extend(800_u16.to_be_bytes());
+        bytes.extend(600_u16.to_be_bytes());
+        bytes.resize(6_000, 0);
+        bytes
+    }
+
+    #[test]
+    fn public_library_cover_command_proves_the_reported_provider_matrix_and_hot_cache() {
+        for case in [
+            ReportedLibraryCode::Olm,
+            ReportedLibraryCode::Mium,
+            ReportedLibraryCode::ThreeDsvr,
+            ReportedLibraryCode::Dsvr,
+        ] {
+            let fixture = FilesystemFixture::new();
+            let cache_path = fixture.path.join("presentation-cache");
+            if case == ReportedLibraryCode::ThreeDsvr {
+                fs::write(&cache_path, "library-presentation-v7\n")
+                    .expect("the obsolete command-path cache fixture must be written");
+            }
+            let (adult_state, download_state, vr_state, scan_generation) =
+                reported_library_states(&fixture, case);
+            let presentation_state = LibraryPresentationState::default();
+            let events = RefCell::new(Vec::<String>::new());
+            let remote_images = Cell::new(0_u32);
+            let expected_bytes = reported_cover_jpeg();
+            let response = resolve_library_cover_command_with(
+                case.category(),
+                case.item_id(),
+                scan_generation,
+                1,
+                &cache_path,
+                &adult_state,
+                &download_state,
+                &vr_state,
+                &presentation_state,
+                |state, path, authority, generation, is_current| {
+                    assert_eq!(authority.code, case.item_id());
+                    resolve_cover_with_providers(
+                        state,
+                        path,
+                        authority,
+                        generation,
+                        is_current,
+                        |url| {
+                            events.borrow_mut().push(format!("JavDB document {url}"));
+                            match case {
+                                ReportedLibraryCode::Olm if url.contains("/api/v2/search") => Ok(
+                                    r#"{"success":1,"data":{"movies":[{"id":"olmitem","number":"OLM-332","title":"Exact OLM","cover_url":"https://tp.cmastd.com/olm.jpg"}]}}"#
+                                        .to_owned(),
+                                ),
+                                ReportedLibraryCode::Olm => Ok(
+                                    r#"{"success":1,"data":{"movie":{"id":"olmitem","number":"OLM-332","title":"Exact OLM","tags":[],"cover_url":"https://tp.cmastd.com/olm.jpg"}}}"#
+                                        .to_owned(),
+                                ),
+                                ReportedLibraryCode::Mium => Ok(
+                                    r#"{"success":1,"data":{"movies":[]}}"#.to_owned(),
+                                ),
+                                ReportedLibraryCode::ThreeDsvr
+                                    if url.contains("/api/v2/search") =>
+                                {
+                                    Ok(r#"{"success":1,"data":{"movies":[{"id":"xAOayB","number":"3DSVR-1871","title":"JavDB row","cover_url":"https://tp.cmastd.com/3dsvr.jpg"}]}}"#.to_owned())
+                                }
+                                ReportedLibraryCode::ThreeDsvr => Ok(
+                                    r#"{"success":1,"data":{"movie":{"id":"xAOayB","number":"3DSVR-1871","title":"JavDB row","tags":[{"id":"4","name":"Drama"}],"cover_url":"https://tp.cmastd.com/3dsvr.jpg"}}}"#
+                                        .to_owned(),
+                                ),
+                                ReportedLibraryCode::Dsvr => Ok(
+                                    r#"{"success":1,"data":{"movies":[{"id":"older","number":"DSVR-069","title":"Older item","cover_url":"https://tp.cmastd.com/older.jpg"},{"id":"current","number":"DSVR-069","title":"Different item","cover_url":"https://tp.cmastd.com/current.jpg"}]}}"#
+                                        .to_owned(),
+                                ),
+                            }
+                        },
+                        |url| {
+                            events.borrow_mut().push(format!("JavDB image {url}"));
+                            remote_images.set(remote_images.get() + 1);
+                            Ok(expected_bytes.clone())
+                        },
+                        |body| {
+                            events.borrow_mut().push(format!("FANZA document {body}"));
+                            if case != ReportedLibraryCode::ThreeDsvr {
+                                return Err(ProviderRequestError::Provider);
+                            }
+                            assert!(body.contains("c0:ppvContent(id:\"13dsvr01871\")"));
+                            Ok(r#"{"data":{"c0":{"id":"13dsvr01871","contentType":"VR","title":"Exact VR","packageImage":{"largeUrl":"https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/13dsvr01871/13dsvr01871pl.jpg"}}}}"#.to_owned())
+                        },
+                        |url| {
+                            events.borrow_mut().push(format!("FANZA image {url}"));
+                            assert_eq!(url, "https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/13dsvr01871/13dsvr01871ps.jpg");
+                            remote_images.set(remote_images.get() + 1);
+                            Ok(expected_bytes.clone())
+                        },
+                        |url| {
+                            events.borrow_mut().push(format!("legacy document {url}"));
+                            match case {
+                                ReportedLibraryCode::Dsvr => Ok(
+                                    r#"{"content_id":"dsvr00069","images":{"jacket_image":{"large2":"https://pics.dmm.co.jp/digital/video/dsvr00069/dsvr00069pl.jpg"}}}"#
+                                        .to_owned(),
+                                ),
+                                _ => Err(ProviderRequestError::SourceUnavailable),
+                            }
+                        },
+                        |url| {
+                            events.borrow_mut().push(format!("legacy image {url}"));
+                            remote_images.set(remote_images.get() + 1);
+                            Ok(expected_bytes.clone())
+                        },
+                    )
+                },
+            )
+            .expect("the public Library cover command boundary must complete");
+
+            let events = events.into_inner();
+            assert!(events
+                .first()
+                .is_some_and(|event| event.starts_with("JavDB document ")));
+            let fanza_position = events
+                .iter()
+                .position(|event| event.starts_with("FANZA document "));
+            let legacy_position = events
+                .iter()
+                .position(|event| event.starts_with("legacy document "));
+            if let (Some(fanza), Some(legacy)) = (fanza_position, legacy_position) {
+                assert!(
+                    fanza < legacy,
+                    "FANZA must precede the bounded legacy source"
+                );
+            }
+
+            match case {
+                ReportedLibraryCode::Olm => {
+                    assert_eq!(&response[2..6], ["ready", "JavDB", "olmitem", "OLM-332"]);
+                    assert_eq!(events.len(), 3);
+                    assert!(events[0].contains("search?q=OLM-332&type=movie"));
+                    assert!(events[1].contains("movies/olmitem?from_rankings=false"));
+                    assert_eq!(events[2], "JavDB image https://tp.cmastd.com/olm.jpg");
+                    assert!(fanza_position.is_none());
+                    assert!(legacy_position.is_none());
+                }
+                ReportedLibraryCode::ThreeDsvr => {
+                    assert_eq!(
+                        &response[2..6],
+                        ["ready", "FANZA", "13dsvr01871", "3DSVR-01871"]
+                    );
+                    assert_eq!(events.len(), 4);
+                    assert!(events[0].contains("search?q=3DSVR-01871&type=movie"));
+                    assert!(events[1].contains("movies/xAOayB?from_rankings=false"));
+                    assert!(events[2].starts_with("FANZA document "));
+                    assert!(events[3].starts_with("FANZA image "));
+                    assert!(fanza_position.is_some());
+                    assert!(legacy_position.is_none());
+                }
+                ReportedLibraryCode::Mium => {
+                    assert_eq!(response[2], "unavailable");
+                    assert!(response[3..7].iter().all(String::is_empty));
+                    assert_eq!(remote_images.get(), 0);
+                    assert_eq!(events.len(), 2);
+                    assert!(events[0].contains("search?q=300MIUM-1369&type=movie"));
+                    assert!(events[1].starts_with("legacy document "));
+                    assert!(fanza_position.is_none());
+                    assert!(legacy_position.is_some());
+                    continue;
+                }
+                ReportedLibraryCode::Dsvr => {
+                    assert_eq!(response[2], "unavailable");
+                    assert!(response[3..7].iter().all(String::is_empty));
+                    assert_eq!(remote_images.get(), 0);
+                    assert_eq!(events.len(), 2);
+                    assert!(events[0].contains("search?q=DSVR-00069&type=movie"));
+                    assert!(events[1].starts_with("legacy document "));
+                    assert!(fanza_position.is_none());
+                    assert!(legacy_position.is_some());
+                    continue;
+                }
+            }
+
+            assert_eq!(remote_images.get(), 1);
+            let authority_id = response[6].clone();
+            let first_bytes = fetch_library_cover_command_with(
+                case.category(),
+                case.item_id(),
+                scan_generation,
+                &authority_id,
+                &cache_path,
+                &adult_state,
+                &download_state,
+                &vr_state,
+                &presentation_state,
+            )
+            .expect("the public fetch command must return the validated cover bytes");
+            assert_eq!(first_bytes, expected_bytes);
+
+            for (
+                label,
+                presentation_state,
+                adult_state,
+                download_state,
+                vr_state,
+                generation,
+                request_generation,
+            ) in [
+                (
+                    "revisit",
+                    presentation_state.clone(),
+                    adult_state.clone(),
+                    download_state.clone(),
+                    vr_state.clone(),
+                    scan_generation,
+                    2,
+                ),
+                {
+                    let (adult, download, vr, generation) = reported_library_states(&fixture, case);
+                    (
+                        "restart",
+                        LibraryPresentationState::default(),
+                        adult,
+                        download,
+                        vr,
+                        generation,
+                        1,
+                    )
+                },
+            ] {
+                let provider_traffic = Cell::new(0_u32);
+                let cached = resolve_library_cover_command_with(
+                    case.category(),
+                    case.item_id(),
+                    generation,
+                    request_generation,
+                    &cache_path,
+                    &adult_state,
+                    &download_state,
+                    &vr_state,
+                    &presentation_state,
+                    |state, path, authority, request_generation, is_current| {
+                        resolve_cover_with_providers(
+                            state,
+                            path,
+                            authority,
+                            request_generation,
+                            is_current,
+                            |_| {
+                                provider_traffic.set(provider_traffic.get() + 1);
+                                Err(ProviderRequestError::Network)
+                            },
+                            |_| {
+                                provider_traffic.set(provider_traffic.get() + 1);
+                                Err(ProviderRequestError::Network)
+                            },
+                            |_| {
+                                provider_traffic.set(provider_traffic.get() + 1);
+                                Err(ProviderRequestError::Network)
+                            },
+                            |_| {
+                                provider_traffic.set(provider_traffic.get() + 1);
+                                Err(ProviderRequestError::Network)
+                            },
+                            |_| {
+                                provider_traffic.set(provider_traffic.get() + 1);
+                                Err(ProviderRequestError::Network)
+                            },
+                            |_| {
+                                provider_traffic.set(provider_traffic.get() + 1);
+                                Err(ProviderRequestError::Network)
+                            },
+                        )
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{label} must resolve from local bytes: {error}"));
+                assert_eq!(cached[2], "ready");
+                assert_eq!(
+                    provider_traffic.get(),
+                    0,
+                    "{label} must have zero provider traffic"
+                );
+                let bytes = fetch_library_cover_command_with(
+                    case.category(),
+                    case.item_id(),
+                    generation,
+                    &cached[6],
+                    &cache_path,
+                    &adult_state,
+                    &download_state,
+                    &vr_state,
+                    &presentation_state,
+                )
+                .unwrap_or_else(|error| panic!("{label} must fetch local bytes: {error}"));
+                assert_eq!(bytes, expected_bytes);
+            }
+        }
     }
 
     fn scan_trusted_movie_fixture(
