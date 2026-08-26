@@ -207,11 +207,14 @@ describe("Sera preset contract", () => {
     );
     const grid = ruleBody(".provider-browse-grid");
     const cover = ruleBody(".provider-browse-card__cover");
-    expect(viewport).toContain("min-height: 16.25rem;");
+    expect(viewport).toContain("min-height: 0;");
     expect(viewport).toContain("flex: 1;");
     expect(viewport).not.toContain("clamp(");
     expect(viewport).not.toContain("overflow:");
     expect(ruleBody(".media-gallery__viewport")).toContain("overflow: hidden;");
+    expect(ruleBody(".workspace__content--bounded-gallery")).toContain(
+      "overflow: hidden;",
+    );
     expect(grid).toContain("display: flex;");
     expect(grid).toContain("flex-wrap: wrap;");
     expect(grid).toContain("align-content: flex-start;");

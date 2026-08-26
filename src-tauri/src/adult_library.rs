@@ -6,7 +6,14 @@ use std::{
     time::SystemTime,
 };
 
-use crate::library_scan::{is_supported_library_media, scan_library_files};
+use crate::{
+    library_presentation::{LibraryItemAuthority, LibraryPresentationCategory},
+    library_scan::{is_supported_library_media, scan_library_files},
+    vr_torrent::{
+        adult_library_product_code_prefix_is_supported, hex_sha1,
+        product_code_candidates_with_display, product_code_forms,
+    },
+};
 
 pub const ADULT_FOLDER_STORAGE_FAILED: &str = "adult_folder_storage_failed";
 pub const ADULT_FOLDER_UNAVAILABLE: &str = "adult_folder_unavailable";
@@ -56,6 +63,124 @@ struct AdultLibraryContext {
 
 #[derive(Clone, Default)]
 pub struct AdultLibraryState(Arc<Mutex<AdultLibraryContext>>);
+
+const MULTIPART_IDENTITY_PREFIXES: &[&str] = &["PART", "CD", "DISC", "DISK"];
+
+fn olm_library_suffix_candidates(title: &str) -> Vec<(String, String)> {
+    let bytes = title.as_bytes();
+    let mut candidates = Vec::new();
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        if (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
+            && bytes[index..index + 3].eq_ignore_ascii_case(b"OLM")
+        {
+            let mut number_start = index + 3;
+            while number_start < bytes.len() && matches!(bytes[number_start], b' ' | b'_' | b'-') {
+                number_start += 1;
+            }
+            let mut number_end = number_start;
+            while number_end < bytes.len() && bytes[number_end].is_ascii_digit() {
+                number_end += 1;
+            }
+            let number_length = number_end - number_start;
+            if (1..=10).contains(&number_length)
+                && bytes
+                    .get(number_end)
+                    .is_some_and(|suffix| *suffix == b'E' || *suffix == b'e')
+                && bytes
+                    .get(number_end + 1)
+                    .is_none_or(|next| !next.is_ascii_alphanumeric())
+            {
+                let digits = &title[number_start..number_end];
+                if let Ok(number) = digits.parse::<u64>() {
+                    if number > 0 {
+                        candidates.push((format!("OLM-{number}"), format!("OLM-{digits}")));
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    candidates
+}
+
+fn exact_file_product_code(path: &Path) -> Option<(String, String)> {
+    let title = path.file_stem()?.to_str()?;
+    let mut candidates = product_code_candidates_with_display(title)
+        .into_iter()
+        .filter(|(_, prefix, _)| {
+            adult_library_product_code_prefix_is_supported(prefix)
+                && !MULTIPART_IDENTITY_PREFIXES.contains(&prefix.as_str())
+        })
+        .map(|(identity, _, display)| (identity, display))
+        .collect::<Vec<_>>();
+    candidates.extend(olm_library_suffix_candidates(title));
+    let mut identities = candidates
+        .iter()
+        .map(|(identity, _)| identity)
+        .collect::<Vec<_>>();
+    identities.sort();
+    identities.dedup();
+    (identities.len() == 1).then(|| candidates[0].clone())
+}
+
+pub(crate) fn adult_library_presentation_authority(
+    state: &AdultLibraryState,
+    scan_generation: u64,
+    code: &str,
+) -> Result<LibraryItemAuthority, &'static str> {
+    let requested = product_code_forms(code).ok_or(ADULT_LIBRARY_STALE)?;
+    if requested.display != code {
+        return Err(ADULT_LIBRARY_STALE);
+    }
+    let context = state.0.lock().map_err(|_| ADULT_LIBRARY_SCAN_FAILED)?;
+    let scan = context.completed_scan.as_ref().ok_or(ADULT_LIBRARY_STALE)?;
+    if scan.generation != scan_generation || context.folder.as_ref() != Some(&scan.folder) {
+        return Err(ADULT_LIBRARY_STALE);
+    }
+    let mut members = scan
+        .files
+        .iter()
+        .filter(|file| {
+            exact_file_product_code(&file.path)
+                .is_some_and(|(identity, _)| identity == requested.identity)
+        })
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        return Err(ADULT_LIBRARY_STALE);
+    }
+    if !members.iter().any(|member| {
+        exact_file_product_code(&member.path)
+            .is_some_and(|(_, display)| display == requested.display)
+    }) {
+        return Err(ADULT_LIBRARY_STALE);
+    }
+    members.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut identity = format!(
+        "adult\0{}\0{}\0{code}",
+        scan.folder.display(),
+        requested.identity
+    );
+    for member in members {
+        let modified = member
+            .modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| ADULT_LIBRARY_STALE)?;
+        identity.push_str(&format!(
+            "\0{}\0{}\0{}\0{}",
+            member.path.display(),
+            member.size,
+            modified.as_secs(),
+            modified.subsec_nanos()
+        ));
+    }
+    Ok(LibraryItemAuthority {
+        category: LibraryPresentationCategory::Adult,
+        identity: hex_sha1(identity.as_bytes()),
+        code: code.to_owned(),
+        product_identity: requested.identity,
+    })
+}
 
 #[derive(Clone, Copy)]
 enum AdultFileValidationError {
@@ -432,6 +557,99 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn presentation_authority_requires_one_exact_current_group_and_member_identity() {
+        let fixture = Fixture::new("presentation-authority");
+        for name in [
+            "ADLT-123 Part 01.mp4",
+            "adlt_00123 CD2.MKV",
+            "ADLT-124.mp4",
+            "ADLT-123 + XYZ-7.mp4",
+            "459TEN-00048-A.mp4",
+            "459ten_0048-B.MKV",
+            "CAWB-001-A.mp4",
+            "cawb_00001-B.MKV",
+            "OLM-332E.mp4",
+            "olm_00332e bonus.MKV",
+            "OLM-333X.mp4",
+            "OLM-334EE.mp4",
+            "OLM-335E + ADLT-123.mp4",
+            "300MIUM-1369.mp4",
+            "3DSVR-01871-A.mp4",
+            "unassociated.mp4",
+        ] {
+            fs::write(fixture.path.join(name), name.as_bytes())
+                .expect("Adult member must be written");
+        }
+        let state = AdultLibraryState::default();
+        set_adult_folder(&state, &fixture.path.join("config"), fixture.path.clone())
+            .expect("Adult folder must be configured");
+        let scan = scan_adult_library_with(&state).expect("scan must complete");
+        let generation = scan[0].parse().expect("generation must be valid");
+
+        let authority = adult_library_presentation_authority(&state, generation, "ADLT-123")
+            .expect("one exact grouped code must authorize presentation");
+        assert_eq!(authority.category, LibraryPresentationCategory::Adult);
+        assert_eq!(authority.code, "ADLT-123");
+        assert_eq!(authority.identity.len(), 40);
+        let maker = adult_library_presentation_authority(&state, generation, "459TEN-00048")
+            .expect("an evidenced Adult maker prefix must authorize one exact group");
+        assert_eq!(maker.code, "459TEN-00048");
+        assert_eq!(
+            adult_library_presentation_authority(&state, generation, "459TEN-48"),
+            Err(ADULT_LIBRARY_STALE)
+        );
+        let cawb = adult_library_presentation_authority(&state, generation, "CAWB-001")
+            .expect("the exact local CAWB display form must authorize its numeric identity");
+        assert_eq!(cawb.code, "CAWB-001");
+        assert_eq!(cawb.product_identity, "CAWB-1");
+        let olm = adult_library_presentation_authority(&state, generation, "OLM-332")
+            .expect("the evidenced OLM E suffix must retain the exact provider identity");
+        assert_eq!(olm.code, "OLM-332");
+        assert_eq!(olm.product_identity, "OLM-332");
+        for rejected in ["OLM-333", "OLM-334", "OLM-335"] {
+            assert_eq!(
+                adult_library_presentation_authority(&state, generation, rejected),
+                Err(ADULT_LIBRARY_STALE)
+            );
+        }
+        let mium = adult_library_presentation_authority(&state, generation, "300MIUM-1369")
+            .expect("the exact reported digit-leading Adult item must authorize presentation");
+        assert_eq!(mium.code, "300MIUM-1369");
+        assert_eq!(mium.product_identity, "300MIUM-1369");
+        assert_eq!(
+            adult_library_presentation_authority(&state, generation, "CAWB-1"),
+            Err(ADULT_LIBRARY_STALE)
+        );
+        assert_eq!(
+            adult_library_presentation_authority(&state, generation, "ADLT-125"),
+            Err(ADULT_LIBRARY_STALE)
+        );
+        assert_eq!(
+            adult_library_presentation_authority(&state, generation, "ADLT-123 + XYZ-7"),
+            Err(ADULT_LIBRARY_STALE)
+        );
+        assert_eq!(
+            adult_library_presentation_authority(&state, generation, "3DSVR-1871"),
+            Err(ADULT_LIBRARY_STALE)
+        );
+
+        fs::write(fixture.path.join("ADLT-123 Part 01.mp4"), b"changed")
+            .expect("member must change");
+        let refreshed = scan_adult_library_with(&state).expect("refresh must complete");
+        let refreshed_generation = refreshed[0].parse().expect("generation must be valid");
+        assert_eq!(
+            adult_library_presentation_authority(&state, generation, "ADLT-123"),
+            Err(ADULT_LIBRARY_STALE)
+        );
+        assert_ne!(
+            adult_library_presentation_authority(&state, refreshed_generation, "ADLT-123")
+                .expect("refreshed authority must resolve")
+                .identity,
+            authority.identity
+        );
     }
 
     #[test]
