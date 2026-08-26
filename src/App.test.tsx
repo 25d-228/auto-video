@@ -1449,7 +1449,7 @@ beforeEach(() => {
         case "resolve_tmdb_card_cover":
           return Promise.resolve([
             "tmdb-card-cover-v1",
-            "ready",
+            "pending",
             parameters?.category as string,
             parameters?.surface as string,
             parameters?.tmdbId as string,
@@ -1469,6 +1469,7 @@ beforeEach(() => {
             0xff,
             ...Array.from({ length: 61 }, () => 0),
           ]);
+        case "confirm_tmdb_card_cover":
         case "cancel_tmdb_card_cover":
         case "invalidate_tmdb_card_cover":
           return Promise.resolve();
@@ -6031,13 +6032,16 @@ describe("TMDB Discover", () => {
 
     const poster = await waitFor(() => {
       const current = document.querySelector<HTMLImageElement>(
-        'img[data-cover-source="TMDB"]',
+        'img[src="blob:javdb-cover"]',
       );
       expect(current).not.toBeNull();
       return current as HTMLImageElement;
     });
+    expect(poster.dataset.coverSource).toBeUndefined();
     fireEvent.error(poster);
-    expect(screen.getAllByText("Poster unavailable")).toHaveLength(2);
+    await waitFor(() =>
+      expect(screen.getAllByText("Poster unavailable")).toHaveLength(2),
+    );
   });
 
   it("submits an exact title query explicitly and reuses accessible Discover cards", async () => {
@@ -17869,7 +17873,7 @@ describe("explicit Library cover recovery", () => {
       movieCard.querySelector(".provider-cover__placeholder")?.textContent,
     ).toContain("Exact Movie Title");
     fireEvent.click(
-      within(movieCard).getByRole("button", {
+      await within(movieCard).findByRole("button", {
         name: "Retry cover: Exact Movie Title",
       }),
     );
@@ -17901,7 +17905,7 @@ describe("explicit Library cover recovery", () => {
       tvCard.querySelector(".provider-cover__placeholder")?.textContent,
     ).toContain("Exact TV Title");
     fireEvent.click(
-      within(tvCard).getByRole("button", {
+      await within(tvCard).findByRole("button", {
         name: "Retry cover: Exact TV Title",
       }),
     );
@@ -17945,6 +17949,11 @@ describe("explicit Library cover recovery", () => {
         ([command]) => command === "invalidate_tmdb_card_cover",
       ),
     ).toHaveLength(2);
+    expect(
+      invokeMock.mock.calls.filter(
+        ([command]) => command === "confirm_tmdb_card_cover",
+      ),
+    ).toHaveLength(0);
   });
 
   it("uses the Discover provider-card structure for every Library category", async () => {

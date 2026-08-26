@@ -139,8 +139,10 @@ struct RequestSlot {
 struct CoverAuthority {
     request: TmdbCoverRequest,
     authority_id: String,
+    source: String,
     bytes: Vec<u8>,
     ratio: f64,
+    persisted: bool,
 }
 
 #[derive(Default)]
@@ -151,7 +153,10 @@ struct TmdbCoverContext {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct TmdbCoverState(Arc<(Mutex<TmdbCoverContext>, Condvar)>);
+pub(crate) struct TmdbCoverState {
+    context: Arc<(Mutex<TmdbCoverContext>, Condvar)>,
+    cache_admission: Arc<Mutex<()>>,
+}
 
 struct OperationPermit {
     state: TmdbCoverState,
@@ -159,7 +164,7 @@ struct OperationPermit {
 
 impl Drop for OperationPermit {
     fn drop(&mut self) {
-        let (lock, available) = &*self.state.0;
+        let (lock, available) = &*self.state.context;
         if let Ok(mut context) = lock.lock() {
             context.active_operations = context.active_operations.saturating_sub(1);
             available.notify_all();
@@ -291,7 +296,7 @@ fn begin_request(state: &TmdbCoverState, request: &TmdbCoverRequest) -> Result<(
     if !request.validate() {
         return Err(TMDB_COVER_STALE);
     }
-    let (lock, available) = &*state.0;
+    let (lock, available) = &*state.context;
     let mut context = lock.lock().map_err(|_| TMDB_COVER_FAILED)?;
     let slot = request.slot();
     context.requests.insert(slot.clone(), request.clone());
@@ -314,7 +319,7 @@ fn acquire_operation(
     state: &TmdbCoverState,
     request: &TmdbCoverRequest,
 ) -> Result<OperationPermit, &'static str> {
-    let (lock, available) = &*state.0;
+    let (lock, available) = &*state.context;
     let mut context = lock.lock().map_err(|_| TMDB_COVER_FAILED)?;
     loop {
         if !request_is_current(&context, request) {
@@ -400,10 +405,16 @@ fn cache_header(
         + "\n"
 }
 
-fn remove_cache_file(path: &Path) {
-    if fs::symlink_metadata(path).is_ok() {
-        let _ = fs::remove_file(path);
+fn remove_cache_file_checked(path: &Path) -> Result<(), ()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::remove_file(path).map_err(|_| ()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(()),
     }
+}
+
+fn remove_cache_file(path: &Path) {
+    let _ = remove_cache_file_checked(path);
 }
 
 fn read_cache(directory: &Path, request: &TmdbCoverRequest, now: u64) -> Option<(Vec<u8>, f64)> {
@@ -502,13 +513,15 @@ fn cache_files(directory: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
 
 fn bound_cache(
     directory: &Path,
+    target: &Path,
     required_bytes: u64,
     protected: &HashSet<PathBuf>,
 ) -> Result<(), ()> {
     let mut files = cache_files(directory);
-    files.sort_by_key(|(_, _, modified)| *modified);
+    files.retain(|(path, _, _)| path != target);
+    files.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
     let mut total = files.iter().map(|(_, length, _)| *length).sum::<u64>();
-    while files.len() >= CACHE_MAX_FILES
+    while files.len() + 1 > CACHE_MAX_FILES
         || total.saturating_add(required_bytes) > CACHE_MAX_TOTAL_BYTES
     {
         let Some(index) = files
@@ -540,7 +553,7 @@ fn write_cache(
     let path = cache_path(directory, request);
     let header = cache_header(request, source, ratio, now_seconds(), bytes.len());
     let total_length = header.len() as u64 + bytes.len() as u64;
-    bound_cache(directory, total_length, protected)?;
+    bound_cache(directory, &path, total_length, protected)?;
     let temporary = directory.join(format!(
         ".tmdb-cover-{}-{}.tmp",
         cache_identity(request),
@@ -566,17 +579,12 @@ fn write_cache(
     Ok(())
 }
 
-fn active_cache_paths(state: &TmdbCoverState, directory: &Path) -> HashSet<PathBuf> {
-    let (lock, _) = &*state.0;
-    lock.lock()
-        .map(|context| {
-            context
-                .authorities
-                .values()
-                .map(|authority| cache_path(directory, &authority.request))
-                .collect()
-        })
-        .unwrap_or_default()
+fn active_cache_paths(context: &TmdbCoverContext, directory: &Path) -> HashSet<PathBuf> {
+    context
+        .requests
+        .values()
+        .map(|request| cache_path(directory, request))
+        .collect()
 }
 
 fn authority_id(request: &TmdbCoverRequest, source: &str) -> String {
@@ -599,10 +607,10 @@ fn authority_id(request: &TmdbCoverRequest, source: &str) -> String {
     )
 }
 
-fn ready_response(request: &TmdbCoverRequest, authority_id: &str, ratio: f64) -> Vec<String> {
+fn pending_response(request: &TmdbCoverRequest, authority_id: &str, ratio: f64) -> Vec<String> {
     vec![
         "tmdb-card-cover-v1".to_owned(),
-        "ready".to_owned(),
+        "pending".to_owned(),
         request.category.as_str().to_owned(),
         request.surface.as_str().to_owned(),
         request.tmdb_id.to_string(),
@@ -653,19 +661,22 @@ pub(crate) fn resolve_cover_with(
     }
     let source = tmdb_poster_url(request.poster_path.as_deref().unwrap_or_default())
         .ok_or(TMDB_COVER_FAILED)?;
-    let cached = read_cache(cache_directory, request, now_seconds());
-    let (bytes, ratio) = match cached {
-        Some(cached) => cached,
+    let cached = {
+        let _cache = state
+            .cache_admission
+            .lock()
+            .map_err(|_| TMDB_COVER_FAILED)?;
+        read_cache(cache_directory, request, now_seconds())
+    };
+    let (bytes, ratio, persisted) = match cached {
+        Some((bytes, ratio)) => (bytes, ratio, true),
         None => {
             let bytes = fetch(&source).map_err(|_| TMDB_COVER_FAILED)?;
             let (bytes, ratio) = validate_cover(bytes).map_err(|_| TMDB_COVER_FAILED)?;
             if !is_current_request(state, request) || !is_current() {
                 return Err(TMDB_COVER_STALE);
             }
-            let protected = active_cache_paths(state, cache_directory);
-            write_cache(cache_directory, request, &source, ratio, &bytes, &protected)
-                .map_err(|_| TMDB_COVER_FAILED)?;
-            (bytes, ratio)
+            (bytes, ratio, false)
         }
     };
     if !is_current_request(state, request) || !is_current() {
@@ -675,10 +686,12 @@ pub(crate) fn resolve_cover_with(
     let authority = CoverAuthority {
         request: request.clone(),
         authority_id: authority_id.clone(),
+        source,
         bytes,
         ratio,
+        persisted,
     };
-    let (lock, _) = &*state.0;
+    let (lock, _) = &*state.context;
     let mut context = lock.lock().map_err(|_| TMDB_COVER_FAILED)?;
     if !request_is_current(&context, request) {
         return Err(TMDB_COVER_STALE);
@@ -693,7 +706,7 @@ pub(crate) fn resolve_cover_with(
         let Some(obsolete) = obsolete else { break };
         context.authorities.remove(&obsolete);
     }
-    Ok(ready_response(request, &authority_id, ratio))
+    Ok(pending_response(request, &authority_id, ratio))
 }
 
 pub(crate) fn fetch_cover(
@@ -701,31 +714,76 @@ pub(crate) fn fetch_cover(
     request: &TmdbCoverRequest,
     requested_authority_id: &str,
 ) -> Result<Vec<u8>, &'static str> {
-    let (lock, _) = &*state.0;
-    let mut context = lock.lock().map_err(|_| TMDB_COVER_FAILED)?;
+    let (lock, _) = &*state.context;
+    let context = lock.lock().map_err(|_| TMDB_COVER_FAILED)?;
     if !request_is_current(&context, request) {
         return Err(TMDB_COVER_STALE);
     }
     let authority = context
         .authorities
-        .remove(requested_authority_id)
+        .get(requested_authority_id)
         .filter(|authority| {
             authority.authority_id == requested_authority_id
                 && authority.request == *request
                 && authority.ratio.is_finite()
         })
         .ok_or(TMDB_COVER_STALE)?;
-    Ok(authority.bytes)
+    Ok(authority.bytes.clone())
+}
+
+pub(crate) fn confirm_cover(
+    state: &TmdbCoverState,
+    cache_directory: &Path,
+    request: &TmdbCoverRequest,
+    requested_authority_id: &str,
+) -> Result<(), &'static str> {
+    let _admission = state
+        .cache_admission
+        .lock()
+        .map_err(|_| TMDB_COVER_FAILED)?;
+    let (lock, _) = &*state.context;
+    let mut context = lock.lock().map_err(|_| TMDB_COVER_FAILED)?;
+    if !request_is_current(&context, request) {
+        return Err(TMDB_COVER_STALE);
+    }
+    let authority = context
+        .authorities
+        .get(requested_authority_id)
+        .filter(|authority| {
+            authority.authority_id == requested_authority_id
+                && authority.request == *request
+                && authority.ratio.is_finite()
+        })
+        .cloned()
+        .ok_or(TMDB_COVER_STALE)?;
+    if !authority.persisted {
+        let protected = active_cache_paths(&context, cache_directory);
+        write_cache(
+            cache_directory,
+            request,
+            &authority.source,
+            authority.ratio,
+            &authority.bytes,
+            &protected,
+        )
+        .map_err(|_| TMDB_COVER_FAILED)?;
+        context
+            .authorities
+            .get_mut(requested_authority_id)
+            .ok_or(TMDB_COVER_STALE)?
+            .persisted = true;
+    }
+    Ok(())
 }
 
 pub(crate) fn is_current_request(state: &TmdbCoverState, request: &TmdbCoverRequest) -> bool {
-    let (lock, _) = &*state.0;
+    let (lock, _) = &*state.context;
     lock.lock()
         .is_ok_and(|context| request_is_current(&context, request))
 }
 
 pub(crate) fn cancel_request(state: &TmdbCoverState, request: &TmdbCoverRequest) {
-    let (lock, available) = &*state.0;
+    let (lock, available) = &*state.context;
     if let Ok(mut context) = lock.lock() {
         if request_is_current(&context, request) {
             context.requests.remove(&request.slot());
@@ -745,7 +803,11 @@ pub(crate) fn invalidate_cover(
     if !request.validate() {
         return Err(TMDB_COVER_STALE);
     }
-    let (lock, available) = &*state.0;
+    let _admission = state
+        .cache_admission
+        .lock()
+        .map_err(|_| TMDB_COVER_FAILED)?;
+    let (lock, available) = &*state.context;
     let mut context = lock.lock().map_err(|_| TMDB_COVER_FAILED)?;
     if !request_is_current(&context, request) {
         return Err(TMDB_COVER_STALE);
@@ -754,7 +816,8 @@ pub(crate) fn invalidate_cover(
         .authorities
         .retain(|_, authority| authority.request != *request);
     drop(context);
-    remove_cache_file(&cache_path(cache_directory, request));
+    remove_cache_file_checked(&cache_path(cache_directory, request))
+        .map_err(|_| TMDB_COVER_FAILED)?;
     available.notify_all();
     Ok(())
 }
@@ -914,7 +977,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(response[1], "ready");
+            assert_eq!(response[1], "pending");
             assert_eq!(response[2], category.as_str());
             assert_eq!(response[3], surface.as_str());
             assert_eq!(response[12], "TMDB");
@@ -922,6 +985,9 @@ mod tests {
                 fetch_cover(&state, &request, &response[10]).unwrap(),
                 jpeg()
             );
+            assert!(!cache_path(&fixture.0, &request).exists());
+            confirm_cover(&state, &fixture.0, &request, &response[10]).unwrap();
+            assert!(cache_path(&fixture.0, &request).exists());
             assert_eq!(dispatches.get(), 1);
 
             let mut revisit = request.clone();
@@ -1040,14 +1106,16 @@ mod tests {
         fs::write(&invalid_directory, b"file").unwrap();
         let mut failed_write = request.clone();
         failed_write.request_generation += 2;
+        let response = resolve_cover_with(
+            &state,
+            &invalid_directory,
+            &failed_write,
+            || true,
+            |_| Ok(jpeg()),
+        )
+        .unwrap();
         assert_eq!(
-            resolve_cover_with(
-                &state,
-                &invalid_directory,
-                &failed_write,
-                || true,
-                |_| Ok(jpeg())
-            ),
+            confirm_cover(&state, &invalid_directory, &failed_write, &response[10]),
             Err(TMDB_COVER_FAILED)
         );
     }
@@ -1175,7 +1243,7 @@ mod tests {
         expired.extend(bytes);
         fs::write(cache_path(&fixture.0, &request), expired).unwrap();
         let dispatches = Cell::new(0);
-        resolve_cover_with(
+        let response = resolve_cover_with(
             &state,
             &fixture.0,
             &request,
@@ -1186,6 +1254,7 @@ mod tests {
             },
         )
         .unwrap();
+        confirm_cover(&state, &fixture.0, &request, &response[10]).unwrap();
         assert_eq!(dispatches.get(), 1);
 
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -1207,7 +1276,15 @@ mod tests {
         for index in 0..CACHE_MAX_FILES {
             fs::write(fixture.0.join(format!("tmdb-cover-{index:040x}.bin")), [0]).unwrap();
         }
-        bound_cache(&fixture.0, 1, &HashSet::new()).unwrap();
+        bound_cache(
+            &fixture.0,
+            &fixture
+                .0
+                .join(format!("tmdb-cover-{:040x}.bin", CACHE_MAX_FILES)),
+            1,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(cache_files(&fixture.0).len(), CACHE_MAX_FILES - 1);
 
         for (path, _, _) in cache_files(&fixture.0) {
@@ -1221,12 +1298,137 @@ mod tests {
                 .unwrap();
             file.set_len(20 * 1024 * 1024).unwrap();
         }
-        bound_cache(&fixture.0, 16 * 1024 * 1024, &HashSet::new()).unwrap();
+        bound_cache(
+            &fixture.0,
+            &fixture
+                .0
+                .join("tmdb-cover-ffffffffffffffffffffffffffffffffffffffff.bin"),
+            16 * 1024 * 1024,
+            &HashSet::new(),
+        )
+        .unwrap();
         let total = cache_files(&fixture.0)
             .iter()
             .map(|(_, length, _)| *length)
             .sum::<u64>();
         assert!(total + 16 * 1024 * 1024 <= CACHE_MAX_TOTAL_BYTES);
+    }
+
+    fn stage_current_covers(
+        state: &TmdbCoverState,
+        directory: &Path,
+        bytes: &[u8],
+    ) -> Vec<(TmdbCoverRequest, String)> {
+        (1..=MAX_CONCURRENT_OPERATIONS as u64)
+            .map(|item| {
+                let mut request = request(TmdbCoverCategory::Movie, TmdbCoverSurface::Discover);
+                request.tmdb_id = 10_000 + item;
+                request.poster_path = Some(format!("/current-{item}.jpg"));
+                request.request_generation = 100 + item;
+                let response =
+                    resolve_cover_with(state, directory, &request, || true, |_| Ok(bytes.to_vec()))
+                        .unwrap();
+                (request, response[10].clone())
+            })
+            .collect()
+    }
+
+    fn confirm_simultaneously(
+        state: &TmdbCoverState,
+        directory: &Path,
+        current: &[(TmdbCoverRequest, String)],
+    ) {
+        let barrier = Arc::new(std::sync::Barrier::new(current.len()));
+        let workers = current
+            .iter()
+            .cloned()
+            .map(|(request, authority_id)| {
+                let state = state.clone();
+                let directory = directory.to_owned();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    confirm_cover(&state, &directory, &request, &authority_id)
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn simultaneous_count_limit_admission_retains_every_current_visible_cover() {
+        let fixture = Fixture::new();
+        let state = TmdbCoverState::default();
+        let current = stage_current_covers(&state, &fixture.0, &jpeg());
+        for index in 0..CACHE_MAX_FILES {
+            fs::write(fixture.0.join(format!("tmdb-cover-{index:040x}.bin")), [0]).unwrap();
+        }
+
+        confirm_simultaneously(&state, &fixture.0, &current);
+
+        let files = cache_files(&fixture.0);
+        assert_eq!(files.len(), CACHE_MAX_FILES);
+        for (request, _) in &current {
+            assert!(cache_path(&fixture.0, request).is_file());
+        }
+    }
+
+    #[test]
+    fn simultaneous_byte_limit_admission_retains_every_current_visible_cover() {
+        let fixture = Fixture::new();
+        let state = TmdbCoverState::default();
+        let mut large_jpeg = jpeg();
+        large_jpeg.resize(1024 * 1024, 0);
+        let current = stage_current_covers(&state, &fixture.0, &large_jpeg);
+        let current_bytes = current
+            .iter()
+            .map(|(request, _)| {
+                let source = tmdb_poster_url(request.poster_path.as_deref().unwrap()).unwrap();
+                cache_header(request, &source, 2.0 / 3.0, now_seconds(), large_jpeg.len()).len()
+                    as u64
+                    + large_jpeg.len() as u64
+            })
+            .sum::<u64>();
+        let obsolete = fixture
+            .0
+            .join("tmdb-cover-ffffffffffffffffffffffffffffffffffffffff.bin");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&obsolete)
+            .unwrap();
+        file.set_len(CACHE_MAX_TOTAL_BYTES - current_bytes + 1)
+            .unwrap();
+
+        confirm_simultaneously(&state, &fixture.0, &current);
+
+        let files = cache_files(&fixture.0);
+        assert!(files.iter().map(|(_, length, _)| *length).sum::<u64>() <= CACHE_MAX_TOTAL_BYTES);
+        assert!(!obsolete.exists());
+        for (request, _) in &current {
+            assert!(cache_path(&fixture.0, request).is_file());
+        }
+    }
+
+    #[test]
+    fn failed_decode_cleanup_is_reported_and_keeps_the_authority_unusable() {
+        let fixture = Fixture::new();
+        let state = TmdbCoverState::default();
+        let request = request(TmdbCoverCategory::Movie, TmdbCoverSurface::Discover);
+        let response =
+            resolve_cover_with(&state, &fixture.0, &request, || true, |_| Ok(jpeg())).unwrap();
+        fs::create_dir(cache_path(&fixture.0, &request)).unwrap();
+
+        assert_eq!(
+            invalidate_cover(&state, &fixture.0, &request),
+            Err(TMDB_COVER_FAILED)
+        );
+        assert_eq!(
+            fetch_cover(&state, &request, &response[10]),
+            Err(TMDB_COVER_STALE)
+        );
     }
 
     #[cfg(unix)]
@@ -1242,7 +1444,7 @@ mod tests {
         let path = cache_path(&fixture.0, &request);
         symlink(&target, &path).unwrap();
         let dispatches = Cell::new(0);
-        resolve_cover_with(
+        let response = resolve_cover_with(
             &state,
             &fixture.0,
             &request,
@@ -1253,6 +1455,7 @@ mod tests {
             },
         )
         .unwrap();
+        confirm_cover(&state, &fixture.0, &request, &response[10]).unwrap();
         assert_eq!(dispatches.get(), 1);
         assert!(!fs::symlink_metadata(&path)
             .unwrap()

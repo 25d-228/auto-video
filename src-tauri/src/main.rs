@@ -63,10 +63,11 @@ use library_scan::{is_supported_library_media, scan_library_files};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tmdb_cover::{
-    cancel_request as cancel_tmdb_cover_request_with, fetch_cover as fetch_tmdb_cover_with,
-    fetch_tmdb_image, invalidate_cover as invalidate_tmdb_cover_with,
-    resolve_cover_with as resolve_tmdb_cover_with, TmdbCoverCategory, TmdbCoverRequest,
-    TmdbCoverState, TmdbCoverSurface, TMDB_COVER_FAILED, TMDB_COVER_STALE,
+    cancel_request as cancel_tmdb_cover_request_with, confirm_cover as confirm_tmdb_cover_with,
+    fetch_cover as fetch_tmdb_cover_with, fetch_tmdb_image,
+    invalidate_cover as invalidate_tmdb_cover_with, resolve_cover_with as resolve_tmdb_cover_with,
+    TmdbCoverCategory, TmdbCoverRequest, TmdbCoverState, TmdbCoverSurface, TMDB_COVER_FAILED,
+    TMDB_COVER_STALE,
 };
 use tv_library::{
     begin_tv_metadata_search, begin_tv_metadata_verification,
@@ -4821,6 +4822,43 @@ fn fetch_tmdb_card_cover(
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
+fn confirm_tmdb_card_cover(
+    app: tauri::AppHandle,
+    category: String,
+    surface: String,
+    tmdb_id: String,
+    poster_path: Option<String>,
+    context_generation: String,
+    request_generation: String,
+    library_item_id: Option<String>,
+    association_generation: Option<String>,
+    cover_authority_id: String,
+    movie_state: tauri::State<'_, MoviesLibraryState>,
+    tv_state: tauri::State<'_, TvLibraryState>,
+    cover_state: tauri::State<'_, TmdbCoverState>,
+) -> Result<(), String> {
+    let request = tmdb_cover_request(
+        &category,
+        &surface,
+        &tmdb_id,
+        poster_path,
+        &context_generation,
+        &request_generation,
+        library_item_id,
+        association_generation,
+    )?;
+    validate_tmdb_library_cover_request(&request, movie_state.inner(), tv_state.inner())?;
+    confirm_tmdb_cover_with(
+        cover_state.inner(),
+        &tmdb_cover_cache_path(&app)?,
+        &request,
+        &cover_authority_id,
+    )
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn cancel_tmdb_card_cover(
     category: String,
     surface: String,
@@ -4933,6 +4971,7 @@ fn main() {
             invalidate_library_cover,
             resolve_tmdb_card_cover,
             fetch_tmdb_card_cover,
+            confirm_tmdb_card_cover,
             cancel_tmdb_card_cover,
             invalidate_tmdb_card_cover,
             open_adult_file,

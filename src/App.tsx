@@ -1903,11 +1903,12 @@ function TmdbCardCoverArtwork({
   cover: ReturnType<typeof useTmdbCardCover>;
   title: string;
 }) {
-  return cover.status === "ready" && cover.objectUrl !== null ? (
+  return cover.objectUrl !== null ? (
     <img
       alt=""
       data-cover-source={cover.source ?? undefined}
       onError={cover.reportDecodeFailure ?? undefined}
+      onLoad={cover.reportDecodeSuccess ?? undefined}
       src={cover.objectUrl}
     />
   ) : (
@@ -6091,7 +6092,7 @@ function LibraryCoverArtwork({
   const objectUrl = presentation?.cover.objectUrl ?? tmdbCover?.objectUrl ?? null;
   const failed =
     presentation === null
-      ? tmdbCover?.status !== "ready"
+      ? tmdbCover?.objectUrl === null
       : presentation.cover.status !== "ready";
   if (objectUrl === null || failed) {
     return (
@@ -6112,7 +6113,10 @@ function LibraryCoverArtwork({
         }
       }}
       onLoad={(event) => {
-        if (presentation === null) return;
+        if (presentation === null) {
+          tmdbCover?.reportDecodeSuccess?.();
+          return;
+        }
         const { naturalHeight, naturalWidth } = event.currentTarget;
         if (naturalHeight > 0 && naturalWidth > 0) {
           onDecodedRatio(naturalWidth / naturalHeight);
