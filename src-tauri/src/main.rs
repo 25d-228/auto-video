@@ -5,6 +5,7 @@ mod fanza_catalog;
 mod javdb_catalog;
 mod library_presentation;
 mod library_scan;
+mod tmdb_cover;
 mod tv_library;
 mod tv_release;
 mod vr_download;
@@ -61,6 +62,12 @@ use library_presentation::{
 use library_scan::{is_supported_library_media, scan_library_files};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
+use tmdb_cover::{
+    cancel_request as cancel_tmdb_cover_request_with, fetch_cover as fetch_tmdb_cover_with,
+    fetch_tmdb_image, invalidate_cover as invalidate_tmdb_cover_with,
+    resolve_cover_with as resolve_tmdb_cover_with, TmdbCoverCategory, TmdbCoverRequest,
+    TmdbCoverState, TmdbCoverSurface, TMDB_COVER_FAILED, TMDB_COVER_STALE,
+};
 use tv_library::{
     begin_tv_metadata_search, begin_tv_metadata_verification,
     clear_tv_folder as clear_trusted_tv_folder, clear_tv_metadata_match_with, configured_tv_folder,
@@ -69,9 +76,10 @@ use tv_library::{
     load_tv_folder_with, open_tv_file_with, parse_tv_metadata_candidates,
     parse_verified_tv_metadata, percent_encode_tv_metadata_query, reveal_tv_file_with,
     save_tv_metadata_match_with, scan_tv_library_with_metadata, set_tv_folder,
-    trash_tv_file_with_download_ownership_and_metadata, TvLibraryState, TV_FILE_OPEN_FAILED,
-    TV_FILE_REVEAL_FAILED, TV_FILE_TRASH_FAILED, TV_FOLDER_STORAGE_FAILED, TV_FOLDER_UNAVAILABLE,
-    TV_LIBRARY_SCAN_FAILED, TV_METADATA_CONTEXT_INVALID, TV_METADATA_PERSISTENCE_FAILED,
+    trash_tv_file_with_download_ownership_and_metadata, tv_tmdb_cover_authority, TvLibraryState,
+    TV_FILE_OPEN_FAILED, TV_FILE_REVEAL_FAILED, TV_FILE_TRASH_FAILED, TV_FOLDER_STORAGE_FAILED,
+    TV_FOLDER_UNAVAILABLE, TV_LIBRARY_SCAN_FAILED, TV_METADATA_CONTEXT_INVALID,
+    TV_METADATA_PERSISTENCE_FAILED,
 };
 use tv_release::{
     fetch_apibay_tv_releases_for_state_with, TvReleaseState, TV_APIBAY_PROVIDER_ERROR,
@@ -1236,6 +1244,24 @@ fn movie_metadata_authority(
     })
 }
 
+fn movie_tmdb_cover_authority(
+    library: &MoviesLibraryContext,
+    file_id: &str,
+    scan_generation: u64,
+) -> Result<(u64, Option<String>, u64), &'static str> {
+    let authority = movie_metadata_authority(library, file_id)?;
+    if authority.scan_generation != scan_generation {
+        return Err(MOVIE_METADATA_STALE);
+    }
+    let file = validate_movie_metadata_authority(library, &authority)?;
+    let association = file.association.ok_or(MOVIE_METADATA_STALE)?;
+    Ok((
+        association.tmdb_movie_id,
+        association.poster_path,
+        association.generation,
+    ))
+}
+
 fn validate_movie_metadata_authority(
     library: &MoviesLibraryContext,
     authority: &MovieMetadataAuthority,
@@ -2301,6 +2327,13 @@ fn library_presentation_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, St
         .app_data_dir()
         .map(|directory| directory.join(LIBRARY_PRESENTATION_CACHE_FILE_NAME))
         .map_err(|_| LIBRARY_PRESENTATION_FAILED.to_owned())
+}
+
+fn tmdb_cover_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_cache_dir()
+        .map(|directory| directory.join("tmdb-card-covers"))
+        .map_err(|_| TMDB_COVER_FAILED.to_owned())
 }
 
 #[tauri::command]
@@ -4635,6 +4668,215 @@ async fn save_verified_tv_torrent(
     .map_err(|_| TV_TORRENT_SAVE_FAILED.to_owned())?
 }
 
+#[allow(clippy::too_many_arguments)]
+fn tmdb_cover_request(
+    category: &str,
+    surface: &str,
+    tmdb_id: &str,
+    poster_path: Option<String>,
+    context_generation: &str,
+    request_generation: &str,
+    library_item_id: Option<String>,
+    association_generation: Option<String>,
+) -> Result<TmdbCoverRequest, String> {
+    let request = TmdbCoverRequest {
+        category: TmdbCoverCategory::parse(category).ok_or_else(|| TMDB_COVER_STALE.to_owned())?,
+        surface: TmdbCoverSurface::parse(surface).ok_or_else(|| TMDB_COVER_STALE.to_owned())?,
+        tmdb_id: tmdb_id.parse().map_err(|_| TMDB_COVER_STALE.to_owned())?,
+        poster_path,
+        context_generation: context_generation
+            .parse()
+            .map_err(|_| TMDB_COVER_STALE.to_owned())?,
+        request_generation: request_generation
+            .parse()
+            .map_err(|_| TMDB_COVER_STALE.to_owned())?,
+        library_item_id,
+        association_generation: association_generation
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| TMDB_COVER_STALE.to_owned())?,
+    };
+    request
+        .validate()
+        .then_some(request)
+        .ok_or_else(|| TMDB_COVER_STALE.to_owned())
+}
+
+fn validate_tmdb_library_cover_request(
+    request: &TmdbCoverRequest,
+    movie_state: &MoviesLibraryState,
+    tv_state: &TvLibraryState,
+) -> Result<(), String> {
+    if request.surface != TmdbCoverSurface::Library {
+        return Ok(());
+    }
+    let item_id = request
+        .library_item_id
+        .as_deref()
+        .ok_or_else(|| TMDB_COVER_STALE.to_owned())?;
+    let expected = match request.category {
+        TmdbCoverCategory::Movie => {
+            let library = movie_state
+                .0
+                .lock()
+                .map_err(|_| TMDB_COVER_FAILED.to_owned())?;
+            let scan_generation = library
+                .completed_scan
+                .as_ref()
+                .map(|scan| scan.generation)
+                .ok_or_else(|| TMDB_COVER_STALE.to_owned())?;
+            movie_tmdb_cover_authority(&library, item_id, scan_generation).map_err(str::to_owned)?
+        }
+        TmdbCoverCategory::Tv => {
+            let authority = tv_tmdb_cover_authority(tv_state, item_id).map_err(str::to_owned)?;
+            (
+                authority.tmdb_id,
+                authority.poster_path,
+                authority.association_generation,
+            )
+        }
+    };
+    (expected.0 == request.tmdb_id
+        && expected.1 == request.poster_path
+        && Some(expected.2) == request.association_generation
+        && expected.2 == request.context_generation)
+        .then_some(())
+        .ok_or_else(|| TMDB_COVER_STALE.to_owned())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn resolve_tmdb_card_cover(
+    app: tauri::AppHandle,
+    category: String,
+    surface: String,
+    tmdb_id: String,
+    poster_path: Option<String>,
+    context_generation: String,
+    request_generation: String,
+    library_item_id: Option<String>,
+    association_generation: Option<String>,
+    movie_state: tauri::State<'_, MoviesLibraryState>,
+    tv_state: tauri::State<'_, TvLibraryState>,
+    cover_state: tauri::State<'_, TmdbCoverState>,
+) -> Result<Vec<String>, String> {
+    let request = tmdb_cover_request(
+        &category,
+        &surface,
+        &tmdb_id,
+        poster_path,
+        &context_generation,
+        &request_generation,
+        library_item_id,
+        association_generation,
+    )?;
+    validate_tmdb_library_cover_request(&request, movie_state.inner(), tv_state.inner())?;
+    let cache = tmdb_cover_cache_path(&app)?;
+    let movie_state = movie_state.inner().clone();
+    let tv_state = tv_state.inner().clone();
+    let cover_state = cover_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        resolve_tmdb_cover_with(
+            &cover_state,
+            &cache,
+            &request,
+            || validate_tmdb_library_cover_request(&request, &movie_state, &tv_state).is_ok(),
+            fetch_tmdb_image,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| TMDB_COVER_FAILED.to_owned())?
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn fetch_tmdb_card_cover(
+    category: String,
+    surface: String,
+    tmdb_id: String,
+    poster_path: Option<String>,
+    context_generation: String,
+    request_generation: String,
+    library_item_id: Option<String>,
+    association_generation: Option<String>,
+    cover_authority_id: String,
+    movie_state: tauri::State<'_, MoviesLibraryState>,
+    tv_state: tauri::State<'_, TvLibraryState>,
+    cover_state: tauri::State<'_, TmdbCoverState>,
+) -> Result<Vec<u8>, String> {
+    let request = tmdb_cover_request(
+        &category,
+        &surface,
+        &tmdb_id,
+        poster_path,
+        &context_generation,
+        &request_generation,
+        library_item_id,
+        association_generation,
+    )?;
+    validate_tmdb_library_cover_request(&request, movie_state.inner(), tv_state.inner())?;
+    fetch_tmdb_cover_with(cover_state.inner(), &request, &cover_authority_id).map_err(str::to_owned)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn cancel_tmdb_card_cover(
+    category: String,
+    surface: String,
+    tmdb_id: String,
+    poster_path: Option<String>,
+    context_generation: String,
+    request_generation: String,
+    library_item_id: Option<String>,
+    association_generation: Option<String>,
+    cover_state: tauri::State<'_, TmdbCoverState>,
+) -> Result<(), String> {
+    let request = tmdb_cover_request(
+        &category,
+        &surface,
+        &tmdb_id,
+        poster_path,
+        &context_generation,
+        &request_generation,
+        library_item_id,
+        association_generation,
+    )?;
+    cancel_tmdb_cover_request_with(cover_state.inner(), &request);
+    Ok(())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn invalidate_tmdb_card_cover(
+    app: tauri::AppHandle,
+    category: String,
+    surface: String,
+    tmdb_id: String,
+    poster_path: Option<String>,
+    context_generation: String,
+    request_generation: String,
+    library_item_id: Option<String>,
+    association_generation: Option<String>,
+    movie_state: tauri::State<'_, MoviesLibraryState>,
+    tv_state: tauri::State<'_, TvLibraryState>,
+    cover_state: tauri::State<'_, TmdbCoverState>,
+) -> Result<(), String> {
+    let request = tmdb_cover_request(
+        &category,
+        &surface,
+        &tmdb_id,
+        poster_path,
+        &context_generation,
+        &request_generation,
+        library_item_id,
+        association_generation,
+    )?;
+    validate_tmdb_library_cover_request(&request, movie_state.inner(), tv_state.inner())?;
+    invalidate_tmdb_cover_with(cover_state.inner(), &tmdb_cover_cache_path(&app)?, &request)
+        .map_err(str::to_owned)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -4645,6 +4887,7 @@ fn main() {
         .manage(FanzaCatalogState::default())
         .manage(JavdbCatalogState::default())
         .manage(LibraryPresentationState::default())
+        .manage(TmdbCoverState::default())
         .manage(TvLibraryState::default())
         .manage(TvReleaseState::default())
         .manage(TvTorrentState::default())
@@ -4688,6 +4931,10 @@ fn main() {
             fetch_library_cover,
             cancel_library_cover_request,
             invalidate_library_cover,
+            resolve_tmdb_card_cover,
+            fetch_tmdb_card_cover,
+            cancel_tmdb_card_cover,
+            invalidate_tmdb_card_cover,
             open_adult_file,
             reveal_adult_file,
             trash_adult_file,

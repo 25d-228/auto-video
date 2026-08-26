@@ -105,6 +105,15 @@ pub(crate) struct TvMetadataAssociation {
     generation: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TvTmdbCoverAuthority {
+    pub(crate) scan_generation: u64,
+    pub(crate) group_id: String,
+    pub(crate) tmdb_id: u64,
+    pub(crate) poster_path: Option<String>,
+    pub(crate) association_generation: u64,
+}
+
 #[derive(Clone)]
 struct TrustedTvShowGroup {
     group_id: String,
@@ -1245,6 +1254,28 @@ fn tv_metadata_authority(
         group_id: group.group_id.clone(),
         local_show_title: group.show_title.clone(),
         anchors,
+    })
+}
+
+pub(crate) fn tv_tmdb_cover_authority(
+    state: &TvLibraryState,
+    group_id: &str,
+) -> Result<TvTmdbCoverAuthority, &'static str> {
+    let context = state.0.lock().map_err(|_| TV_METADATA_UNAVAILABLE)?;
+    let authority = tv_metadata_authority(&context, group_id)?;
+    let scan = context.completed_scan.as_ref().ok_or(TV_METADATA_STALE)?;
+    let association = scan
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .and_then(|group| group.association.as_ref())
+        .ok_or(TV_METADATA_STALE)?;
+    Ok(TvTmdbCoverAuthority {
+        scan_generation: authority.scan_generation,
+        group_id: group_id.to_owned(),
+        tmdb_id: association.tmdb_tv_id,
+        poster_path: association.poster_path.clone(),
+        association_generation: association.generation,
     })
 }
 

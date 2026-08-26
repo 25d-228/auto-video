@@ -1446,6 +1446,32 @@ beforeEach(() => {
         case "cancel_library_cover_request":
         case "invalidate_library_cover":
           return Promise.resolve();
+        case "resolve_tmdb_card_cover":
+          return Promise.resolve([
+            "tmdb-card-cover-v1",
+            "ready",
+            parameters?.category as string,
+            parameters?.surface as string,
+            parameters?.tmdbId as string,
+            parameters?.posterPath as string,
+            parameters?.contextGeneration as string,
+            parameters?.requestGeneration as string,
+            (parameters?.libraryItemId as string | undefined) ?? "",
+            (parameters?.associationGeneration as string | undefined) ?? "0",
+            `tmdb-cover-${"b".repeat(40)}`,
+            String(2 / 3),
+            "TMDB",
+          ]);
+        case "fetch_tmdb_card_cover":
+          return Promise.resolve([
+            0xff,
+            0xd8,
+            0xff,
+            ...Array.from({ length: 61 }, () => 0),
+          ]);
+        case "cancel_tmdb_card_cover":
+        case "invalidate_tmdb_card_cover":
+          return Promise.resolve();
         case "load_tmdb_token":
           return loadTmdbTokenMock();
         case "save_tmdb_token":
@@ -6003,11 +6029,14 @@ describe("TMDB Discover", () => {
     expect(screen.getByRole("img", { name: "TMDB" })).toBeTruthy();
     expect(screen.getByText("Poster unavailable")).toBeTruthy();
 
-    const poster = document.querySelector<HTMLImageElement>(
-      'img[src="https://image.tmdb.org/t/p/w500/working-poster.jpg"]',
-    );
-    expect(poster).not.toBeNull();
-    fireEvent.error(poster as HTMLImageElement);
+    const poster = await waitFor(() => {
+      const current = document.querySelector<HTMLImageElement>(
+        'img[data-cover-source="TMDB"]',
+      );
+      expect(current).not.toBeNull();
+      return current as HTMLImageElement;
+    });
+    fireEvent.error(poster);
     expect(screen.getAllByText("Poster unavailable")).toHaveLength(2);
   });
 
@@ -17827,9 +17856,11 @@ describe("explicit Library cover recovery", () => {
       name: "Exact Movie Title",
     });
     const movieCard = movieHeading.closest("article") as HTMLElement;
-    const firstMovieCover = movieCard.querySelector(
-      'img[src="https://image.tmdb.org/t/p/w500/movie-cover.jpg"]',
-    );
+    const firstMovieCover = await waitFor(() => {
+      const cover = movieCard.querySelector('img[src="blob:javdb-cover"]');
+      expect(cover).not.toBeNull();
+      return cover;
+    });
     if (!(firstMovieCover instanceof HTMLImageElement)) {
       throw new Error("The explicit Movie cover was not rendered.");
     }
@@ -17844,7 +17875,7 @@ describe("explicit Library cover recovery", () => {
     );
     const replacementMovieCover = await waitFor(() => {
       const cover = movieCard.querySelector(
-        'img[src="https://image.tmdb.org/t/p/w500/movie-cover.jpg"]',
+        'img[src="blob:javdb-cover"]',
       );
       expect(cover).not.toBeNull();
       return cover as HTMLImageElement;
@@ -17857,9 +17888,11 @@ describe("explicit Library cover recovery", () => {
       name: "Exact TV Title",
     });
     const tvCard = tvHeading.closest("article") as HTMLElement;
-    const firstTvCover = tvCard.querySelector(
-      'img[src="https://image.tmdb.org/t/p/w500/tv-cover.jpg"]',
-    );
+    const firstTvCover = await waitFor(() => {
+      const cover = tvCard.querySelector('img[src="blob:javdb-cover"]');
+      expect(cover).not.toBeNull();
+      return cover;
+    });
     if (!(firstTvCover instanceof HTMLImageElement)) {
       throw new Error("The explicit TV cover was not rendered.");
     }
@@ -17874,7 +17907,7 @@ describe("explicit Library cover recovery", () => {
     );
     const replacementTvCover = await waitFor(() => {
       const cover = tvCard.querySelector(
-        'img[src="https://image.tmdb.org/t/p/w500/tv-cover.jpg"]',
+        'img[src="blob:javdb-cover"]',
       );
       expect(cover).not.toBeNull();
       return cover as HTMLImageElement;
@@ -17885,6 +17918,33 @@ describe("explicit Library cover recovery", () => {
     expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
     expect(searchMovieMetadataMock).not.toHaveBeenCalled();
     expect(searchTvShowMetadataMock).not.toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledWith(
+      "resolve_tmdb_card_cover",
+      expect.objectContaining({
+        associationGeneration: "12",
+        category: "movie",
+        contextGeneration: "12",
+        posterPath: "/movie-cover.jpg",
+        surface: "library",
+        tmdbId: "55",
+      }),
+    );
+    expect(invokeMock).toHaveBeenCalledWith(
+      "resolve_tmdb_card_cover",
+      expect.objectContaining({
+        associationGeneration: "1",
+        category: "tv",
+        contextGeneration: "1",
+        posterPath: "/tv-cover.jpg",
+        surface: "library",
+        tmdbId: "77",
+      }),
+    );
+    expect(
+      invokeMock.mock.calls.filter(
+        ([command]) => command === "invalidate_tmdb_card_cover",
+      ),
+    ).toHaveLength(2);
   });
 
   it("uses the Discover provider-card structure for every Library category", async () => {
