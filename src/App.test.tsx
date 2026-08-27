@@ -5328,8 +5328,8 @@ describe("parsed VR Library and Dashboard", () => {
   });
 });
 
-describe("Mira visual preset", () => {
-  it("renders existing accessible controls with Base UI and Phosphor icons", () => {
+describe("Nova visual preset", () => {
+  it("renders existing accessible controls with Base UI and Lucide icons", () => {
     render(<App />);
 
     const dashboard = screen.getByRole("button", { name: "Dashboard" });
@@ -5338,7 +5338,7 @@ describe("Mira visual preset", () => {
     const icons = Array.from(document.querySelectorAll("svg.app-icon"));
     expect(icons.length).toBeGreaterThan(0);
     expect(
-      icons.every((icon) => icon.getAttribute("viewBox") === "0 0 256 256"),
+      icons.every((icon) => icon.getAttribute("viewBox") === "0 0 24 24"),
     ).toBe(true);
   });
 });

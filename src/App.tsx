@@ -1,34 +1,34 @@
 import { AlertDialog } from "@base-ui/react/alert-dialog";
 import { Dialog } from "@base-ui/react/dialog";
 import {
-  ArrowClockwiseIcon,
-  CheckIcon,
-  CompassIcon,
-  CopySimpleIcon,
-  DownloadSimpleIcon,
-  FilmSlateIcon,
-  FilmStripIcon,
-  FolderOpenIcon,
-  FolderSimpleIcon,
-  GearSixIcon,
-  ImageSquareIcon,
-  InfoIcon,
-  type Icon,
-  KeyIcon,
-  MagnifyingGlassIcon,
-  GogglesIcon,
-  ListMagnifyingGlassIcon,
-  MonitorIcon,
-  MoonIcon,
-  PauseIcon,
-  PlayIcon,
-  SquaresFourIcon,
-  SunIcon,
-  TelevisionSimpleIcon,
-  TrashIcon,
-  WarningCircleIcon,
-  XIcon,
-} from "@phosphor-icons/react";
+  Check,
+  CircleAlert,
+  Clapperboard,
+  Compass,
+  Copy,
+  Download,
+  Film,
+  Folder,
+  FolderOpen,
+  Glasses,
+  Image,
+  Info,
+  KeyRound,
+  LayoutDashboard,
+  ListFilter,
+  type LucideIcon,
+  Monitor,
+  Moon,
+  Pause,
+  Play,
+  RotateCw,
+  Search,
+  Settings,
+  Sun,
+  Trash2,
+  Tv,
+  X,
+} from "lucide-react";
 import {
   type CSSProperties,
   type FormEvent,
@@ -45,6 +45,7 @@ import {
 
 import tmdbLogo from "@/assets/tmdb-logo.svg";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   naturalWidthGalleryPages,
   providerGalleryMetrics,
@@ -269,35 +270,35 @@ const appearanceModes = [
 ] as const;
 
 const appIcons = {
-  brand: PlayIcon,
-  dashboard: SquaresFourIcon,
-  discover: CompassIcon,
-  library: FilmSlateIcon,
-  downloads: DownloadSimpleIcon,
-  settings: GearSixIcon,
-  light: SunIcon,
-  dark: MoonIcon,
-  system: MonitorIcon,
-  folder: FolderSimpleIcon,
-  credential: KeyIcon,
-  refresh: ArrowClockwiseIcon,
-  movie: FilmStripIcon,
-  open: PlayIcon,
-  reveal: FolderOpenIcon,
-  trash: TrashIcon,
-  close: XIcon,
-  poster: ImageSquareIcon,
-  copy: CopySimpleIcon,
-  copied: CheckIcon,
-  "copy-error": WarningCircleIcon,
-  search: MagnifyingGlassIcon,
-  details: InfoIcon,
-  vr: GogglesIcon,
-  tv: TelevisionSimpleIcon,
-  adult: FilmStripIcon,
-  releases: ListMagnifyingGlassIcon,
-  pause: PauseIcon,
-} satisfies Record<string, Icon>;
+  brand: Play,
+  dashboard: LayoutDashboard,
+  discover: Compass,
+  library: Clapperboard,
+  downloads: Download,
+  settings: Settings,
+  light: Sun,
+  dark: Moon,
+  system: Monitor,
+  folder: Folder,
+  credential: KeyRound,
+  refresh: RotateCw,
+  movie: Film,
+  open: Play,
+  reveal: FolderOpen,
+  trash: Trash2,
+  close: X,
+  poster: Image,
+  copy: Copy,
+  copied: Check,
+  "copy-error": CircleAlert,
+  search: Search,
+  details: Info,
+  vr: Glasses,
+  tv: Tv,
+  adult: Film,
+  releases: ListFilter,
+  pause: Pause,
+} satisfies Record<string, LucideIcon>;
 
 type AppearanceMode = (typeof appearanceModes)[number]["id"];
 type IconName = keyof typeof appIcons;
@@ -1643,7 +1644,6 @@ function AppIcon({ name }: { name: IconName }) {
       aria-hidden="true"
       className="app-icon"
       focusable="false"
-      weight="regular"
     />
   );
 }
@@ -5528,7 +5528,7 @@ function MovieMetadataMatchDialog({
             >
               <label htmlFor="movie-metadata-query">Movie title query</label>
               <div>
-                <input
+                <Input
                   disabled={isBusy}
                   id="movie-metadata-query"
                   onChange={(event) => onQueryChange(event.target.value)}
@@ -5841,7 +5841,7 @@ function TvMetadataMatchDialog({
             >
               <label htmlFor="tv-show-metadata-query">TV show title query</label>
               <div>
-                <input
+                <Input
                   disabled={isBusy}
                   id="tv-show-metadata-query"
                   onChange={(event) => onQueryChange(event.target.value)}
@@ -15625,7 +15625,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         Search product code
                       </label>
                       <div className="discover-search__field">
-                        <input
+                        <Input
                           aria-describedby={
                             vrSearchInputError === null
                               ? undefined
@@ -15730,7 +15730,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         Search product code
                       </label>
                       <div className="discover-search__field">
-                        <input
+                        <Input
                           aria-describedby={
                             adultSearchInputError === null
                               ? undefined
@@ -15781,7 +15781,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         >
                           <label htmlFor="discover-tv-search">Search TV</label>
                           <div className="discover-search__field">
-                            <input
+                            <Input
                               aria-describedby={
                                 tvDiscoverSearchInputError === null
                                   ? undefined
@@ -15850,7 +15850,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           Search Movies
                         </label>
                         <div className="discover-search__field">
-                          <input
+                          <Input
                             aria-describedby={
                               discoverSearchInputError === null
                                 ? undefined
@@ -16418,7 +16418,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         <span className="movie-search__icon">
                           <AppIcon name="search" />
                         </span>
-                        <input
+                        <Input
                           aria-describedby={
                             movieScanState.status === "ready"
                               ? "movies-search-results"
@@ -16495,7 +16495,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         <span className="movie-search__icon">
                           <AppIcon name="search" />
                         </span>
-                        <input
+                        <Input
                           aria-describedby={
                             tvLibraryScanState.status === "ready"
                               ? "tv-library-search-results"
@@ -16575,7 +16575,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         <span className="movie-search__icon">
                           <AppIcon name="search" />
                         </span>
-                        <input
+                        <Input
                           aria-describedby={
                             adultLibraryScanState.status === "ready"
                               ? "adult-library-search-results"
@@ -16654,7 +16654,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                         <span className="movie-search__icon">
                           <AppIcon name="search" />
                         </span>
-                        <input
+                        <Input
                           aria-describedby={
                             vrLibraryScanState.status === "ready"
                               ? "vr-library-search-results"
@@ -17376,7 +17376,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                   <label className="field-label" htmlFor="tmdb-token">
                     {tmdbToken === null ? "Token" : "New token"}
                   </label>
-                  <input
+                  <Input
                     aria-describedby="tmdb-token-help tmdb-token-status"
                     autoComplete="off"
                     className="credential-input"
@@ -17833,7 +17833,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       <label className="field-label" htmlFor="vr-download-limit-value">
                         Finite limit (MiB/s)
                       </label>
-                      <input
+                      <Input
                         aria-describedby="vr-download-limit-help"
                         className="credential-input"
                         disabled={
