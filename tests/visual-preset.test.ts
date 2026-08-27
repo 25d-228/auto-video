@@ -17,6 +17,11 @@ const applicationStyles = readFileSync(resolve("src/index.css"), "utf8");
 const packageJson = JSON.parse(
   readFileSync(resolve("package.json"), "utf8"),
 ) as { dependencies: Record<string, string> };
+const packageLock = JSON.parse(
+  readFileSync(resolve("package-lock.json"), "utf8"),
+) as {
+  packages: Record<string, { version?: string }>;
+};
 const buttonSource = readFileSync(
   resolve("src/components/ui/button.tsx"),
   "utf8",
@@ -44,6 +49,10 @@ describe("default Nova preset contract", () => {
       menuColor: "default",
       menuAccent: "subtle",
     });
+    expect(packageJson.dependencies.shadcn).toBe("4.16.1");
+    expect(packageLock.packages["node_modules/shadcn"]?.version).toBe("4.16.1");
+    expect(packageLock.packages).not.toHaveProperty("node_modules/socks");
+    expect(packageLock.packages).not.toHaveProperty("node_modules/smart-buffer");
   });
 
   it("uses Geist, Lucide, neutral tokens, charts, and the default radius", () => {
@@ -53,7 +62,7 @@ describe("default Nova preset contract", () => {
     expect(packageJson.dependencies).toMatchObject({
       "@fontsource-variable/geist": "5.3.0",
       "lucide-react": "1.34.0",
-      shadcn: "4.19.0",
+      shadcn: "4.16.1",
     });
     expect(packageJson.dependencies).not.toHaveProperty("@phosphor-icons/react");
     expect(packageJson.dependencies).not.toHaveProperty("@fontsource-variable/noto-sans");
@@ -74,6 +83,16 @@ describe("default Nova preset contract", () => {
     expect(surfaceRadii).not.toContain("0");
     expect(surfaceRadii).toEqual(
       expect.arrayContaining(["var(--radius-lg)", "var(--radius-xl)"]),
+    );
+  });
+
+  it("leaves headings in authored casing with the default Geist behavior", () => {
+    expect(applicationStyles).not.toContain("tracking-wider");
+    expect(applicationStyles).not.toMatch(
+      /h1,\s*h2,\s*h3,\s*h4,\s*h5,\s*h6\s*\{[^}]*text-transform/s,
+    );
+    expect(applicationStyles).not.toMatch(
+      /h1,\s*h2,\s*h3,\s*h4,\s*h5,\s*h6\s*\{[^}]*uppercase/s,
     );
   });
 
