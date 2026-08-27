@@ -271,6 +271,7 @@ let movieMetadataAssociations: Map<
   }
 >;
 let movieFixtureFileIds: Map<string, string>;
+let movieScanGeneration: number;
 
 function fixtureMovieFileId(path: string) {
   const existing = movieFixtureFileIds.get(path);
@@ -305,7 +306,14 @@ function fixtureNativeMovieScan(paths: string[]) {
       association?.generation ?? (association === undefined ? "" : "1"),
     ];
   });
-  return ["movie-library-v1", movieMetadataStoreStatus, paths.length.toString(), ...rows];
+  movieScanGeneration += 1;
+  return [
+    "movie-library-v1",
+    movieMetadataStoreStatus,
+    String(movieScanGeneration),
+    paths.length.toString(),
+    ...rows,
+  ];
 }
 
 function createResizeEntry(
@@ -1046,6 +1054,7 @@ beforeEach(() => {
   movieMetadataStoreStatus = "ready";
   movieMetadataAssociations = new Map();
   movieFixtureFileIds = new Map();
+  movieScanGeneration = 0;
   scanMoviesMock = vi.fn().mockResolvedValue([]);
   searchMovieMetadataMock = vi.fn().mockResolvedValue([
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1445,6 +1454,34 @@ beforeEach(() => {
           return fetchLibraryCoverMock(parameters);
         case "cancel_library_cover_request":
         case "invalidate_library_cover":
+          return Promise.resolve();
+        case "resolve_tmdb_card_cover":
+          return Promise.resolve([
+            "tmdb-card-cover-v1",
+            "pending",
+            parameters?.category as string,
+            parameters?.surface as string,
+            parameters?.tmdbId as string,
+            parameters?.posterPath as string,
+            parameters?.contextGeneration as string,
+            parameters?.requestGeneration as string,
+            (parameters?.libraryItemId as string | undefined) ?? "",
+            (parameters?.associationGeneration as string | undefined) ?? "0",
+            (parameters?.scanGeneration as string | undefined) ?? "0",
+            `tmdb-cover-${"b".repeat(40)}`,
+            String(2 / 3),
+            "TMDB",
+          ]);
+        case "fetch_tmdb_card_cover":
+          return Promise.resolve([
+            0xff,
+            0xd8,
+            0xff,
+            ...Array.from({ length: 61 }, () => 0),
+          ]);
+        case "confirm_tmdb_card_cover":
+        case "cancel_tmdb_card_cover":
+        case "invalidate_tmdb_card_cover":
           return Promise.resolve();
         case "load_tmdb_token":
           return loadTmdbTokenMock();
@@ -6003,12 +6040,18 @@ describe("TMDB Discover", () => {
     expect(screen.getByRole("img", { name: "TMDB" })).toBeTruthy();
     expect(screen.getByText("Poster unavailable")).toBeTruthy();
 
-    const poster = document.querySelector<HTMLImageElement>(
-      'img[src="https://image.tmdb.org/t/p/w500/working-poster.jpg"]',
+    const poster = await waitFor(() => {
+      const current = document.querySelector<HTMLImageElement>(
+        'img[src="blob:javdb-cover"]',
+      );
+      expect(current).not.toBeNull();
+      return current as HTMLImageElement;
+    });
+    expect(poster.dataset.coverSource).toBeUndefined();
+    fireEvent.error(poster);
+    await waitFor(() =>
+      expect(screen.getAllByText("Poster unavailable")).toHaveLength(2),
     );
-    expect(poster).not.toBeNull();
-    fireEvent.error(poster as HTMLImageElement);
-    expect(screen.getAllByText("Poster unavailable")).toHaveLength(2);
   });
 
   it("submits an exact title query explicitly and reuses accessible Discover cards", async () => {
@@ -17827,9 +17870,11 @@ describe("explicit Library cover recovery", () => {
       name: "Exact Movie Title",
     });
     const movieCard = movieHeading.closest("article") as HTMLElement;
-    const firstMovieCover = movieCard.querySelector(
-      'img[src="https://image.tmdb.org/t/p/w500/movie-cover.jpg"]',
-    );
+    const firstMovieCover = await waitFor(() => {
+      const cover = movieCard.querySelector('img[src="blob:javdb-cover"]');
+      expect(cover).not.toBeNull();
+      return cover;
+    });
     if (!(firstMovieCover instanceof HTMLImageElement)) {
       throw new Error("The explicit Movie cover was not rendered.");
     }
@@ -17838,13 +17883,13 @@ describe("explicit Library cover recovery", () => {
       movieCard.querySelector(".provider-cover__placeholder")?.textContent,
     ).toContain("Exact Movie Title");
     fireEvent.click(
-      within(movieCard).getByRole("button", {
+      await within(movieCard).findByRole("button", {
         name: "Retry cover: Exact Movie Title",
       }),
     );
     const replacementMovieCover = await waitFor(() => {
       const cover = movieCard.querySelector(
-        'img[src="https://image.tmdb.org/t/p/w500/movie-cover.jpg"]',
+        'img[src="blob:javdb-cover"]',
       );
       expect(cover).not.toBeNull();
       return cover as HTMLImageElement;
@@ -17857,9 +17902,11 @@ describe("explicit Library cover recovery", () => {
       name: "Exact TV Title",
     });
     const tvCard = tvHeading.closest("article") as HTMLElement;
-    const firstTvCover = tvCard.querySelector(
-      'img[src="https://image.tmdb.org/t/p/w500/tv-cover.jpg"]',
-    );
+    const firstTvCover = await waitFor(() => {
+      const cover = tvCard.querySelector('img[src="blob:javdb-cover"]');
+      expect(cover).not.toBeNull();
+      return cover;
+    });
     if (!(firstTvCover instanceof HTMLImageElement)) {
       throw new Error("The explicit TV cover was not rendered.");
     }
@@ -17868,13 +17915,13 @@ describe("explicit Library cover recovery", () => {
       tvCard.querySelector(".provider-cover__placeholder")?.textContent,
     ).toContain("Exact TV Title");
     fireEvent.click(
-      within(tvCard).getByRole("button", {
+      await within(tvCard).findByRole("button", {
         name: "Retry cover: Exact TV Title",
       }),
     );
     const replacementTvCover = await waitFor(() => {
       const cover = tvCard.querySelector(
-        'img[src="https://image.tmdb.org/t/p/w500/tv-cover.jpg"]',
+        'img[src="blob:javdb-cover"]',
       );
       expect(cover).not.toBeNull();
       return cover as HTMLImageElement;
@@ -17885,6 +17932,40 @@ describe("explicit Library cover recovery", () => {
     expect(fetchLibraryCoverMock).not.toHaveBeenCalled();
     expect(searchMovieMetadataMock).not.toHaveBeenCalled();
     expect(searchTvShowMetadataMock).not.toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledWith(
+      "resolve_tmdb_card_cover",
+      expect.objectContaining({
+        associationGeneration: "12",
+        category: "movie",
+        contextGeneration: "12",
+        posterPath: "/movie-cover.jpg",
+        scanGeneration: "1",
+        surface: "library",
+        tmdbId: "55",
+      }),
+    );
+    expect(invokeMock).toHaveBeenCalledWith(
+      "resolve_tmdb_card_cover",
+      expect.objectContaining({
+        associationGeneration: "1",
+        category: "tv",
+        contextGeneration: "1",
+        posterPath: "/tv-cover.jpg",
+        scanGeneration: "7",
+        surface: "library",
+        tmdbId: "77",
+      }),
+    );
+    expect(
+      invokeMock.mock.calls.filter(
+        ([command]) => command === "invalidate_tmdb_card_cover",
+      ),
+    ).toHaveLength(2);
+    expect(
+      invokeMock.mock.calls.filter(
+        ([command]) => command === "confirm_tmdb_card_cover",
+      ),
+    ).toHaveLength(0);
   });
 
   it("uses the Discover provider-card structure for every Library category", async () => {

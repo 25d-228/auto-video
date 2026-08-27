@@ -111,6 +111,7 @@ import {
   type TmdbTvShowsResult,
   tmdbPosterUrl,
 } from "@/tmdb";
+import { useTmdbCardCover } from "@/tmdb-cover";
 import {
   fetchVerifiedApiBayTvReleases,
   inspectVerifiedApiBayTvTorrent,
@@ -311,6 +312,7 @@ type MovieScanState =
   | { status: "error" }
   | {
       status: "ready";
+      generation: string;
       movies: Movie[];
       metadataStatus: "ready" | "attention" | "unavailable";
     };
@@ -1895,18 +1897,75 @@ function ResizeAwareGallery<Item>({
   );
 }
 
+function TmdbCardCoverArtwork({
+  cover,
+  title,
+}: {
+  cover: ReturnType<typeof useTmdbCardCover>;
+  title: string;
+}) {
+  return cover.objectUrl !== null ? (
+    <img
+      alt=""
+      data-cover-source={cover.source ?? undefined}
+      onError={cover.reportDecodeFailure ?? undefined}
+      onLoad={cover.reportDecodeSuccess ?? undefined}
+      src={cover.objectUrl}
+    />
+  ) : (
+    <div aria-label={`${title} cover`} className="discover-card__poster-fallback">
+      <AppIcon name="poster" />
+      <span>{cover.status === "loading" ? "Loading poster" : "Poster unavailable"}</span>
+    </div>
+  );
+}
+
+function TmdbCoverRetry({
+  cover,
+  title,
+}: {
+  cover: ReturnType<typeof useTmdbCardCover>;
+  title: string;
+}) {
+  return cover.retry === null ? null : (
+    <Button
+      aria-label={`Retry cover: ${title}`}
+      onClick={(event) => {
+        event.stopPropagation();
+        cover.retry?.();
+      }}
+      onKeyDown={(event) => event.stopPropagation()}
+      onPointerDown={(event) => event.stopPropagation()}
+      size="xs"
+      type="button"
+      variant="outline"
+    >
+      <AppIcon name="refresh" />
+      Retry cover
+    </Button>
+  );
+}
+
 function DiscoverMovieCard({
+  coverContextGeneration,
   movie,
   onFindReleases,
   onViewDetails,
   resultIndex,
 }: {
+  coverContextGeneration: string;
   movie: TmdbMovie;
   onFindReleases: (movie: TmdbMovie, triggerId: string) => void;
   onViewDetails: (movie: TmdbMovie, triggerId: string) => void;
   resultIndex: number;
 }) {
-  const [posterFailed, setPosterFailed] = useState(false);
+  const cover = useTmdbCardCover({
+    category: "movie",
+    contextGeneration: coverContextGeneration,
+    posterPath: movie.posterPath,
+    surface: "discover",
+    tmdbId: movie.id,
+  });
   const detailsTriggerId = useId();
   const releasesTriggerId = useId();
   const titleId = `tmdb-movie-${movie.id}-${resultIndex}`;
@@ -1917,24 +1976,14 @@ function DiscoverMovieCard({
       className="discover-card discover-card--movie"
     >
       <div className="discover-card__poster">
-        {movie.posterPath !== null && !posterFailed ? (
-          <img
-            alt=""
-            onError={() => setPosterFailed(true)}
-            src={tmdbPosterUrl(movie.posterPath)}
-          />
-        ) : (
-          <div className="discover-card__poster-fallback">
-            <AppIcon name="poster" />
-            <span>Poster unavailable</span>
-          </div>
-        )}
+        <TmdbCardCoverArtwork cover={cover} title={movie.title} />
       </div>
       <div className="discover-card__body">
         <div className="media-title-row">
           <h3 id={titleId}>{movie.title}</h3>
           <div className="discover-card__title-actions">
             <CopyTitleAction title={movie.title} />
+            <TmdbCoverRetry cover={cover} title={movie.title} />
             <Button
               aria-label={`Find releases: ${movie.title}`}
               className="discover-card__releases-action"
@@ -1978,7 +2027,7 @@ function DiscoverMovieCard({
             <dd>{movie.releaseDate ?? "Unavailable"}</dd>
           </div>
           <div>
-            <dt>Source</dt>
+            <dt>Catalog source</dt>
             <dd>TMDB</dd>
           </div>
         </dl>
@@ -1988,39 +2037,37 @@ function DiscoverMovieCard({
 }
 
 function DiscoverTvCard({
+  coverContextGeneration,
   onViewDetails,
   resultIndex,
   show,
 }: {
+  coverContextGeneration: string;
   onViewDetails: (show: TmdbTvShow, triggerId: string) => void;
   resultIndex: number;
   show: TmdbTvShow;
 }) {
-  const [posterFailed, setPosterFailed] = useState(false);
+  const cover = useTmdbCardCover({
+    category: "tv",
+    contextGeneration: coverContextGeneration,
+    posterPath: show.posterPath,
+    surface: "discover",
+    tmdbId: show.id,
+  });
   const detailsTriggerId = useId();
   const titleId = `tmdb-tv-${show.id}-${resultIndex}`;
 
   return (
     <article aria-labelledby={titleId} className="discover-card">
       <div className="discover-card__poster">
-        {show.posterPath !== null && !posterFailed ? (
-          <img
-            alt=""
-            onError={() => setPosterFailed(true)}
-            src={tmdbPosterUrl(show.posterPath)}
-          />
-        ) : (
-          <div className="discover-card__poster-fallback">
-            <AppIcon name="poster" />
-            <span>Poster unavailable</span>
-          </div>
-        )}
+        <TmdbCardCoverArtwork cover={cover} title={show.name} />
       </div>
       <div className="discover-card__body">
         <div className="media-title-row">
           <h3 id={titleId}>{show.name}</h3>
           <div className="discover-card__title-actions">
             <CopyTitleAction title={show.name} />
+            <TmdbCoverRetry cover={cover} title={show.name} />
             <Button
               aria-label={`View details: ${show.name}`}
               className="discover-card__details-action"
@@ -2047,7 +2094,7 @@ function DiscoverTvCard({
             <dd>{show.firstAirDate ?? "Unavailable"}</dd>
           </div>
           <div>
-            <dt>Source</dt>
+            <dt>Catalog source</dt>
             <dd>TMDB</dd>
           </div>
         </dl>
@@ -6030,45 +6077,23 @@ function TvMetadataDetailsDialog({
   );
 }
 
-function useExplicitLibraryPoster(posterUrl: string | null) {
-  const [failed, setFailed] = useState(false);
-  const [retryGeneration, setRetryGeneration] = useState(0);
-
-  useEffect(() => {
-    setFailed(false);
-    setRetryGeneration(0);
-  }, [posterUrl]);
-
-  return {
-    failed,
-    reportFailure: () => setFailed(true),
-    retry: () => {
-      setFailed(false);
-      setRetryGeneration((generation) => generation + 1);
-    },
-    retryGeneration,
-  };
-}
-
 function LibraryCoverArtwork({
-  explicitPoster,
   icon,
   onDecodedRatio,
   presentation,
-  posterUrl = null,
+  tmdbCover = null,
   title,
 }: {
-  explicitPoster?: ReturnType<typeof useExplicitLibraryPoster>;
   icon: IconName;
   onDecodedRatio: (ratio: number) => void;
   presentation: LibraryPresentationState | null;
-  posterUrl?: string | null;
+  tmdbCover?: ReturnType<typeof useTmdbCardCover> | null;
   title: string;
 }) {
-  const objectUrl = presentation?.cover.objectUrl ?? posterUrl;
+  const objectUrl = presentation?.cover.objectUrl ?? tmdbCover?.objectUrl ?? null;
   const failed =
     presentation === null
-      ? explicitPoster?.failed === true
+      ? tmdbCover?.objectUrl === null
       : presentation.cover.status !== "ready";
   if (objectUrl === null || failed) {
     return (
@@ -6081,15 +6106,18 @@ function LibraryCoverArtwork({
   return (
     <img
       alt=""
-      key={`${objectUrl}:${explicitPoster?.retryGeneration ?? 0}`}
       onError={() => {
         if (presentation === null) {
-          explicitPoster?.reportFailure();
+          tmdbCover?.reportDecodeFailure?.();
         } else {
           presentation.cover.reportDecodeFailure?.();
         }
       }}
       onLoad={(event) => {
+        if (presentation === null) {
+          tmdbCover?.reportDecodeSuccess?.();
+          return;
+        }
         const { naturalHeight, naturalWidth } = event.currentTarget;
         if (naturalHeight > 0 && naturalWidth > 0) {
           onDecodedRatio(naturalWidth / naturalHeight);
@@ -6342,6 +6370,7 @@ function LibraryMovieCard({
   onMovieTrashed,
   onRatioChange,
   onViewMetadataDetails,
+  scanGeneration,
 }: {
   folder: string;
   movie: Movie;
@@ -6349,6 +6378,7 @@ function LibraryMovieCard({
   onMovieTrashed: (movie: Movie, folder: string) => void;
   onRatioChange: (ratio: number) => void;
   onViewMetadataDetails: (movie: Movie, triggerId: string) => void;
+  scanGeneration: string;
 }) {
   const primaryTitle = moviePrimaryTitle(movie);
   const [isOpening, setIsOpening] = useState(false);
@@ -6365,11 +6395,16 @@ function LibraryMovieCard({
   const trashDialogPopup = useRef<HTMLDivElement | null>(null);
   const trashTriggerId = useId();
   const metadataTriggerId = `movie-metadata-${movie.fileId}`;
-  const posterUrl =
-    movie.association?.posterPath == null
-      ? null
-      : tmdbPosterUrl(movie.association.posterPath);
-  const explicitPoster = useExplicitLibraryPoster(posterUrl);
+  const tmdbCover = useTmdbCardCover({
+    associationGeneration: movie.association?.generation,
+    category: "movie",
+    contextGeneration: movie.association?.generation ?? "1",
+    libraryItemId: movie.fileId,
+    posterPath: movie.association?.posterPath ?? null,
+    scanGeneration,
+    surface: "library",
+    tmdbId: movie.association?.tmdbMovieId ?? 0,
+  });
   const [ratio, reportDecodedRatio] = useLibraryCardRatio(
     movie.association?.posterPath == null ? 0.72 : 2 / 3,
     `${movie.association?.generation ?? "local"}:${movie.association?.posterPath ?? ""}`,
@@ -6503,10 +6538,10 @@ function LibraryMovieCard({
             <AppIcon name="details" />
             {movie.association === null ? "Match metadata" : "View metadata"}
           </Button>
-          {posterUrl !== null && explicitPoster.failed ? (
+          {tmdbCover.retry === null ? null : (
             <Button
               aria-label={`Retry cover: ${primaryTitle}`}
-              onClick={explicitPoster.retry}
+              onClick={tmdbCover.retry}
               size="xs"
               type="button"
               variant="ghost"
@@ -6514,20 +6549,17 @@ function LibraryMovieCard({
               <AppIcon name="refresh" />
               Retry cover
             </Button>
-          ) : null}
+          )}
         </>
       }
       className="movie-card"
-      coverSource={
-        posterUrl !== null && !explicitPoster.failed ? "TMDB" : "Local Library"
-      }
+      coverSource={tmdbCover.source ?? "Local Library"}
       cover={
         <LibraryCoverArtwork
-          explicitPoster={explicitPoster}
           icon="movie"
           onDecodedRatio={reportDecodedRatio}
-          posterUrl={posterUrl}
           presentation={null}
+          tmdbCover={tmdbCover}
           title={primaryTitle}
         />
       }
@@ -7384,11 +7416,16 @@ function TvLibraryCard({
   trashPendingPath: string | null;
 }) {
   const metadataTriggerId = useId();
-  const posterUrl =
-    item.association?.posterPath == null
-      ? null
-      : tmdbPosterUrl(item.association.posterPath);
-  const explicitPoster = useExplicitLibraryPoster(posterUrl);
+  const tmdbCover = useTmdbCardCover({
+    associationGeneration: item.association?.generation,
+    category: "tv",
+    contextGeneration: item.association?.generation ?? "1",
+    libraryItemId: item.groupId,
+    posterPath: item.association?.posterPath ?? null,
+    scanGeneration,
+    surface: "library",
+    tmdbId: item.association?.tmdbTvId ?? 0,
+  });
   const [ratio, reportDecodedRatio] = useLibraryCardRatio(
     item.association?.posterPath == null ? 0.72 : 2 / 3,
     `${item.association?.generation ?? "local"}:${item.association?.posterPath ?? ""}`,
@@ -7436,10 +7473,10 @@ function TvLibraryCard({
               View metadata
             </Button>
           )}
-          {posterUrl !== null && explicitPoster.failed ? (
+          {tmdbCover.retry === null ? null : (
             <Button
               aria-label={`Retry cover: ${item.title}`}
-              onClick={explicitPoster.retry}
+              onClick={tmdbCover.retry}
               size="xs"
               type="button"
               variant="ghost"
@@ -7447,20 +7484,17 @@ function TvLibraryCard({
               <AppIcon name="refresh" />
               Retry cover
             </Button>
-          ) : null}
+          )}
         </>
       }
       className="movie-card vr-library-card tv-library-card"
-      coverSource={
-        posterUrl !== null && !explicitPoster.failed ? "TMDB" : "Local Library"
-      }
+      coverSource={tmdbCover.source ?? "Local Library"}
       cover={
         <LibraryCoverArtwork
-          explicitPoster={explicitPoster}
           icon="tv"
           onDecodedRatio={reportDecodedRatio}
-          posterUrl={posterUrl}
           presentation={null}
+          tmdbCover={tmdbCover}
           title={item.title}
         />
       }
@@ -10009,7 +10043,12 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         setMovieScanState(
           movies.length === 0
             ? { status: "empty" }
-            : { status: "ready", movies, metadataStatus: scan.metadataStatus },
+            : {
+                status: "ready",
+                generation: scan.generation,
+                movies,
+                metadataStatus: scan.metadataStatus,
+              },
         );
       })
       .catch((error: unknown) => {
@@ -12817,6 +12856,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         ? { status: "empty" }
         : {
             status: "ready",
+            generation: currentState.generation,
             movies: remainingMovies,
             metadataStatus: currentState.metadataStatus,
           };
@@ -16190,6 +16230,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     onSelectedPageChange={setTvDiscoverSelectedPage}
                     renderItem={(show, resultIndex) => (
                       <DiscoverTvCard
+                        coverContextGeneration={String(tvDiscoverRequestId.current || 1)}
                         onViewDetails={openDiscoverTvDetails}
                         resultIndex={resultIndex}
                         show={show}
@@ -16236,6 +16277,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     onSelectedPageChange={setDiscoverSelectedPage}
                     renderItem={(movie, resultIndex) => (
                       <DiscoverMovieCard
+                        coverContextGeneration={String(discoverRequestId.current || 1)}
                         movie={movie}
                         onFindReleases={openMovieReleaseComparison}
                         onViewDetails={openDiscoverMovieDetails}
@@ -16894,6 +16936,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                             });
                           }}
                           onViewMetadataDetails={openMovieMetadataDetails}
+                          scanGeneration={movieScanState.generation}
                         />
                       )}
                       selectedPage={librarySelectedPage}

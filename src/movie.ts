@@ -25,6 +25,7 @@ export type MovieLibraryFile = {
 };
 
 export type MovieLibraryScan = {
+  generation: string;
   metadataStatus: "ready" | "attention" | "unavailable";
   movies: MovieLibraryFile[];
 };
@@ -47,7 +48,7 @@ export type VerifiedMovieMetadata = {
   association: MovieMetadataAssociation;
 };
 
-const movieLibraryHeaderLength = 3;
+const movieLibraryHeaderLength = 4;
 const movieLibraryRowLength = 13;
 const movieMetadataAssociationLength = 8;
 const movieMetadataCandidateLength = 5;
@@ -114,10 +115,11 @@ export function parseMovieLibraryScan(value: unknown): MovieLibraryScan | null {
     return null;
   }
   const values = value as string[];
-  const [version, metadataStatus, countValue] = values;
+  const [version, metadataStatus, generation, countValue] = values;
   if (
     version !== "movie-library-v1" ||
     !["ready", "attention", "unavailable"].includes(metadataStatus) ||
+    !positiveIntegerPattern.test(generation) ||
     !/^\d{1,6}$/.test(countValue)
   ) {
     return null;
@@ -162,6 +164,7 @@ export function parseMovieLibraryScan(value: unknown): MovieLibraryScan | null {
     movies.push({ fileId, path, relativePath, sizeBytes, association });
   }
   return {
+    generation,
     metadataStatus: metadataStatus as MovieLibraryScan["metadataStatus"],
     movies,
   };
