@@ -37,6 +37,7 @@ describe("trusted Movie Library metadata boundary", () => {
       parseMovieLibraryScan([
         "movie-library-v1",
         "ready",
+        "4",
         "1",
         fileId,
         "/Movies/映画  —  Local.File.MKV",
@@ -53,6 +54,7 @@ describe("trusted Movie Library metadata boundary", () => {
         "7",
       ]),
     ).toEqual({
+      generation: "4",
       metadataStatus: "ready",
       movies: [
         {
@@ -92,13 +94,15 @@ describe("trusted Movie Library metadata boundary", () => {
       "",
     ];
     for (const response of [
-      ["movie-library-v2", "ready", "0"],
-      ["movie-library-v1", "invalid", "0"],
-      ["movie-library-v1", "ready", "1", ...validRow.slice(0, -1)],
-      ["movie-library-v1", "ready", "2", ...validRow, ...validRow],
+      ["movie-library-v2", "ready", "1", "0"],
+      ["movie-library-v1", "invalid", "1", "0"],
+      ["movie-library-v1", "ready", "0", "0"],
+      ["movie-library-v1", "ready", "1", "1", ...validRow.slice(0, -1)],
+      ["movie-library-v1", "ready", "1", "2", ...validRow, ...validRow],
       [
         "movie-library-v1",
         "ready",
+        "1",
         "1",
         ...validRow.slice(0, 4),
         "1",

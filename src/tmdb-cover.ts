@@ -10,6 +10,7 @@ export type TmdbCardCoverRequest = {
   contextGeneration: string;
   libraryItemId?: string;
   associationGeneration?: string;
+  scanGeneration?: string;
 };
 
 export type TmdbCardCover = {
@@ -36,6 +37,7 @@ function requestArguments(
     libraryItemId: request.libraryItemId,
     posterPath: request.posterPath,
     requestGeneration,
+    scanGeneration: request.scanGeneration,
     surface: request.surface,
     tmdbId: String(request.tmdbId),
   };
@@ -48,7 +50,7 @@ export function parseTmdbCardCoverResponse(
 ) {
   if (
     !Array.isArray(value) ||
-    value.length !== 13 ||
+    value.length !== 14 ||
     !value.every((field) => typeof field === "string")
   ) {
     return null;
@@ -64,6 +66,7 @@ export function parseTmdbCardCoverResponse(
     returnedRequestGeneration,
     libraryItemId,
     associationGeneration,
+    scanGeneration,
     authorityId,
     ratio,
     source,
@@ -77,6 +80,7 @@ export function parseTmdbCardCoverResponse(
     returnedRequestGeneration === requestGeneration &&
     libraryItemId === (request.libraryItemId ?? "") &&
     associationGeneration === (request.associationGeneration ?? "0") &&
+    scanGeneration === (request.scanGeneration ?? "0") &&
     Number(requestGeneration) > 0;
   if (!commonIsExact) return null;
   if (status === "missing") {
@@ -128,6 +132,7 @@ export function useTmdbCardCover(request: TmdbCardCoverRequest): TmdbCardCover {
     contextGeneration,
     libraryItemId,
     posterPath,
+    scanGeneration,
     surface,
     tmdbId,
   } = request;
@@ -147,6 +152,7 @@ export function useTmdbCardCover(request: TmdbCardCoverRequest): TmdbCardCover {
       contextGeneration,
       libraryItemId,
       posterPath,
+      scanGeneration,
       surface,
       tmdbId,
     }),
@@ -156,6 +162,7 @@ export function useTmdbCardCover(request: TmdbCardCoverRequest): TmdbCardCover {
       contextGeneration,
       libraryItemId,
       posterPath,
+      scanGeneration,
       surface,
       tmdbId,
     ],

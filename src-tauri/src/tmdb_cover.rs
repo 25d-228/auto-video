@@ -86,6 +86,7 @@ pub(crate) struct TmdbCoverRequest {
     pub(crate) request_generation: u64,
     pub(crate) library_item_id: Option<String>,
     pub(crate) association_generation: Option<u64>,
+    pub(crate) scan_generation: Option<u64>,
 }
 
 impl TmdbCoverRequest {
@@ -103,7 +104,9 @@ impl TmdbCoverRequest {
         }
         match self.surface {
             TmdbCoverSurface::Discover => {
-                self.library_item_id.is_none() && self.association_generation.is_none()
+                self.library_item_id.is_none()
+                    && self.association_generation.is_none()
+                    && self.scan_generation.is_none()
             }
             TmdbCoverSurface::Library => {
                 self.library_item_id
@@ -111,6 +114,9 @@ impl TmdbCoverRequest {
                     .is_some_and(valid_library_item_id)
                     && self
                         .association_generation
+                        .is_some_and(|generation| generation > 0)
+                    && self
+                        .scan_generation
                         .is_some_and(|generation| generation > 0)
             }
         }
@@ -484,7 +490,15 @@ fn read_cache_file(path: &Path, request: &TmdbCoverRequest, now: u64) -> Option<
     Some((bytes, ratio))
 }
 
-fn cache_files(directory: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+#[derive(Clone)]
+struct CacheEntry {
+    path: PathBuf,
+    length: u64,
+    modified: SystemTime,
+    temporary: bool,
+}
+
+fn cache_entries(directory: &Path) -> Vec<CacheEntry> {
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
     };
@@ -494,20 +508,27 @@ fn cache_files(directory: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_str()?;
-            if !name.starts_with("tmdb-cover-") || !name.ends_with(".bin") {
+            let temporary = name.starts_with(".tmdb-cover-") && name.ends_with(".tmp");
+            if !temporary && (!name.starts_with("tmdb-cover-") || !name.ends_with(".bin")) {
                 return None;
             }
             let metadata = fs::symlink_metadata(&path).ok()?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                remove_cache_file(&path);
-                return None;
-            }
-            Some((
+            Some(CacheEntry {
                 path,
-                metadata.len(),
-                metadata.modified().unwrap_or(UNIX_EPOCH),
-            ))
+                length: metadata.len(),
+                modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+                temporary,
+            })
         })
+        .collect()
+}
+
+#[cfg(test)]
+fn cache_files(directory: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+    cache_entries(directory)
+        .into_iter()
+        .filter(|entry| !entry.temporary)
+        .map(|entry| (entry.path, entry.length, entry.modified))
         .collect()
 }
 
@@ -517,22 +538,29 @@ fn bound_cache(
     required_bytes: u64,
     protected: &HashSet<PathBuf>,
 ) -> Result<(), ()> {
-    let mut files = cache_files(directory);
-    files.retain(|(path, _, _)| path != target);
-    files.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
-    let mut total = files.iter().map(|(_, length, _)| *length).sum::<u64>();
+    remove_cache_file_checked(target)?;
+    let mut files = cache_entries(directory);
+    files.sort_by(|left, right| {
+        right
+            .temporary
+            .cmp(&left.temporary)
+            .then_with(|| left.modified.cmp(&right.modified))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut total = files.iter().map(|entry| entry.length).sum::<u64>();
     while files.len() + 1 > CACHE_MAX_FILES
         || total.saturating_add(required_bytes) > CACHE_MAX_TOTAL_BYTES
     {
         let Some(index) = files
             .iter()
-            .position(|(path, _, _)| !protected.contains(path))
+            .position(|entry| !protected.contains(&entry.path))
         else {
             return Err(());
         };
-        let (path, length, _) = files.remove(index);
-        remove_cache_file(&path);
-        total = total.saturating_sub(length);
+        let entry = &files[index];
+        remove_cache_file_checked(&entry.path)?;
+        total = total.saturating_sub(entry.length);
+        files.remove(index);
     }
     Ok(())
 }
@@ -559,7 +587,7 @@ fn write_cache(
         cache_identity(request),
         request.request_generation
     ));
-    remove_cache_file(&temporary);
+    remove_cache_file_checked(&temporary)?;
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -569,11 +597,11 @@ fn write_cache(
         || file.write_all(bytes).is_err()
         || file.sync_all().is_err()
     {
-        remove_cache_file(&temporary);
+        let _ = remove_cache_file_checked(&temporary);
         return Err(());
     }
     if fs::rename(&temporary, &path).is_err() {
-        remove_cache_file(&temporary);
+        let _ = remove_cache_file_checked(&temporary);
         return Err(());
     }
     Ok(())
@@ -592,7 +620,7 @@ fn authority_id(request: &TmdbCoverRequest, source: &str) -> String {
         "tmdb-cover-{}",
         hex_sha1(
             format!(
-                "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                 request.category.as_str(),
                 request.surface.as_str(),
                 request.tmdb_id,
@@ -600,6 +628,7 @@ fn authority_id(request: &TmdbCoverRequest, source: &str) -> String {
                 request.context_generation,
                 request.request_generation,
                 request.library_item_id.as_deref().unwrap_or(""),
+                request.scan_generation.unwrap_or(0),
                 source
             )
             .as_bytes()
@@ -619,6 +648,7 @@ fn pending_response(request: &TmdbCoverRequest, authority_id: &str, ratio: f64) 
         request.request_generation.to_string(),
         request.library_item_id.clone().unwrap_or_default(),
         request.association_generation.unwrap_or(0).to_string(),
+        request.scan_generation.unwrap_or(0).to_string(),
         authority_id.to_owned(),
         ratio.to_string(),
         "TMDB".to_owned(),
@@ -637,6 +667,7 @@ fn missing_response(request: &TmdbCoverRequest) -> Vec<String> {
         request.request_generation.to_string(),
         request.library_item_id.clone().unwrap_or_default(),
         request.association_generation.unwrap_or(0).to_string(),
+        request.scan_generation.unwrap_or(0).to_string(),
         String::new(),
         DEFAULT_RATIO.to_string(),
         String::new(),
@@ -942,6 +973,7 @@ mod tests {
             request_generation: 9,
             library_item_id: (surface == TmdbCoverSurface::Library).then(|| "a".repeat(40)),
             association_generation: (surface == TmdbCoverSurface::Library).then_some(3),
+            scan_generation: (surface == TmdbCoverSurface::Library).then_some(4),
         }
     }
 
@@ -980,18 +1012,23 @@ mod tests {
             assert_eq!(response[1], "pending");
             assert_eq!(response[2], category.as_str());
             assert_eq!(response[3], surface.as_str());
-            assert_eq!(response[12], "TMDB");
+            assert_eq!(response[13], "TMDB");
             assert_eq!(
-                fetch_cover(&state, &request, &response[10]).unwrap(),
+                fetch_cover(&state, &request, &response[11]).unwrap(),
                 jpeg()
             );
             assert!(!cache_path(&fixture.0, &request).exists());
-            confirm_cover(&state, &fixture.0, &request, &response[10]).unwrap();
+            confirm_cover(&state, &fixture.0, &request, &response[11]).unwrap();
             assert!(cache_path(&fixture.0, &request).exists());
             assert_eq!(dispatches.get(), 1);
 
             let mut revisit = request.clone();
             revisit.request_generation += 1;
+            if revisit.surface == TmdbCoverSurface::Library {
+                let original_cache_path = cache_path(&fixture.0, &revisit);
+                revisit.scan_generation = revisit.scan_generation.map(|generation| generation + 1);
+                assert_eq!(cache_path(&fixture.0, &revisit), original_cache_path);
+            }
             let response = resolve_cover_with(
                 &state,
                 &fixture.0,
@@ -1004,7 +1041,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                fetch_cover(&state, &revisit, &response[10]).unwrap(),
+                fetch_cover(&state, &revisit, &response[11]).unwrap(),
                 jpeg()
             );
 
@@ -1024,7 +1061,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                fetch_cover(&restarted, &restart_request, &response[10]).unwrap(),
+                fetch_cover(&restarted, &restart_request, &response[11]).unwrap(),
                 jpeg()
             );
             assert_eq!(dispatches.get(), 1);
@@ -1076,9 +1113,13 @@ mod tests {
                 association_generation: Some(4),
                 ..request.clone()
             },
+            TmdbCoverRequest {
+                scan_generation: Some(5),
+                ..request.clone()
+            },
         ] {
             assert_eq!(
-                fetch_cover(&state, &crossed, &response[10]),
+                fetch_cover(&state, &crossed, &response[11]),
                 Err(TMDB_COVER_STALE)
             );
         }
@@ -1100,7 +1141,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls.get(), 1);
-        assert_eq!(fetch_cover(&state, &retry, &response[10]).unwrap(), jpeg());
+        assert_eq!(fetch_cover(&state, &retry, &response[11]).unwrap(), jpeg());
 
         let invalid_directory = fixture.0.join("not-a-directory");
         fs::write(&invalid_directory, b"file").unwrap();
@@ -1115,7 +1156,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            confirm_cover(&state, &invalid_directory, &failed_write, &response[10]),
+            confirm_cover(&state, &invalid_directory, &failed_write, &response[11]),
             Err(TMDB_COVER_FAILED)
         );
     }
@@ -1254,7 +1295,7 @@ mod tests {
             },
         )
         .unwrap();
-        confirm_cover(&state, &fixture.0, &request, &response[10]).unwrap();
+        confirm_cover(&state, &fixture.0, &request, &response[11]).unwrap();
         assert_eq!(dispatches.get(), 1);
 
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -1314,6 +1355,74 @@ mod tests {
         assert!(total + 16 * 1024 * 1024 <= CACHE_MAX_TOTAL_BYTES);
     }
 
+    #[test]
+    fn cache_admission_fails_when_deterministic_obsolete_eviction_cannot_complete() {
+        let fixture = Fixture::new();
+        let state = TmdbCoverState::default();
+        let request = request(TmdbCoverCategory::Movie, TmdbCoverSurface::Discover);
+        let response =
+            resolve_cover_with(&state, &fixture.0, &request, || true, |_| Ok(jpeg())).unwrap();
+        let blocked = fixture
+            .0
+            .join("tmdb-cover-0000000000000000000000000000000000000000.bin");
+        fs::create_dir(&blocked).unwrap();
+        for index in 1..CACHE_MAX_FILES {
+            fs::write(fixture.0.join(format!("tmdb-cover-{index:040x}.bin")), [0]).unwrap();
+        }
+        assert_eq!(
+            confirm_cover(&state, &fixture.0, &request, &response[11]),
+            Err(TMDB_COVER_FAILED)
+        );
+        assert!(blocked.is_dir());
+        assert!(!cache_path(&fixture.0, &request).exists());
+        assert_eq!(cache_entries(&fixture.0).len(), CACHE_MAX_FILES);
+    }
+
+    #[test]
+    fn interrupted_temporary_files_are_counted_and_removed_before_admission() {
+        let fixture = Fixture::new();
+        let state = TmdbCoverState::default();
+        let mut retained_request = request(TmdbCoverCategory::Movie, TmdbCoverSurface::Discover);
+        retained_request.tmdb_id = 702;
+        retained_request.poster_path = Some("/retained.jpg".to_owned());
+        let retained_response = resolve_cover_with(
+            &state,
+            &fixture.0,
+            &retained_request,
+            || true,
+            |_| Ok(jpeg()),
+        )
+        .unwrap();
+        confirm_cover(
+            &state,
+            &fixture.0,
+            &retained_request,
+            &retained_response[11],
+        )
+        .unwrap();
+        let request = request(TmdbCoverCategory::Tv, TmdbCoverSurface::Discover);
+        let response =
+            resolve_cover_with(&state, &fixture.0, &request, || true, |_| Ok(jpeg())).unwrap();
+        let stale = fixture
+            .0
+            .join(".tmdb-cover-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-7.tmp");
+        let stale_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&stale)
+            .unwrap();
+        stale_file.set_len(CACHE_MAX_TOTAL_BYTES).unwrap();
+
+        confirm_cover(&state, &fixture.0, &request, &response[11]).unwrap();
+
+        assert!(!stale.exists());
+        assert!(cache_path(&fixture.0, &retained_request).exists());
+        assert!(cache_path(&fixture.0, &request).exists());
+        let retained = cache_entries(&fixture.0);
+        assert_eq!(retained.len(), 2);
+        assert!(retained.iter().map(|entry| entry.length).sum::<u64>() <= CACHE_MAX_TOTAL_BYTES);
+    }
+
     fn stage_current_covers(
         state: &TmdbCoverState,
         directory: &Path,
@@ -1328,7 +1437,7 @@ mod tests {
                 let response =
                     resolve_cover_with(state, directory, &request, || true, |_| Ok(bytes.to_vec()))
                         .unwrap();
-                (request, response[10].clone())
+                (request, response[11].clone())
             })
             .collect()
     }
@@ -1426,7 +1535,7 @@ mod tests {
             Err(TMDB_COVER_FAILED)
         );
         assert_eq!(
-            fetch_cover(&state, &request, &response[10]),
+            fetch_cover(&state, &request, &response[11]),
             Err(TMDB_COVER_STALE)
         );
     }
@@ -1455,7 +1564,7 @@ mod tests {
             },
         )
         .unwrap();
-        confirm_cover(&state, &fixture.0, &request, &response[10]).unwrap();
+        confirm_cover(&state, &fixture.0, &request, &response[11]).unwrap();
         assert_eq!(dispatches.get(), 1);
         assert!(!fs::symlink_metadata(&path)
             .unwrap()

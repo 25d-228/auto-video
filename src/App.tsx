@@ -312,6 +312,7 @@ type MovieScanState =
   | { status: "error" }
   | {
       status: "ready";
+      generation: string;
       movies: Movie[];
       metadataStatus: "ready" | "attention" | "unavailable";
     };
@@ -6369,6 +6370,7 @@ function LibraryMovieCard({
   onMovieTrashed,
   onRatioChange,
   onViewMetadataDetails,
+  scanGeneration,
 }: {
   folder: string;
   movie: Movie;
@@ -6376,6 +6378,7 @@ function LibraryMovieCard({
   onMovieTrashed: (movie: Movie, folder: string) => void;
   onRatioChange: (ratio: number) => void;
   onViewMetadataDetails: (movie: Movie, triggerId: string) => void;
+  scanGeneration: string;
 }) {
   const primaryTitle = moviePrimaryTitle(movie);
   const [isOpening, setIsOpening] = useState(false);
@@ -6398,6 +6401,7 @@ function LibraryMovieCard({
     contextGeneration: movie.association?.generation ?? "1",
     libraryItemId: movie.fileId,
     posterPath: movie.association?.posterPath ?? null,
+    scanGeneration,
     surface: "library",
     tmdbId: movie.association?.tmdbMovieId ?? 0,
   });
@@ -7418,6 +7422,7 @@ function TvLibraryCard({
     contextGeneration: item.association?.generation ?? "1",
     libraryItemId: item.groupId,
     posterPath: item.association?.posterPath ?? null,
+    scanGeneration,
     surface: "library",
     tmdbId: item.association?.tmdbTvId ?? 0,
   });
@@ -10038,7 +10043,12 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         setMovieScanState(
           movies.length === 0
             ? { status: "empty" }
-            : { status: "ready", movies, metadataStatus: scan.metadataStatus },
+            : {
+                status: "ready",
+                generation: scan.generation,
+                movies,
+                metadataStatus: scan.metadataStatus,
+              },
         );
       })
       .catch((error: unknown) => {
@@ -12846,6 +12856,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         ? { status: "empty" }
         : {
             status: "ready",
+            generation: currentState.generation,
             movies: remainingMovies,
             metadataStatus: currentState.metadataStatus,
           };
@@ -16925,6 +16936,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                             });
                           }}
                           onViewMetadataDetails={openMovieMetadataDetails}
+                          scanGeneration={movieScanState.generation}
                         />
                       )}
                       selectedPage={librarySelectedPage}

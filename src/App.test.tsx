@@ -271,6 +271,7 @@ let movieMetadataAssociations: Map<
   }
 >;
 let movieFixtureFileIds: Map<string, string>;
+let movieScanGeneration: number;
 
 function fixtureMovieFileId(path: string) {
   const existing = movieFixtureFileIds.get(path);
@@ -305,7 +306,14 @@ function fixtureNativeMovieScan(paths: string[]) {
       association?.generation ?? (association === undefined ? "" : "1"),
     ];
   });
-  return ["movie-library-v1", movieMetadataStoreStatus, paths.length.toString(), ...rows];
+  movieScanGeneration += 1;
+  return [
+    "movie-library-v1",
+    movieMetadataStoreStatus,
+    String(movieScanGeneration),
+    paths.length.toString(),
+    ...rows,
+  ];
 }
 
 function createResizeEntry(
@@ -1046,6 +1054,7 @@ beforeEach(() => {
   movieMetadataStoreStatus = "ready";
   movieMetadataAssociations = new Map();
   movieFixtureFileIds = new Map();
+  movieScanGeneration = 0;
   scanMoviesMock = vi.fn().mockResolvedValue([]);
   searchMovieMetadataMock = vi.fn().mockResolvedValue([
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1458,6 +1467,7 @@ beforeEach(() => {
             parameters?.requestGeneration as string,
             (parameters?.libraryItemId as string | undefined) ?? "",
             (parameters?.associationGeneration as string | undefined) ?? "0",
+            (parameters?.scanGeneration as string | undefined) ?? "0",
             `tmdb-cover-${"b".repeat(40)}`,
             String(2 / 3),
             "TMDB",
@@ -17929,6 +17939,7 @@ describe("explicit Library cover recovery", () => {
         category: "movie",
         contextGeneration: "12",
         posterPath: "/movie-cover.jpg",
+        scanGeneration: "1",
         surface: "library",
         tmdbId: "55",
       }),
@@ -17940,6 +17951,7 @@ describe("explicit Library cover recovery", () => {
         category: "tv",
         contextGeneration: "1",
         posterPath: "/tv-cover.jpg",
+        scanGeneration: "7",
         surface: "library",
         tmdbId: "77",
       }),

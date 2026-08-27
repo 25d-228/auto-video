@@ -23,6 +23,7 @@ const tvLibrary: TmdbCardCoverRequest = {
   contextGeneration: "9",
   libraryItemId: "a".repeat(40),
   posterPath: "/show.webp",
+  scanGeneration: "14",
   surface: "library",
   tmdbId: 202,
 };
@@ -39,6 +40,7 @@ function response(request: TmdbCardCoverRequest) {
     "12",
     request.libraryItemId ?? "",
     request.associationGeneration ?? "0",
+    request.scanGeneration ?? "0",
     `tmdb-cover-${"b".repeat(40)}`,
     String(2 / 3),
     "TMDB",
@@ -76,7 +78,7 @@ describe("TMDB card-cover response authority", () => {
   });
 
   it("rejects crossed category, item, generation, poster, and Library authority", () => {
-    for (const index of [2, 4, 5, 6, 7, 8, 9]) {
+    for (const index of [2, 4, 5, 6, 7, 8, 9, 10]) {
       const crossed = response(tvLibrary);
       crossed[index] = `${crossed[index]}-crossed`;
       expect(parseTmdbCardCoverResponse(crossed, tvLibrary, "12")).toBeNull();
@@ -87,9 +89,9 @@ describe("TMDB card-cover response authority", () => {
     const request = { ...movieDiscover, posterPath: null };
     const missing = response(request);
     missing[1] = "missing";
-    missing[10] = "";
-    missing[11] = String(2 / 3);
-    missing[12] = "";
+    missing[11] = "";
+    missing[12] = String(2 / 3);
+    missing[13] = "";
     expect(parseTmdbCardCoverResponse(missing, request, "12")).toEqual({
       authorityId: null,
       status: "missing",
@@ -133,6 +135,55 @@ describe("TMDB card-cover response authority", () => {
       expect.anything(),
     );
     expect(createObjectUrl).not.toHaveBeenCalled();
+  });
+
+  it("rejects a replaced Library scan while the stable cache identity stays unchanged", async () => {
+    const oldResolve = deferred<unknown>();
+    const invoke = vi.fn((command: string, parameters?: Record<string, unknown>) => {
+      if (command === "resolve_tmdb_card_cover") {
+        if (parameters?.scanGeneration === "14") return oldResolve.promise;
+        const current = { ...tvLibrary, scanGeneration: "15" };
+        return Promise.resolve(
+          response(current).map((field, index) =>
+            index === 7 ? String(parameters?.requestGeneration) : field,
+          ),
+        );
+      }
+      if (command === "fetch_tmdb_card_cover") return Promise.resolve(coverBytes());
+      if (command === "cancel_tmdb_card_cover") return Promise.resolve();
+      return Promise.reject(new Error(`Unexpected command ${command}`));
+    });
+    vi.stubGlobal("__TAURI__", { core: { invoke } });
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:current-scan");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+
+    const { result, rerender } = renderHook(
+      ({ scanGeneration }) =>
+        useTmdbCardCover({ ...tvLibrary, scanGeneration }),
+      { initialProps: { scanGeneration: "14" } },
+    );
+    rerender({ scanGeneration: "15" });
+    await waitFor(() => expect(result.current.objectUrl).toBe("blob:current-scan"));
+
+    oldResolve.resolve(response(tvLibrary));
+    await Promise.resolve();
+    expect(
+      invoke.mock.calls.filter(
+        ([command, parameters]) =>
+          command === "fetch_tmdb_card_cover" && parameters?.scanGeneration === "14",
+      ),
+    ).toHaveLength(0);
+    expect(
+      invoke.mock.calls.filter(
+        ([command, parameters]) =>
+          command === "fetch_tmdb_card_cover" && parameters?.scanGeneration === "15",
+      ),
+    ).toHaveLength(1);
+    expect(invoke.mock.calls[0]?.[1]).toMatchObject({
+      associationGeneration: "9",
+      libraryItemId: "a".repeat(40),
+      scanGeneration: "14",
+    });
   });
 
   it("keeps fetched bytes pending until decode confirms the reusable cover", async () => {

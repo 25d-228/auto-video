@@ -956,7 +956,7 @@ fn anchor_matches_file(
 
 fn build_tv_show_groups(
     folder_identity: &str,
-    generation: u64,
+    _generation: u64,
     files: &[TrustedTvFile],
 ) -> Vec<TrustedTvShowGroup> {
     let mut grouped = BTreeMap::<String, Vec<&TrustedTvFile>>::new();
@@ -971,7 +971,7 @@ fn build_tv_show_groups(
     grouped
         .into_iter()
         .map(|(show_title, members)| {
-            let mut authority = format!("{generation}\0{folder_identity}\0{show_title}");
+            let mut authority = format!("{folder_identity}\0{show_title}");
             let member_paths = members
                 .into_iter()
                 .map(|file| {
@@ -2023,6 +2023,128 @@ mod tests {
             .into_iter()
             .next()
             .expect("association must exist")
+    }
+
+    fn tmdb_test_jpeg() -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xc0, 0, 17, 8];
+        bytes.extend(750_u16.to_be_bytes());
+        bytes.extend(500_u16.to_be_bytes());
+        bytes.resize(6_000, 0);
+        bytes
+    }
+
+    #[test]
+    fn tv_cover_command_rejects_replaced_scans_and_reuses_stable_cache_after_rescan() {
+        use crate::tmdb_cover::{
+            confirm_cover, fetch_cover, TmdbCoverCategory, TmdbCoverRequest, TmdbCoverState,
+            TmdbCoverSurface,
+        };
+
+        let fixture = Fixture::new("tmdb-cover-scan");
+        let folder_path = fixture.path.join("folder-store");
+        let association_path = fixture.path.join("association-store");
+        fs::write(fixture.path.join("Exact Local Show.S01E01.mkv"), b"episode").unwrap();
+        let state = TvLibraryState::default();
+        set_tv_folder(&state, &folder_path, fixture.path.clone()).unwrap();
+        let initial = scan_tv_library_with_metadata(&state, &association_path).unwrap();
+        verified_tv_association(&state, &association_path, &initial[10], 1);
+        let first = tv_tmdb_cover_authority(&state, &initial[10]).unwrap();
+        let rescanned = scan_tv_library_with_metadata(&state, &association_path).unwrap();
+        let current = tv_tmdb_cover_authority(&state, &rescanned[10]).unwrap();
+        assert_eq!(current.group_id, first.group_id);
+        assert_ne!(current.scan_generation, first.scan_generation);
+
+        let cache = fixture.path.join("cover-cache");
+        let movie_state = crate::MoviesLibraryState::default();
+        let cover_state = TmdbCoverState::default();
+        let request = TmdbCoverRequest {
+            category: TmdbCoverCategory::Tv,
+            surface: TmdbCoverSurface::Library,
+            tmdb_id: current.tmdb_id,
+            poster_path: current.poster_path.clone(),
+            context_generation: current.association_generation,
+            request_generation: 1,
+            library_item_id: Some(current.group_id.clone()),
+            association_generation: Some(current.association_generation),
+            scan_generation: Some(current.scan_generation),
+        };
+        let stale = TmdbCoverRequest {
+            scan_generation: Some(first.scan_generation),
+            ..request.clone()
+        };
+        assert_eq!(
+            crate::resolve_tmdb_library_cover_command_with(
+                &stale,
+                &cache,
+                &movie_state,
+                &state,
+                &cover_state,
+                |_| Ok(tmdb_test_jpeg()),
+            ),
+            Err(crate::tmdb_cover::TMDB_COVER_STALE.to_owned())
+        );
+
+        let remote = Cell::new(0);
+        let response = crate::resolve_tmdb_library_cover_command_with(
+            &request,
+            &cache,
+            &movie_state,
+            &state,
+            &cover_state,
+            |_| {
+                remote.set(remote.get() + 1);
+                Ok(tmdb_test_jpeg())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fetch_cover(&cover_state, &request, &response[11]).unwrap(),
+            tmdb_test_jpeg()
+        );
+        confirm_cover(&cover_state, &cache, &request, &response[11]).unwrap();
+
+        let later = scan_tv_library_with_metadata(&state, &association_path).unwrap();
+        let later_authority = tv_tmdb_cover_authority(&state, &later[10]).unwrap();
+        let revisit = TmdbCoverRequest {
+            scan_generation: Some(later_authority.scan_generation),
+            request_generation: 2,
+            ..request.clone()
+        };
+        crate::resolve_tmdb_library_cover_command_with(
+            &revisit,
+            &cache,
+            &movie_state,
+            &state,
+            &cover_state,
+            |_| {
+                remote.set(remote.get() + 1);
+                Err(crate::ProviderRequestError::Network)
+            },
+        )
+        .unwrap();
+
+        let restarted = TvLibraryState::default();
+        load_tv_folder_with(&restarted, &folder_path).unwrap();
+        let restart_scan = scan_tv_library_with_metadata(&restarted, &association_path).unwrap();
+        let restart_authority = tv_tmdb_cover_authority(&restarted, &restart_scan[10]).unwrap();
+        let restart_request = TmdbCoverRequest {
+            scan_generation: Some(restart_authority.scan_generation),
+            request_generation: 3,
+            ..request
+        };
+        crate::resolve_tmdb_library_cover_command_with(
+            &restart_request,
+            &cache,
+            &movie_state,
+            &restarted,
+            &TmdbCoverState::default(),
+            |_| {
+                remote.set(remote.get() + 1);
+                Err(crate::ProviderRequestError::Network)
+            },
+        )
+        .unwrap();
+        assert_eq!(remote.get(), 1);
     }
 
     #[test]

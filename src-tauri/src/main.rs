@@ -578,7 +578,6 @@ pub(crate) fn movie_file_fingerprint(metadata: &fs::Metadata) -> String {
 fn capture_trusted_movie_file(
     folder: &Path,
     folder_identity: &str,
-    generation: u64,
     path: PathBuf,
 ) -> Result<TrustedMovieFile, &'static str> {
     validate_movie_components(folder, &path)?;
@@ -601,10 +600,8 @@ fn capture_trusted_movie_file(
     let fingerprint = movie_file_fingerprint(&metadata);
     let size = metadata.len();
     let file_id = hex_sha1(
-        format!(
-            "{generation}\0{folder_identity}\0{relative_path}\0{file_identity}\0{fingerprint}\0{size}"
-        )
-        .as_bytes(),
+        format!("{folder_identity}\0{relative_path}\0{file_identity}\0{fingerprint}\0{size}")
+            .as_bytes(),
     );
     Ok(TrustedMovieFile {
         file_id,
@@ -619,7 +616,6 @@ fn capture_trusted_movie_file(
 
 fn scan_trusted_movie_files(
     folder: &Path,
-    generation: u64,
 ) -> Result<(String, Vec<TrustedMovieFile>), &'static str> {
     let canonical_folder = fs::canonicalize(folder).map_err(|_| MOVIES_FOLDER_UNAVAILABLE)?;
     if canonical_folder != folder
@@ -631,7 +627,7 @@ fn scan_trusted_movie_files(
     }
     let folder_identity = movie_path_identity(folder, false).map_err(|_| MOVIES_SCAN_FAILED)?;
     let files = scan_library_files(folder, |path, _| {
-        capture_trusted_movie_file(folder, &folder_identity, generation, path).ok()
+        capture_trusted_movie_file(folder, &folder_identity, path).ok()
     })
     .map_err(|_| MOVIES_SCAN_FAILED)?;
     Ok((folder_identity, files))
@@ -1028,9 +1024,10 @@ fn association_matches_file(
 }
 
 fn encode_movie_scan(scan: &CompletedMovieScan) -> Result<Vec<String>, &'static str> {
-    let mut response = Vec::with_capacity(3 + scan.files.len() * 13);
+    let mut response = Vec::with_capacity(4 + scan.files.len() * 13);
     response.push("movie-library-v1".to_owned());
     response.push(scan.association_status.to_owned());
+    response.push(scan.generation.to_string());
     response.push(scan.files.len().to_string());
     for file in &scan.files {
         response.push(file.file_id.clone());
@@ -1072,7 +1069,7 @@ fn scan_movies_library(
     let generation = library.generation;
     library.completed_scan = None;
     invalidate_movie_metadata_context(library);
-    let (folder_identity, mut files) = scan_trusted_movie_files(&folder, generation)?;
+    let (folder_identity, mut files) = scan_trusted_movie_files(&folder)?;
     if library.folder.as_ref() != Some(&folder) || library.generation != generation {
         return Err(MOVIE_METADATA_STALE);
     }
@@ -4679,6 +4676,7 @@ fn tmdb_cover_request(
     request_generation: &str,
     library_item_id: Option<String>,
     association_generation: Option<String>,
+    scan_generation: Option<String>,
 ) -> Result<TmdbCoverRequest, String> {
     let request = TmdbCoverRequest {
         category: TmdbCoverCategory::parse(category).ok_or_else(|| TMDB_COVER_STALE.to_owned())?,
@@ -4693,6 +4691,10 @@ fn tmdb_cover_request(
             .map_err(|_| TMDB_COVER_STALE.to_owned())?,
         library_item_id,
         association_generation: association_generation
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| TMDB_COVER_STALE.to_owned())?,
+        scan_generation: scan_generation
             .map(|value| value.parse::<u64>())
             .transpose()
             .map_err(|_| TMDB_COVER_STALE.to_owned())?,
@@ -4721,15 +4723,16 @@ fn validate_tmdb_library_cover_request(
                 .0
                 .lock()
                 .map_err(|_| TMDB_COVER_FAILED.to_owned())?;
-            let scan_generation = library
-                .completed_scan
-                .as_ref()
-                .map(|scan| scan.generation)
+            let scan_generation = request
+                .scan_generation
                 .ok_or_else(|| TMDB_COVER_STALE.to_owned())?;
             movie_tmdb_cover_authority(&library, item_id, scan_generation).map_err(str::to_owned)?
         }
         TmdbCoverCategory::Tv => {
             let authority = tv_tmdb_cover_authority(tv_state, item_id).map_err(str::to_owned)?;
+            if Some(authority.scan_generation) != request.scan_generation {
+                return Err(TMDB_COVER_STALE.to_owned());
+            }
             (
                 authority.tmdb_id,
                 authority.poster_path,
@@ -4745,6 +4748,25 @@ fn validate_tmdb_library_cover_request(
         .ok_or_else(|| TMDB_COVER_STALE.to_owned())
 }
 
+fn resolve_tmdb_library_cover_command_with(
+    request: &TmdbCoverRequest,
+    cache: &Path,
+    movie_state: &MoviesLibraryState,
+    tv_state: &TvLibraryState,
+    cover_state: &TmdbCoverState,
+    fetch: impl FnOnce(&str) -> Result<Vec<u8>, ProviderRequestError>,
+) -> Result<Vec<String>, String> {
+    validate_tmdb_library_cover_request(request, movie_state, tv_state)?;
+    resolve_tmdb_cover_with(
+        cover_state,
+        cache,
+        request,
+        || validate_tmdb_library_cover_request(request, movie_state, tv_state).is_ok(),
+        fetch,
+    )
+    .map_err(str::to_owned)
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn resolve_tmdb_card_cover(
@@ -4757,6 +4779,7 @@ async fn resolve_tmdb_card_cover(
     request_generation: String,
     library_item_id: Option<String>,
     association_generation: Option<String>,
+    scan_generation: Option<String>,
     movie_state: tauri::State<'_, MoviesLibraryState>,
     tv_state: tauri::State<'_, TvLibraryState>,
     cover_state: tauri::State<'_, TmdbCoverState>,
@@ -4770,6 +4793,7 @@ async fn resolve_tmdb_card_cover(
         &request_generation,
         library_item_id,
         association_generation,
+        scan_generation,
     )?;
     validate_tmdb_library_cover_request(&request, movie_state.inner(), tv_state.inner())?;
     let cache = tmdb_cover_cache_path(&app)?;
@@ -4777,14 +4801,14 @@ async fn resolve_tmdb_card_cover(
     let tv_state = tv_state.inner().clone();
     let cover_state = cover_state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        resolve_tmdb_cover_with(
-            &cover_state,
-            &cache,
+        resolve_tmdb_library_cover_command_with(
             &request,
-            || validate_tmdb_library_cover_request(&request, &movie_state, &tv_state).is_ok(),
+            &cache,
+            &movie_state,
+            &tv_state,
+            &cover_state,
             fetch_tmdb_image,
         )
-        .map_err(str::to_owned)
     })
     .await
     .map_err(|_| TMDB_COVER_FAILED.to_owned())?
@@ -4801,6 +4825,7 @@ fn fetch_tmdb_card_cover(
     request_generation: String,
     library_item_id: Option<String>,
     association_generation: Option<String>,
+    scan_generation: Option<String>,
     cover_authority_id: String,
     movie_state: tauri::State<'_, MoviesLibraryState>,
     tv_state: tauri::State<'_, TvLibraryState>,
@@ -4815,6 +4840,7 @@ fn fetch_tmdb_card_cover(
         &request_generation,
         library_item_id,
         association_generation,
+        scan_generation,
     )?;
     validate_tmdb_library_cover_request(&request, movie_state.inner(), tv_state.inner())?;
     fetch_tmdb_cover_with(cover_state.inner(), &request, &cover_authority_id).map_err(str::to_owned)
@@ -4832,6 +4858,7 @@ fn confirm_tmdb_card_cover(
     request_generation: String,
     library_item_id: Option<String>,
     association_generation: Option<String>,
+    scan_generation: Option<String>,
     cover_authority_id: String,
     movie_state: tauri::State<'_, MoviesLibraryState>,
     tv_state: tauri::State<'_, TvLibraryState>,
@@ -4846,6 +4873,7 @@ fn confirm_tmdb_card_cover(
         &request_generation,
         library_item_id,
         association_generation,
+        scan_generation,
     )?;
     validate_tmdb_library_cover_request(&request, movie_state.inner(), tv_state.inner())?;
     confirm_tmdb_cover_with(
@@ -4868,6 +4896,7 @@ fn cancel_tmdb_card_cover(
     request_generation: String,
     library_item_id: Option<String>,
     association_generation: Option<String>,
+    scan_generation: Option<String>,
     cover_state: tauri::State<'_, TmdbCoverState>,
 ) -> Result<(), String> {
     let request = tmdb_cover_request(
@@ -4879,6 +4908,7 @@ fn cancel_tmdb_card_cover(
         &request_generation,
         library_item_id,
         association_generation,
+        scan_generation,
     )?;
     cancel_tmdb_cover_request_with(cover_state.inner(), &request);
     Ok(())
@@ -4896,6 +4926,7 @@ fn invalidate_tmdb_card_cover(
     request_generation: String,
     library_item_id: Option<String>,
     association_generation: Option<String>,
+    scan_generation: Option<String>,
     movie_state: tauri::State<'_, MoviesLibraryState>,
     tv_state: tauri::State<'_, TvLibraryState>,
     cover_state: tauri::State<'_, TmdbCoverState>,
@@ -4909,6 +4940,7 @@ fn invalidate_tmdb_card_cover(
         &request_generation,
         library_item_id,
         association_generation,
+        scan_generation,
     )?;
     validate_tmdb_library_cover_request(&request, movie_state.inner(), tv_state.inner())?;
     invalidate_tmdb_cover_with(cover_state.inner(), &tmdb_cover_cache_path(&app)?, &request)
@@ -5064,16 +5096,17 @@ mod tests {
         load_movies_folder_file, load_tmdb_token_file, movie_metadata_error, open_movie_path_with,
         open_movie_request_with, parse_movie_metadata_candidates, parse_movie_provider_response,
         parse_provider_response, parse_verified_movie_metadata, query_movies_volume_storage_with,
-        resolve_library_cover_command_with, reveal_movie_path_with, reveal_movie_request_with,
-        save_movie_metadata_match_with, save_movies_folder_file, save_tmdb_token_file,
-        scan_movie_paths, scan_movies_library, trash_movie_path_with, trash_movie_request_with,
+        resolve_library_cover_command_with, resolve_tmdb_library_cover_command_with,
+        reveal_movie_path_with, reveal_movie_request_with, save_movie_metadata_match_with,
+        save_movies_folder_file, save_tmdb_token_file, scan_movie_paths, scan_movies_library,
+        trash_movie_path_with, trash_movie_request_with, MovieMetadataAssociation,
         MoviePathValidationError, MovieProviderRequestError, MovieTorrentState,
-        MoviesLibraryContext, MoviesVolumeStorageQueryError, ProviderRequestError,
-        TrashMovieRequest, ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE, MOVIES_STORAGE_FAILED,
-        MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID, MOVIE_METADATA_MALFORMED,
-        MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE, MOVIE_OPEN_FAILED,
-        MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE, MOVIE_OPEN_UNSUPPORTED,
-        MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
+        MoviesLibraryContext, MoviesLibraryState, MoviesVolumeStorageQueryError,
+        ProviderRequestError, TrashMovieRequest, ADULT_PROVIDER_ERROR, MOVIES_FOLDER_UNAVAILABLE,
+        MOVIES_STORAGE_FAILED, MOVIES_STORAGE_UNAVAILABLE, MOVIE_METADATA_CONTEXT_INVALID,
+        MOVIE_METADATA_MALFORMED, MOVIE_METADATA_PERSISTENCE_FAILED, MOVIE_METADATA_STALE,
+        MOVIE_OPEN_FAILED, MOVIE_OPEN_NOT_FILE, MOVIE_OPEN_NOT_FOUND, MOVIE_OPEN_UNAVAILABLE,
+        MOVIE_OPEN_UNSUPPORTED, MOVIE_REVEAL_FAILED, MOVIE_REVEAL_NOT_FILE, MOVIE_REVEAL_NOT_FOUND,
         MOVIE_REVEAL_UNAVAILABLE, MOVIE_REVEAL_UNSUPPORTED, MOVIE_TRASH_FAILED,
         MOVIE_TRASH_FOLDER_UNAVAILABLE, MOVIE_TRASH_NOT_FILE, MOVIE_TRASH_NOT_FOUND,
         MOVIE_TRASH_OUTSIDE_FOLDER, MOVIE_TRASH_STALE, MOVIE_TRASH_UNAVAILABLE,
@@ -5084,6 +5117,11 @@ mod tests {
         library_presentation::{
             resolve_cover_with_providers, LibraryPresentationCategory, LibraryPresentationState,
         },
+        tmdb_cover::{
+            confirm_cover as confirm_tmdb_cover, fetch_cover as fetch_tmdb_cover,
+            TmdbCoverCategory, TmdbCoverRequest, TmdbCoverState, TmdbCoverSurface,
+        },
+        tv_library::TvLibraryState,
         vr_download::{set_vr_folder, VrDownloadState},
         vr_library::{scan_vr_library_with, VrLibraryState},
     };
@@ -5502,6 +5540,173 @@ mod tests {
         scan_movies_library(&mut library, association_path)
             .expect("trusted Movie scan must succeed");
         library
+    }
+
+    fn attach_movie_tmdb_cover(
+        library: &mut MoviesLibraryContext,
+    ) -> (String, u64, MovieMetadataAssociation) {
+        let scan = library.completed_scan.as_mut().unwrap();
+        let file = scan.files.first_mut().unwrap();
+        let association = MovieMetadataAssociation {
+            folder: scan.folder.clone(),
+            folder_identity: scan.folder_identity.clone(),
+            relative_path: file.relative_path.clone(),
+            file_identity: file.file_identity.clone(),
+            fingerprint: file.fingerprint.clone(),
+            size: file.size,
+            tmdb_movie_id: 701,
+            imdb_id: "tt0000701".to_owned(),
+            title: "Exact Movie".to_owned(),
+            original_title: None,
+            release_date: Some("2001-01-01".to_owned()),
+            poster_path: Some("/exact-poster.jpg".to_owned()),
+            overview: None,
+            generation: 3,
+        };
+        file.association = Some(association.clone());
+        (file.file_id.clone(), scan.generation, association)
+    }
+
+    fn tmdb_test_jpeg() -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xc0, 0, 17, 8];
+        bytes.extend(750_u16.to_be_bytes());
+        bytes.extend(500_u16.to_be_bytes());
+        bytes.resize(6_000, 0);
+        bytes
+    }
+
+    #[test]
+    fn movie_cover_command_rejects_replaced_scans_and_reuses_stable_cache_after_rescan() {
+        let fixture = FilesystemFixture::new();
+        fixture.create_file("Exact.mp4");
+        let association_path = fixture.path.join("metadata.bin");
+        let cache = fixture.path.join("cover-cache");
+        let mut library = scan_trusted_movie_fixture(&fixture, &association_path);
+        let (stable_item, old_scan, _) = attach_movie_tmdb_cover(&mut library);
+        scan_movies_library(&mut library, &association_path).unwrap();
+        let (rescanned_item, current_scan, association) = attach_movie_tmdb_cover(&mut library);
+        assert_eq!(rescanned_item, stable_item);
+        assert_ne!(current_scan, old_scan);
+
+        let movie_state = MoviesLibraryState::default();
+        *movie_state.0.lock().unwrap() = library;
+        let tv_state = TvLibraryState::default();
+        let cover_state = TmdbCoverState::default();
+        let request = TmdbCoverRequest {
+            category: TmdbCoverCategory::Movie,
+            surface: TmdbCoverSurface::Library,
+            tmdb_id: association.tmdb_movie_id,
+            poster_path: association.poster_path.clone(),
+            context_generation: association.generation,
+            request_generation: 1,
+            library_item_id: Some(stable_item.clone()),
+            association_generation: Some(association.generation),
+            scan_generation: Some(current_scan),
+        };
+        let stale = TmdbCoverRequest {
+            scan_generation: Some(old_scan),
+            ..request.clone()
+        };
+        assert_eq!(
+            resolve_tmdb_library_cover_command_with(
+                &stale,
+                &cache,
+                &movie_state,
+                &tv_state,
+                &cover_state,
+                |_| Ok(tmdb_test_jpeg()),
+            ),
+            Err(MOVIE_METADATA_STALE.to_owned())
+        );
+
+        let remote = Cell::new(0);
+        let response = resolve_tmdb_library_cover_command_with(
+            &request,
+            &cache,
+            &movie_state,
+            &tv_state,
+            &cover_state,
+            |_| {
+                remote.set(remote.get() + 1);
+                Ok(tmdb_test_jpeg())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fetch_tmdb_cover(&cover_state, &request, &response[11]).unwrap(),
+            tmdb_test_jpeg()
+        );
+        confirm_tmdb_cover(&cover_state, &cache, &request, &response[11]).unwrap();
+
+        {
+            let mut current = movie_state.0.lock().unwrap();
+            scan_movies_library(&mut current, &association_path).unwrap();
+            let (item, scan, _) = attach_movie_tmdb_cover(&mut current);
+            assert_eq!(item, stable_item);
+            assert_ne!(scan, current_scan);
+        }
+        let latest_scan = movie_state
+            .0
+            .lock()
+            .unwrap()
+            .completed_scan
+            .as_ref()
+            .unwrap()
+            .generation;
+        let revisit = TmdbCoverRequest {
+            scan_generation: Some(latest_scan),
+            request_generation: 2,
+            ..request.clone()
+        };
+        let response = resolve_tmdb_library_cover_command_with(
+            &revisit,
+            &cache,
+            &movie_state,
+            &tv_state,
+            &cover_state,
+            |_| {
+                remote.set(remote.get() + 1);
+                Err(ProviderRequestError::Network)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fetch_tmdb_cover(&cover_state, &revisit, &response[11]).unwrap(),
+            tmdb_test_jpeg()
+        );
+        assert_eq!(remote.get(), 1);
+
+        let restarted_library = scan_trusted_movie_fixture(&fixture, &association_path);
+        let restarted_state = MoviesLibraryState::default();
+        *restarted_state.0.lock().unwrap() = restarted_library;
+        let (restart_item, restart_scan, _) = {
+            let mut current = restarted_state.0.lock().unwrap();
+            attach_movie_tmdb_cover(&mut current)
+        };
+        assert_eq!(restart_item, stable_item);
+        let restart_request = TmdbCoverRequest {
+            scan_generation: Some(restart_scan),
+            request_generation: 3,
+            ..request
+        };
+        let restarted_cover_state = TmdbCoverState::default();
+        let response = resolve_tmdb_library_cover_command_with(
+            &restart_request,
+            &cache,
+            &restarted_state,
+            &tv_state,
+            &restarted_cover_state,
+            |_| {
+                remote.set(remote.get() + 1);
+                Err(ProviderRequestError::Network)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fetch_tmdb_cover(&restarted_cover_state, &restart_request, &response[11]).unwrap(),
+            tmdb_test_jpeg()
+        );
+        assert_eq!(remote.get(), 1);
     }
 
     #[test]
