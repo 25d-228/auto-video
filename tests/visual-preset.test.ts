@@ -17,10 +17,16 @@ const applicationStyles = readFileSync(resolve("src/index.css"), "utf8");
 const packageJson = JSON.parse(
   readFileSync(resolve("package.json"), "utf8"),
 ) as { dependencies: Record<string, string> };
+const packageLock = JSON.parse(
+  readFileSync(resolve("package-lock.json"), "utf8"),
+) as {
+  packages: Record<string, { version?: string }>;
+};
 const buttonSource = readFileSync(
   resolve("src/components/ui/button.tsx"),
   "utf8",
 );
+const inputSource = readFileSync(resolve("src/components/ui/input.tsx"), "utf8");
 
 function ruleBody(selector: string) {
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -31,60 +37,66 @@ function ruleBody(selector: string) {
   return match?.[1] ?? "";
 }
 
-describe("Sera preset contract", () => {
-  it("records the Base UI Sera configuration with Neutral and Phosphor", () => {
+describe("default Nova preset contract", () => {
+  it("records the pinned Base UI Nova configuration", () => {
     expect(presetConfiguration).toMatchObject({
-      style: "base-sera",
+      style: "base-nova",
       tailwind: {
         baseColor: "neutral",
         cssVariables: true,
       },
-      iconLibrary: "phosphor",
+      iconLibrary: "lucide",
       menuColor: "default",
       menuAccent: "subtle",
     });
+    expect(packageJson.dependencies.shadcn).toBe("4.16.1");
+    expect(packageLock.packages["node_modules/shadcn"]?.version).toBe("4.16.1");
+    expect(packageLock.packages).not.toHaveProperty("node_modules/socks");
+    expect(packageLock.packages).not.toHaveProperty("node_modules/smart-buffer");
   });
 
-  it("defines the approved Sera fonts, Red theme, Rose charts, and square surfaces", () => {
-    expect(applicationStyles).toContain(
-      '@import "@fontsource-variable/noto-sans";',
-    );
-    expect(applicationStyles).toContain(
-      '@import "@fontsource-variable/playfair-display";',
-    );
-    expect(applicationStyles).toContain(
-      '--font-sans: "Noto Sans Variable", sans-serif;',
-    );
-    expect(applicationStyles).toContain(
-      '--font-heading: "Playfair Display Variable", serif;',
-    );
+  it("uses Geist, Lucide, neutral tokens, charts, and the default radius", () => {
+    expect(applicationStyles).toContain('@import "@fontsource-variable/geist";');
+    expect(applicationStyles).toContain('--font-sans: "Geist Variable", sans-serif;');
+    expect(applicationStyles).toContain("--font-heading: var(--font-sans);");
     expect(packageJson.dependencies).toMatchObject({
-      "@fontsource-variable/noto-sans": "5.3.0",
-      "@fontsource-variable/playfair-display": "5.3.0",
+      "@fontsource-variable/geist": "5.3.0",
+      "lucide-react": "1.34.0",
+      shadcn: "4.16.1",
     });
-    expect(packageJson.dependencies).not.toHaveProperty(
-      "@fontsource-variable/inter",
-    );
-    expect(packageJson.dependencies).not.toHaveProperty(
-      "@fontsource-variable/geist-mono",
-    );
-    expect(applicationStyles).toContain(
-      "--primary: oklch(0.505 0.213 27.518);",
-    );
-    expect(applicationStyles).toContain(
-      "--chart-3: oklch(0.586 0.253 17.585);",
-    );
+    expect(packageJson.dependencies).not.toHaveProperty("@phosphor-icons/react");
+    expect(packageJson.dependencies).not.toHaveProperty("@fontsource-variable/noto-sans");
+    expect(packageJson.dependencies).not.toHaveProperty("@fontsource-variable/playfair-display");
+    expect(applicationStyles).toContain("--primary: oklch(0.205 0 0);");
+    expect(applicationStyles).toContain("--chart-3: oklch(0.439 0 0);");
+    expect(applicationStyles).toContain("--sidebar-primary: oklch(0.205 0 0);");
     expect(applicationStyles).toContain(":root[data-theme=\"dark\"]");
-    expect(applicationStyles).toContain("--radius: 0;");
+    expect(applicationStyles).toContain("--radius: 0.625rem;");
+    expect(applicationStyles).not.toContain("--radius: 0;");
+    expect(applicationStyles).not.toContain("Noto Sans");
+    expect(applicationStyles).not.toContain("Playfair Display");
 
     const surfaceRadii = Array.from(
       applicationStyles.matchAll(/border-radius:\s*([^;]+);/g),
       (match) => match[1],
     );
-    expect(new Set(surfaceRadii)).toEqual(new Set(["0", "var(--radius)"]));
+    expect(surfaceRadii).not.toContain("0");
+    expect(surfaceRadii).toEqual(
+      expect.arrayContaining(["var(--radius-lg)", "var(--radius-xl)"]),
+    );
   });
 
-  it("keeps the shared Button on the current Sera contract", () => {
+  it("leaves headings in authored casing with the default Geist behavior", () => {
+    expect(applicationStyles).not.toContain("tracking-wider");
+    expect(applicationStyles).not.toMatch(
+      /h1,\s*h2,\s*h3,\s*h4,\s*h5,\s*h6\s*\{[^}]*text-transform/s,
+    );
+    expect(applicationStyles).not.toMatch(
+      /h1,\s*h2,\s*h3,\s*h4,\s*h5,\s*h6\s*\{[^}]*uppercase/s,
+    );
+  });
+
+  it("uses the generated Nova Button and Input contracts", () => {
     const defaultButton = buttonVariants({ variant: "default" }).split(/\s+/);
     const outlineButton = buttonVariants({ variant: "outline" }).split(/\s+/);
     const destructiveButton = buttonVariants({
@@ -93,27 +105,27 @@ describe("Sera preset contract", () => {
 
     expect(defaultButton).toEqual(
       expect.arrayContaining([
-        "text-xs",
-        "font-semibold",
-        "tracking-widest",
-        "uppercase",
+        "rounded-lg",
+        "text-sm",
+        "font-medium",
         "bg-primary",
         "text-primary-foreground",
         "hover:bg-primary/80",
         "disabled:pointer-events-none",
         "disabled:opacity-50",
         "focus-visible:border-ring",
-        "focus-visible:ring-2",
-        "focus-visible:ring-ring/30",
+        "focus-visible:ring-3",
+        "focus-visible:ring-ring/50",
       ]),
     );
     expect(outlineButton).toEqual(
       expect.arrayContaining([
         "border-border",
-        "bg-transparent",
+        "bg-background",
         "hover:bg-muted",
         "hover:text-foreground",
-        "dark:hover:bg-input/30",
+        "dark:bg-input/30",
+        "dark:hover:bg-input/50",
       ]),
     );
     expect(destructiveButton).toEqual(
@@ -128,21 +140,18 @@ describe("Sera preset contract", () => {
         "dark:focus-visible:ring-destructive/40",
       ]),
     );
+    expect(buttonSource).toContain("rounded-lg border border-transparent");
+    expect(buttonSource).toContain("text-sm font-medium whitespace-nowrap");
     expect(buttonSource).toContain(
-      "rounded-none border border-transparent bg-clip-padding text-xs font-semibold tracking-widest whitespace-nowrap uppercase",
+      '"border-border bg-background hover:bg-muted hover:text-foreground',
     );
-    expect(buttonSource).toContain(
-      '"border-border bg-transparent hover:bg-muted hover:text-foreground',
-    );
-    expect(buttonSource).toContain(
-      'default:\n          "h-10 gap-1.5 px-6',
-    );
-    expect(buttonSource).toContain('xs: "h-7 gap-1 px-3');
-    expect(buttonSource).not.toContain("rounded-md");
-    expect(buttonSource).not.toContain("text-xs/relaxed font-medium");
+    expect(buttonSource).toContain('default:\n          "h-8 gap-1.5 px-2.5');
+    expect(inputSource).toContain('data-slot="input"');
+    expect(inputSource).toContain("rounded-lg border border-input");
+    expect(inputSource).toContain("focus-visible:ring-3");
   });
 
-  it("keeps native-control inheritance in the base layer below Sera utilities", () => {
+  it("keeps native-control inheritance below Nova utilities", () => {
     const baseLayerStart = applicationStyles.indexOf("@layer base {");
     const baseLayerEnd = applicationStyles.indexOf(
       "\n}\n\n* {",
@@ -182,6 +191,43 @@ describe("Sera preset contract", () => {
     expect(workspace).not.toContain("62rem");
     expect(ruleBody(".page-header")).toContain("max-width: 42rem;");
     expect(applicationStyles).not.toContain("width: min(100%, 62rem);");
+  });
+
+  it("uses one viewport shell with independent sidebar and workspace scrolling", () => {
+    const shell = ruleBody(".app-shell");
+    const sidebar = ruleBody(".sidebar");
+    const workspace = ruleBody(".workspace");
+    const root = ruleBody("#root");
+
+    expect(shell).toContain("height: 100vh;");
+    expect(shell).toContain("min-height: 32.5rem;");
+    expect(shell).toContain("overflow: hidden;");
+    expect(sidebar).toContain("min-height: 0;");
+    expect(sidebar).toContain("overflow-y: auto;");
+    expect(workspace).toContain("min-height: 0;");
+    expect(workspace).toContain("overflow-y: auto;");
+    expect(applicationStyles).toMatch(
+      /body\s*\{\s*min-width: 45rem;\s*margin: 0;\s*overflow: hidden;/,
+    );
+    expect(root).toContain("height: 100%;");
+  });
+
+  it("applies the Nova surface contract across pages, states, cards, and dialogs", () => {
+    const sharedSurfaces = ruleBody(
+      ".empty-state,\n.dashboard-library-summary,\n.settings-card,\n.library-toolbar,\n.movie-card,\n.discover-card,\n.vr-download-card,\n.tmdb-attribution",
+    );
+    const providerCard = ruleBody(".provider-browse-card");
+    const dialogs = ruleBody(
+      ".movie-details__popup,\n.vr-releases__popup,\n.vr-torrent__popup,\n.movie-metadata__popup,\n.trash-dialog__popup",
+    );
+
+    for (const surface of [sharedSurfaces, providerCard, dialogs]) {
+      expect(surface).toContain("border: 1px solid var(--border);");
+    }
+    expect(sharedSurfaces).toContain("border-radius: var(--radius-xl);");
+    expect(providerCard).toContain("border-radius: var(--radius-xl);");
+    expect(dialogs).toContain("border-radius: var(--radius-xl);");
+    expect(applicationStyles).not.toContain("border-radius: 0;");
   });
 
   it("uses responsive ordered toolbar rows without a fixed request block", () => {

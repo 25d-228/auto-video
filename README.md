@@ -4,23 +4,23 @@ Auto-Video is a Tauri 2 desktop application for macOS and Windows with a React a
 
 ## Toolchain
 
-Tauri 2 provides the maintained macOS and Windows native shell. React 19, TypeScript 6, and Vite 8 provide the interface foundation. The interface uses the shadcn/ui Base UI Mira preset and its semantic tokens. The native selected-file transfer engine uses librqbit with upload disabled so completed downloads do not seed.
+Tauri 2 provides the maintained macOS and Windows native shell. React 19, TypeScript 6, and Vite 8 provide the interface foundation. The interface uses the shadcn/ui Base UI Nova preset and its semantic tokens. The native selected-file transfer engine uses librqbit with upload disabled so completed downloads do not seed.
 
 ## Visual preset
 
-The approved shadcn/ui preset is `b3wnVLs40m`. Base UI is the single component base.
+The repository-pinned shadcn CLI resolves the following default Nova preset. Base UI is the single component base.
 
 | Setting | Value |
 |---|---|
-| Style | Mira |
+| Style | Nova (`base-nova`) |
 | Base color | Neutral |
-| Theme | Red |
-| Chart color | Rose |
-| Heading | Geist Mono |
-| Font | Inter |
-| Icon library | Phosphor Icons |
-| Radius | None |
-| Menu | Default (solid) |
+| Theme | Neutral |
+| Chart color | Neutral |
+| Heading | Geist default |
+| Font | Geist Variable |
+| Icon library | Lucide |
+| Radius | Default (`0.625rem`) |
+| Menu | Default |
 | Menu accent | Subtle |
 
 ## TV Library TMDB show metadata matching

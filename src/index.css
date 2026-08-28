@@ -1,17 +1,14 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/noto-sans";
-@import "@fontsource-variable/playfair-display";
+@import "@fontsource-variable/geist";
 
 @custom-variant dark (&:is([data-theme="dark"] *));
 
 :root {
   color: var(--foreground);
   background: var(--background);
-  font-family:
-    "Noto Sans Variable", ui-sans-serif, system-ui, -apple-system,
-    BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Geist Variable", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   color-scheme: light;
@@ -21,10 +18,10 @@
   --card-foreground: oklch(0.145 0 0);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.505 0.213 27.518);
-  --primary-foreground: oklch(0.971 0.013 17.38);
-  --secondary: oklch(0.967 0.001 286.375);
-  --secondary-foreground: oklch(0.21 0.006 285.885);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
   --muted: oklch(0.97 0 0);
   --muted-foreground: oklch(0.556 0 0);
   --accent: oklch(0.97 0 0);
@@ -33,16 +30,16 @@
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.81 0.117 11.638);
-  --chart-2: oklch(0.645 0.246 16.439);
-  --chart-3: oklch(0.586 0.253 17.585);
-  --chart-4: oklch(0.514 0.222 16.935);
-  --chart-5: oklch(0.455 0.188 13.697);
-  --radius: 0;
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.577 0.245 27.325);
-  --sidebar-primary-foreground: oklch(0.971 0.013 17.38);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
   --sidebar-accent: oklch(0.97 0 0);
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
@@ -57,9 +54,9 @@
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.205 0 0);
   --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.444 0.177 26.899);
-  --primary-foreground: oklch(0.971 0.013 17.38);
-  --secondary: oklch(0.274 0.006 286.033);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.269 0 0);
   --muted-foreground: oklch(0.708 0 0);
@@ -69,15 +66,15 @@
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.81 0.117 11.638);
-  --chart-2: oklch(0.645 0.246 16.439);
-  --chart-3: oklch(0.586 0.253 17.585);
-  --chart-4: oklch(0.514 0.222 16.935);
-  --chart-5: oklch(0.455 0.188 13.697);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
   --sidebar: oklch(0.205 0 0);
   --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.637 0.237 25.331);
-  --sidebar-primary-foreground: oklch(0.971 0.013 17.38);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
   --sidebar-accent: oklch(0.269 0 0);
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
@@ -85,8 +82,8 @@
 }
 
 @theme inline {
-  --font-sans: "Noto Sans Variable", sans-serif;
-  --font-heading: "Playfair Display Variable", serif;
+  --font-sans: "Geist Variable", sans-serif;
+  --font-heading: var(--font-sans);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -140,15 +137,6 @@
     @apply font-sans;
   }
 
-  h1,
-  h2,
-  h3,
-  h4,
-  h5,
-  h6 {
-    @apply font-heading tracking-wider uppercase;
-  }
-
   button,
   input,
   select {
@@ -164,15 +152,20 @@
   box-sizing: border-box;
 }
 
+html,
+body {
+  height: 100%;
+}
+
 body {
   min-width: 45rem;
-  min-height: 100vh;
   margin: 0;
+  overflow: hidden;
   background: var(--background);
 }
 
 #root {
-  min-height: 100vh;
+  height: 100%;
 }
 
 .app-shell {
@@ -194,6 +187,10 @@ body {
   border-right: 1px solid var(--border);
   background: var(--sidebar);
   color: var(--sidebar-foreground);
+}
+
+.sidebar > * {
+  flex-shrink: 0;
 }
 
 .brand {
@@ -230,7 +227,6 @@ body {
 .brand strong {
   font-family: var(--font-heading);
   font-size: 0.8125rem;
-  letter-spacing: 0.06em;
 }
 
 .brand small {
@@ -254,9 +250,7 @@ body {
   margin: 0;
   color: var(--muted-foreground);
   font-size: 0.6875rem;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  font-weight: 600;
 }
 
 .navigation-label {
@@ -280,15 +274,13 @@ body {
   gap: 0.5rem;
   padding: 0.375rem 0.5rem;
   border: 1px solid transparent;
-  border-radius: 0;
+  border-radius: var(--radius-lg);
   background: transparent;
   color: var(--muted-foreground);
   cursor: pointer;
   font-size: 0.8125rem;
-  font-weight: 600;
-  letter-spacing: 0.08em;
+  font-weight: 500;
   text-align: left;
-  text-transform: uppercase;
 }
 
 .navigation-item:hover {
@@ -297,10 +289,9 @@ body {
 }
 
 .navigation-item[aria-current="page"] {
-  border-color: var(--sidebar-border);
+  border-color: transparent;
   background: var(--sidebar-accent);
   color: var(--sidebar-accent-foreground);
-  box-shadow: inset 2px 0 0 var(--sidebar-primary);
 }
 
 .navigation-item:focus-visible,
@@ -353,7 +344,6 @@ body {
   font-family: var(--font-heading);
   font-size: clamp(1.5rem, 3vw, 2rem);
   line-height: 1.15;
-  letter-spacing: 0.06em;
 }
 
 .page-header > p:last-child {
@@ -371,13 +361,11 @@ body {
 .discover-card,
 .vr-download-card,
 .tmdb-attribution {
-  border: 0;
-  border-radius: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
   background: var(--card);
   color: var(--card-foreground);
-  box-shadow:
-    0 1px 2px color-mix(in oklch, var(--foreground) 8%, transparent),
-    0 0 0 1px color-mix(in oklch, var(--foreground) 5%, transparent);
+  box-shadow: 0 1px 2px color-mix(in oklch, var(--foreground) 6%, transparent);
 }
 
 .dashboard-library-summary {
@@ -410,7 +398,6 @@ body {
   margin: 0.25rem 0 0;
   font-family: var(--font-heading);
   font-size: 0.875rem;
-  letter-spacing: 0.06em;
 }
 
 .dashboard-library-summary__folder,
@@ -491,7 +478,6 @@ body {
   color: var(--card-foreground);
   font-family: var(--font-heading);
   font-size: 0.875rem;
-  letter-spacing: 0.06em;
 }
 
 .empty-state p,
@@ -629,11 +615,10 @@ body {
   width: 100%;
   min-height: 2rem;
   margin-top: 0.375rem;
-  padding: 0.375rem 0;
-  border: 0;
-  border-bottom: 1px solid var(--input);
-  border-radius: 0;
-  background: transparent;
+  padding: 0.375rem 0.625rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  background: var(--background);
   color: var(--foreground);
 }
 
@@ -658,7 +643,7 @@ body {
 .field-label {
   color: var(--foreground);
   font-size: 0.75rem;
-  font-weight: 650;
+  font-weight: 500;
 }
 
 .folder-path {
@@ -720,7 +705,6 @@ body {
   margin: 0.25rem 0 0;
   font-family: var(--font-heading);
   font-size: 0.875rem;
-  letter-spacing: 0.06em;
 }
 
 .vr-downloads {
@@ -924,19 +908,16 @@ body {
   gap: 0.25rem;
   color: var(--foreground);
   font-size: 0.6875rem;
-  font-weight: 650;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-weight: 500;
 }
 
 .provider-select-label select {
   width: 100%;
   min-height: 2.25rem;
-  padding: 0.375rem 1.5rem 0.375rem 0;
-  border: 0;
-  border-bottom: 1px solid var(--input);
-  border-radius: 0;
-  background: transparent;
+  padding: 0.375rem 1.75rem 0.375rem 0.625rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  background: var(--background);
   color: var(--foreground);
   font-size: 0.75rem;
   font-weight: 500;
@@ -952,9 +933,7 @@ body {
 .discover-category legend {
   color: var(--foreground);
   font-size: 0.6875rem;
-  font-weight: 650;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-weight: 500;
 }
 
 .discover-category > div {
@@ -980,17 +959,23 @@ body {
   min-height: 1.75rem;
   padding: 0.25rem 0.625rem;
   border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
   background: var(--background);
   color: var(--muted-foreground);
   font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.08em;
+  font-weight: 500;
   place-items: center;
-  text-transform: uppercase;
 }
 
 .discover-category label + label span {
   border-left-width: 0;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.discover-category label:first-child span {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
 }
 
 .discover-category input:checked + span {
@@ -1009,9 +994,7 @@ body {
 .discover-search > label {
   color: var(--foreground);
   font-size: 0.6875rem;
-  font-weight: 650;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-weight: 500;
 }
 
 .discover-search__field {
@@ -1025,11 +1008,10 @@ body {
   width: 100%;
   min-width: 0;
   min-height: 2.25rem;
-  padding: 0.375rem 0;
-  border: 0;
-  border-bottom: 1px solid var(--input);
-  border-radius: 0;
-  background: transparent;
+  padding: 0.375rem 0.625rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  background: var(--background);
   color: var(--foreground);
   font-size: 0.75rem;
 }
@@ -1072,9 +1054,7 @@ body {
 .movie-sort > label {
   color: var(--foreground);
   font-size: 0.6875rem;
-  font-weight: 650;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-weight: 500;
 }
 
 .movie-search__field {
@@ -1097,10 +1077,9 @@ body {
   width: 100%;
   min-height: 2.25rem;
   padding: 0.375rem 2rem;
-  border: 0;
-  border-bottom: 1px solid var(--input);
-  border-radius: 0;
-  background: transparent;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  background: var(--background);
   color: var(--foreground);
   font-size: 0.75rem;
 }
@@ -1126,11 +1105,10 @@ body {
 .movie-sort__select {
   width: 100%;
   min-height: 2.25rem;
-  padding: 0.375rem 1.5rem 0.375rem 0;
-  border: 0;
-  border-bottom: 1px solid var(--input);
-  border-radius: 0;
-  background: transparent;
+  padding: 0.375rem 1.75rem 0.375rem 0.625rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  background: var(--background);
   color: var(--foreground);
   font-size: 0.75rem;
 }
@@ -1139,9 +1117,7 @@ body {
   margin: 0;
   color: var(--muted-foreground);
   font-size: 0.625rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-weight: 600;
 }
 
 .library-folder {
@@ -1162,7 +1138,7 @@ body {
   padding: 0.625rem 0.75rem;
   border: 1px solid var(--border);
   border-left: 2px solid var(--foreground);
-  border-radius: 0;
+  border-radius: var(--radius-lg);
   background: var(--card);
   font-size: 0.75rem;
   line-height: 1.4;
@@ -1239,13 +1215,11 @@ body {
   max-width: 100%;
   height: 16.25rem;
   overflow: hidden;
-  border: 0;
-  border-radius: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
   background: var(--card);
   color: var(--card-foreground);
-  box-shadow:
-    0 1px 2px color-mix(in oklch, var(--foreground) 8%, transparent),
-    0 0 0 1px color-mix(in oklch, var(--foreground) 5%, transparent);
+  box-shadow: 0 1px 2px color-mix(in oklch, var(--foreground) 6%, transparent);
 }
 
 .provider-browse-card:focus-within {
@@ -1583,7 +1557,6 @@ body {
   font-family: var(--font-heading);
   font-size: 0.8125rem;
   line-height: 1.45;
-  letter-spacing: 0.06em;
   white-space: pre-wrap;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 4;
@@ -2557,9 +2530,7 @@ body {
 
 .movie-metadata__search > label {
   font-size: 0.6875rem;
-  font-weight: 650;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-weight: 500;
 }
 
 .movie-metadata__search > div {
@@ -2572,11 +2543,10 @@ body {
   width: 100%;
   min-width: 0;
   min-height: 2.25rem;
-  padding: 0.375rem 0;
-  border: 0;
-  border-bottom: 1px solid var(--input);
-  border-radius: 0;
-  background: transparent;
+  padding: 0.375rem 0.625rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  background: var(--background);
   color: var(--foreground);
 }
 
@@ -2939,8 +2909,8 @@ body {
 .vr-torrent__popup,
 .movie-metadata__popup,
 .trash-dialog__popup {
-  border: 0;
-  border-radius: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
   background: var(--popover);
   color: var(--popover-foreground);
   box-shadow:
