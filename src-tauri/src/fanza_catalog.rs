@@ -809,12 +809,17 @@ fn parse_preview(
         };
         let large_url = preview_image_field(image, "largeImageUrl")?;
         let regular_url = preview_image_field(image, "imageUrl")?;
+        if large_url
+            .iter()
+            .chain(regular_url.iter())
+            .any(|url| seen_urls.contains(url))
+        {
+            return Err(DocumentError::Conflicting);
+        }
+        seen_urls.extend(large_url.iter().chain(regular_url.iter()).cloned());
         let Some(url) = large_url.or(regular_url) else {
             continue;
         };
-        if !seen_urls.insert(url.clone()) {
-            return Err(DocumentError::Conflicting);
-        }
         if images.len() < 24 {
             images.push(url);
         }
@@ -1988,11 +1993,28 @@ mod tests {
             .unwrap();
             assert!(no_preview.images.is_empty());
 
-            let mut rows = (1..=25)
-                .map(|index| format!(r#"{{"imageUrl":"https://awsimgsrc.dmm.co.jp/{index}.jpg"}}"#))
+            assert_eq!(
+                parse_preview(
+                    &document(
+                        r#"{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/large.jpg","imageUrl":"https://awsimgsrc.dmm.co.jp/hidden-fallback.jpg"},{"imageUrl":"https://awsimgsrc.dmm.co.jp/hidden-fallback.jpg"}"#,
+                    ),
+                    category,
+                    content_id,
+                ),
+                Err(DocumentError::Conflicting)
+            );
+
+            let mut rows = (1..=24)
+                .map(|index| {
+                    if index == 1 {
+                        r#"{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/1.jpg","imageUrl":"https://awsimgsrc.dmm.co.jp/hidden-after-limit.jpg"}"#.to_owned()
+                    } else {
+                        format!(r#"{{"imageUrl":"https://awsimgsrc.dmm.co.jp/{index}.jpg"}}"#)
+                    }
+                })
                 .collect::<Vec<_>>();
             rows.push(
-                r#"{"largeImageUrl":null,"imageUrl":"https://awsimgsrc.dmm.co.jp/25.jpg"}"#
+                r#"{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/25.jpg","imageUrl":"https://awsimgsrc.dmm.co.jp/hidden-after-limit.jpg"}"#
                     .to_owned(),
             );
             assert_eq!(
