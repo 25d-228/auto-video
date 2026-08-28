@@ -204,6 +204,28 @@ struct AuthorizedItem {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct PreviewImageAuthority {
+    id: String,
+    url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreviewAuthority {
+    generation: u64,
+    catalog_context_generation: u64,
+    catalog_request_generation: u64,
+    content_id: String,
+    display_code: String,
+    images: Vec<PreviewImageAuthority>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedPreview {
+    content_id: String,
+    images: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CatalogAuthority {
     context_generation: u64,
     request_generation: u64,
@@ -213,10 +235,13 @@ struct CatalogAuthority {
 #[derive(Default)]
 struct CatalogContext {
     request_generation: u64,
+    preview_generation: u64,
     adult_context_generation: u64,
     vr_context_generation: u64,
     adult: Option<CatalogAuthority>,
     vr: Option<CatalogAuthority>,
+    adult_preview: Option<PreviewAuthority>,
+    vr_preview: Option<PreviewAuthority>,
 }
 
 #[derive(Clone, Default)]
@@ -695,6 +720,336 @@ fn set_authority(
     }
 }
 
+fn preview_authority(context: &CatalogContext, category: Category) -> Option<&PreviewAuthority> {
+    match category {
+        Category::Adult => context.adult_preview.as_ref(),
+        Category::Vr => context.vr_preview.as_ref(),
+    }
+}
+
+fn set_preview_authority(
+    context: &mut CatalogContext,
+    category: Category,
+    value: Option<PreviewAuthority>,
+) {
+    match category {
+        Category::Adult => context.adult_preview = value,
+        Category::Vr => context.vr_preview = value,
+    }
+}
+
+fn clear_preview_generation(state: &FanzaCatalogState, category: Category, generation: u64) {
+    if let Ok(mut context) = state.0.lock() {
+        if preview_authority(&context, category)
+            .is_some_and(|preview| preview.generation == generation)
+        {
+            set_preview_authority(&mut context, category, None);
+        }
+    }
+}
+
+fn preview_body(content_id: &str) -> String {
+    format!(
+        r#"{{"query":"query{{ppvContent(id:\"{content_id}\"){{id contentType sampleImages{{largeImageUrl}}}}}}","variables":{{}}}}"#
+    )
+}
+
+fn parse_preview(
+    document: &str,
+    category: Category,
+    content_id: &str,
+) -> Result<ParsedPreview, DocumentError> {
+    let root = parse_root(document)?;
+    let Some(JsonValue::Object(data)) = root.get("data") else {
+        return Err(DocumentError::Malformed);
+    };
+    let value = data.get("ppvContent").ok_or(DocumentError::Malformed)?;
+    let JsonValue::Object(content) = value else {
+        return if matches!(value, JsonValue::Null) {
+            Ok(ParsedPreview {
+                content_id: content_id.to_owned(),
+                images: Vec::new(),
+            })
+        } else {
+            Err(DocumentError::Malformed)
+        };
+    };
+    let returned_id = match content.get("id") {
+        Some(JsonValue::String(value)) if valid_content_id(value) => value,
+        _ => return Err(DocumentError::Malformed),
+    };
+    let content_type = match content.get("contentType") {
+        Some(JsonValue::String(value)) => value,
+        _ => return Err(DocumentError::Malformed),
+    };
+    if returned_id != content_id || content_type != category.content_type() {
+        return Err(DocumentError::Conflicting);
+    }
+    let values = match content.get("sampleImages") {
+        None | Some(JsonValue::Null) => &[][..],
+        Some(JsonValue::Array(values)) => values.as_slice(),
+        Some(_) => return Err(DocumentError::Malformed),
+    };
+    let mut images = Vec::new();
+    for value in values {
+        let JsonValue::Object(image) = value else {
+            return Err(DocumentError::Malformed);
+        };
+        let url = match image.get("largeImageUrl") {
+            Some(JsonValue::String(url)) if valid_image_url(url) => url,
+            _ => return Err(DocumentError::Malformed),
+        };
+        if images.iter().any(|existing| existing == url) {
+            return Err(DocumentError::Conflicting);
+        }
+        if images.len() < 24 {
+            images.push(url.clone());
+        }
+    }
+    Ok(ParsedPreview {
+        content_id: returned_id.clone(),
+        images,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fetch_preview_with(
+    state: &FanzaCatalogState,
+    category: &str,
+    catalog_context_generation: &str,
+    catalog_request_generation: &str,
+    content_id: &str,
+    display_code: &str,
+    fetch: impl FnOnce(&str) -> Result<String, ProviderRequestError>,
+) -> Result<Vec<String>, &'static str> {
+    let category = Category::parse(category).ok_or(VR_PROVIDER_ERROR)?;
+    let catalog_context_generation = catalog_context_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| category.stale())?;
+    let catalog_request_generation = catalog_request_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| category.stale())?;
+    if !valid_content_id(content_id) || !valid_display_code(display_code) {
+        return Err(category.stale());
+    }
+    let preview_generation = {
+        let mut context = state.0.lock().map_err(|_| category.stale())?;
+        let retained = authority(&context, category)
+            .filter(|authority| {
+                authority.context_generation == catalog_context_generation
+                    && authority.request_generation == catalog_request_generation
+            })
+            .and_then(|authority| {
+                authority
+                    .items
+                    .iter()
+                    .find(|item| item.content_id == content_id && item.display_code == display_code)
+            })
+            .ok_or_else(|| category.stale())?;
+        let retained_content_id = retained.content_id.clone();
+        let retained_display_code = retained.display_code.clone();
+        context.preview_generation = context
+            .preview_generation
+            .checked_add(1)
+            .ok_or_else(|| category.request_error(ProviderRequestError::Provider))?;
+        let generation = context.preview_generation;
+        set_preview_authority(
+            &mut context,
+            category,
+            Some(PreviewAuthority {
+                generation,
+                catalog_context_generation,
+                catalog_request_generation,
+                content_id: retained_content_id,
+                display_code: retained_display_code,
+                images: Vec::new(),
+            }),
+        );
+        generation
+    };
+
+    let result = (|| {
+        let document =
+            fetch(&preview_body(content_id)).map_err(|error| category.request_error(error))?;
+        let preview =
+            parse_preview(&document, category, content_id).map_err(|error| match error {
+                DocumentError::Malformed => category.malformed(),
+                DocumentError::Provider => category.request_error(ProviderRequestError::Provider),
+                DocumentError::Conflicting => category.conflicting(),
+            })?;
+        let mut context = state.0.lock().map_err(|_| category.stale())?;
+        let catalog_is_current = authority(&context, category).is_some_and(|authority| {
+            authority.context_generation == catalog_context_generation
+                && authority.request_generation == catalog_request_generation
+                && authority
+                    .items
+                    .iter()
+                    .any(|item| item.content_id == content_id && item.display_code == display_code)
+        });
+        if !catalog_is_current {
+            return Err(category.stale());
+        }
+        let current = preview_authority(&context, category)
+            .filter(|authority| authority.generation == preview_generation)
+            .ok_or_else(|| category.stale())?;
+        if current.catalog_context_generation != catalog_context_generation
+            || current.catalog_request_generation != catalog_request_generation
+            || current.content_id != content_id
+            || current.display_code != display_code
+            || preview.content_id != content_id
+        {
+            return Err(category.stale());
+        }
+        let images = preview
+            .images
+            .into_iter()
+            .enumerate()
+            .map(|(index, url)| PreviewImageAuthority {
+                id: format!("fanza-preview-{preview_generation}-{}", index + 1),
+                url,
+            })
+            .collect::<Vec<_>>();
+        let response = {
+            let mut response = vec![
+                preview_generation.to_string(),
+                category.value().to_owned(),
+                catalog_context_generation.to_string(),
+                catalog_request_generation.to_string(),
+                content_id.to_owned(),
+                display_code.to_owned(),
+                images.len().to_string(),
+            ];
+            response.extend(images.iter().map(|image| image.id.clone()));
+            response
+        };
+        set_preview_authority(
+            &mut context,
+            category,
+            Some(PreviewAuthority {
+                generation: preview_generation,
+                catalog_context_generation,
+                catalog_request_generation,
+                content_id: content_id.to_owned(),
+                display_code: display_code.to_owned(),
+                images,
+            }),
+        );
+        Ok(response)
+    })();
+    if result.is_err() {
+        clear_preview_generation(state, category, preview_generation);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preview_image_url(
+    state: &FanzaCatalogState,
+    category: &str,
+    catalog_context_generation: &str,
+    catalog_request_generation: &str,
+    preview_generation: &str,
+    content_id: &str,
+    display_code: &str,
+    authority_id: &str,
+) -> Result<(Category, String), &'static str> {
+    let category = Category::parse(category).ok_or(VR_PROVIDER_ERROR)?;
+    let parse_generation = |value: &str| {
+        value
+            .parse::<u64>()
+            .ok()
+            .filter(|generation| *generation > 0)
+            .ok_or_else(|| category.stale())
+    };
+    let catalog_context_generation = parse_generation(catalog_context_generation)?;
+    let catalog_request_generation = parse_generation(catalog_request_generation)?;
+    let preview_generation = parse_generation(preview_generation)?;
+    let context = state.0.lock().map_err(|_| category.stale())?;
+    let current = preview_authority(&context, category)
+        .filter(|authority| {
+            authority.generation == preview_generation
+                && authority.catalog_context_generation == catalog_context_generation
+                && authority.catalog_request_generation == catalog_request_generation
+                && authority.content_id == content_id
+                && authority.display_code == display_code
+        })
+        .ok_or_else(|| category.stale())?;
+    current
+        .images
+        .iter()
+        .find(|image| image.id == authority_id)
+        .map(|image| (category, image.url.clone()))
+        .ok_or_else(|| category.stale())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fetch_preview_image_with(
+    state: &FanzaCatalogState,
+    category: &str,
+    catalog_context_generation: &str,
+    catalog_request_generation: &str,
+    preview_generation: &str,
+    content_id: &str,
+    display_code: &str,
+    authority_id: &str,
+    fetch: impl FnOnce(&str) -> Result<Vec<u8>, ProviderRequestError>,
+) -> Result<Vec<u8>, &'static str> {
+    let (parsed_category, url) = preview_image_url(
+        state,
+        category,
+        catalog_context_generation,
+        catalog_request_generation,
+        preview_generation,
+        content_id,
+        display_code,
+        authority_id,
+    )?;
+    let bytes = fetch(&url).map_err(|error| parsed_category.request_error(error))?;
+    if !accepted_raster(&bytes) {
+        return Err(parsed_category.request_error(ProviderRequestError::Provider));
+    }
+    if preview_image_url(
+        state,
+        category,
+        catalog_context_generation,
+        catalog_request_generation,
+        preview_generation,
+        content_id,
+        display_code,
+        authority_id,
+    )?
+    .1 != url
+    {
+        return Err(parsed_category.stale());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn invalidate_preview(
+    state: &FanzaCatalogState,
+    category: &str,
+    preview_generation: &str,
+) -> Result<(), &'static str> {
+    let category = Category::parse(category).ok_or(VR_PROVIDER_ERROR)?;
+    let generation = preview_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| category.stale())?;
+    let mut context = state.0.lock().map_err(|_| category.stale())?;
+    if preview_authority(&context, category).is_some_and(|preview| preview.generation == generation)
+    {
+        set_preview_authority(&mut context, category, None);
+        Ok(())
+    } else {
+        Err(category.stale())
+    }
+}
+
 fn current_context_generation(context: &CatalogContext, category: Category) -> u64 {
     match category {
         Category::Adult => context.adult_context_generation,
@@ -729,6 +1084,7 @@ pub(crate) fn fetch_catalog_with(
             return Err(category.stale());
         }
         set_context_generation(&mut context, category, requested_context_generation);
+        set_preview_authority(&mut context, category, None);
         context.request_generation = context
             .request_generation
             .checked_add(1)
@@ -820,6 +1176,7 @@ pub(crate) fn invalidate_catalog(
     }
     set_context_generation(&mut context, category, generation);
     set_authority(&mut context, category, None);
+    set_preview_authority(&mut context, category, None);
     Ok(())
 }
 
@@ -1474,6 +1831,182 @@ mod tests {
             0xff, 0xd8, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0
         ]));
         assert!(!accepted_raster(b"not an image"));
+    }
+
+    #[test]
+    fn preview_is_bound_to_the_exact_catalog_item_category_and_generation() {
+        let state = FanzaCatalogState::default();
+        let catalog = fetch_catalog_with(&state, &request("vr", 1), |_| {
+            Ok(search_document(
+                r#"{"id":"13dsvr01947","title":"Current","packageImage":null}"#,
+            ))
+        })
+        .unwrap();
+        assert_eq!(catalog[4], "3DSVR-01947");
+        let preview = fetch_preview_with(
+            &state,
+            "vr",
+            "1",
+            &catalog[0],
+            "13dsvr01947",
+            "3DSVR-01947",
+            |body| {
+                assert!(body.contains(r#"ppvContent(id:\"13dsvr01947\")"#));
+                assert!(body.contains("id contentType sampleImages"));
+                Ok(r#"{"data":{"ppvContent":{"id":"13dsvr01947","contentType":"VR","sampleImages":[{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/digital/video/13dsvr01947/a.jpg"},{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/digital/video/13dsvr01947/b.jpg"}]}}}"#.to_owned())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            &preview[1..7],
+            ["vr", "1", "1", "13dsvr01947", "3DSVR-01947", "2"]
+        );
+        assert_eq!(preview[7], "fanza-preview-1-1");
+        let bytes = fetch_preview_image_with(
+            &state,
+            "vr",
+            "1",
+            "1",
+            "1",
+            "13dsvr01947",
+            "3DSVR-01947",
+            &preview[7],
+            |url| {
+                assert!(url.ends_with("/a.jpg"));
+                Ok(vec![0xff, 0xd8, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            },
+        )
+        .unwrap();
+        assert!(accepted_raster(&bytes));
+
+        assert_eq!(
+            fetch_preview_image_with(
+                &state,
+                "adult",
+                "1",
+                "1",
+                "1",
+                "13dsvr01947",
+                "3DSVR-01947",
+                &preview[7],
+                |_| panic!("cross-category preview must not dispatch"),
+            ),
+            Err(ADULT_STALE)
+        );
+        invalidate_preview(&state, "vr", "1").unwrap();
+        assert_eq!(
+            fetch_preview_image_with(
+                &state,
+                "vr",
+                "1",
+                "1",
+                "1",
+                "13dsvr01947",
+                "3DSVR-01947",
+                &preview[7],
+                |_| panic!("invalidated preview must not dispatch"),
+            ),
+            Err(VR_STALE)
+        );
+    }
+
+    #[test]
+    fn preview_rejects_unproven_identity_malformed_images_and_duplicates() {
+        for document in [
+            r#"{"data":{"ppvContent":{"id":"13dsvr01948","contentType":"VR","sampleImages":[]}}}"#,
+            r#"{"data":{"ppvContent":{"id":"13dsvr01947","contentType":"TWO_DIMENSION","sampleImages":[]}}}"#,
+            r#"{"data":{"ppvContent":{"id":"13dsvr01947","contentType":"VR","sampleImages":[{"largeImageUrl":42}]}}}"#,
+            r#"{"data":{"ppvContent":{"id":"13dsvr01947","contentType":"VR","sampleImages":[{"largeImageUrl":" https://awsimgsrc.dmm.co.jp/a.jpg"}]}}}"#,
+            r#"{"data":{"ppvContent":{"id":"13dsvr01947","contentType":"VR","sampleImages":[{"largeImageUrl":"https://evil.example/a.jpg"}]}}}"#,
+            r#"{"data":{"ppvContent":{"id":"13dsvr01947","contentType":"VR","sampleImages":[{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/a.jpg"},{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/a.jpg"}]}}}"#,
+        ] {
+            let result = parse_preview(document, Category::Vr, "13dsvr01947");
+            assert!(matches!(
+                result,
+                Err(DocumentError::Malformed | DocumentError::Conflicting)
+            ));
+        }
+        assert!(parse_preview(
+            r#"{"data":{"ppvContent":null}}"#,
+            Category::Vr,
+            "13dsvr01947"
+        )
+        .unwrap()
+        .images
+        .is_empty());
+    }
+
+    #[test]
+    fn adult_preview_retains_at_most_twenty_four_images_in_provider_order() {
+        let state = FanzaCatalogState::default();
+        let catalog = fetch_catalog_with(&state, &request("adult", 1), |_| {
+            Ok(search_document(r#"{"id":"maraa244","packageImage":null}"#))
+        })
+        .unwrap();
+        let images = (1..=26)
+            .map(|index| {
+                format!(r#"{{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/preview/{index}.jpg"}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let document = format!(
+            r#"{{"data":{{"ppvContent":{{"id":"maraa244","contentType":"TWO_DIMENSION","sampleImages":[{images}]}}}}}}"#
+        );
+        let preview = fetch_preview_with(
+            &state,
+            "adult",
+            "1",
+            &catalog[0],
+            "maraa244",
+            "MARAA-244",
+            |_| Ok(document),
+        )
+        .unwrap();
+        assert_eq!(preview[6], "24");
+        assert_eq!(preview.len(), 31);
+        assert_eq!(preview[7], "fanza-preview-1-1");
+        assert_eq!(preview[30], "fanza-preview-1-24");
+        fetch_preview_image_with(
+            &state,
+            "adult",
+            "1",
+            &catalog[0],
+            "1",
+            "maraa244",
+            "MARAA-244",
+            &preview[30],
+            |url| {
+                assert!(url.ends_with("/24.jpg"));
+                Ok(vec![0xff, 0xd8, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fetch_preview_image_with(
+                &state,
+                "adult",
+                "1",
+                &catalog[0],
+                "1",
+                "maraa244",
+                "MARAA-244",
+                "fanza-preview-1-25",
+                |_| panic!("an unretained image must not dispatch"),
+            ),
+            Err(ADULT_STALE)
+        );
+        assert_eq!(
+            fetch_preview_with(
+                &state,
+                "adult",
+                "1",
+                &catalog[0],
+                "neighbor245",
+                "MARAA-245",
+                |_| panic!("fabricated item data must not dispatch"),
+            ),
+            Err(ADULT_STALE)
+        );
     }
 
     #[test]

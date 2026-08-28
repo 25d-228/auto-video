@@ -36,6 +36,29 @@ export type FanzaCatalogResult =
         | "stale";
     };
 
+export type FanzaPreview = {
+  category: FanzaCategory;
+  contextGeneration: string;
+  requestGeneration: string;
+  previewGeneration: string;
+  contentId: string;
+  displayCode: string;
+  imageAuthorityIds: string[];
+};
+
+export type FanzaPreviewResult =
+  | { status: "ready"; preview: FanzaPreview }
+  | {
+      status:
+        | "no-preview"
+        | "source-unavailable"
+        | "network-error"
+        | "malformed-provider"
+        | "conflicting-provider"
+        | "provider-error"
+        | "stale";
+    };
+
 const feeds = new Set<FanzaFeed>([
   "popular",
   "newest",
@@ -49,6 +72,7 @@ const maximumU64 = 18_446_744_073_709_551_615n;
 const contentIdPattern = /^[a-z0-9_]{1,64}$/;
 const displayCodePattern = /^([A-Z0-9]{1,15}[A-Z])-([0-9]{1,10})$/;
 const coverAuthorityPattern = /^fanza-cover-[1-9][0-9]{0,19}-[1-9][0-9]{0,2}$/;
+const previewAuthorityPattern = /^fanza-preview-([1-9][0-9]{0,19})-([1-9]|1[0-9]|2[0-4])$/;
 const sourceAspectRatio = 0.72;
 
 function validGeneration(value: string) {
@@ -72,7 +96,7 @@ function validRequest(request: FanzaCatalogRequest) {
   );
 }
 
-function errorStatus(
+export function fanzaErrorStatus(
   category: FanzaCategory,
   error: unknown,
 ): Exclude<FanzaCatalogResult["status"], "ready"> {
@@ -173,7 +197,7 @@ export async function fetchFanzaCatalog(
     );
     return parseFanzaCatalogResponse(response, request, contextGeneration);
   } catch (error) {
-    return { status: errorStatus(request.category, error) };
+    return { status: fanzaErrorStatus(request.category, error) };
   }
 }
 
@@ -262,4 +286,135 @@ export async function fetchFanzaCoverObjectUrl(item: FanzaCatalogItem) {
     throw new Error("FANZA returned an invalid cover.");
   }
   return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+}
+
+export function parseFanzaPreviewResponse(
+  value: unknown,
+  item: FanzaCatalogItem,
+): FanzaPreviewResult {
+  if (
+    !Array.isArray(value) ||
+    !value.every((entry) => typeof entry === "string") ||
+    value.length < 7
+  ) {
+    return { status: "malformed-provider" };
+  }
+  const [
+    previewGeneration,
+    category,
+    contextGeneration,
+    requestGeneration,
+    contentId,
+    displayCode,
+    countText,
+    ...authorityIds
+  ] = value as string[];
+  const count = Number(countText);
+  if (
+    !validGeneration(previewGeneration) ||
+    category !== item.category ||
+    contextGeneration !== item.contextGeneration ||
+    requestGeneration !== item.requestGeneration ||
+    contentId !== item.contentId ||
+    displayCode !== item.displayCode ||
+    !/^(?:0|[1-9]|1[0-9]|2[0-4])$/.test(countText) ||
+    count !== authorityIds.length ||
+    new Set(authorityIds).size !== authorityIds.length ||
+    authorityIds.some((id, index) => {
+      const match = previewAuthorityPattern.exec(id);
+      return (
+        match === null ||
+        match[1] !== previewGeneration ||
+        Number(match[2]) !== index + 1
+      );
+    })
+  ) {
+    return { status: "malformed-provider" };
+  }
+  if (count === 0) return { status: "no-preview" };
+  return {
+    status: "ready",
+    preview: {
+      category: item.category,
+      contextGeneration,
+      requestGeneration,
+      previewGeneration,
+      contentId,
+      displayCode,
+      imageAuthorityIds: authorityIds,
+    },
+  };
+}
+
+export async function fetchFanzaPreview(
+  item: FanzaCatalogItem,
+): Promise<FanzaPreviewResult> {
+  try {
+    const response = await window.__TAURI__.core.invoke<unknown>(
+      "fetch_fanza_preview",
+      {
+        category: item.category,
+        contextGeneration: item.contextGeneration,
+        requestGeneration: item.requestGeneration,
+        contentId: item.contentId,
+        displayCode: item.displayCode,
+      },
+    );
+    const result = parseFanzaPreviewResponse(response, item);
+    if (result.status === "malformed-provider") {
+      const generation = Array.isArray(response) ? response[0] : null;
+      if (typeof generation === "string" && validGeneration(generation)) {
+        void invalidateFanzaPreview(item.category, generation).catch(() => undefined);
+      }
+    }
+    return result;
+  } catch (error) {
+    return { status: fanzaErrorStatus(item.category, error) };
+  }
+}
+
+export async function fetchFanzaPreviewImageObjectUrl(
+  preview: FanzaPreview,
+  previewAuthorityId: string,
+) {
+  if (!preview.imageAuthorityIds.includes(previewAuthorityId)) {
+    throw new Error("A current FANZA preview image authority is required.");
+  }
+  const response = await window.__TAURI__.core.invoke<unknown>(
+    "fetch_fanza_preview_image",
+    {
+      category: preview.category,
+      contextGeneration: preview.contextGeneration,
+      requestGeneration: preview.requestGeneration,
+      previewGeneration: preview.previewGeneration,
+      contentId: preview.contentId,
+      displayCode: preview.displayCode,
+      previewAuthorityId,
+    },
+  );
+  if (
+    !Array.isArray(response) ||
+    !response.every(
+      (value) => Number.isInteger(value) && value >= 0 && value <= 255,
+    )
+  ) {
+    throw new Error("FANZA returned an invalid preview image.");
+  }
+  const bytes = Uint8Array.from(response as number[]);
+  const mimeType = coverMimeType(bytes);
+  if (mimeType === null) {
+    throw new Error("FANZA returned an invalid preview image.");
+  }
+  return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+}
+
+export async function invalidateFanzaPreview(
+  category: FanzaCategory,
+  previewGeneration: string,
+) {
+  if (!validGeneration(previewGeneration)) return;
+  await window.__TAURI__.core.invoke("invalidate_fanza_preview", {
+    category,
+    previewGeneration,
+  });
 }
