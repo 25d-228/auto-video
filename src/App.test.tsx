@@ -11652,6 +11652,31 @@ describe("native-owned FANZA Adult and VR catalogs", () => {
     expect(fetchFanzaPreviewImageMock).not.toHaveBeenCalled();
   });
 
+  it("reports malformed native FANZA preview bytes distinctly", async () => {
+    fetchFanzaCatalogMock.mockResolvedValue(
+      fanzaCatalogFixture("vr", [
+        { code: "3DSVR-01947", contentId: "13dsvr01947", cover: false },
+      ]),
+    );
+    fetchFanzaPreviewMock.mockResolvedValue([
+      "17", "vr", "1", "9", "13dsvr01947", "3DSVR-01947", "1",
+      "fanza-preview-17-1",
+    ]);
+    fetchFanzaPreviewImageMock.mockResolvedValue([0xff, 0xd8]);
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Preview: 3DSVR-01947" }),
+    );
+    expect(
+      await screen.findByRole("heading", {
+        name: "FANZA returned invalid preview data",
+      }),
+    ).toBeTruthy();
+    expect(createObjectUrlMock).not.toHaveBeenCalled();
+  });
+
   it("removes an undecodable FANZA image and retries only the exact item", async () => {
     fetchFanzaCatalogMock.mockResolvedValue(
       fanzaCatalogFixture("vr", [

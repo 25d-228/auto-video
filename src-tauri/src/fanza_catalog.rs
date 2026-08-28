@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -750,8 +750,19 @@ fn clear_preview_generation(state: &FanzaCatalogState, category: Category, gener
 
 fn preview_body(content_id: &str) -> String {
     format!(
-        r#"{{"query":"query{{ppvContent(id:\"{content_id}\"){{id contentType sampleImages{{largeImageUrl}}}}}}","variables":{{}}}}"#
+        r#"{{"query":"query{{ppvContent(id:\"{content_id}\"){{id contentType sampleImages{{largeImageUrl imageUrl}}}}}}","variables":{{}}}}"#
     )
+}
+
+fn preview_image_field(
+    image: &std::collections::BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<String>, DocumentError> {
+    match image.get(key) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(url)) if valid_image_url(url) => Ok(Some(url.clone())),
+        Some(_) => Err(DocumentError::Malformed),
+    }
 }
 
 fn parse_preview(
@@ -791,19 +802,21 @@ fn parse_preview(
         Some(_) => return Err(DocumentError::Malformed),
     };
     let mut images = Vec::new();
+    let mut seen_urls = HashSet::new();
     for value in values {
         let JsonValue::Object(image) = value else {
             return Err(DocumentError::Malformed);
         };
-        let url = match image.get("largeImageUrl") {
-            Some(JsonValue::String(url)) if valid_image_url(url) => url,
-            _ => return Err(DocumentError::Malformed),
+        let large_url = preview_image_field(image, "largeImageUrl")?;
+        let regular_url = preview_image_field(image, "imageUrl")?;
+        let Some(url) = large_url.or(regular_url) else {
+            continue;
         };
-        if images.iter().any(|existing| existing == url) {
+        if !seen_urls.insert(url.clone()) {
             return Err(DocumentError::Conflicting);
         }
         if images.len() < 24 {
-            images.push(url.clone());
+            images.push(url);
         }
     }
     Ok(ParsedPreview {
@@ -1010,7 +1023,7 @@ pub(crate) fn fetch_preview_image_with(
     )?;
     let bytes = fetch(&url).map_err(|error| parsed_category.request_error(error))?;
     if !accepted_raster(&bytes) {
-        return Err(parsed_category.request_error(ProviderRequestError::Provider));
+        return Err(parsed_category.malformed());
     }
     if preview_image_url(
         state,
@@ -1852,7 +1865,7 @@ mod tests {
             "3DSVR-01947",
             |body| {
                 assert!(body.contains(r#"ppvContent(id:\"13dsvr01947\")"#));
-                assert!(body.contains("id contentType sampleImages"));
+                assert!(body.contains("sampleImages{largeImageUrl imageUrl}"));
                 Ok(r#"{"data":{"ppvContent":{"id":"13dsvr01947","contentType":"VR","sampleImages":[{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/digital/video/13dsvr01947/a.jpg"},{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/digital/video/13dsvr01947/b.jpg"}]}}}"#.to_owned())
             },
         )
@@ -1934,6 +1947,107 @@ mod tests {
         .unwrap()
         .images
         .is_empty());
+    }
+
+    #[test]
+    fn adult_and_vr_preview_select_valid_image_alternatives_and_honestly_report_none() {
+        for (category, content_type, content_id) in [
+            (Category::Adult, "TWO_DIMENSION", "maraa244"),
+            (Category::Vr, "VR", "13dsvr01947"),
+        ] {
+            let document = |images: &str| {
+                format!(
+                    r#"{{"data":{{"ppvContent":{{"id":"{content_id}","contentType":"{content_type}","sampleImages":[{images}]}}}}}}"#
+                )
+            };
+            let both = parse_preview(
+                &document(
+                    r#"{"largeImageUrl":"https://awsimgsrc.dmm.co.jp/large.jpg","imageUrl":"https://awsimgsrc.dmm.co.jp/regular.jpg"}"#,
+                ),
+                category,
+                content_id,
+            )
+            .unwrap();
+            assert_eq!(both.images, ["https://awsimgsrc.dmm.co.jp/large.jpg"]);
+
+            let fallback = parse_preview(
+                &document(
+                    r#"{"largeImageUrl":null,"imageUrl":"https://awsimgsrc.dmm.co.jp/regular.jpg"}"#,
+                ),
+                category,
+                content_id,
+            )
+            .unwrap();
+            assert_eq!(fallback.images, ["https://awsimgsrc.dmm.co.jp/regular.jpg"]);
+
+            let no_preview = parse_preview(
+                &document(r#"{},{"largeImageUrl":null,"imageUrl":null}"#),
+                category,
+                content_id,
+            )
+            .unwrap();
+            assert!(no_preview.images.is_empty());
+
+            let mut rows = (1..=25)
+                .map(|index| format!(r#"{{"imageUrl":"https://awsimgsrc.dmm.co.jp/{index}.jpg"}}"#))
+                .collect::<Vec<_>>();
+            rows.push(
+                r#"{"largeImageUrl":null,"imageUrl":"https://awsimgsrc.dmm.co.jp/25.jpg"}"#
+                    .to_owned(),
+            );
+            assert_eq!(
+                parse_preview(&document(&rows.join(",")), category, content_id),
+                Err(DocumentError::Conflicting)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_preview_raster_bytes_are_malformed_for_adult_and_vr() {
+        for (category, content_type, content_id, display_code, malformed) in [
+            (
+                "adult",
+                "TWO_DIMENSION",
+                "maraa244",
+                "MARAA-244",
+                ADULT_MALFORMED,
+            ),
+            ("vr", "VR", "13dsvr01947", "3DSVR-01947", VR_MALFORMED),
+        ] {
+            let state = FanzaCatalogState::default();
+            let catalog = fetch_catalog_with(&state, &request(category, 1), |_| {
+                Ok(search_document(&format!(r#"{{"id":"{content_id}"}}"#)))
+            })
+            .unwrap();
+            let preview = fetch_preview_with(
+                &state,
+                category,
+                "1",
+                &catalog[0],
+                content_id,
+                display_code,
+                |_| {
+                    Ok(format!(
+                        r#"{{"data":{{"ppvContent":{{"id":"{content_id}","contentType":"{content_type}","sampleImages":[{{"imageUrl":"https://awsimgsrc.dmm.co.jp/regular.jpg"}}]}}}}}}"#
+                    ))
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                fetch_preview_image_with(
+                    &state,
+                    category,
+                    "1",
+                    &catalog[0],
+                    &preview[0],
+                    content_id,
+                    display_code,
+                    &preview[7],
+                    |_| Ok(b"not a supported raster".to_vec()),
+                ),
+                Err(malformed)
+            );
+        }
     }
 
     #[test]

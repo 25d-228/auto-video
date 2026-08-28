@@ -153,6 +153,25 @@ describe("FANZA catalog boundary", () => {
     });
   });
 
+  it("classifies malformed native preview bytes without creating an object URL", async () => {
+    const preview = {
+      category: "vr" as const,
+      contextGeneration: "4",
+      requestGeneration: "8",
+      previewGeneration: "9",
+      contentId: "13dsvr01947",
+      displayCode: "3DSVR-01947",
+      imageAuthorityIds: ["fanza-preview-9-1"],
+    };
+    for (const response of ["not-bytes", [0xff, 0xd8]]) {
+      invoke.mockResolvedValueOnce(response);
+      await expect(
+        fetchFanzaPreviewImageObjectUrl(preview, "fanza-preview-9-1"),
+      ).rejects.toThrow("vr_fanza_malformed_provider");
+    }
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+  });
+
   it("rejects over-return, invalid display identity, and duplicate content IDs", () => {
     expect(
       parseFanzaCatalogResponse(

@@ -398,12 +398,12 @@ export async function fetchFanzaPreviewImageObjectUrl(
       (value) => Number.isInteger(value) && value >= 0 && value <= 255,
     )
   ) {
-    throw new Error("FANZA returned an invalid preview image.");
+    throw new Error(`${preview.category}_fanza_malformed_provider`);
   }
   const bytes = Uint8Array.from(response as number[]);
   const mimeType = coverMimeType(bytes);
   if (mimeType === null) {
-    throw new Error("FANZA returned an invalid preview image.");
+    throw new Error(`${preview.category}_fanza_malformed_provider`);
   }
   return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
 }
