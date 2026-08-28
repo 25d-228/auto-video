@@ -37,7 +37,10 @@ use fanza_catalog::{
     fetch_catalog_with as fetch_fanza_catalog_with, fetch_cover_bytes as fetch_fanza_cover_bytes,
     fetch_cover_with as fetch_fanza_cover_with,
     fetch_graphql_document as fetch_fanza_graphql_document,
-    invalidate_catalog as invalidate_fanza_catalog_with, FanzaCatalogRequest, FanzaCatalogState,
+    fetch_preview_image_with as fetch_fanza_preview_image_with,
+    fetch_preview_with as fetch_fanza_preview_with,
+    invalidate_catalog as invalidate_fanza_catalog_with,
+    invalidate_preview as invalidate_fanza_preview_with, FanzaCatalogRequest, FanzaCatalogState,
 };
 use javdb_catalog::{
     fetch_api_document as fetch_javdb_api_document, fetch_catalog_with as fetch_javdb_catalog_with,
@@ -3799,6 +3802,84 @@ async fn fetch_fanza_cover(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn fetch_fanza_preview(
+    category: String,
+    context_generation: String,
+    request_generation: String,
+    content_id: String,
+    display_code: String,
+    state: tauri::State<'_, FanzaCatalogState>,
+) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_fanza_preview_with(
+            &state,
+            &category,
+            &context_generation,
+            &request_generation,
+            &content_id,
+            &display_code,
+            fetch_fanza_graphql_document,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn fetch_fanza_preview_image(
+    category: String,
+    context_generation: String,
+    request_generation: String,
+    preview_generation: String,
+    content_id: String,
+    display_code: String,
+    preview_authority_id: String,
+    state: tauri::State<'_, FanzaCatalogState>,
+) -> Result<Vec<u8>, String> {
+    let state = state.inner().clone();
+    let join_error = if category == "adult" {
+        ADULT_PROVIDER_ERROR
+    } else {
+        VR_PROVIDER_ERROR
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        fetch_fanza_preview_image_with(
+            &state,
+            &category,
+            &context_generation,
+            &request_generation,
+            &preview_generation,
+            &content_id,
+            &display_code,
+            &preview_authority_id,
+            fetch_fanza_cover_bytes,
+        )
+        .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| join_error.to_owned())?
+}
+
+#[tauri::command]
+fn invalidate_fanza_preview(
+    category: String,
+    preview_generation: String,
+    state: tauri::State<'_, FanzaCatalogState>,
+) -> Result<(), String> {
+    invalidate_fanza_preview_with(state.inner(), &category, &preview_generation)
+        .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn invalidate_javdb_catalog(
     category: String,
     context_generation: String,
@@ -5041,6 +5122,9 @@ fn main() {
             fetch_fanza_catalog,
             invalidate_fanza_catalog,
             fetch_fanza_cover,
+            fetch_fanza_preview,
+            fetch_fanza_preview_image,
+            invalidate_fanza_preview,
             fetch_javdb_catalog,
             invalidate_javdb_catalog,
             fetch_javdb_cover,
