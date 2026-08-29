@@ -3539,7 +3539,7 @@ impl TorrentStorage for SelectedFileStorage {
 }
 
 #[cfg(unix)]
-fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
+pub(crate) fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = fs::symlink_metadata(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
@@ -4196,7 +4196,7 @@ pub(crate) fn open_file_fingerprint(file: &File) -> io::Result<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
+pub(crate) fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
     let metadata = fs::symlink_metadata(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(VR_DOWNLOAD_DESTINATION_CONFLICT);
@@ -4273,7 +4273,7 @@ fn delete_exact_windows_cleanup_file(
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
-fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
+pub(crate) fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
     let metadata = fs::symlink_metadata(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(VR_DOWNLOAD_DESTINATION_CONFLICT);
@@ -5110,7 +5110,7 @@ fn validate_organization_component_length(value: &str) -> Result<(), &'static st
     }
 }
 
-fn validate_portable_organization_component(value: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_portable_organization_component(value: &str) -> Result<(), &'static str> {
     let reserved_base = value.split('.').next().unwrap_or(value);
     let reserved_name = reserved_base.to_ascii_uppercase();
     let is_reserved = matches!(
@@ -5565,7 +5565,7 @@ pub fn dismiss_organization(state: &VrDownloadState) -> Result<(), &'static str>
 }
 
 #[cfg(target_os = "macos")]
-fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
     unsafe extern "C" {
@@ -5587,7 +5587,7 @@ fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()>
 }
 
 #[cfg(target_os = "windows")]
-fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "Kernel32")]
@@ -5613,7 +5613,7 @@ fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()>
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
     match fs::symlink_metadata(destination) {
         Ok(_) => {
             return Err(io::Error::new(

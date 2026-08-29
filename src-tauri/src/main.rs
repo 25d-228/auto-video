@@ -45,7 +45,8 @@ use fanza_catalog::{
     invalidate_preview as invalidate_fanza_preview_with, FanzaCatalogRequest, FanzaCatalogState,
 };
 use filename_normalization::{
-    apply as apply_filename_normalization_with, dismiss as dismiss_filename_normalization_with,
+    apply_with_current as apply_filename_normalization_with,
+    dismiss as dismiss_filename_normalization_with,
     plan_scan_generation as filename_normalization_plan_scan_generation,
     production_audit as audit_filename_normalization_with,
     recovery_status as filename_normalization_recovery_status, FilenameNormalizationState,
@@ -67,6 +68,7 @@ use library_presentation::{
     cover_request_is_current as library_cover_request_is_current,
     fetch_cover as fetch_library_presentation_cover_with,
     invalidate_cover as invalidate_library_presentation_cover_with,
+    invalidate_filename_authority as invalidate_library_filename_authority,
     resolve_cover as resolve_library_cover_with, resolve_metadata as resolve_library_metadata_with,
     LibraryItemAuthority, LibraryPresentationCategory, LibraryPresentationState,
     LIBRARY_PRESENTATION_FAILED, LIBRARY_PRESENTATION_STALE,
@@ -2807,14 +2809,17 @@ async fn apply_library_filename_normalization(
     download_state: tauri::State<'_, VrDownloadState>,
     vr_state: tauri::State<'_, VrLibraryState>,
     normalization_state: tauri::State<'_, FilenameNormalizationState>,
+    presentation_state: tauri::State<'_, LibraryPresentationState>,
 ) -> Result<Vec<String>, String> {
     let category = NormalizationCategory::parse(&category)
         .ok_or_else(|| filename_normalization::NORMALIZATION_STALE.to_owned())?;
     let recovery_path = filename_normalization_recovery_path(&app)?;
+    let presentation_cache_path = library_presentation_cache_path(&app)?;
     let adult_state = adult_state.inner().clone();
     let download_state = download_state.inner().clone();
     let vr_state = vr_state.inner().clone();
     let normalization_state = normalization_state.inner().clone();
+    let presentation_state = presentation_state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let scan_generation =
             filename_normalization_plan_scan_generation(&normalization_state, category, &plan_id)
@@ -2832,13 +2837,35 @@ async fn apply_library_filename_normalization(
                     .map_err(str::to_owned)?;
             }
         }
-        let (applied_category, _, _affected_codes) = apply_filename_normalization_with(
+        let scan_is_current = || match category {
+            NormalizationCategory::Adult => {
+                adult_normalization_snapshot(&adult_state, scan_generation).is_ok()
+            }
+            NormalizationCategory::Vr => configured_vr_folder(&download_state)
+                .ok()
+                .flatten()
+                .is_some_and(|folder| {
+                    vr_normalization_snapshot(&vr_state, scan_generation, &folder).is_ok()
+                }),
+        };
+        let (applied_category, _, affected_codes) = apply_filename_normalization_with(
             &normalization_state,
             &download_state,
             &recovery_path,
             category,
             &plan_id,
             &selected_entry_ids,
+            scan_is_current,
+        )
+        .map_err(str::to_owned)?;
+        invalidate_library_filename_authority(
+            &presentation_state,
+            &presentation_cache_path,
+            match applied_category {
+                NormalizationCategory::Adult => LibraryPresentationCategory::Adult,
+                NormalizationCategory::Vr => LibraryPresentationCategory::Vr,
+            },
+            &affected_codes,
         )
         .map_err(str::to_owned)?;
         match applied_category {

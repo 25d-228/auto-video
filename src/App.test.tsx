@@ -3363,7 +3363,8 @@ describe("parsed Adult Library and Dashboard", () => {
     const selection = within(dialog).getByRole("checkbox", {
       name: "Select ADLT-123 for normalization",
     });
-    expect((selection as HTMLInputElement).checked).toBe(true);
+    expect((selection as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(selection);
     fireEvent.click(within(dialog).getByRole("button", { name: "Review selected" }));
     fireEvent.click(within(dialog).getByRole("button", { name: "Confirm 1 rename" }));
 
@@ -3379,6 +3380,60 @@ describe("parsed Adult Library and Dashboard", () => {
       selectedEntryIds: ["b".repeat(40)],
     });
     expect(JSON.stringify(applyCall?.[1])).not.toContain("ADLT-123.mp4");
+  });
+
+  it("makes a partial filename selection explicit in confirmation", async () => {
+    loadAdultFolderMock.mockResolvedValue(["ready", "/Adult"]);
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/ADLT-123.mp4",
+      "ADLT-123.mp4",
+      "1",
+    ]);
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { level: 3, name: "ADLT-123" });
+    invokeMock.mockImplementationOnce(() =>
+      Promise.resolve([
+        "filename-normalization-v1",
+        "a".repeat(40),
+        "adult",
+        "1",
+        "2",
+        "b".repeat(40),
+        "ready",
+        "ADLT-123",
+        "FANZA",
+        "adlt00123",
+        "ADLT-0123",
+        "Exact FANZA proof.",
+        "1",
+        "ADLT-123.mp4",
+        "ADLT-0123.mp4",
+        "c".repeat(40),
+        "ready",
+        "ADLT-124",
+        "FANZA",
+        "adlt00124",
+        "ADLT-0124",
+        "Exact FANZA proof.",
+        "1",
+        "ADLT-124.mp4",
+        "ADLT-0124.mp4",
+      ]),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Normalize filenames" }));
+    const dialog = await screen.findByRole("dialog", { name: "Normalize filenames" });
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "Select ADLT-124 for normalization",
+      }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Review selected" }));
+    expect(within(dialog).getByText("1 selected filename shown for confirmation.")).toBeTruthy();
+    expect(within(dialog).getByText("ADLT-124.mp4")).toBeTruthy();
+    expect(within(dialog).queryByText("ADLT-123.mp4")).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "Confirm 1 rename" })).toBeTruthy();
   });
 
   it("distinguishes an unconfigured Adult Library without scanning or querying storage", async () => {

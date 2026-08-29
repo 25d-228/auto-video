@@ -4,7 +4,7 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use unicode_normalization::UnicodeNormalization;
@@ -13,6 +13,7 @@ use crate::{
     fanza_catalog, javdb_catalog,
     library_scan::is_supported_library_media,
     vr_download::{
+        file_fingerprint, rename_without_overwrite, validate_portable_organization_component,
         with_unowned_adult_library_path, with_unowned_vr_library_path, VrDownloadState,
         VrLibraryTrashOwnershipError,
     },
@@ -92,6 +93,7 @@ struct RenameMember {
     destination_relative: String,
     size: u64,
     modified: SystemTime,
+    fingerprint: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,10 +119,26 @@ struct NormalizationPlan {
 struct NormalizationContext {
     generation: u64,
     plan: Option<NormalizationPlan>,
+    active_operation: Option<u64>,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct FilenameNormalizationState(Arc<Mutex<NormalizationContext>>);
+
+struct OperationGuard {
+    state: FilenameNormalizationState,
+    generation: u64,
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut context) = self.state.0.lock() {
+            if context.active_operation == Some(self.generation) {
+                context.active_operation = None;
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FanzaExactResult {
@@ -154,14 +172,14 @@ fn fanza_transport_id(category: NormalizationCategory, code: &str) -> Option<Str
         return None;
     }
     let (_, number) = forms.identity.split_once('-')?;
+    // The public GraphQL boundary has no maker-code lookup. It accepts one bounded
+    // family-derived transport candidate, which is never identity authority: the
+    // returned transport ID, category, and maker code must all validate below.
     let prefix = match (category, forms.prefix.as_str()) {
-        (NormalizationCategory::Adult, "CAWB") | (NormalizationCategory::Vr, "DSVR") => {
-            forms.prefix.to_ascii_lowercase()
-        }
         (NormalizationCategory::Vr, "3DSVR") => {
             format!("1{}", forms.prefix.to_ascii_lowercase())
         }
-        _ => return None,
+        _ => forms.prefix.to_ascii_lowercase(),
     };
     Some(format!("{prefix}{number:0>5}"))
 }
@@ -361,15 +379,20 @@ fn multipart_label(title: &str, allow_pt: bool) -> Option<String> {
             {
                 continue;
             }
+            let mut continuation = cursor;
+            while continuation < bytes.len()
+                && matches!(bytes[continuation], b' ' | b'_' | b'-' | b'+' | b'.' | b'/')
+            {
+                continuation += 1;
+            }
+            if bytes.get(continuation).is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
             let number = title[number_start..cursor].parse::<u64>().ok()?;
             matches.push((title[index..cursor].to_owned(), number));
         }
     }
-    let identities = matches
-        .iter()
-        .map(|(_, number)| *number)
-        .collect::<HashSet<_>>();
-    (identities.len() == 1).then(|| matches[0].0.clone())
+    (matches.len() == 1).then(|| matches[0].0.clone())
 }
 
 fn proposed_members(
@@ -420,6 +443,8 @@ fn proposed_members(
             Some(label) => format!("{verified_code} - {label}.{extension}"),
             None => format!("{verified_code}.{extension}"),
         };
+        validate_portable_organization_component(&destination_name)
+            .map_err(|_| "The proposed filename is not one portable path component.".to_owned())?;
         let parent = source
             .parent()
             .ok_or_else(|| "The current file has no safe parent directory.".to_owned())?;
@@ -436,6 +461,35 @@ fn proposed_members(
                 "The proposed filenames collide after Unicode and case folding.".to_owned(),
             );
         }
+        let selected_sources = files
+            .iter()
+            .map(|selected| selected.path.as_path())
+            .collect::<HashSet<_>>();
+        let folded_destination = folded_path(
+            destination
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| "The proposed filename is not valid Unicode.".to_owned())?,
+        );
+        for sibling in fs::read_dir(parent)
+            .map_err(|_| "The destination directory cannot be inspected safely.".to_owned())?
+        {
+            let sibling = sibling
+                .map_err(|_| "The destination directory cannot be inspected safely.".to_owned())?;
+            let sibling_path = sibling.path();
+            if selected_sources.contains(sibling_path.as_path()) {
+                continue;
+            }
+            let sibling_name = sibling.file_name();
+            let sibling_name = sibling_name
+                .to_str()
+                .ok_or_else(|| "An unrelated sibling filename is not valid Unicode.".to_owned())?;
+            if folded_path(sibling_name) == folded_destination {
+                return Err(
+                    "The proposed filename collides with an unrelated existing sibling.".to_owned(),
+                );
+            }
+        }
         let source_relative = file.relative_path.clone();
         if filename.is_empty() || source_relative.is_empty() {
             return Err("The current relative filename is unavailable.".to_owned());
@@ -447,6 +501,8 @@ fn proposed_members(
             destination_relative,
             size: file.size,
             modified: file.modified,
+            fingerprint: file_fingerprint(&file.path)
+                .map_err(|_| "The current file identity cannot be retained safely.".to_owned())?,
         });
     }
     Ok(members)
@@ -462,6 +518,7 @@ fn unchanged_members(files: &[NormalizationFile]) -> Vec<RenameMember> {
             destination_relative: String::new(),
             size: file.size,
             modified: file.modified,
+            fingerprint: file_fingerprint(&file.path).unwrap_or_default(),
         })
         .collect()
 }
@@ -554,6 +611,7 @@ pub(crate) fn audit_with(
         let mut context = state.0.lock().map_err(|_| NORMALIZATION_FAILED)?;
         context.generation = context.generation.wrapping_add(1);
         context.plan = None;
+        context.active_operation = None;
         context.generation
     };
     let mut grouped = BTreeMap::<String, Vec<NormalizationFile>>::new();
@@ -575,6 +633,7 @@ pub(crate) fn audit_with(
                     destination_relative: String::new(),
                     size: file.size,
                     modified: file.modified,
+                    fingerprint: file_fingerprint(&file.path).unwrap_or_default(),
                 }],
             });
         }
@@ -614,13 +673,17 @@ pub(crate) fn audit_with(
                         .to_owned(),
                 members: files
                     .into_iter()
-                    .map(|file| RenameMember {
-                        source: file.path.clone(),
-                        destination: file.path,
-                        source_relative: file.relative_path,
-                        destination_relative: String::new(),
-                        size: file.size,
-                        modified: file.modified,
+                    .map(|file| {
+                        let fingerprint = file_fingerprint(&file.path).unwrap_or_default();
+                        RenameMember {
+                            source: file.path.clone(),
+                            destination: file.path,
+                            source_relative: file.relative_path,
+                            destination_relative: String::new(),
+                            size: file.size,
+                            modified: file.modified,
+                            fingerprint,
+                        }
                     })
                     .collect(),
             });
@@ -760,6 +823,7 @@ pub(crate) fn dismiss(state: &FilenameNormalizationState) -> Result<(), &'static
     let mut context = state.0.lock().map_err(|_| NORMALIZATION_FAILED)?;
     context.generation = context.generation.wrapping_add(1);
     context.plan = None;
+    context.active_operation = None;
     Ok(())
 }
 
@@ -804,6 +868,7 @@ fn exact_current_member(member: &RenameMember, folder: &Path) -> bool {
         && is_supported_library_media(&member.destination)
         && metadata.len() == member.size
         && metadata.modified().ok() == Some(member.modified)
+        && file_fingerprint(&member.source).ok().as_deref() == Some(&member.fingerprint)
         && fs::canonicalize(&member.source).ok().as_deref() == Some(member.source.as_path())
 }
 
@@ -831,11 +896,19 @@ fn recovery_bytes(plan: &NormalizationPlan, entries: &[AuditEntry]) -> Vec<u8> {
                 .join(format!(".auto-video-normalize-{token}.pending"))
                 .to_string_lossy()
                 .into_owned();
+            let modified = member
+                .modified
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
             lines.push(format!(
-                "{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 hex_encode(&member.source_relative),
                 hex_encode(&member.destination_relative),
-                hex_encode(&staging_relative)
+                hex_encode(&staging_relative),
+                member.size,
+                modified.as_secs(),
+                modified.subsec_nanos(),
+                hex_encode(&member.fingerprint),
             ));
         }
     }
@@ -848,11 +921,8 @@ fn write_recovery(path: &Path, plan: &NormalizationPlan, entries: &[AuditEntry])
     if fs::symlink_metadata(path).is_ok() {
         return Err(());
     }
-    let temporary = path.with_extension("next");
+    let temporary = path.with_extension(format!("next-{}", plan.id));
     match fs::symlink_metadata(&temporary) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            fs::remove_file(&temporary).map_err(|_| ())?;
-        }
         Ok(_) => return Err(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(()),
@@ -865,7 +935,22 @@ fn write_recovery(path: &Path, plan: &NormalizationPlan, entries: &[AuditEntry])
     file.write_all(&recovery_bytes(plan, entries))
         .map_err(|_| ())?;
     file.sync_all().map_err(|_| ())?;
-    fs::rename(&temporary, path).map_err(|_| ())
+    rename_without_overwrite(&temporary, path).map_err(|_| ())?;
+    sync_directory(parent)
+}
+
+fn sync_directory(path: &Path) -> Result<(), ()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| ())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn hex_decode(value: &str) -> Option<String> {
@@ -891,14 +976,46 @@ fn safe_relative(value: &str) -> bool {
 }
 
 fn remove_recovery(path: &Path) -> Result<(), ()> {
+    let parent = path.parent().ok_or(())?;
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_directory(parent),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(()),
     }
 }
 
+fn recovery_file_matches(
+    folder: &Path,
+    relative: &str,
+    size: u64,
+    modified: SystemTime,
+    fingerprint: &str,
+) -> bool {
+    let path = folder.join(relative);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.len() == size
+        && metadata.modified().ok() == Some(modified)
+        && file_fingerprint(&path).ok().as_deref() == Some(fingerprint)
+        && fs::canonicalize(&path)
+            .ok()
+            .is_some_and(|canonical| canonical.starts_with(folder) && canonical == path)
+}
+
 pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() <= 8 * 1024 * 1024 => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(vec!["none".to_owned()]);
+        }
+        _ => return Err(NORMALIZATION_RECOVERY),
+    }
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -919,7 +1036,12 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         .ok_or(NORMALIZATION_RECOVERY)?;
     let folder = hex_decode(lines.next().ok_or(NORMALIZATION_RECOVERY)?)
         .map(PathBuf::from)
-        .filter(|value| value.is_absolute())
+        .filter(|value| {
+            value.is_absolute()
+                && fs::canonicalize(value).ok().as_deref() == Some(value.as_path())
+                && fs::symlink_metadata(value)
+                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        })
         .ok_or(NORMALIZATION_RECOVERY)?;
     let mut paths = Vec::new();
     let mut records = 0usize;
@@ -930,6 +1052,22 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         let source = fields.next().ok_or(NORMALIZATION_RECOVERY)?;
         let destination = fields.next().ok_or(NORMALIZATION_RECOVERY)?;
         let staging = fields.next().ok_or(NORMALIZATION_RECOVERY)?;
+        let size = fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(NORMALIZATION_RECOVERY)?;
+        let modified_secs = fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(NORMALIZATION_RECOVERY)?;
+        let modified_nanos = fields
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value < 1_000_000_000)
+            .ok_or(NORMALIZATION_RECOVERY)?;
+        let fingerprint = hex_decode(fields.next().ok_or(NORMALIZATION_RECOVERY)?)
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .ok_or(NORMALIZATION_RECOVERY)?;
         if fields.next().is_some() {
             return Err(NORMALIZATION_RECOVERY);
         }
@@ -942,14 +1080,30 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         let staging = hex_decode(staging)
             .filter(|value| safe_relative(value))
             .ok_or(NORMALIZATION_RECOVERY)?;
+        if !is_supported_library_media(&folder.join(&source))
+            || !is_supported_library_media(&folder.join(&destination))
+        {
+            return Err(NORMALIZATION_RECOVERY);
+        }
+        let modified = UNIX_EPOCH
+            .checked_add(std::time::Duration::new(modified_secs, modified_nanos))
+            .ok_or(NORMALIZATION_RECOVERY)?;
         let current = [&source, &staging, &destination]
             .into_iter()
-            .filter(|relative| fs::symlink_metadata(folder.join(relative)).is_ok())
+            .filter(|relative| {
+                recovery_file_matches(&folder, relative, size, modified, &fingerprint)
+            })
             .cloned()
             .collect::<Vec<_>>();
+        let foreign = [&source, &staging, &destination]
+            .into_iter()
+            .any(|relative| {
+                fs::symlink_metadata(folder.join(relative)).is_ok()
+                    && !recovery_file_matches(&folder, relative, size, modified, &fingerprint)
+            });
         records += 1;
-        every_source &= current.len() == 1 && current[0] == source;
-        every_destination &= current.len() == 1 && current[0] == destination;
+        every_source &= !foreign && current.len() == 1 && current[0] == source;
+        every_destination &= !foreign && current.len() == 1 && current[0] == destination;
         if current.is_empty() {
             paths.push(source);
             paths.push(destination);
@@ -984,17 +1138,27 @@ enum RenameExecution {
     RecoveryRequired,
 }
 
+#[cfg(test)]
 fn execute_rename_plan(
     plan: &NormalizationPlan,
     entries: &[AuditEntry],
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> RenameExecution {
+    execute_rename_plan_while_current(plan, entries, &mut rename, || true)
+}
+
+fn execute_rename_plan_while_current(
+    plan: &NormalizationPlan,
+    entries: &[AuditEntry],
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    is_current: impl Fn() -> bool,
 ) -> RenameExecution {
     let mut staged = Vec::<(PathBuf, RenameMember)>::new();
     let mut completed = Vec::<RenameMember>::new();
     let operation = (|| -> Result<(), ()> {
         for entry in entries {
             for member in &entry.members {
-                if !exact_current_member(member, &plan.folder) {
+                if !is_current() || !exact_current_member(member, &plan.folder) {
                     return Err(());
                 }
                 let parent = member.source.parent().ok_or(())?;
@@ -1008,6 +1172,9 @@ fn execute_rename_plan(
             }
         }
         for (temporary, member) in &staged {
+            if !is_current() {
+                return Err(());
+            }
             let metadata = fs::symlink_metadata(temporary).map_err(|_| ())?;
             if !metadata.is_file()
                 || metadata.file_type().is_symlink()
@@ -1046,24 +1213,39 @@ fn execute_rename_plan(
     }
 }
 
-pub(crate) fn apply(
+pub(crate) fn apply_with_current(
     state: &FilenameNormalizationState,
     download_state: &VrDownloadState,
     recovery_path: &Path,
     category: NormalizationCategory,
     plan_id: &str,
     selected_ids: &[String],
+    is_scan_current: impl Fn() -> bool,
 ) -> Result<(NormalizationCategory, u64, Vec<String>), &'static str> {
     if selected_ids.is_empty() || selected_ids.len() > MAX_AUDIT_ITEMS {
         return Err(NORMALIZATION_STALE);
     }
-    let plan = {
-        let context = state.0.lock().map_err(|_| NORMALIZATION_FAILED)?;
-        context.plan.clone().ok_or(NORMALIZATION_STALE)?
+    let (plan, operation_generation) = {
+        let mut context = state.0.lock().map_err(|_| NORMALIZATION_FAILED)?;
+        let plan = context.plan.take().ok_or(NORMALIZATION_STALE)?;
+        if plan.id != plan_id || plan.category != category || !is_scan_current() {
+            return Err(NORMALIZATION_STALE);
+        }
+        let generation = context.generation;
+        context.active_operation = Some(generation);
+        (plan, generation)
     };
-    if plan.id != plan_id || plan.category != category {
-        return Err(NORMALIZATION_STALE);
-    }
+    let operation_is_current = || {
+        is_scan_current()
+            && state.0.lock().is_ok_and(|context| {
+                context.generation == operation_generation
+                    && context.active_operation == Some(operation_generation)
+            })
+    };
+    let _operation_guard = OperationGuard {
+        state: state.clone(),
+        generation: operation_generation,
+    };
     let selected = selected_ids.iter().cloned().collect::<HashSet<_>>();
     if selected.len() != selected_ids.len() {
         return Err(NORMALIZATION_STALE);
@@ -1122,10 +1304,16 @@ pub(crate) fn apply(
             }
         }
     }
+    if !operation_is_current() {
+        return Err(NORMALIZATION_STALE);
+    }
     write_recovery(recovery_path, &plan, &entries).map_err(|_| NORMALIZATION_RECOVERY)?;
-    match execute_rename_plan(&plan, &entries, |source, destination| {
-        fs::rename(source, destination)
-    }) {
+    match execute_rename_plan_while_current(
+        &plan,
+        &entries,
+        rename_without_overwrite,
+        operation_is_current,
+    ) {
         RenameExecution::Complete => {}
         RenameExecution::RolledBack => {
             let _ = remove_recovery(recovery_path);
@@ -1138,8 +1326,27 @@ pub(crate) fn apply(
         .iter()
         .filter_map(|entry| entry.local_code.clone())
         .collect::<Vec<_>>();
-    dismiss(state)?;
     Ok((category, plan.scan_generation, affected_codes))
+}
+
+#[cfg(test)]
+fn apply(
+    state: &FilenameNormalizationState,
+    download_state: &VrDownloadState,
+    recovery_path: &Path,
+    category: NormalizationCategory,
+    plan_id: &str,
+    selected_ids: &[String],
+) -> Result<(NormalizationCategory, u64, Vec<String>), &'static str> {
+    apply_with_current(
+        state,
+        download_state,
+        recovery_path,
+        category,
+        plan_id,
+        selected_ids,
+        || true,
+    )
 }
 
 pub(crate) fn production_audit(
@@ -1225,8 +1432,8 @@ mod tests {
             Some("13dsvr01871")
         );
         assert_eq!(
-            fanza_transport_id(NormalizationCategory::Adult, "DSVR-69"),
-            None
+            fanza_transport_id(NormalizationCategory::Adult, "DSVR-69").as_deref(),
+            Some("dsvr00069")
         );
     }
 
@@ -1380,6 +1587,8 @@ mod tests {
             modified: metadata
                 .modified()
                 .expect("outside modified time must exist"),
+            fingerprint: file_fingerprint(&outside.0.join("CAWB-1.mp4"))
+                .expect("outside fingerprint must exist"),
         };
         assert!(!exact_current_member(&outside_member, &fixture.0));
         let unsupported = normalization_file(&fixture.0, "CAWB-1.txt", Some("CAWB-1"));
@@ -1394,6 +1603,8 @@ mod tests {
                 modified: unsupported_metadata
                     .modified()
                     .expect("modified time must exist"),
+                fingerprint: file_fingerprint(&fixture.0.join("CAWB-1.txt"))
+                    .expect("unsupported fingerprint must exist"),
             },
             &fixture.0
         ));
@@ -1529,6 +1740,7 @@ mod tests {
             b"unrelated"
         );
         fs::remove_file(&destination).expect("collision fixture must be removed");
+        state.0.lock().expect("state must lock").plan = Some(plan.clone());
         apply(
             &state,
             &download_state,
@@ -1581,6 +1793,8 @@ mod tests {
                 destination_relative: "DSVR-069.mp4".to_owned(),
                 size: file.size,
                 modified: file.modified,
+                fingerprint: file_fingerprint(&fixture.0.join("DSVR-69.mp4"))
+                    .expect("fingerprint must exist"),
             }],
         };
         write_recovery(&recovery, &plan, &[entry]).expect("recovery must be durable");
@@ -1685,6 +1899,7 @@ mod tests {
             destination_relative: "DSVR-069.mp4".to_owned(),
             size: metadata.len(),
             modified: metadata.modified().expect("modified time must exist"),
+            fingerprint: file_fingerprint(&file.path).expect("fingerprint must exist"),
         };
         let plan = NormalizationPlan {
             id: hex_sha1(b"case-only-plan"),
@@ -1728,8 +1943,303 @@ mod tests {
                 destination_relative: "CAWB-001.mp4".to_owned(),
                 size: metadata.len(),
                 modified: metadata.modified().expect("modified time must exist"),
+                fingerprint: file_fingerprint(&target.path).expect("fingerprint must exist"),
             },
             &fixture.0
         ));
+    }
+
+    #[test]
+    fn supported_non_special_fanza_families_dispatch_before_javdb() {
+        for (category, code, content_id, content_type, maker) in [
+            (
+                NormalizationCategory::Adult,
+                "ADLT-123",
+                "adlt00123",
+                "TWO_DIMENSION",
+                "ADLT-0123",
+            ),
+            (
+                NormalizationCategory::Vr,
+                "MDVR-419",
+                "mdvr00419",
+                "VR",
+                "MDVR-0419",
+            ),
+        ] {
+            let mut fanza_calls = 0;
+            let mut javdb_calls = 0;
+            let proof = resolve_provider_proof(
+                category,
+                code,
+                &mut |body| {
+                    fanza_calls += 1;
+                    assert!(body.contains(content_id));
+                    Ok(format!(
+                        r#"{{"data":{{"ppvContent":{{"id":"{content_id}","contentType":"{content_type}","makerContentId":"{maker}"}}}}}}"#
+                    ))
+                },
+                &mut |_| {
+                    javdb_calls += 1;
+                    Err(ProviderRequestError::Provider)
+                },
+            )
+            .expect("the exact FANZA item must resolve")
+            .expect("the exact FANZA proof must exist");
+            assert_eq!(proof.display_code, maker);
+            assert_eq!(fanza_calls, 1);
+            assert_eq!(javdb_calls, 0);
+        }
+    }
+
+    #[test]
+    fn non_special_fanza_no_match_and_missing_maker_are_the_only_javdb_fallbacks() {
+        for (category, code, content_id, content_type, display, tag) in [
+            (
+                NormalizationCategory::Adult,
+                "ADLT-123",
+                "adlt00123",
+                "TWO_DIMENSION",
+                "ADLT-0123",
+                None,
+            ),
+            (
+                NormalizationCategory::Vr,
+                "MDVR-419",
+                "mdvr00419",
+                "VR",
+                "MDVR-0419",
+                Some("212"),
+            ),
+        ] {
+            for fanza in [
+                r#"{"data":{"ppvContent":null}}"#.to_owned(),
+                format!(
+                    r#"{{"data":{{"ppvContent":{{"id":"{content_id}","contentType":"{content_type}","makerContentId":null}}}}}}"#
+                ),
+            ] {
+                let mut fanza_calls = 0;
+                let mut javdb_calls = 0;
+                let proof = resolve_provider_proof(
+                    category,
+                    code,
+                    &mut |body| {
+                        fanza_calls += 1;
+                        assert!(body.contains(content_id));
+                        Ok(fanza.clone())
+                    },
+                    &mut |url| {
+                        javdb_calls += 1;
+                        if url.contains("/movies/") {
+                            let tags = tag.map_or_else(
+                                || "[]".to_owned(),
+                                |id| format!(r#"[{{"id":"{id}"}}]"#),
+                            );
+                            Ok(format!(r#"{{"success":1,"data":{{"movie":{{"id":"item","number":"{display}","tags":{tags},"cover_url":null,"thumb_url":null}}}}}}"#))
+                        } else {
+                            Ok(format!(r#"{{"success":1,"data":{{"movies":[{{"id":"item","number":"{display}"}}]}}}}"#))
+                        }
+                    },
+                )
+                .expect("the allowed fallback must complete")
+                .expect("JavDB must prove the exact item");
+                assert_eq!(proof.provider, "JavDB");
+                assert_eq!(fanza_calls, 1);
+                assert!(javdb_calls >= 2);
+            }
+        }
+    }
+
+    #[test]
+    fn non_special_fanza_failure_or_conflict_never_falls_through() {
+        let documents = [
+            Err(ProviderRequestError::Network),
+            Ok(r#"{"data":{"ppvContent":{"id":"mdvr00419","contentType":"VR","makerContentId":"MDVR-0420"}}}"#.to_owned()),
+        ];
+        for document in documents {
+            let mut javdb_calls = 0;
+            let result = resolve_provider_proof(
+                NormalizationCategory::Vr,
+                "MDVR-419",
+                &mut |_| document.clone(),
+                &mut |_| {
+                    javdb_calls += 1;
+                    Err(ProviderRequestError::Provider)
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(javdb_calls, 0);
+        }
+    }
+
+    #[test]
+    fn compact_and_repeated_multipart_labels_are_rejected_for_both_categories() {
+        for allow_pt in [false, true] {
+            assert_eq!(multipart_label("Feature Part 1-2", allow_pt), None);
+            assert_eq!(multipart_label("Feature CD1+2", allow_pt), None);
+            assert_eq!(multipart_label("Feature Part 01 CD 01", allow_pt), None);
+        }
+    }
+
+    #[test]
+    fn portable_component_limits_and_unicode_sibling_collisions_are_preflighted() {
+        assert!(validate_portable_organization_component(&"x".repeat(255)).is_ok());
+        assert!(validate_portable_organization_component(&"x".repeat(256)).is_err());
+
+        let fixture = Fixture::new();
+        let file = normalization_file(&fixture.0, "CAWB-1.mp4", Some("CAWB-1"));
+        fs::write(fixture.0.join("CAWB-001.MP4"), b"case collision")
+            .expect("case collision fixture must exist");
+        let snapshot = NormalizationSnapshot {
+            category: NormalizationCategory::Adult,
+            folder: fixture.0.clone(),
+            generation: 1,
+            files: vec![file.clone()],
+        };
+        assert!(proposed_members(&snapshot, std::slice::from_ref(&file), "CAWB-001").is_err());
+        fs::remove_file(fixture.0.join("CAWB-001.MP4")).expect("case fixture must remove");
+        fs::write(
+            fixture.0.join("CAWB-001 - Cafe\u{301}.mp4"),
+            b"unicode collision",
+        )
+        .expect("Unicode collision fixture must exist");
+        let part = normalization_file(&fixture.0, "CAWB-1 - Caf\u{e9}.mp4", Some("CAWB-1"));
+        let second = normalization_file(&fixture.0, "CAWB-1 - Part 02.mp4", Some("CAWB-1"));
+        let multipart_snapshot = NormalizationSnapshot {
+            files: vec![part.clone(), second.clone()],
+            ..snapshot
+        };
+        assert!(proposed_members(&multipart_snapshot, &[part, second], "CAWB-001").is_err());
+    }
+
+    #[test]
+    fn no_replace_race_rolls_back_without_touching_the_raced_destination() {
+        let fixture = Fixture::new();
+        let file = normalization_file(&fixture.0, "CAWB-1.mp4", Some("CAWB-1"));
+        let snapshot = NormalizationSnapshot {
+            category: NormalizationCategory::Adult,
+            folder: fixture.0.clone(),
+            generation: 1,
+            files: vec![file.clone()],
+        };
+        let member = proposed_members(&snapshot, std::slice::from_ref(&file), "CAWB-001")
+            .expect("proposal must resolve")
+            .remove(0);
+        let plan = NormalizationPlan {
+            id: hex_sha1(b"race-plan"),
+            category: snapshot.category,
+            folder: snapshot.folder,
+            scan_generation: 1,
+            entries: Vec::new(),
+        };
+        let entry = AuditEntry {
+            id: hex_sha1(b"race-entry"),
+            status: "ready",
+            local_code: Some("CAWB-1".to_owned()),
+            proof: None,
+            reason: "fixture".to_owned(),
+            members: vec![member.clone()],
+        };
+        let mut calls = 0;
+        assert_eq!(
+            execute_rename_plan(&plan, &[entry], |source, destination| {
+                calls += 1;
+                if calls == 2 {
+                    fs::write(destination, b"raced unrelated file")?;
+                }
+                rename_without_overwrite(source, destination)
+            }),
+            RenameExecution::RolledBack
+        );
+        assert!(member.source.exists());
+        assert_eq!(
+            fs::read(member.destination).expect("race must remain"),
+            b"raced unrelated file"
+        );
+    }
+
+    #[test]
+    fn stale_operation_rolls_back_before_the_next_mutation() {
+        use std::cell::Cell;
+
+        let fixture = Fixture::new();
+        let file = normalization_file(&fixture.0, "DSVR-69.mp4", Some("DSVR-69"));
+        let snapshot = NormalizationSnapshot {
+            category: NormalizationCategory::Vr,
+            folder: fixture.0.clone(),
+            generation: 1,
+            files: vec![file.clone()],
+        };
+        let member = proposed_members(&snapshot, std::slice::from_ref(&file), "DSVR-069")
+            .expect("proposal must resolve")
+            .remove(0);
+        let plan = NormalizationPlan {
+            id: hex_sha1(b"stale-plan"),
+            category: snapshot.category,
+            folder: snapshot.folder,
+            scan_generation: 1,
+            entries: Vec::new(),
+        };
+        let entry = AuditEntry {
+            id: hex_sha1(b"stale-entry"),
+            status: "ready",
+            local_code: Some("DSVR-69".to_owned()),
+            proof: None,
+            reason: "fixture".to_owned(),
+            members: vec![member.clone()],
+        };
+        let checks = Cell::new(0);
+        assert_eq!(
+            execute_rename_plan_while_current(&plan, &[entry], rename_without_overwrite, || {
+                let current = checks.get() == 0;
+                checks.set(checks.get() + 1);
+                current
+            },),
+            RenameExecution::RolledBack
+        );
+        assert!(member.source.exists());
+        assert!(!member.destination.exists());
+    }
+
+    #[test]
+    fn recovery_never_accepts_or_discards_an_unrelated_replacement() {
+        let fixture = Fixture::new();
+        let recovery = fixture.0.join("recovery");
+        let file = normalization_file(&fixture.0, "DSVR-69.mp4", Some("DSVR-69"));
+        let snapshot = NormalizationSnapshot {
+            category: NormalizationCategory::Vr,
+            folder: fixture.0.clone(),
+            generation: 1,
+            files: vec![file.clone()],
+        };
+        let member = proposed_members(&snapshot, std::slice::from_ref(&file), "DSVR-069")
+            .expect("proposal must resolve")
+            .remove(0);
+        let plan = NormalizationPlan {
+            id: hex_sha1(b"replacement-plan"),
+            category: snapshot.category,
+            folder: snapshot.folder,
+            scan_generation: 1,
+            entries: Vec::new(),
+        };
+        let entry = AuditEntry {
+            id: hex_sha1(b"replacement-entry"),
+            status: "ready",
+            local_code: Some("DSVR-69".to_owned()),
+            proof: None,
+            reason: "fixture".to_owned(),
+            members: vec![member.clone()],
+        };
+        write_recovery(&recovery, &plan, &[entry]).expect("record must persist");
+        rename_without_overwrite(&member.source, &member.destination)
+            .expect("exact member must move");
+        fs::write(&member.source, b"unrelated replacement").expect("replacement must be created");
+        let status = recovery_status(&recovery).expect("record must remain readable");
+        assert_eq!(status.first().map(String::as_str), Some("attention"));
+        assert!(recovery.exists());
+        assert_eq!(
+            fs::read(&member.source).expect("replacement must remain"),
+            b"unrelated replacement"
+        );
     }
 }

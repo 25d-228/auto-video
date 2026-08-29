@@ -9199,6 +9199,10 @@ function FilenameNormalizationDialog({
   const triggerId = state.triggerId;
   const categoryLabel = category === "adult" ? "Adult" : "VR";
   const readyCount = plan?.entries.filter((entry) => entry.status === "ready").length ?? 0;
+  const visibleEntries =
+    plan === null || state.status === "preview"
+      ? plan?.entries ?? []
+      : plan.entries.filter((entry) => selected.has(entry.id));
 
   return (
     <Dialog.Portal>
@@ -9241,10 +9245,12 @@ function FilenameNormalizationDialog({
           ) : plan === null ? null : (
             <>
               <p className="filename-normalization__summary" role="status">
-                {readyCount} ready to rename; {plan.entries.length - readyCount} unchanged or blocked.
+                {state.status === "preview"
+                  ? `${readyCount} ready to rename; ${plan.entries.length - readyCount} unchanged or blocked.`
+                  : `${selected.size} selected filename${selected.size === 1 ? "" : "s"} shown for confirmation.`}
               </p>
               <div className="filename-normalization__entries">
-                {plan.entries.map((entry) => (
+                {visibleEntries.map((entry) => (
                   <section className="filename-normalization__entry" key={entry.id}>
                     <div className="filename-normalization__entry-heading">
                       {state.status === "preview" && entry.status === "ready" ? (
@@ -11956,9 +11962,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
         setFilenameNormalizationState({
           status: "preview",
           plan,
-          selectedEntryIds: plan.entries
-            .filter((entry) => entry.status === "ready")
-            .map((entry) => entry.id),
+          selectedEntryIds: [],
           triggerId,
         });
       })

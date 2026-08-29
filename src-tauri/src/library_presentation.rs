@@ -1947,6 +1947,67 @@ fn remove_cache_entry(path: &Path, identity: &str) -> Result<(), ()> {
     Ok(())
 }
 
+pub(crate) fn invalidate_filename_authority(
+    state: &LibraryPresentationState,
+    cache_path: &Path,
+    category: LibraryPresentationCategory,
+    codes: &[String],
+) -> Result<(), &'static str> {
+    let identities = codes
+        .iter()
+        .filter_map(|code| crate::vr_torrent::canonical_product_code(code))
+        .collect::<HashSet<_>>();
+    if identities.is_empty() {
+        return Ok(());
+    }
+    {
+        let mut context = state.0.lock().map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+        context.covers.retain(|_, cover| {
+            cover.category != category
+                || crate::vr_torrent::canonical_product_code(&cover.code)
+                    .is_none_or(|identity| !identities.contains(&identity))
+        });
+        context.cover_requests.retain(|(entry_category, code), _| {
+            *entry_category != category
+                || crate::vr_torrent::canonical_product_code(code)
+                    .is_none_or(|identity| !identities.contains(&identity))
+        });
+        context.failed_cover_sources.retain(|_, failed| {
+            failed.category != category
+                || crate::vr_torrent::canonical_product_code(&failed.code)
+                    .is_none_or(|identity| !identities.contains(&identity))
+        });
+        context.metadata_seeds.retain(|key, _| {
+            key.category != category
+                || crate::vr_torrent::canonical_product_code(&key.code)
+                    .is_none_or(|identity| !identities.contains(&identity))
+        });
+        context.verified_identity_seeds.retain(|key, _| {
+            key.category != category
+                || crate::vr_torrent::canonical_product_code(&key.code)
+                    .is_none_or(|identity| !identities.contains(&identity))
+        });
+        context.identity_conflicts.retain(|key| {
+            key.category != category
+                || crate::vr_torrent::canonical_product_code(&key.code)
+                    .is_none_or(|identity| !identities.contains(&identity))
+        });
+    }
+    let cache_identities = load_cache(cache_path)
+        .into_iter()
+        .filter(|entry| {
+            entry.category == category
+                && crate::vr_torrent::canonical_product_code(&entry.code)
+                    .is_some_and(|identity| identities.contains(&identity))
+        })
+        .map(|entry| entry.identity)
+        .collect::<Vec<_>>();
+    for identity in cache_identities {
+        remove_cache_entry(cache_path, &identity).map_err(|_| LIBRARY_PRESENTATION_FAILED)?;
+    }
+    Ok(())
+}
+
 fn cache_entry_matches_authority(entry: &CacheEntry, authority: &LibraryItemAuthority) -> bool {
     entry.identity == authority.identity
         && entry.category == authority.category
@@ -6574,6 +6635,67 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn filename_reconciliation_removes_only_affected_memory_and_persistent_authority() {
+        let fixture = CacheFixture::new("filename-reconciliation");
+        let affected = authority(LibraryPresentationCategory::Vr);
+        let mut unrelated = affected.clone();
+        unrelated.identity = "b".repeat(40);
+        unrelated.code = "MDVR-420".to_owned();
+        unrelated.product_identity = "MDVR-420".to_owned();
+        let entry = |authority: &LibraryItemAuthority| CacheEntry {
+            identity: authority.identity.clone(),
+            category: authority.category,
+            code: authority.code.clone(),
+            identity_saved_at: 0,
+            verified_identity: None,
+            cover_saved_at: 1,
+            cover_state: "missing",
+            cover: None,
+            metadata_saved_at: 1,
+            metadata_state: "missing",
+            metadata: PresentationMetadata::default(),
+        };
+        write_cache(&fixture.path, &[entry(&affected), entry(&unrelated)])
+            .expect("cache fixture must persist");
+        let state = LibraryPresentationState::default();
+        {
+            let mut context = state.0.lock().expect("state must lock");
+            context.cover_requests.insert(
+                (affected.category, affected.code.clone()),
+                CoverRequestAuthority {
+                    active: true,
+                    generation: 1,
+                },
+            );
+            context.cover_requests.insert(
+                (unrelated.category, unrelated.code.clone()),
+                CoverRequestAuthority {
+                    active: true,
+                    generation: 2,
+                },
+            );
+        }
+        invalidate_filename_authority(
+            &state,
+            &fixture.path,
+            affected.category,
+            std::slice::from_ref(&affected.code),
+        )
+        .expect("affected filename authority must invalidate");
+        let context = state.0.lock().expect("state must remain readable");
+        assert!(!context
+            .cover_requests
+            .contains_key(&(affected.category, affected.code.clone())));
+        assert!(context
+            .cover_requests
+            .contains_key(&(unrelated.category, unrelated.code.clone())));
+        drop(context);
+        let cached = read_cache(&fixture.path).expect("remaining cache must be valid");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].identity, unrelated.identity);
     }
 
     #[test]
