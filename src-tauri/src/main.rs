@@ -49,6 +49,7 @@ use filename_normalization::{
     dismiss as dismiss_filename_normalization_with,
     plan_scan_generation as filename_normalization_plan_scan_generation,
     production_audit as audit_filename_normalization_with,
+    reconcile_committed_with as reconcile_filename_normalization_with,
     recovery_status as filename_normalization_recovery_status, FilenameNormalizationState,
     NormalizationCategory, NORMALIZATION_FAILED,
 };
@@ -2858,24 +2859,26 @@ async fn apply_library_filename_normalization(
             scan_is_current,
         )
         .map_err(str::to_owned)?;
-        invalidate_library_filename_authority(
-            &presentation_state,
-            &presentation_cache_path,
-            match applied_category {
-                NormalizationCategory::Adult => LibraryPresentationCategory::Adult,
-                NormalizationCategory::Vr => LibraryPresentationCategory::Vr,
+        reconcile_filename_normalization_with(
+            &recovery_path,
+            &plan_id,
+            || {
+                invalidate_library_filename_authority(
+                    &presentation_state,
+                    &presentation_cache_path,
+                    match applied_category {
+                        NormalizationCategory::Adult => LibraryPresentationCategory::Adult,
+                        NormalizationCategory::Vr => LibraryPresentationCategory::Vr,
+                    },
+                    &affected_codes,
+                )
             },
-            &affected_codes,
+            || match applied_category {
+                NormalizationCategory::Adult => scan_adult_library_with(&adult_state),
+                NormalizationCategory::Vr => scan_vr_library_with(&download_state, &vr_state),
+            },
         )
-        .map_err(str::to_owned)?;
-        match applied_category {
-            NormalizationCategory::Adult => {
-                scan_adult_library_with(&adult_state).map_err(str::to_owned)
-            }
-            NormalizationCategory::Vr => {
-                scan_vr_library_with(&download_state, &vr_state).map_err(str::to_owned)
-            }
-        }
+        .map_err(str::to_owned)
     })
     .await
     .map_err(|_| NORMALIZATION_FAILED.to_owned())?

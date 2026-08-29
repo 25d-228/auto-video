@@ -103,6 +103,10 @@ let revealAdultFileMock: Mock<
 let trashAdultFileMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<void>
 >;
+let loadFilenameNormalizationRecoveryMock: Mock<() => Promise<string[]>>;
+let applyFilenameNormalizationMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
 let resolveLibraryCoverMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
@@ -1160,6 +1164,14 @@ beforeEach(() => {
   openAdultFileMock = vi.fn().mockResolvedValue(undefined);
   revealAdultFileMock = vi.fn().mockResolvedValue(undefined);
   trashAdultFileMock = vi.fn().mockResolvedValue(undefined);
+  loadFilenameNormalizationRecoveryMock = vi.fn().mockResolvedValue(["none"]);
+  applyFilenameNormalizationMock = vi.fn().mockImplementation((parameters) =>
+    Promise.resolve(
+      parameters?.category === "adult"
+        ? ["2", "/Adult/ADLT-0123.mp4", "ADLT-0123.mp4", "1"]
+        : ["2", "/VR/MDVR-0419.mp4", "1"],
+    ),
+  );
   resolveLibraryCoverMock = vi.fn().mockImplementation((parameters) =>
     Promise.resolve([
       "library-cover-v3",
@@ -1456,7 +1468,7 @@ beforeEach(() => {
         case "scan_adult_library":
           return scanAdultLibraryMock().then((rows) => ["1", ...rows]);
         case "load_library_filename_normalization_recovery":
-          return Promise.resolve(["none"]);
+          return loadFilenameNormalizationRecoveryMock();
         case "audit_library_filenames":
           return Promise.resolve([
             "filename-normalization-v1",
@@ -1476,11 +1488,7 @@ beforeEach(() => {
             parameters?.category === "adult" ? "ADLT-0123.mp4" : "MDVR-0419.mp4",
           ]);
         case "apply_library_filename_normalization":
-          return Promise.resolve(
-            parameters?.category === "adult"
-              ? ["2", "/Adult/ADLT-0123.mp4", "ADLT-0123.mp4", "1"]
-              : ["2", "/VR/MDVR-0419.mp4", "1"],
-          );
+          return applyFilenameNormalizationMock(parameters);
         case "dismiss_library_filename_normalization":
           return Promise.resolve([]);
         case "query_adult_storage":
@@ -3342,6 +3350,78 @@ describe("explicit TV Library TMDB show metadata matching", () => {
 });
 
 describe("parsed Adult Library and Dashboard", () => {
+  it("reports committed renames truthfully when Library reconciliation fails", async () => {
+    loadAdultFolderMock.mockResolvedValue(["ready", "/Adult"]);
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/ADLT-123.mp4",
+      "ADLT-123.mp4",
+      "1",
+    ]);
+    loadFilenameNormalizationRecoveryMock
+      .mockResolvedValueOnce(["none"])
+      .mockResolvedValue([
+        "attention",
+        "adult",
+        "c".repeat(40),
+        "1",
+        "ADLT-0123.mp4",
+        "ADLT-0123.mp4",
+      ]);
+    applyFilenameNormalizationMock.mockRejectedValue(
+      "filename_normalization_committed",
+    );
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { level: 3, name: "ADLT-123" });
+    fireEvent.click(screen.getByRole("button", { name: "Normalize filenames" }));
+    const dialog = await screen.findByRole("dialog", { name: "Normalize filenames" });
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "Select ADLT-123 for normalization",
+      }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Review selected" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Confirm 1 rename" }));
+
+    expect(
+      await screen.findByText(
+        "The filenames were renamed, but Library reconciliation did not finish. Review the recorded paths before retrying.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText(
+        "The rename failed and the original names were restored. No file was overwritten.",
+      ),
+    ).toBeNull();
+    expect(await screen.findAllByText("ADLT-0123.mp4")).toHaveLength(2);
+  });
+
+  it("reports malformed recovery generically without inventing an Adult record", async () => {
+    loadFilenameNormalizationRecoveryMock.mockRejectedValue(
+      "filename_normalization_recovery",
+    );
+    loadAdultFolderMock.mockResolvedValue(["ready", "/Adult"]);
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/ADLT-123.mp4",
+      "ADLT-123.mp4",
+      "1",
+    ]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    expect(
+      await screen.findByText(/Filename recovery information is unavailable/),
+    ).toBeTruthy();
+    expect(
+      (screen.getByRole("button", {
+        name: "Normalize filenames",
+      }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
   it("previews and confirms only the selected native filename plan", async () => {
     loadAdultFolderMock.mockResolvedValue(["ready", "/Adult"]);
     scanAdultLibraryMock.mockResolvedValue([

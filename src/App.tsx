@@ -9896,12 +9896,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       })
       .catch(() => {
         if (current) {
-          setFilenameNormalizationRecovery({
-            status: "attention",
-            category: "adult",
-            planId: "0000000000000000000000000000000000000000",
-            paths: [],
-          });
+          setFilenameNormalizationRecovery({ status: "error" });
         }
       });
     return () => {
@@ -12036,10 +12031,13 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       })
       .catch((error: unknown) => {
         const code = nativeErrorCode(error);
-        if (code === "filename_normalization_recovery") {
+        if (
+          code === "filename_normalization_recovery" ||
+          code === "filename_normalization_committed"
+        ) {
           void loadLibraryFilenameNormalizationRecovery()
             .then(setFilenameNormalizationRecovery)
-            .catch(() => undefined);
+            .catch(() => setFilenameNormalizationRecovery({ status: "error" }));
         }
         setFilenameNormalizationState({
           status: "error",
@@ -12047,7 +12045,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           triggerId: current.triggerId,
           message:
             code === "filename_normalization_recovery"
-              ? "The operation needs recovery attention. Review every reported current path before retrying."
+              ? "The operation needs recovery attention. Review the recorded path evidence before retrying."
+              : code === "filename_normalization_committed"
+                ? "The filenames were renamed, but Library reconciliation did not finish. Review the recorded paths before retrying."
               : code === "filename_normalization_stale"
                 ? "The folder or Library scan changed. No rename was started; audit again."
                 : "The rename failed and the original names were restored. No file was overwritten.",
@@ -17308,7 +17308,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       disabled={
                         adultLibraryScanState.status !== "ready" ||
                         filenameNormalizationState !== null ||
-                        filenameNormalizationRecovery?.status === "attention"
+                        filenameNormalizationRecovery !== null &&
+                        filenameNormalizationRecovery.status !== "none"
                       }
                       id="adult-library-normalize-filenames"
                       onClick={() => startFilenameNormalization("adult")}
@@ -17400,7 +17401,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       disabled={
                         vrLibraryScanState.status !== "ready" ||
                         filenameNormalizationState !== null ||
-                        filenameNormalizationRecovery?.status === "attention"
+                        filenameNormalizationRecovery !== null &&
+                        filenameNormalizationRecovery.status !== "none"
                       }
                       id="vr-library-normalize-filenames"
                       onClick={() => startFilenameNormalization("vr")}
@@ -17437,8 +17439,9 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
               {filenameNormalizationRecovery?.status === "attention" ? (
                 <div className="library-action-attention" role="alert">
                   <p>
-                    A filename operation needs recovery attention. Review the current
-                    paths before changing this Library folder.
+                    A filename operation needs recovery attention. Review the recorded
+                    source and proposed path evidence before changing this Library
+                    folder.
                   </p>
                   {filenameNormalizationRecovery.paths.length === 0 ? null : (
                     <ul className="filename-normalization__members">
@@ -17451,6 +17454,15 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       ))}
                     </ul>
                   )}
+                </div>
+              ) : null}
+              {filenameNormalizationRecovery?.status === "error" ? (
+                <div className="library-action-attention" role="alert">
+                  <p>
+                    Filename recovery information is unavailable. No category or path
+                    could be verified; resolve the recovery record before normalizing
+                    filenames.
+                  </p>
                 </div>
               ) : null}
 

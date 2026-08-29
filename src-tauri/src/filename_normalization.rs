@@ -24,9 +24,11 @@ use crate::{
 pub(crate) const NORMALIZATION_FAILED: &str = "filename_normalization_failed";
 pub(crate) const NORMALIZATION_STALE: &str = "filename_normalization_stale";
 pub(crate) const NORMALIZATION_RECOVERY: &str = "filename_normalization_recovery";
+pub(crate) const NORMALIZATION_COMMITTED: &str = "filename_normalization_committed";
 
 const RESPONSE_VERSION: &str = "filename-normalization-v1";
 const RECOVERY_VERSION: &str = "AUTO_VIDEO_FILENAME_NORMALIZATION_V1";
+const RECOVERY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AUDIT_ITEMS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -172,14 +174,14 @@ fn fanza_transport_id(category: NormalizationCategory, code: &str) -> Option<Str
         return None;
     }
     let (_, number) = forms.identity.split_once('-')?;
-    // The public GraphQL boundary has no maker-code lookup. It accepts one bounded
-    // family-derived transport candidate, which is never identity authority: the
-    // returned transport ID, category, and maker code must all validate below.
     let prefix = match (category, forms.prefix.as_str()) {
+        (NormalizationCategory::Adult, "CAWB") | (NormalizationCategory::Vr, "DSVR") => {
+            forms.prefix.to_ascii_lowercase()
+        }
         (NormalizationCategory::Vr, "3DSVR") => {
             format!("1{}", forms.prefix.to_ascii_lowercase())
         }
-        _ => forms.prefix.to_ascii_lowercase(),
+        _ => return None,
     };
     Some(format!("{prefix}{number:0>5}"))
 }
@@ -381,7 +383,8 @@ fn multipart_label(title: &str, allow_pt: bool) -> Option<String> {
             }
             let mut continuation = cursor;
             while continuation < bytes.len()
-                && matches!(bytes[continuation], b' ' | b'_' | b'-' | b'+' | b'.' | b'/')
+                && (bytes[continuation].is_ascii_punctuation()
+                    || bytes[continuation].is_ascii_whitespace())
             {
                 continuation += 1;
             }
@@ -463,32 +466,12 @@ fn proposed_members(
         }
         let selected_sources = files
             .iter()
-            .map(|selected| selected.path.as_path())
+            .map(|selected| selected.path.clone())
             .collect::<HashSet<_>>();
-        let folded_destination = folded_path(
-            destination
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| "The proposed filename is not valid Unicode.".to_owned())?,
-        );
-        for sibling in fs::read_dir(parent)
-            .map_err(|_| "The destination directory cannot be inspected safely.".to_owned())?
-        {
-            let sibling = sibling
-                .map_err(|_| "The destination directory cannot be inspected safely.".to_owned())?;
-            let sibling_path = sibling.path();
-            if selected_sources.contains(sibling_path.as_path()) {
-                continue;
-            }
-            let sibling_name = sibling.file_name();
-            let sibling_name = sibling_name
-                .to_str()
-                .ok_or_else(|| "An unrelated sibling filename is not valid Unicode.".to_owned())?;
-            if folded_path(sibling_name) == folded_destination {
-                return Err(
-                    "The proposed filename collides with an unrelated existing sibling.".to_owned(),
-                );
-            }
+        if unrelated_sibling_collision(&destination, &selected_sources) {
+            return Err(
+                "The proposed filename collides with an unrelated existing sibling.".to_owned(),
+            );
         }
         let source_relative = file.relative_path.clone();
         if filename.is_empty() || source_relative.is_empty() {
@@ -506,6 +489,35 @@ fn proposed_members(
         });
     }
     Ok(members)
+}
+
+fn unrelated_sibling_collision(destination: &Path, allowed: &HashSet<PathBuf>) -> bool {
+    let Some(parent) = destination.parent() else {
+        return true;
+    };
+    let Some(destination_name) = destination.file_name().and_then(|value| value.to_str()) else {
+        return true;
+    };
+    let folded_destination = folded_path(destination_name);
+    let Ok(siblings) = fs::read_dir(parent) else {
+        return true;
+    };
+    for sibling in siblings {
+        let Ok(sibling) = sibling else {
+            return true;
+        };
+        if allowed.contains(&sibling.path()) {
+            continue;
+        }
+        let sibling_name = sibling.file_name();
+        let Some(sibling_name) = sibling_name.to_str() else {
+            return true;
+        };
+        if folded_path(sibling_name) == folded_destination {
+            return true;
+        }
+    }
+    false
 }
 
 fn unchanged_members(files: &[NormalizationFile]) -> Vec<RenameMember> {
@@ -916,6 +928,10 @@ fn recovery_bytes(plan: &NormalizationPlan, entries: &[AuditEntry]) -> Vec<u8> {
 }
 
 fn write_recovery(path: &Path, plan: &NormalizationPlan, entries: &[AuditEntry]) -> Result<(), ()> {
+    let bytes = recovery_bytes(plan, entries);
+    if u64::try_from(bytes.len()).map_err(|_| ())? > RECOVERY_MAX_BYTES {
+        return Err(());
+    }
     let parent = path.parent().ok_or(())?;
     fs::create_dir_all(parent).map_err(|_| ())?;
     if fs::symlink_metadata(path).is_ok() {
@@ -932,8 +948,7 @@ fn write_recovery(path: &Path, plan: &NormalizationPlan, entries: &[AuditEntry])
         .create_new(true)
         .open(&temporary)
         .map_err(|_| ())?;
-    file.write_all(&recovery_bytes(plan, entries))
-        .map_err(|_| ())?;
+    file.write_all(&bytes).map_err(|_| ())?;
     file.sync_all().map_err(|_| ())?;
     rename_without_overwrite(&temporary, path).map_err(|_| ())?;
     sync_directory(parent)
@@ -1010,7 +1025,7 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         Ok(metadata)
             if metadata.is_file()
                 && !metadata.file_type().is_symlink()
-                && metadata.len() <= 8 * 1024 * 1024 => {}
+                && metadata.len() <= RECOVERY_MAX_BYTES => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(vec!["none".to_owned()]);
         }
@@ -1023,6 +1038,9 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         }
         Err(_) => return Err(NORMALIZATION_RECOVERY),
     };
+    if u64::try_from(bytes.len()).map_err(|_| NORMALIZATION_RECOVERY)? > RECOVERY_MAX_BYTES {
+        return Err(NORMALIZATION_RECOVERY);
+    }
     let text = std::str::from_utf8(&bytes).map_err(|_| NORMALIZATION_RECOVERY)?;
     let mut lines = text.lines();
     if lines.next() != Some(RECOVERY_VERSION) {
@@ -1036,17 +1054,14 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         .ok_or(NORMALIZATION_RECOVERY)?;
     let folder = hex_decode(lines.next().ok_or(NORMALIZATION_RECOVERY)?)
         .map(PathBuf::from)
-        .filter(|value| {
-            value.is_absolute()
-                && fs::canonicalize(value).ok().as_deref() == Some(value.as_path())
-                && fs::symlink_metadata(value)
-                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-        })
+        .filter(|value| value.is_absolute())
         .ok_or(NORMALIZATION_RECOVERY)?;
+    let folder_available = fs::canonicalize(&folder).ok().as_deref() == Some(folder.as_path())
+        && fs::symlink_metadata(&folder)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
     let mut paths = Vec::new();
     let mut records = 0usize;
     let mut every_source = true;
-    let mut every_destination = true;
     for line in lines {
         let mut fields = line.split('\t');
         let source = fields.next().ok_or(NORMALIZATION_RECOVERY)?;
@@ -1088,22 +1103,26 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         let modified = UNIX_EPOCH
             .checked_add(std::time::Duration::new(modified_secs, modified_nanos))
             .ok_or(NORMALIZATION_RECOVERY)?;
-        let current = [&source, &staging, &destination]
-            .into_iter()
-            .filter(|relative| {
-                recovery_file_matches(&folder, relative, size, modified, &fingerprint)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let foreign = [&source, &staging, &destination]
-            .into_iter()
-            .any(|relative| {
-                fs::symlink_metadata(folder.join(relative)).is_ok()
-                    && !recovery_file_matches(&folder, relative, size, modified, &fingerprint)
-            });
+        let current = if folder_available {
+            [&source, &staging, &destination]
+                .into_iter()
+                .filter(|relative| {
+                    recovery_file_matches(&folder, relative, size, modified, &fingerprint)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let foreign = folder_available
+            && [&source, &staging, &destination]
+                .into_iter()
+                .any(|relative| {
+                    fs::symlink_metadata(folder.join(relative)).is_ok()
+                        && !recovery_file_matches(&folder, relative, size, modified, &fingerprint)
+                });
         records += 1;
-        every_source &= !foreign && current.len() == 1 && current[0] == source;
-        every_destination &= !foreign && current.len() == 1 && current[0] == destination;
+        every_source &= folder_available && !foreign && current.len() == 1 && current[0] == source;
         if current.is_empty() {
             paths.push(source);
             paths.push(destination);
@@ -1117,7 +1136,7 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
     if records == 0 {
         return Err(NORMALIZATION_RECOVERY);
     }
-    if every_source || every_destination {
+    if every_source {
         remove_recovery(path).map_err(|_| NORMALIZATION_RECOVERY)?;
         return Ok(vec!["none".to_owned()]);
     }
@@ -1128,6 +1147,37 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         (paths.len() / 2).to_string(),
     ];
     response.extend(paths);
+    Ok(response)
+}
+
+fn finalize_committed_recovery(path: &Path, plan_id: &str) -> Result<(), ()> {
+    let bytes = fs::read(path).map_err(|_| ())?;
+    if u64::try_from(bytes.len()).map_err(|_| ())? > RECOVERY_MAX_BYTES {
+        return Err(());
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| ())?;
+    let mut lines = text.lines();
+    if lines.next() != Some(RECOVERY_VERSION)
+        || hex_decode(lines.next().ok_or(())?)
+            .as_deref()
+            .and_then(NormalizationCategory::parse)
+            .is_none()
+        || hex_decode(lines.next().ok_or(())?).as_deref() != Some(plan_id)
+    {
+        return Err(());
+    }
+    remove_recovery(path)
+}
+
+pub(crate) fn reconcile_committed_with<T, E>(
+    recovery_path: &Path,
+    plan_id: &str,
+    prepare_cache: impl FnOnce() -> Result<(), E>,
+    scan: impl FnOnce() -> Result<T, E>,
+) -> Result<T, &'static str> {
+    prepare_cache().map_err(|_| NORMALIZATION_COMMITTED)?;
+    let response = scan().map_err(|_| NORMALIZATION_COMMITTED)?;
+    finalize_committed_recovery(recovery_path, plan_id).map_err(|_| NORMALIZATION_COMMITTED)?;
     Ok(response)
 }
 
@@ -1171,6 +1221,10 @@ fn execute_rename_plan_while_current(
                 staged.push((temporary, member.clone()));
             }
         }
+        let allowed = staged
+            .iter()
+            .map(|(temporary, _)| temporary.clone())
+            .collect::<HashSet<_>>();
         for (temporary, member) in &staged {
             if !is_current() {
                 return Err(());
@@ -1179,6 +1233,7 @@ fn execute_rename_plan_while_current(
             if !metadata.is_file()
                 || metadata.file_type().is_symlink()
                 || metadata.len() != member.size
+                || unrelated_sibling_collision(&member.destination, &allowed)
                 || (member.destination.exists()
                     && !staged.iter().any(|(_, staged_member)| {
                         folded_path(&staged_member.source_relative)
@@ -1227,10 +1282,11 @@ pub(crate) fn apply_with_current(
     }
     let (plan, operation_generation) = {
         let mut context = state.0.lock().map_err(|_| NORMALIZATION_FAILED)?;
-        let plan = context.plan.take().ok_or(NORMALIZATION_STALE)?;
-        if plan.id != plan_id || plan.category != category || !is_scan_current() {
+        let current = context.plan.as_ref().ok_or(NORMALIZATION_STALE)?;
+        if current.id != plan_id || current.category != category || !is_scan_current() {
             return Err(NORMALIZATION_STALE);
         }
+        let plan = context.plan.take().ok_or(NORMALIZATION_STALE)?;
         let generation = context.generation;
         context.active_operation = Some(generation);
         (plan, generation)
@@ -1302,6 +1358,13 @@ pub(crate) fn apply_with_current(
             {
                 return Err(NORMALIZATION_FAILED);
             }
+            let allowed = entries
+                .iter()
+                .flat_map(|entry| entry.members.iter().map(|member| member.source.clone()))
+                .collect::<HashSet<_>>();
+            if unrelated_sibling_collision(&member.destination, &allowed) {
+                return Err(NORMALIZATION_FAILED);
+            }
         }
     }
     if !operation_is_current() {
@@ -1321,7 +1384,6 @@ pub(crate) fn apply_with_current(
         }
         RenameExecution::RecoveryRequired => return Err(NORMALIZATION_RECOVERY),
     }
-    remove_recovery(recovery_path).map_err(|_| NORMALIZATION_RECOVERY)?;
     let affected_codes = entries
         .iter()
         .filter_map(|entry| entry.local_code.clone())
@@ -1431,9 +1493,13 @@ mod tests {
             fanza_transport_id(NormalizationCategory::Vr, "3DSVR-1871").as_deref(),
             Some("13dsvr01871")
         );
+        assert_ne!(
+            fanza_transport_id(NormalizationCategory::Vr, "3DSVR-1871").as_deref(),
+            Some("3dsvr01871")
+        );
         assert_eq!(
             fanza_transport_id(NormalizationCategory::Adult, "DSVR-69").as_deref(),
-            Some("dsvr00069")
+            None
         );
     }
 
@@ -1752,6 +1818,12 @@ mod tests {
         .expect("confirmed rename must succeed");
         assert!(!file.path.exists());
         assert!(destination.exists());
+        assert!(
+            recovery.exists(),
+            "committed renames retain reconciliation evidence"
+        );
+        finalize_committed_recovery(&recovery, &plan.id)
+            .expect("successful reconciliation must retire exact evidence");
         assert!(!recovery.exists());
         assert_eq!(
             apply(
@@ -1950,65 +2022,49 @@ mod tests {
     }
 
     #[test]
-    fn supported_non_special_fanza_families_dispatch_before_javdb() {
-        for (category, code, content_id, content_type, maker) in [
-            (
-                NormalizationCategory::Adult,
-                "ADLT-123",
-                "adlt00123",
-                "TWO_DIMENSION",
-                "ADLT-0123",
-            ),
-            (
-                NormalizationCategory::Vr,
-                "MDVR-419",
-                "mdvr00419",
-                "VR",
-                "MDVR-0419",
-            ),
+    fn unsupported_fanza_transport_families_remain_unresolved_without_provider_dispatch() {
+        for (category, code) in [
+            (NormalizationCategory::Adult, "ADLT-123"),
+            (NormalizationCategory::Vr, "MDVR-419"),
         ] {
             let mut fanza_calls = 0;
             let mut javdb_calls = 0;
-            let proof = resolve_provider_proof(
+            let result = resolve_provider_proof(
                 category,
                 code,
-                &mut |body| {
+                &mut |_| {
                     fanza_calls += 1;
-                    assert!(body.contains(content_id));
-                    Ok(format!(
-                        r#"{{"data":{{"ppvContent":{{"id":"{content_id}","contentType":"{content_type}","makerContentId":"{maker}"}}}}}}"#
-                    ))
+                    panic!("an unsupported transport family must not query FANZA")
                 },
                 &mut |_| {
                     javdb_calls += 1;
-                    Err(ProviderRequestError::Provider)
+                    panic!("a guessed FANZA no-match must not authorize JavDB")
                 },
             )
-            .expect("the exact FANZA item must resolve")
-            .expect("the exact FANZA proof must exist");
-            assert_eq!(proof.display_code, maker);
-            assert_eq!(fanza_calls, 1);
+            .expect("unsupported evidence must remain a truthful unresolved result");
+            assert!(result.is_none());
+            assert_eq!(fanza_calls, 0);
             assert_eq!(javdb_calls, 0);
         }
     }
 
     #[test]
-    fn non_special_fanza_no_match_and_missing_maker_are_the_only_javdb_fallbacks() {
+    fn evidence_backed_fanza_no_match_and_missing_maker_allow_javdb_fallback() {
         for (category, code, content_id, content_type, display, tag) in [
             (
                 NormalizationCategory::Adult,
-                "ADLT-123",
-                "adlt00123",
+                "CAWB-1",
+                "cawb00001",
                 "TWO_DIMENSION",
-                "ADLT-0123",
+                "CAWB-001",
                 None,
             ),
             (
                 NormalizationCategory::Vr,
-                "MDVR-419",
-                "mdvr00419",
+                "3DSVR-1871",
+                "13dsvr01871",
                 "VR",
-                "MDVR-0419",
+                "3DSVR-01871",
                 Some("212"),
             ),
         ] {
@@ -2051,16 +2107,16 @@ mod tests {
     }
 
     #[test]
-    fn non_special_fanza_failure_or_conflict_never_falls_through() {
+    fn evidence_backed_fanza_failure_or_conflict_never_falls_through() {
         let documents = [
             Err(ProviderRequestError::Network),
-            Ok(r#"{"data":{"ppvContent":{"id":"mdvr00419","contentType":"VR","makerContentId":"MDVR-0420"}}}"#.to_owned()),
+            Ok(r#"{"data":{"ppvContent":{"id":"13dsvr01871","contentType":"VR","makerContentId":"3DSVR-01872"}}}"#.to_owned()),
         ];
         for document in documents {
             let mut javdb_calls = 0;
             let result = resolve_provider_proof(
                 NormalizationCategory::Vr,
-                "MDVR-419",
+                "3DSVR-1871",
                 &mut |_| document.clone(),
                 &mut |_| {
                     javdb_calls += 1;
@@ -2074,10 +2130,37 @@ mod tests {
 
     #[test]
     fn compact_and_repeated_multipart_labels_are_rejected_for_both_categories() {
-        for allow_pt in [false, true] {
+        for (category, allow_pt) in [
+            (NormalizationCategory::Adult, false),
+            (NormalizationCategory::Vr, true),
+        ] {
             assert_eq!(multipart_label("Feature Part 1-2", allow_pt), None);
             assert_eq!(multipart_label("Feature CD1+2", allow_pt), None);
+            assert_eq!(multipart_label("Feature Part 1&2", allow_pt), None);
+            assert_eq!(multipart_label("Feature CD1,2", allow_pt), None);
+            assert_eq!(multipart_label("Feature Disc 3:4", allow_pt), None);
             assert_eq!(multipart_label("Feature Part 01 CD 01", allow_pt), None);
+
+            for ambiguous in ["Part 1&2", "CD1,2", "Disc 3:4"] {
+                let fixture = Fixture::new();
+                let first = normalization_file(
+                    &fixture.0,
+                    &format!("DSVR-69 {ambiguous}.mp4"),
+                    Some("DSVR-69"),
+                );
+                let second = normalization_file(&fixture.0, "DSVR-69 Part 04.mp4", Some("DSVR-69"));
+                assert!(proposed_members(
+                    &NormalizationSnapshot {
+                        category,
+                        folder: fixture.0.clone(),
+                        generation: 1,
+                        files: vec![first.clone(), second.clone()],
+                    },
+                    &[first, second],
+                    "DSVR-069",
+                )
+                .is_err());
+            }
         }
     }
 
@@ -2156,6 +2239,244 @@ mod tests {
             fs::read(member.destination).expect("race must remain"),
             b"raced unrelated file"
         );
+    }
+
+    #[test]
+    fn final_placement_rechecks_casefolded_and_nfc_sibling_races() {
+        for (destination_name, raced_name) in [
+            ("CAWB-001.mp4", "CAWB-001.MP4"),
+            ("Caf\u{e9}.mp4", "Cafe\u{301}.mp4"),
+        ] {
+            let fixture = Fixture::new();
+            let file = normalization_file(&fixture.0, "CAWB-1.mp4", Some("CAWB-1"));
+            let metadata = fs::metadata(&file.path).expect("metadata must exist");
+            let member = RenameMember {
+                source: file.path.clone(),
+                destination: fixture.0.join(destination_name),
+                source_relative: "CAWB-1.mp4".to_owned(),
+                destination_relative: destination_name.to_owned(),
+                size: metadata.len(),
+                modified: metadata.modified().expect("modified time must exist"),
+                fingerprint: file_fingerprint(&file.path).expect("fingerprint must exist"),
+            };
+            let plan = NormalizationPlan {
+                id: hex_sha1(destination_name.as_bytes()),
+                category: NormalizationCategory::Adult,
+                folder: fixture.0.clone(),
+                scan_generation: 1,
+                entries: Vec::new(),
+            };
+            let entry = AuditEntry {
+                id: hex_sha1(raced_name.as_bytes()),
+                status: "ready",
+                local_code: Some("CAWB-1".to_owned()),
+                proof: None,
+                reason: "fixture".to_owned(),
+                members: vec![member.clone()],
+            };
+            let raced = fixture.0.join(raced_name);
+            let mut calls = 0;
+            let outcome = execute_rename_plan(&plan, &[entry], |source, destination| {
+                calls += 1;
+                rename_without_overwrite(source, destination)?;
+                if calls == 1 {
+                    fs::write(&raced, b"unrelated race")?;
+                }
+                Ok(())
+            });
+            assert_eq!(outcome, RenameExecution::RolledBack);
+            assert!(member.source.exists());
+            assert_eq!(
+                fs::read(&raced).expect("race must remain"),
+                b"unrelated race"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_apply_does_not_consume_the_newer_current_plan() {
+        let fixture = Fixture::new();
+        let newer = NormalizationPlan {
+            id: hex_sha1(b"newer-plan"),
+            category: NormalizationCategory::Adult,
+            folder: fixture.0.clone(),
+            scan_generation: 2,
+            entries: Vec::new(),
+        };
+        let state = FilenameNormalizationState::default();
+        state.0.lock().expect("state must lock").plan = Some(newer.clone());
+        assert_eq!(
+            apply_with_current(
+                &state,
+                &VrDownloadState::default(),
+                &fixture.0.join("recovery"),
+                NormalizationCategory::Adult,
+                &hex_sha1(b"stale-plan"),
+                &[hex_sha1(b"stale-entry")],
+                || true,
+            ),
+            Err(NORMALIZATION_STALE)
+        );
+        assert_eq!(
+            state
+                .0
+                .lock()
+                .expect("state must lock")
+                .plan
+                .as_ref()
+                .map(|plan| plan.id.as_str()),
+            Some(newer.id.as_str())
+        );
+    }
+
+    #[test]
+    fn committed_renames_remain_recoverable_until_cache_and_scan_reconcile() {
+        let fixture = Fixture::new();
+        let recovery = fixture.0.join("recovery");
+        let file = normalization_file(&fixture.0, "DSVR-69.mp4", Some("DSVR-69"));
+        let snapshot = NormalizationSnapshot {
+            category: NormalizationCategory::Vr,
+            folder: fixture.0.clone(),
+            generation: 1,
+            files: vec![file.clone()],
+        };
+        let member = proposed_members(&snapshot, &[file], "DSVR-069")
+            .expect("proposal must resolve")
+            .remove(0);
+        let plan = NormalizationPlan {
+            id: hex_sha1(b"committed-plan"),
+            category: NormalizationCategory::Vr,
+            folder: fixture.0.clone(),
+            scan_generation: 1,
+            entries: Vec::new(),
+        };
+        let entry = AuditEntry {
+            id: hex_sha1(b"committed-entry"),
+            status: "ready",
+            local_code: Some("DSVR-69".to_owned()),
+            proof: None,
+            reason: "fixture".to_owned(),
+            members: vec![member.clone()],
+        };
+        write_recovery(&recovery, &plan, &[entry]).expect("record must persist");
+        rename_without_overwrite(&member.source, &member.destination)
+            .expect("fixture rename must commit");
+
+        assert_eq!(
+            reconcile_committed_with(
+                &recovery,
+                &plan.id,
+                || Err::<(), ()>(()),
+                || Ok::<_, ()>(vec!["scan"]),
+            ),
+            Err(NORMALIZATION_COMMITTED)
+        );
+        assert!(member.destination.exists());
+        assert_eq!(
+            recovery_status(&recovery)
+                .expect("committed record must remain")
+                .first()
+                .map(String::as_str),
+            Some("attention")
+        );
+        assert_eq!(
+            reconcile_committed_with(
+                &recovery,
+                &plan.id,
+                || Ok::<_, ()>(()),
+                || Err::<Vec<String>, ()>(()),
+            ),
+            Err(NORMALIZATION_COMMITTED)
+        );
+        assert!(recovery.exists());
+        assert_eq!(
+            reconcile_committed_with(
+                &recovery,
+                &plan.id,
+                || Ok::<_, ()>(()),
+                || Ok::<_, ()>(vec!["scan"]),
+            ),
+            Ok(vec!["scan"])
+        );
+        assert!(!recovery.exists());
+    }
+
+    #[test]
+    fn unavailable_adult_and_vr_volumes_preserve_verified_recovery_evidence() {
+        for category in [NormalizationCategory::Adult, NormalizationCategory::Vr] {
+            let fixture = Fixture::new();
+            let library = fixture.0.join(category.as_str());
+            fs::create_dir(&library).expect("library must exist");
+            let recovery = fixture.0.join(format!("{}-recovery", category.as_str()));
+            let file = normalization_file(&library, "DSVR-69.mp4", Some("DSVR-69"));
+            let snapshot = NormalizationSnapshot {
+                category,
+                folder: fs::canonicalize(&library).expect("library must canonicalize"),
+                generation: 1,
+                files: vec![file.clone()],
+            };
+            let member = proposed_members(&snapshot, &[file], "DSVR-069")
+                .expect("proposal must resolve")
+                .remove(0);
+            let plan = NormalizationPlan {
+                id: hex_sha1(category.as_str().as_bytes()),
+                category,
+                folder: snapshot.folder,
+                scan_generation: 1,
+                entries: Vec::new(),
+            };
+            let entry = AuditEntry {
+                id: hex_sha1(format!("{}-entry", category.as_str()).as_bytes()),
+                status: "ready",
+                local_code: Some("DSVR-69".to_owned()),
+                proof: None,
+                reason: "fixture".to_owned(),
+                members: vec![member],
+            };
+            write_recovery(&recovery, &plan, &[entry]).expect("record must persist");
+            let unavailable = fixture.0.join(format!("{}-offline", category.as_str()));
+            fs::rename(&library, &unavailable).expect("volume must become unavailable");
+            let status = recovery_status(&recovery).expect("safe evidence must remain readable");
+            assert_eq!(status[0], "attention");
+            assert_eq!(status[1], category.as_str());
+            assert_eq!(status[4], "DSVR-69.mp4");
+            assert_eq!(status[5], "DSVR-069.mp4");
+            assert!(recovery.exists());
+            fs::rename(&unavailable, &library).expect("volume must be restored");
+            assert_eq!(recovery_status(&recovery), Ok(vec!["none".to_owned()]));
+        }
+    }
+
+    #[test]
+    fn oversized_recovery_is_rejected_before_creating_persistent_state() {
+        let fixture = Fixture::new();
+        let recovery = fixture.0.join("recovery");
+        let member = RenameMember {
+            source: fixture.0.join("source.mp4"),
+            destination: fixture.0.join("destination.mp4"),
+            source_relative: format!("{}.mp4", "s".repeat(4_000)),
+            destination_relative: format!("{}.mp4", "d".repeat(4_000)),
+            size: 1,
+            modified: UNIX_EPOCH,
+            fingerprint: "f".repeat(256),
+        };
+        let entry = AuditEntry {
+            id: hex_sha1(b"oversized-entry"),
+            status: "ready",
+            local_code: None,
+            proof: None,
+            reason: "fixture".to_owned(),
+            members: vec![member; 1_100],
+        };
+        let plan = NormalizationPlan {
+            id: hex_sha1(b"oversized-plan"),
+            category: NormalizationCategory::Adult,
+            folder: fixture.0.clone(),
+            scan_generation: 1,
+            entries: Vec::new(),
+        };
+        assert_eq!(write_recovery(&recovery, &plan, &[entry]), Err(()));
+        assert!(!recovery.exists());
     }
 
     #[test]

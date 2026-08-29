@@ -178,6 +178,7 @@ export async function dismissLibraryFilenameNormalization() {
 
 export type FilenameNormalizationRecovery =
   | { status: "none" }
+  | { status: "error" }
   | {
       status: "attention";
       category: FilenameNormalizationCategory;
