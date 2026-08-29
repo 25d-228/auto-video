@@ -26,6 +26,7 @@ const JAVDB_SIGNATURE_SECRET: &str = "71cf27bb3c0bcdf207b64abecddc970098c7421ee7
 const JAVDB_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const JAVDB_COVER_MAX_BYTES: usize = 16 * 1024 * 1024;
 const JAVDB_PREVIEW_LIMIT: usize = 24;
+const JAVDB_CATEGORY_PAGE_LIMIT: u16 = 50;
 // Four global worker slots reduce serial latency while bounding provider processes and native threads.
 const ADULT_CATEGORY_CHECK_CONCURRENCY: usize = 4;
 const JAVDB_HTTP_STATUS_MARKER: &str = "\nAUTO_VIDEO_HTTP_STATUS:";
@@ -215,7 +216,8 @@ enum AdultCategoryCheck {
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedListing {
     items: Vec<CatalogItem>,
-    provider_empty: bool,
+    raw_count: usize,
+    page_identity: Vec<(String, String)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -626,7 +628,10 @@ pub(crate) fn fetch_exact_library_item_with(
     }))
 }
 
-fn parse_listing(document: &str) -> Result<ParsedListing, CatalogDocumentError> {
+fn parse_listing(
+    document: &str,
+    expected_page: Option<u32>,
+) -> Result<ParsedListing, CatalogDocumentError> {
     let JsonValue::Object(envelope) = JsonParser::new(document)
         .parse()
         .ok_or(CatalogDocumentError::Malformed)?
@@ -645,13 +650,37 @@ fn parse_listing(document: &str) -> Result<ParsedListing, CatalogDocumentError> 
     let Some(JsonValue::Array(movies)) = data.get("movies") else {
         return Err(CatalogDocumentError::Malformed);
     };
+    let current_page = if expected_page.is_some() {
+        match data.get("current_page") {
+            None => None,
+            Some(JsonValue::Number(value))
+                if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                value.parse::<u32>().ok().filter(|page| *page > 0)
+            }
+            _ => return Err(CatalogDocumentError::Malformed),
+        }
+    } else {
+        None
+    };
+    if let (Some(expected), Some(actual)) = (expected_page, current_page) {
+        if actual != expected {
+            return Err(CatalogDocumentError::Malformed);
+        }
+    }
 
     let mut items = Vec::new();
     let mut accepted_codes = HashMap::<String, String>::new();
+    let mut page_identity = Vec::new();
     for movie in movies {
         let JsonValue::Object(movie) = movie else {
             continue;
         };
+        if let (Some(JsonValue::String(provider_item_id)), Some(JsonValue::String(number))) =
+            (movie.get("id"), movie.get("number"))
+        {
+            page_identity.push((provider_item_id.clone(), number.clone()));
+        }
         let Some(JsonValue::String(provider_item_id)) = movie.get("id") else {
             continue;
         };
@@ -681,7 +710,8 @@ fn parse_listing(document: &str) -> Result<ParsedListing, CatalogDocumentError> 
     }
     Ok(ParsedListing {
         items,
-        provider_empty: movies.is_empty(),
+        raw_count: movies.len(),
+        page_identity,
     })
 }
 
@@ -798,13 +828,22 @@ fn validated_request(request: &JavdbCatalogRequest) -> Option<CatalogCategory> {
     Some(category)
 }
 
-fn listing_urls(request: &JavdbCatalogRequest, category: CatalogCategory) -> Vec<String> {
+fn ranking_url(request: &JavdbCatalogRequest) -> Option<String> {
     if request.mode == "ranking" {
-        return vec![format!(
+        return Some(format!(
             "{JAVDB_API_URL}/api/v1/rankings?type=0&period={}",
             request.period
-        )];
+        ));
     }
+    None
+}
+
+fn category_listing_url(
+    request: &JavdbCatalogRequest,
+    category: CatalogCategory,
+    page: u32,
+    limit: u16,
+) -> String {
     let (sort_by, order_by) = sort_parameters(&request.sort).expect("validated sort");
     let genre = if category == CatalogCategory::Vr {
         "212"
@@ -816,15 +855,9 @@ fn listing_urls(request: &JavdbCatalogRequest, category: CatalogCategory) -> Vec
         .month
         .map(|value| value.to_string())
         .unwrap_or_default();
-    let limit = request.count.min(50);
-    let pages = if request.count == 100 { 2 } else { 1 };
-    (1..=pages)
-        .map(|page| {
-            format!(
-                "{JAVDB_API_URL}/api/v1/movies/tags?filter_by=0%3At%3Am%3A{genre}%3A{year}%3A%3A{month}&filter_by_tags=&sort_by={sort_by}&order_by={order_by}&page={page}&limit={limit}"
-            )
-        })
-        .collect()
+    format!(
+        "{JAVDB_API_URL}/api/v1/movies/tags?filter_by=0%3At%3Am%3A{genre}%3A{year}%3A%3A{month}&filter_by_tags=&sort_by={sort_by}&order_by={order_by}&page={page}&limit={limit}"
+    )
 }
 
 fn begin_request(
@@ -1155,30 +1188,61 @@ where
     let generation = begin_request(state, category, context_generation)?;
     let mut items = Vec::new();
     let mut accepted_codes = HashMap::<String, String>::new();
-    for url in listing_urls(request, category) {
+    let mut seen_pages = Vec::<(usize, Vec<(String, String)>)>::new();
+
+    if let Some(url) = ranking_url(request) {
         require_current_request(state, category, generation)?;
         let document = fetch(&url);
         require_current_request(state, category, generation)?;
         let document = document.map_err(|error| category.provider_error(error))?;
-        let page = parse_listing(&document).map_err(|error| parse_error(category, error))?;
-        for item in page.items {
-            if let Some(previous_code) = accepted_codes.get(&item.provider_item_id) {
-                if previous_code != &item.code {
-                    return Err(category.conflicting_error());
-                }
-                continue;
-            }
-            accepted_codes.insert(item.provider_item_id.clone(), item.code.clone());
-            items.push(item);
+        let listing =
+            parse_listing(&document, None).map_err(|error| parse_error(category, error))?;
+        items = listing.items;
+        if category == CatalogCategory::Adult {
+            items = verify_adult_items(state, generation, items, &fetch)?;
         }
-        if page.provider_empty {
-            break;
+    } else {
+        let limit = request.count.min(JAVDB_CATEGORY_PAGE_LIMIT);
+        let mut complete = false;
+        for page_number in 1..=u32::from(request.count) {
+            require_current_request(state, category, generation)?;
+            let url = category_listing_url(request, category, page_number, limit);
+            let document = fetch(&url);
+            require_current_request(state, category, generation)?;
+            let document = document.map_err(|error| category.provider_error(error))?;
+            let listing = parse_listing(&document, Some(page_number))
+                .map_err(|error| parse_error(category, error))?;
+            let page_identity = (listing.raw_count, listing.page_identity.clone());
+            if seen_pages.contains(&page_identity) {
+                return Err(category.malformed_error());
+            }
+            seen_pages.push(page_identity);
+
+            let mut new_items = Vec::new();
+            for item in listing.items {
+                if let Some(previous_code) = accepted_codes.get(&item.provider_item_id) {
+                    if previous_code != &item.code {
+                        return Err(category.conflicting_error());
+                    }
+                    continue;
+                }
+                accepted_codes.insert(item.provider_item_id.clone(), item.code.clone());
+                new_items.push(item);
+            }
+            if category == CatalogCategory::Adult {
+                new_items = verify_adult_items(state, generation, new_items, &fetch)?;
+            }
+            items.extend(new_items);
+            if items.len() >= request.count as usize || listing.raw_count < usize::from(limit) {
+                complete = true;
+                break;
+            }
+        }
+        if !complete {
+            return Err(category.provider_error(ProviderRequestError::Provider));
         }
     }
 
-    if category == CatalogCategory::Adult {
-        items = verify_adult_items(state, generation, items, &fetch)?;
-    }
     items.truncate(request.count as usize);
     finish_request(state, category, generation, items)
 }
@@ -2040,6 +2104,19 @@ mod tests {
         )
     }
 
+    fn category_page(page: u32, rows: impl IntoIterator<Item = String>) -> String {
+        format!(
+            r#"{{"success":1,"data":{{"movies":[{}],"current_page":{page}}}}}"#,
+            rows.into_iter().collect::<Vec<_>>().join(",")
+        )
+    }
+
+    fn vr_rows(start: usize, count: usize) -> Vec<String> {
+        (start..start + count)
+            .map(|index| format!(r#"{{"id":"Vr{index}","number":"MDVR-{index}"}}"#))
+            .collect()
+    }
+
     fn jpeg() -> Vec<u8> {
         vec![0xff, 0xd8, 0xff, 0xe0, 0, 16, 0, 0, 0, 0, 0, 0]
     }
@@ -2113,7 +2190,7 @@ mod tests {
                     .expect("request list must remain available")
                     .push(url.to_owned());
                 Ok(if url.contains("rankings") {
-                    r#"{"success":1,"data":{"movies":[]}}"#.to_owned()
+                    r#"{"success":1,"data":{"movies":[],"current_page":"ranking"}}"#.to_owned()
                 } else {
                     unreachable!()
                 })
@@ -2173,19 +2250,26 @@ mod tests {
             assert!(!dispatched.load(Ordering::Relaxed));
         }
 
-        let mut vr = request("vr");
-        vr.count = 100;
-        let urls = Mutex::new(Vec::new());
-        fetch_catalog_with(&state, &vr, |url| {
-            urls.lock()
-                .expect("request list must remain available")
-                .push(url.to_owned());
-            Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
-        })
-        .expect("VR request must be accepted");
-        let urls = urls.lock().expect("request list must remain available");
-        assert_eq!(urls.len(), 1);
-        assert!(urls[0].contains("filter_by=0%3At%3Am%3A212%3A%3A%3A"));
+        for (count, limit) in [(10, 10), (25, 25), (50, 50), (100, 50)] {
+            let mut vr = request("vr");
+            vr.month = Some(8);
+            vr.sort = "most-wanted".to_owned();
+            vr.count = count;
+            let urls = Mutex::new(Vec::new());
+            fetch_catalog_with(&state, &vr, |url| {
+                urls.lock()
+                    .expect("request list must remain available")
+                    .push(url.to_owned());
+                Ok(category_page(1, []))
+            })
+            .expect("VR request must be accepted");
+            assert_eq!(
+                urls.into_inner().expect("request list must remain available"),
+                [format!(
+                    "https://apidd.spthgb.com/api/v1/movies/tags?filter_by=0%3At%3Am%3A212%3A%3A%3A8&filter_by_tags=&sort_by=want_watch_count&order_by=desc&page=1&limit={limit}"
+                )]
+            );
+        }
     }
 
     #[test]
@@ -2209,15 +2293,239 @@ mod tests {
         two_pages.count = 100;
         let response = fetch_catalog_with(&state, &two_pages, |url| {
             Ok(if url.contains("page=1") {
-                r#"{"success":1,"data":{"movies":[{"id":"MissingCode"}]}}"#.to_owned()
+                category_page(
+                    1,
+                    (0..50).map(|index| format!(r#"{{"id":"Missing{index}"}}"#)),
+                )
             } else {
-                r#"{"success":1,"data":{"movies":[{"id":"Later","number":"mdvr_00419"}]}}"#
-                    .to_owned()
+                category_page(2, [r#"{"id":"Later","number":"mdvr_00419"}"#.to_owned()])
             })
         })
         .expect("unusable rows must not hide later provider pages");
         assert_eq!(response[1], "1");
         assert_eq!(response[4], "MDVR-00419");
+    }
+
+    #[test]
+    fn filtered_hundred_result_window_continues_past_two_provider_pages() {
+        let state = JavdbCatalogState::default();
+        let mut request = request("vr");
+        request.month = Some(8);
+        request.sort = "most-wanted".to_owned();
+        request.count = 100;
+        let urls = Mutex::new(Vec::new());
+        let response = fetch_catalog_with(&state, &request, |url| {
+            urls.lock()
+                .expect("request list must remain available")
+                .push(url.to_owned());
+            let (page, start, valid) = if url.contains("page=1") {
+                (1, 1000, 45)
+            } else if url.contains("page=2") {
+                (2, 1045, 45)
+            } else {
+                (3, 1090, 10)
+            };
+            let mut rows = vr_rows(start, valid);
+            if page < 3 {
+                rows.extend((0..5).map(|index| format!(r#"{{"id":"Missing{page}{index}"}}"#)));
+            }
+            Ok(category_page(page, rows))
+        })
+        .expect("three source pages must supply the complete accepted window");
+
+        assert_eq!(response[1], "100");
+        assert_eq!(response[4], "MDVR-1000");
+        assert_eq!(response[2 + 99 * 7 + 2], "MDVR-1099");
+        let urls = urls.lock().expect("request list must remain available");
+        assert_eq!(urls.len(), 3);
+        for (index, url) in urls.iter().enumerate() {
+            assert!(url.contains(&format!("page={}", index + 1)));
+            assert!(url.contains("limit=50"));
+            assert!(url.contains("filter_by=0%3At%3Am%3A212%3A%3A%3A8"));
+            assert!(url.contains("sort_by=want_watch_count&order_by=desc"));
+        }
+    }
+
+    #[test]
+    fn short_final_page_returns_the_truthful_smaller_window() {
+        let state = JavdbCatalogState::default();
+        let mut request = request("vr");
+        request.count = 100;
+        let calls = AtomicUsize::new(0);
+        let response = fetch_catalog_with(&state, &request, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(category_page(1, vr_rows(2000, 17)))
+        })
+        .expect("a short first page must prove the end of provider results");
+        assert_eq!(response[1], "17");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn replacement_during_page_fetch_stops_obsolete_page_scheduling() {
+        let state = JavdbCatalogState::default();
+        let mut old_request = request("vr");
+        old_request.count = 100;
+        let old_page_calls = AtomicUsize::new(0);
+
+        let result = fetch_catalog_with(&state, &old_request, |_| {
+            old_page_calls.fetch_add(1, Ordering::SeqCst);
+            let current = fetch_catalog_with(&state, &request("vr"), |_| Ok(category_page(1, [])))
+                .expect("the replacement request must become current");
+            assert_eq!(current[1], "0");
+            Ok(category_page(1, vr_rows(7000, 50)))
+        });
+
+        assert_eq!(result, Err(VR_JAVDB_STALE));
+        assert_eq!(old_page_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pagination_rejects_repeated_skipped_regressed_and_malformed_identity() {
+        let state = JavdbCatalogState::default();
+        let mut request = request("vr");
+        request.count = 100;
+
+        assert_eq!(
+            fetch_catalog_with(&state, &request, |_| Ok(category_page(2, vr_rows(1, 1)))),
+            Err(VR_JAVDB_MALFORMED)
+        );
+        request.context_generation = NEXT_CONTEXT_GENERATION
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        assert_eq!(
+            fetch_catalog_with(&state, &request, |_| {
+                Ok(r#"{"success":1,"data":{"movies":[],"current_page":"1"}}"#.to_owned())
+            }),
+            Err(VR_JAVDB_MALFORMED)
+        );
+
+        request.context_generation = NEXT_CONTEXT_GENERATION
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        let repeated_rows = vr_rows(3000, 50);
+        assert_eq!(
+            fetch_catalog_with(&state, &request, |url| {
+                Ok(category_page(
+                    if url.contains("page=1") { 1 } else { 2 },
+                    repeated_rows.clone(),
+                ))
+            }),
+            Err(VR_JAVDB_MALFORMED)
+        );
+        request.context_generation = NEXT_CONTEXT_GENERATION
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        assert_eq!(
+            fetch_catalog_with(&state, &request, |url| {
+                Ok(category_page(
+                    1,
+                    if url.contains("page=1") {
+                        vr_rows(4000, 50)
+                    } else {
+                        vr_rows(4050, 1)
+                    },
+                ))
+            }),
+            Err(VR_JAVDB_MALFORMED)
+        );
+    }
+
+    #[test]
+    fn cross_page_duplicates_remain_identical_or_conflicting() {
+        let state = JavdbCatalogState::default();
+        let mut request = request("vr");
+        request.count = 100;
+        let mut first_page = vr_rows(5000, 49);
+        first_page.insert(0, r#"{"id":"Same","number":"MDVR-419"}"#.to_owned());
+        let response = fetch_catalog_with(&state, &request, |url| {
+            Ok(if url.contains("page=1") {
+                category_page(1, first_page.clone())
+            } else {
+                category_page(
+                    2,
+                    [
+                        r#"{"id":"Same","number":"mdvr 419"}"#.to_owned(),
+                        r#"{"id":"Later","number":"MDVR-6000"}"#.to_owned(),
+                    ],
+                )
+            })
+        })
+        .expect("one identical cross-page row must deduplicate");
+        assert_eq!(response[1], "51");
+        assert_eq!(response[2 + 50 * 7 + 1], "Later");
+
+        request.context_generation = NEXT_CONTEXT_GENERATION
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        assert_eq!(
+            fetch_catalog_with(&state, &request, |url| {
+                Ok(if url.contains("page=1") {
+                    category_page(1, first_page.clone())
+                } else {
+                    category_page(2, [r#"{"id":"Same","number":"MDVR-420"}"#.to_owned()])
+                })
+            }),
+            Err(VR_JAVDB_CONFLICTING)
+        );
+    }
+
+    #[test]
+    fn adult_category_rejection_fetches_later_pages_without_reordering() {
+        let state = JavdbCatalogState::default();
+        let mut request = request("adult");
+        request.count = 10;
+        let listing_calls = AtomicUsize::new(0);
+        let response = fetch_catalog_with(&state, &request, |url| {
+            if url.contains("movies/tags") {
+                let page = listing_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let rows: Vec<String> = if page == 1 {
+                    (1..=5)
+                        .flat_map(|index| {
+                            [
+                                format!(r#"{{"id":"Adult{index}","number":"ADLT-{index}"}}"#),
+                                format!(r#"{{"id":"Vr{index}","number":"MDVR-{index}"}}"#),
+                            ]
+                        })
+                        .collect()
+                } else {
+                    (6..=10)
+                        .map(|index| format!(r#"{{"id":"Adult{index}","number":"ADLT-{index}"}}"#))
+                        .collect()
+                };
+                return Ok(category_page(page as u32, rows));
+            }
+            let item_id = url
+                .split("/api/v4/movies/")
+                .nth(1)
+                .and_then(|value| value.split('?').next())
+                .expect("detail URL must contain the exact provider item");
+            let number = if let Some(index) = item_id.strip_prefix("Adult") {
+                format!("ADLT-{index}")
+            } else {
+                format!(
+                    "MDVR-{}",
+                    item_id
+                        .strip_prefix("Vr")
+                        .expect("only the fixture items may be checked")
+                )
+            };
+            Ok(detail_with_number(
+                item_id,
+                &number,
+                if item_id.starts_with("Vr") {
+                    r#"[{"id":"212"}]"#
+                } else {
+                    r#"[{"id":"28"}]"#
+                },
+            ))
+        })
+        .expect("later pages must fill rows rejected by exact Adult category checks");
+        assert_eq!(response[1], "10");
+        for index in 1..=10 {
+            assert_eq!(response[2 + (index - 1) * 7 + 2], format!("ADLT-{index}"));
+        }
+        assert_eq!(listing_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

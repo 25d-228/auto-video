@@ -9720,6 +9720,156 @@ describe("trusted JavDB Adult and VR browse catalogs", () => {
     expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps the complete August Most wanted 100-result window stable and refreshes the exact request", async () => {
+    gallerySizes.discover = { width: 1088, height: 552 };
+    const items = Array.from({ length: 100 }, (_, index) => ({
+      code: `MDVR-${100 + index}`,
+      cover: false,
+      id: `AugustVr${index + 1}`,
+    }));
+    fetchJavdbBrowseMock.mockImplementation((parameters) =>
+      Promise.resolve(
+        javdbBrowseFixture(
+          "vr",
+          items.slice(0, Number(parameters?.count ?? 25)),
+        ),
+      ),
+    );
+
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectVrBrowseProvider("JavDB");
+    await screen.findByRole("heading", { level: 3, name: "MDVR-100" });
+
+    fireEvent.change(screen.getByRole("combobox", { name: "VR month" }), {
+      target: { value: "8" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "VR sort" }), {
+      target: { value: "most-wanted" },
+    });
+    fireEvent.change(
+      screen.getByRole("combobox", { name: "VR result count" }),
+      { target: { value: "100" } },
+    );
+
+    await waitFor(() =>
+      expect(fetchJavdbBrowseMock).toHaveBeenLastCalledWith({
+        category: "vr",
+        contextGeneration: expect.any(String),
+        mode: "category",
+        period: "daily",
+        year: null,
+        month: 8,
+        sort: "most-wanted",
+        count: 100,
+      }),
+    );
+    expect(screen.getByText("Page 1 of 17")).toBeTruthy();
+    const catalog = screen.getByRole("list", { name: "JavDB VR catalog" });
+    expect(
+      within(catalog)
+        .getAllByRole("heading", { level: 3 })
+        .map((heading) => heading.textContent),
+    ).toEqual([
+      "MDVR-100",
+      "MDVR-101",
+      "MDVR-102",
+      "MDVR-103",
+      "MDVR-104",
+      "MDVR-105",
+    ]);
+
+    const requestsBeforePresentationChanges =
+      fetchJavdbBrowseMock.mock.calls.length;
+    for (let page = 2; page <= 17; page += 1) {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Next JavDB VR catalog page" }),
+      );
+    }
+    expect(screen.getByText("Page 17 of 17")).toBeTruthy();
+    expect(
+      within(catalog)
+        .getAllByRole("heading", { level: 3 })
+        .map((heading) => heading.textContent),
+    ).toEqual(["MDVR-196", "MDVR-197", "MDVR-198", "MDVR-199"]);
+    selectSettings();
+    fireEvent.click(screen.getByRole("radio", { name: "Dark" }));
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    resizeGallery("discover", 1088, 552);
+    expect(screen.getByText("Page 17 of 17")).toBeTruthy();
+    expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(
+      requestsBeforePresentationChanges,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() =>
+      expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(
+        requestsBeforePresentationChanges + 1,
+      ),
+    );
+    expect(fetchJavdbBrowseMock).toHaveBeenLastCalledWith({
+      category: "vr",
+      contextGeneration: expect.any(String),
+      mode: "category",
+      period: "daily",
+      year: null,
+      month: 8,
+      sort: "most-wanted",
+      count: 100,
+    });
+    expect(screen.getByText("Page 1 of 17")).toBeTruthy();
+    expect(fetchFanzaCatalogMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets a VR filter change supersede a pending catalog without exposing its rows or covers", async () => {
+    const oldCatalog = createDeferred<string[]>();
+    fetchJavdbBrowseMock
+      .mockReturnValueOnce(oldCatalog.promise)
+      .mockResolvedValueOnce(
+        javdbBrowseFixture("vr", [
+          { code: "MDVR-420", cover: false, id: "CurrentAugust" },
+        ], "8"),
+      );
+
+    render(<App />);
+    selectDiscover();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    selectVrBrowseProvider("JavDB");
+    await waitFor(() => expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByRole("combobox", { name: "VR month" }), {
+      target: { value: "8" },
+    });
+
+    expect(
+      await screen.findByRole("heading", { level: 3, name: "MDVR-420" }),
+    ).toBeTruthy();
+    expect(fetchJavdbBrowseMock).toHaveBeenCalledTimes(2);
+    expect(fetchJavdbBrowseMock).toHaveBeenLastCalledWith({
+      category: "vr",
+      contextGeneration: expect.any(String),
+      mode: "category",
+      period: "daily",
+      year: null,
+      month: 8,
+      sort: "newest",
+      count: 25,
+    });
+
+    await act(async () => {
+      oldCatalog.resolve(
+        javdbBrowseFixture("vr", [
+          { code: "MDVR-419", id: "Superseded" },
+        ]),
+      );
+      await oldCatalog.promise;
+    });
+    expect(screen.queryByRole("heading", { name: "MDVR-419" })).toBeNull();
+    expect(fetchJavdbCoverMock).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: "MDVR-420" })).toBeTruthy();
+  });
+
   it("shows only exact same-category Library and transfer badges", async () => {
     savedAdultFolder = "/Adult";
     scanAdultLibraryMock.mockResolvedValue([
