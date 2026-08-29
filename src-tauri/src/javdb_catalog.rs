@@ -217,7 +217,7 @@ enum AdultCategoryCheck {
 struct ParsedListing {
     items: Vec<CatalogItem>,
     raw_count: usize,
-    page_identity: Vec<(String, String)>,
+    page_identity: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -650,37 +650,28 @@ fn parse_listing(
     let Some(JsonValue::Array(movies)) = data.get("movies") else {
         return Err(CatalogDocumentError::Malformed);
     };
-    let current_page = if expected_page.is_some() {
-        match data.get("current_page") {
-            None => None,
-            Some(JsonValue::Number(value))
-                if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) =>
-            {
-                value.parse::<u32>().ok().filter(|page| *page > 0)
-            }
-            _ => return Err(CatalogDocumentError::Malformed),
+    if let Some(expected) = expected_page {
+        let Some(JsonValue::Number(value)) = data.get("current_page") else {
+            return Err(CatalogDocumentError::Malformed);
+        };
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(CatalogDocumentError::Malformed);
         }
-    } else {
-        None
-    };
-    if let (Some(expected), Some(actual)) = (expected_page, current_page) {
-        if actual != expected {
+        let actual = value
+            .parse::<u32>()
+            .map_err(|_| CatalogDocumentError::Malformed)?;
+        if actual == 0 || actual != expected {
             return Err(CatalogDocumentError::Malformed);
         }
     }
 
     let mut items = Vec::new();
     let mut accepted_codes = HashMap::<String, String>::new();
-    let mut page_identity = Vec::new();
+    let page_identity = md5_hex(format!("{movies:?}").as_bytes());
     for movie in movies {
         let JsonValue::Object(movie) = movie else {
             continue;
         };
-        if let (Some(JsonValue::String(provider_item_id)), Some(JsonValue::String(number))) =
-            (movie.get("id"), movie.get("number"))
-        {
-            page_identity.push((provider_item_id.clone(), number.clone()));
-        }
         let Some(JsonValue::String(provider_item_id)) = movie.get("id") else {
             continue;
         };
@@ -1188,7 +1179,7 @@ where
     let generation = begin_request(state, category, context_generation)?;
     let mut items = Vec::new();
     let mut accepted_codes = HashMap::<String, String>::new();
-    let mut seen_pages = Vec::<(usize, Vec<(String, String)>)>::new();
+    let mut seen_pages = HashSet::<String>::new();
 
     if let Some(url) = ranking_url(request) {
         require_current_request(state, category, generation)?;
@@ -1212,11 +1203,9 @@ where
             let document = document.map_err(|error| category.provider_error(error))?;
             let listing = parse_listing(&document, Some(page_number))
                 .map_err(|error| parse_error(category, error))?;
-            let page_identity = (listing.raw_count, listing.page_identity.clone());
-            if seen_pages.contains(&page_identity) {
+            if !seen_pages.insert(listing.page_identity.clone()) {
                 return Err(category.malformed_error());
             }
-            seen_pages.push(page_identity);
 
             let mut new_items = Vec::new();
             for item in listing.items {
@@ -2111,6 +2100,10 @@ mod tests {
         )
     }
 
+    fn first_category_page(rows: &str) -> String {
+        category_page(1, [rows.to_owned()])
+    }
+
     fn vr_rows(start: usize, count: usize) -> Vec<String> {
         (start..start + count)
             .map(|index| format!(r#"{{"id":"Vr{index}","number":"MDVR-{index}"}}"#))
@@ -2148,9 +2141,9 @@ mod tests {
             Ok(if category == "adult" && url.contains("/api/v4/") {
                 detail_with_number(provider_item_id, code, r#"[{"id":"28"}]"#)
             } else {
-                format!(
-                    r#"{{"success":1,"data":{{"movies":[{{"id":"{provider_item_id}","number":"{code}"}}]}}}}"#
-                )
+                first_category_page(&format!(
+                    r#"{{"id":"{provider_item_id}","number":"{code}"}}"#
+                ))
             })
         })
         .expect("catalog authority must be established");
@@ -2226,7 +2219,7 @@ mod tests {
             let url = Mutex::new(String::new());
             fetch_catalog_with(&state, &adult, |value| {
                 *url.lock().expect("request URL must remain available") = value.to_owned();
-                Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
+                Ok(category_page(1, []))
             })
             .expect("Adult category request must be accepted");
             assert_eq!(
@@ -2276,7 +2269,7 @@ mod tests {
     fn preserves_source_order_while_skipping_only_unusable_rows() {
         let state = JavdbCatalogState::default();
         let response = fetch_catalog_with(&state, &request("vr"), |_| {
-            Ok(r#"{"success":1,"data":{"movies":[null,{"id":"VrA","number":"MDVR-419","title":null,"release_date":null,"cover_url":null},{"id":"MissingCode","cover_url":"https://tp.cmastd.com/a.jpg"},{"id":"Bad Id!","number":"MDVR-420"},{"id":"VrB","number":"MDVR-422","title":"Second","cover_url":"https://tp.spfcas.com/b.jpg"},{"id":"VrC","number":"MDVR-430","cover_url":"https://tp.new-cdn.com/c.jpg"}]}}"#.to_owned())
+            Ok(first_category_page(r#"null,{"id":"VrA","number":"MDVR-419","title":null,"release_date":null,"cover_url":null},{"id":"MissingCode","cover_url":"https://tp.cmastd.com/a.jpg"},{"id":"Bad Id!","number":"MDVR-420"},{"id":"VrB","number":"MDVR-422","title":"Second","cover_url":"https://tp.spfcas.com/b.jpg"},{"id":"VrC","number":"MDVR-430","cover_url":"https://tp.new-cdn.com/c.jpg"}"#))
         })
         .expect("mixed rows must preserve valid results");
         assert_eq!(response[1], "3");
@@ -2386,23 +2379,22 @@ mod tests {
         let mut request = request("vr");
         request.count = 100;
 
-        assert_eq!(
-            fetch_catalog_with(&state, &request, |_| Ok(category_page(2, vr_rows(1, 1)))),
-            Err(VR_JAVDB_MALFORMED)
-        );
-        request.context_generation = NEXT_CONTEXT_GENERATION
-            .fetch_add(1, Ordering::Relaxed)
-            .to_string();
-        assert_eq!(
-            fetch_catalog_with(&state, &request, |_| {
-                Ok(r#"{"success":1,"data":{"movies":[],"current_page":"1"}}"#.to_owned())
-            }),
-            Err(VR_JAVDB_MALFORMED)
-        );
+        for response in [
+            r#"{"success":1,"data":{"movies":[]}}"#.to_owned(),
+            category_page(0, []),
+            r#"{"success":1,"data":{"movies":[],"current_page":4294967296}}"#.to_owned(),
+            category_page(2, vr_rows(1, 1)),
+            r#"{"success":1,"data":{"movies":[],"current_page":"1"}}"#.to_owned(),
+        ] {
+            assert_eq!(
+                fetch_catalog_with(&state, &request, |_| Ok(response.clone())),
+                Err(VR_JAVDB_MALFORMED)
+            );
+            request.context_generation = NEXT_CONTEXT_GENERATION
+                .fetch_add(1, Ordering::Relaxed)
+                .to_string();
+        }
 
-        request.context_generation = NEXT_CONTEXT_GENERATION
-            .fetch_add(1, Ordering::Relaxed)
-            .to_string();
         let repeated_rows = vr_rows(3000, 50);
         assert_eq!(
             fetch_catalog_with(&state, &request, |url| {
@@ -2429,6 +2421,32 @@ mod tests {
             }),
             Err(VR_JAVDB_MALFORMED)
         );
+    }
+
+    #[test]
+    fn different_full_unusable_pages_do_not_hide_a_later_valid_page() {
+        let state = JavdbCatalogState::default();
+        let mut request = request("vr");
+        request.count = 100;
+        let calls = AtomicUsize::new(0);
+
+        let response = fetch_catalog_with(&state, &request, |_| {
+            let page = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let rows = if page < 3 {
+                (0..50)
+                    .map(|index| format!(r#"{{"unusable_page":{page},"position":{index}}}"#))
+                    .collect()
+            } else {
+                vec![r#"{"id":"Later","number":"MDVR-419"}"#.to_owned()]
+            };
+            Ok(category_page(page as u32, rows))
+        })
+        .expect("distinct unusable pages must not look repeated");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(response[1], "1");
+        assert_eq!(response[3], "Later");
+        assert_eq!(response[4], "MDVR-419");
     }
 
     #[test]
@@ -2541,19 +2559,21 @@ mod tests {
             }),
             Err(VR_PROVIDER_ERROR)
         );
-        let empty = fetch_catalog_with(&state, &request("vr"), |_| {
-            Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
-        })
-        .expect("valid empty result must succeed");
+        let empty = fetch_catalog_with(&state, &request("vr"), |_| Ok(category_page(1, [])))
+            .expect("valid empty result must succeed");
         assert_eq!(empty[1], "0");
         let identical = fetch_catalog_with(&state, &request("vr"), |_| {
-            Ok(r#"{"success":1,"data":{"movies":[{"id":"Same","number":"MDVR-419"},{"id":"Same","number":"mdvr 419"}]}}"#.to_owned())
+            Ok(first_category_page(
+                r#"{"id":"Same","number":"MDVR-419"},{"id":"Same","number":"mdvr 419"}"#,
+            ))
         })
         .expect("identical duplicates must deduplicate");
         assert_eq!(identical[1], "1");
         assert_eq!(
             fetch_catalog_with(&state, &request("vr"), |_| {
-                Ok(r#"{"success":1,"data":{"movies":[{"id":"Same","number":"MDVR-419"},{"id":"Same","number":"MDVR-422"}]}}"#.to_owned())
+                Ok(first_category_page(
+                    r#"{"id":"Same","number":"MDVR-419"},{"id":"Same","number":"MDVR-422"}"#,
+                ))
             }),
             Err(VR_JAVDB_CONFLICTING)
         );
@@ -2703,9 +2723,7 @@ mod tests {
             let result = scope.spawn(|| {
                 fetch_catalog_with(&state, request, |url| {
                     if url.contains("movies/tags") {
-                        return Ok(format!(
-                            r#"{{"success":1,"data":{{"movies":[{listing}]}}}}"#
-                        ));
+                        return Ok(first_category_page(&listing));
                     }
                     let item_id = url
                         .split("/api/v4/movies/")
@@ -2823,9 +2841,7 @@ mod tests {
             let first_result = scope.spawn(|| {
                 fetch_catalog_with(&state, &first_request, |url| {
                     if url.contains("movies/tags") {
-                        Ok(format!(
-                            r#"{{"success":1,"data":{{"movies":[{first_listing}]}}}}"#
-                        ))
+                        Ok(first_category_page(&first_listing))
                     } else {
                         fetch_detail(url)
                     }
@@ -2855,9 +2871,7 @@ mod tests {
                         listed_sender
                             .send("second")
                             .expect("the second listing must be observed");
-                        Ok(format!(
-                            r#"{{"success":1,"data":{{"movies":[{second_listing}]}}}}"#
-                        ))
+                        Ok(first_category_page(&second_listing))
                     } else {
                         fetch_detail(url)
                     }
@@ -2877,9 +2891,7 @@ mod tests {
                         listed_sender
                             .send("latest")
                             .expect("the latest listing must be observed");
-                        Ok(format!(
-                            r#"{{"success":1,"data":{{"movies":[{latest_listing}]}}}}"#
-                        ))
+                        Ok(first_category_page(latest_listing))
                     } else {
                         fetch_detail(url)
                     }
@@ -2995,7 +3007,7 @@ mod tests {
             let result = scope.spawn(|| {
                 fetch_catalog_with(&state, &request, |url| {
                     if url.contains("movies/tags") {
-                        return Ok(r#"{"success":1,"data":{"movies":[{"id":"First","number":"ADLT-1"},{"id":"Second","number":"ADLT-2"},{"id":"Third","number":"ADLT-3"},{"id":"Fourth","number":"ADLT-4"}]}}"#.to_owned());
+                        return Ok(first_category_page(r#"{"id":"First","number":"ADLT-1"},{"id":"Second","number":"ADLT-2"},{"id":"Third","number":"ADLT-3"},{"id":"Fourth","number":"ADLT-4"}"#));
                     }
                     let item_id = url
                         .split("/api/v4/movies/")
@@ -3076,9 +3088,7 @@ mod tests {
             let old_result = scope.spawn(|| {
                 fetch_catalog_with(&state, &old_request, |url| {
                     if url.contains("movies/tags") {
-                        return Ok(format!(
-                            r#"{{"success":1,"data":{{"movies":[{listing}]}}}}"#
-                        ));
+                        return Ok(first_category_page(&listing));
                     }
                     detail_starts.fetch_add(1, Ordering::SeqCst);
                     started_sender
@@ -3105,10 +3115,9 @@ mod tests {
                     .recv()
                     .expect("the initial bounded checks must start");
             }
-            let current = fetch_catalog_with(&state, &request("adult"), |_| {
-                Ok(r#"{"success":1,"data":{"movies":[]}}"#.to_owned())
-            })
-            .expect("the newer request must become current");
+            let current =
+                fetch_catalog_with(&state, &request("adult"), |_| Ok(category_page(1, [])))
+                    .expect("the newer request must become current");
             assert_eq!(current[1], "0");
             {
                 let (released, available) = &release;
@@ -3156,7 +3165,7 @@ mod tests {
         let response = fetch_catalog_with(&state, &request("vr"), |url| {
             calls.fetch_add(1, Ordering::SeqCst);
             assert!(!url.contains("/api/v4/"));
-            Ok(r#"{"success":1,"data":{"movies":[{"id":"VrA","number":"MDVR-419"}]}}"#.to_owned())
+            Ok(first_category_page(r#"{"id":"VrA","number":"MDVR-419"}"#))
         })
         .expect("VR category listing must not need Adult verification");
 
@@ -3171,7 +3180,7 @@ mod tests {
         let response = fetch_catalog_with(&state, &request("adult"), |url| {
             calls.lock().expect("request list must remain available").push(url.to_owned());
             if url.contains("movies/tags") {
-                return Ok(r#"{"success":1,"data":{"movies":[{"id":"AdultA","number":"ADLT-123"},{"id":"VrA","number":"MDVR-419"},{"id":"Failed","number":"ADLT-124"},{"id":"Unknown","number":"ADLT-125"},{"id":"AdultB","number":"ADLT-126"}]}}"#.to_owned());
+                return Ok(first_category_page(r#"{"id":"AdultA","number":"ADLT-123"},{"id":"VrA","number":"MDVR-419"},{"id":"Failed","number":"ADLT-124"},{"id":"Unknown","number":"ADLT-125"},{"id":"AdultB","number":"ADLT-126"}"#));
             }
             if url.contains("AdultA") {
                 Ok(detail("AdultA", r#"[{"id":"28"}]"#))
@@ -3208,7 +3217,9 @@ mod tests {
                 .expect("request list must remain available")
                 .push(url.to_owned());
             if url.contains("movies/tags") {
-                Ok(r#"{"success":1,"data":{"movies":[{"id":"AdultA","number":"ADLT-123"},{"id":"AdultB","number":"ADLT-124"}]}}"#.to_owned())
+                Ok(first_category_page(
+                    r#"{"id":"AdultA","number":"ADLT-123"},{"id":"AdultB","number":"ADLT-124"}"#,
+                ))
             } else if url.contains("AdultA") {
                 Ok(detail_with_number("AdultA", "ADLT-999", r#"[{"id":"28"}]"#))
             } else {
@@ -3235,7 +3246,7 @@ mod tests {
     fn accepts_only_exact_retained_rotating_cover_authority() {
         let state = JavdbCatalogState::default();
         let response = fetch_catalog_with(&state, &request("vr"), |_| {
-            Ok(r#"{"success":1,"data":{"movies":[{"id":"A","number":"MDVR-419","cover_url":"https://tp.cmastd.com/a.jpg"},{"id":"B","number":"MDVR-422","cover_url":"https://tp.spfcas.com/b.jpg"},{"id":"C","number":"MDVR-430","cover_url":"https://tp.rotating-7.com/c.jpg"}]}}"#.to_owned())
+            Ok(first_category_page(r#"{"id":"A","number":"MDVR-419","cover_url":"https://tp.cmastd.com/a.jpg"},{"id":"B","number":"MDVR-422","cover_url":"https://tp.spfcas.com/b.jpg"},{"id":"C","number":"MDVR-430","cover_url":"https://tp.rotating-7.com/c.jpg"}"#))
         })
         .expect("valid rotating covers must be retained");
         let generation = &response[0];
@@ -3266,7 +3277,7 @@ mod tests {
     fn rejects_forged_stale_cross_item_cross_category_and_raw_url_without_dispatch() {
         let state = JavdbCatalogState::default();
         let response = fetch_catalog_with(&state, &request("vr"), |_| {
-            Ok(r#"{"success":1,"data":{"movies":[{"id":"A","number":"MDVR-419","cover_url":"https://tp.cmastd.com/a.jpg"},{"id":"B","number":"MDVR-422","cover_url":"https://tp.spfcas.com/b.jpg"}]}}"#.to_owned())
+            Ok(first_category_page(r#"{"id":"A","number":"MDVR-419","cover_url":"https://tp.cmastd.com/a.jpg"},{"id":"B","number":"MDVR-422","cover_url":"https://tp.spfcas.com/b.jpg"}"#))
         })
         .expect("cover authority must be established");
         let generation = response[0].clone();
@@ -3342,7 +3353,7 @@ mod tests {
         let first_generation = begin_request(&state, CatalogCategory::Vr, first_context_generation)
             .expect("first request must begin");
         let second = fetch_catalog_with(&state, &request("vr"), |_| {
-            Ok(r#"{"success":1,"data":{"movies":[{"id":"Current","number":"MDVR-422","cover_url":"https://tp.cmastd.com/current.jpg"}]}}"#.to_owned())
+            Ok(first_category_page(r#"{"id":"Current","number":"MDVR-422","cover_url":"https://tp.cmastd.com/current.jpg"}"#))
         })
         .expect("new request must finish");
         assert_eq!(
@@ -3389,7 +3400,7 @@ mod tests {
             .expect("test context must be valid");
         assert!(current_context > older_context);
         let current = fetch_catalog_with(&state, &current_request, |_| {
-            Ok(r#"{"success":1,"data":{"movies":[{"id":"Current","number":"MDVR-419","cover_url":"https://tp.cmastd.com/current.jpg"}]}}"#.to_owned())
+            Ok(first_category_page(r#"{"id":"Current","number":"MDVR-419","cover_url":"https://tp.cmastd.com/current.jpg"}"#))
         })
         .expect("newer catalog must finish");
 
