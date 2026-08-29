@@ -554,6 +554,24 @@ pub(crate) fn with_unowned_vr_library_path<T>(
     with_unowned_library_path(state, requested_path, TransferCategory::Vr, operation)
 }
 
+pub(crate) fn with_unowned_adult_library_path<T>(
+    state: &VrDownloadState,
+    requested_path: &Path,
+    operation: impl FnOnce(Option<&Path>) -> T,
+) -> Result<T, VrLibraryTrashOwnershipError> {
+    with_unowned_library_path(state, requested_path, TransferCategory::Adult, operation)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_unowned_library_paths_for_test(
+    state: &VrDownloadState,
+    persistence_path: PathBuf,
+) {
+    let mut context = state.0.lock().expect("download test state must lock");
+    context.transfers_loaded = true;
+    context.persistence_path = Some(persistence_path);
+}
+
 pub(crate) fn with_unowned_tv_library_path<T>(
     state: &VrDownloadState,
     requested_path: &Path,

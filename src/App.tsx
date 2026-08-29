@@ -71,6 +71,7 @@ import {
   clearAdultFolder,
   loadAdultFolder,
   openAdultFile,
+  parseAdultLibrary,
   queryAdultStorage,
   revealAdultFile,
   scanAdultLibrary,
@@ -119,6 +120,15 @@ import {
   tmdbPosterUrl,
 } from "@/tmdb";
 import { useTmdbCardCover } from "@/tmdb-cover";
+import {
+  applyLibraryFilenameNormalization,
+  auditLibraryFilenames,
+  dismissLibraryFilenameNormalization,
+  loadLibraryFilenameNormalizationRecovery,
+  type FilenameNormalizationCategory,
+  type FilenameNormalizationPlan,
+  type FilenameNormalizationRecovery,
+} from "@/filename-normalization";
 import {
   fetchVerifiedApiBayTvReleases,
   inspectVerifiedApiBayTvTorrent,
@@ -186,6 +196,7 @@ import {
   previewVrOrganization,
   queryVrStorage,
   revealVrFile,
+  parseVrLibrary,
   resumeVrDownload,
   saveVrDownloadLimit,
   saveVerifiedAdultTorrent,
@@ -520,6 +531,20 @@ type AdultFolderUiState =
   | { status: "loading" }
   | AdultFolderState
   | { status: "error" };
+type FilenameNormalizationUiState =
+  | { status: "loading"; category: FilenameNormalizationCategory; triggerId: string }
+  | {
+      status: "preview" | "confirm" | "applying";
+      plan: FilenameNormalizationPlan;
+      selectedEntryIds: string[];
+      triggerId: string;
+    }
+  | {
+      status: "error";
+      category: FilenameNormalizationCategory;
+      triggerId: string;
+      message: string;
+    };
 type VrDownloadsUiState =
   | { status: "loading" }
   | { status: "error"; reason?: "cleanup" | "reconciliation" }
@@ -9145,6 +9170,141 @@ function downloadStartError(
   }
 }
 
+function filenameNormalizationFocusTarget(
+  category: FilenameNormalizationCategory,
+  triggerId: string,
+) {
+  const trigger = document.getElementById(triggerId);
+  if (trigger instanceof HTMLElement && trigger.isConnected) return trigger;
+  const refresh = document.getElementById(`${category}-library-refresh`);
+  return refresh instanceof HTMLElement && refresh.isConnected ? refresh : null;
+}
+
+function FilenameNormalizationDialog({
+  onApply,
+  onClose,
+  onReview,
+  onSelectionChange,
+  state,
+}: {
+  onApply: () => void;
+  onClose: () => void;
+  onReview: () => void;
+  onSelectionChange: (entryId: string, selected: boolean) => void;
+  state: Exclude<FilenameNormalizationUiState, null>;
+}) {
+  const plan = "plan" in state ? state.plan : null;
+  const selected = new Set("selectedEntryIds" in state ? state.selectedEntryIds : []);
+  const category = "category" in state ? state.category : state.plan.category;
+  const triggerId = state.triggerId;
+  const categoryLabel = category === "adult" ? "Adult" : "VR";
+  const readyCount = plan?.entries.filter((entry) => entry.status === "ready").length ?? 0;
+
+  return (
+    <Dialog.Portal>
+      <Dialog.Backdrop className="movie-metadata__backdrop" />
+      <Dialog.Viewport className="movie-metadata__viewport">
+        <Dialog.Popup
+          aria-busy={state.status === "loading" || state.status === "applying"}
+          className="movie-metadata__popup filename-normalization__popup"
+          finalFocus={() => filenameNormalizationFocusTarget(category, triggerId)}
+        >
+          <div className="movie-metadata__heading">
+            <div>
+              <p className="card-eyebrow">{categoryLabel} Library</p>
+              <Dialog.Title>Normalize filenames</Dialog.Title>
+            </div>
+            <Dialog.Close
+              disabled={state.status === "applying"}
+              render={
+                <Button type="button" variant="ghost">
+                  <AppIcon name="close" />
+                  Close
+                </Button>
+              }
+            />
+          </div>
+          <Dialog.Description className="movie-metadata__description">
+            Audit exact provider identities, review every proposed filename, then
+            choose which safe changes to apply. Existing files are never overwritten.
+          </Dialog.Description>
+          {state.status === "loading" ? (
+            <div className="vr-releases__state" role="status">
+              <h3>Auditing filenames…</h3>
+              <p>FANZA and JavDB are verifying the current exact Library scan.</p>
+            </div>
+          ) : state.status === "error" ? (
+            <div className="vr-releases__state" role="alert">
+              <h3>Filename audit unavailable</h3>
+              <p>{state.message}</p>
+            </div>
+          ) : plan === null ? null : (
+            <>
+              <p className="filename-normalization__summary" role="status">
+                {readyCount} ready to rename; {plan.entries.length - readyCount} unchanged or blocked.
+              </p>
+              <div className="filename-normalization__entries">
+                {plan.entries.map((entry) => (
+                  <section className="filename-normalization__entry" key={entry.id}>
+                    <div className="filename-normalization__entry-heading">
+                      {state.status === "preview" && entry.status === "ready" ? (
+                        <input
+                          aria-label={`Select ${entry.localCode ?? "Library item"} for normalization`}
+                          checked={selected.has(entry.id)}
+                          onChange={(event) =>
+                            onSelectionChange(entry.id, event.target.checked)
+                          }
+                          type="checkbox"
+                        />
+                      ) : null}
+                      <h3>{entry.localCode ?? "Unassociated item"}</h3>
+                      <span className="filename-normalization__status">
+                        {entry.status.replace("-", " ")}
+                      </span>
+                    </div>
+                    <dl className="filename-normalization__facts">
+                      <div><dt>Provider</dt><dd>{entry.provider ?? "None"}</dd></div>
+                      <div><dt>Provider item</dt><dd>{entry.providerId ?? "None"}</dd></div>
+                      <div><dt>Verified code</dt><dd>{entry.verifiedCode ?? "None"}</dd></div>
+                    </dl>
+                    <p>{entry.reason}</p>
+                    <ul className="filename-normalization__members">
+                      {entry.members.map((member) => (
+                        <li key={member.currentRelativeFilename}>
+                          <span>{member.currentRelativeFilename}</span>
+                          {member.proposedRelativeFilename === null ? null : (
+                            <><span aria-hidden="true">→</span><strong>{member.proposedRelativeFilename}</strong></>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                ))}
+              </div>
+              <div className="movie-metadata__actions">
+                <Button onClick={onClose} type="button" variant="outline">
+                  Cancel
+                </Button>
+                {state.status === "preview" ? (
+                  <Button disabled={selected.size === 0} onClick={onReview} type="button">
+                    Review selected
+                  </Button>
+                ) : state.status === "confirm" ? (
+                  <Button onClick={onApply} type="button">
+                    Confirm {selected.size} rename{selected.size === 1 ? "" : "s"}
+                  </Button>
+                ) : (
+                  <Button disabled type="button">Applying…</Button>
+                )}
+              </div>
+            </>
+          )}
+        </Dialog.Popup>
+      </Dialog.Viewport>
+    </Dialog.Portal>
+  );
+}
+
 export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [activeDestination, setActiveDestination] = useState<
     (typeof destinations)[number]
@@ -9289,6 +9449,12 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   const [adultFolderActionError, setAdultFolderActionError] = useState<
     string | null
   >(null);
+  const [filenameNormalizationState, setFilenameNormalizationState] =
+    useState<FilenameNormalizationUiState | null>(null);
+  const [filenameNormalizationAnnouncement, setFilenameNormalizationAnnouncement] =
+    useState<string | null>(null);
+  const [filenameNormalizationRecovery, setFilenameNormalizationRecovery] =
+    useState<FilenameNormalizationRecovery | null>(null);
   const [vrLibraryScanState, setVrLibraryScanState] =
     useState<VrLibraryScanState>({ status: "loading" });
   const [vrLibraryRefreshVersion, setVrLibraryRefreshVersion] = useState(0);
@@ -9715,6 +9881,27 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   currentVrLibraryScanState.current = vrLibraryScanState;
   currentVrDownloadsState.current = vrDownloadsState;
   currentTvDiscoverState.current = tvDiscoverState;
+
+  useEffect(() => {
+    let current = true;
+    void loadLibraryFilenameNormalizationRecovery()
+      .then((recovery) => {
+        if (current) setFilenameNormalizationRecovery(recovery);
+      })
+      .catch(() => {
+        if (current) {
+          setFilenameNormalizationRecovery({
+            status: "attention",
+            category: "adult",
+            planId: "0000000000000000000000000000000000000000",
+            paths: [],
+          });
+        }
+      });
+    return () => {
+      current = false;
+    };
+  }, []);
 
   useLayoutEffect(() => {
     if (vrDownloadFocusTarget === null) {
@@ -11733,7 +11920,139 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     );
   };
 
+  const closeFilenameNormalization = () => {
+    if (filenameNormalizationState?.status === "applying") return;
+    setFilenameNormalizationState(null);
+    void dismissLibraryFilenameNormalization();
+  };
+
+  const startFilenameNormalization = (
+    category: FilenameNormalizationCategory,
+  ) => {
+    const scanState =
+      category === "adult"
+        ? currentAdultLibraryScanState.current
+        : currentVrLibraryScanState.current;
+    if (scanState.status !== "ready") return;
+    const triggerId = `${category}-library-normalize-filenames`;
+    setFilenameNormalizationAnnouncement(null);
+    setFilenameNormalizationState({ status: "loading", category, triggerId });
+    void auditLibraryFilenames(category, scanState.generation)
+      .then((plan) => {
+        const current =
+          category === "adult"
+            ? currentAdultLibraryScanState.current
+            : currentVrLibraryScanState.current;
+        if (current.status !== "ready" || current.generation !== plan.scanGeneration) {
+          void dismissLibraryFilenameNormalization();
+          setFilenameNormalizationState({
+            status: "error",
+            category,
+            triggerId,
+            message: "The Library changed during the audit. Refresh and audit again.",
+          });
+          return;
+        }
+        setFilenameNormalizationState({
+          status: "preview",
+          plan,
+          selectedEntryIds: plan.entries
+            .filter((entry) => entry.status === "ready")
+            .map((entry) => entry.id),
+          triggerId,
+        });
+      })
+      .catch(() => {
+        setFilenameNormalizationState({
+          status: "error",
+          category,
+          triggerId,
+          message: "Exact provider verification could not complete. No filename changed.",
+        });
+      });
+  };
+
+  const updateFilenameNormalizationSelection = (
+    entryId: string,
+    selected: boolean,
+  ) => {
+    setFilenameNormalizationState((current) => {
+      if (current === null || current.status !== "preview") return current;
+      const selectedEntryIds = selected
+        ? [...current.selectedEntryIds, entryId]
+        : current.selectedEntryIds.filter((id) => id !== entryId);
+      return { ...current, selectedEntryIds };
+    });
+  };
+
+  const reviewFilenameNormalization = () => {
+    setFilenameNormalizationState((current) =>
+      current !== null && current.status === "preview" && current.selectedEntryIds.length > 0
+        ? { ...current, status: "confirm" }
+        : current,
+    );
+  };
+
+  const applyFilenameNormalization = () => {
+    const current = filenameNormalizationState;
+    if (current === null || current.status !== "confirm") return;
+    setFilenameNormalizationState({ ...current, status: "applying" });
+    void applyLibraryFilenameNormalization(current.plan, current.selectedEntryIds)
+      .then((value) => {
+        const categoryLabel = current.plan.category === "adult" ? "Adult" : "VR";
+        setFilenameNormalizationAnnouncement(
+          `${current.selectedEntryIds.length} ${categoryLabel} filename${current.selectedEntryIds.length === 1 ? " was" : "s were"} normalized.`,
+        );
+        setFilenameNormalizationState(null);
+        if (current.plan.category === "adult") {
+          const scan = parseAdultLibrary(value);
+          const scanState: AdultLibraryScanState =
+            scan.items.length === 0
+              ? { status: "empty", generation: scan.generation }
+              : { status: "ready", generation: scan.generation, items: scan.items };
+          currentAdultLibraryScanState.current = scanState;
+          setAdultLibraryScanState(scanState);
+          adultStorageRequestId.current += 1;
+          setAdultStorageState({ status: "loading" });
+          setAdultLibraryRatios(new Map());
+          setAdultStorageRefreshVersion((version) => version + 1);
+        } else {
+          const scan = parseVrLibrary(value);
+          const scanState: VrLibraryScanState =
+            scan.items.length === 0
+              ? { status: "empty", generation: scan.generation }
+              : { status: "ready", generation: scan.generation, items: scan.items };
+          currentVrLibraryScanState.current = scanState;
+          setVrLibraryScanState(scanState);
+          vrStorageRequestId.current += 1;
+          setVrStorageState({ status: "loading" });
+          setVrLibraryRatios(new Map());
+          setVrStorageRefreshVersion((version) => version + 1);
+        }
+      })
+      .catch((error: unknown) => {
+        const code = nativeErrorCode(error);
+        if (code === "filename_normalization_recovery") {
+          void loadLibraryFilenameNormalizationRecovery()
+            .then(setFilenameNormalizationRecovery)
+            .catch(() => undefined);
+        }
+        setFilenameNormalizationState({
+          status: "error",
+          category: current.plan.category,
+          triggerId: current.triggerId,
+          message:
+            code === "filename_normalization_recovery"
+              ? "The operation needs recovery attention. Review every reported current path before retrying."
+              : code === "filename_normalization_stale"
+                ? "The folder or Library scan changed. No rename was started; audit again."
+                : "The rename failed and the original names were restored. No file was overwritten.",
+        });
+      });
+  };
+
   const refreshAdultLibrary = () => {
+    closeFilenameNormalization();
     if (adultFolderState.status === "unavailable") {
       if (isRevalidatingAdultFolder) {
         return;
@@ -11928,6 +12247,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
   };
 
   const refreshVrLibrary = () => {
+    closeFilenameNormalization();
     if (vrFolderState.status === "unavailable") {
       if (isRevalidatingVrFolder) {
         return;
@@ -16750,7 +17070,10 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                           <input
                             checked={libraryCategory === category}
                             name="library-category"
-                            onChange={() => setLibraryCategory(category)}
+                            onChange={() => {
+                              closeFilenameNormalization();
+                              setLibraryCategory(category);
+                            }}
                             type="radio"
                             value={category}
                           />
@@ -16979,6 +17302,19 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     </div>
                     <Button
                       disabled={
+                        adultLibraryScanState.status !== "ready" ||
+                        filenameNormalizationState !== null ||
+                        filenameNormalizationRecovery?.status === "attention"
+                      }
+                      id="adult-library-normalize-filenames"
+                      onClick={() => startFilenameNormalization("adult")}
+                      type="button"
+                      variant="outline"
+                    >
+                      Normalize filenames
+                    </Button>
+                    <Button
+                      disabled={
                         adultLibraryScanState.status === "scanning" ||
                         isRevalidatingAdultFolder ||
                         adultTrashReconciliationState === "pending" ||
@@ -17058,6 +17394,19 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     </div>
                     <Button
                       disabled={
+                        vrLibraryScanState.status !== "ready" ||
+                        filenameNormalizationState !== null ||
+                        filenameNormalizationRecovery?.status === "attention"
+                      }
+                      id="vr-library-normalize-filenames"
+                      onClick={() => startFilenameNormalization("vr")}
+                      type="button"
+                      variant="outline"
+                    >
+                      Normalize filenames
+                    </Button>
+                    <Button
+                      disabled={
                         vrLibraryScanState.status === "scanning" ||
                         isRevalidatingVrFolder ||
                         vrTrashReconciliationState === "pending" ||
@@ -17075,6 +17424,31 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                 ) : null}
                 </div>
               </div>
+
+              {filenameNormalizationAnnouncement === null ? null : (
+                <p aria-live="polite" className="library-action-status" role="status">
+                  {filenameNormalizationAnnouncement}
+                </p>
+              )}
+              {filenameNormalizationRecovery?.status === "attention" ? (
+                <div className="library-action-attention" role="alert">
+                  <p>
+                    A filename operation needs recovery attention. Review the current
+                    paths before changing this Library folder.
+                  </p>
+                  {filenameNormalizationRecovery.paths.length === 0 ? null : (
+                    <ul className="filename-normalization__members">
+                      {filenameNormalizationRecovery.paths.map((path) => (
+                        <li key={`${path.current}\0${path.proposed}`}>
+                          <span>{path.current}</span>
+                          <span aria-hidden="true">→</span>
+                          <strong>{path.proposed}</strong>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ) : null}
 
               {libraryCategory === "tv" && tvTrashAnnouncement !== null ? (
                 <p
@@ -18350,6 +18724,22 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           triggerId={tvMetadataDetailsContext.triggerId}
         />
       )}
+      <Dialog.Root
+        onOpenChange={(open) => {
+          if (!open) closeFilenameNormalization();
+        }}
+        open={filenameNormalizationState !== null}
+      >
+        {filenameNormalizationState === null ? null : (
+          <FilenameNormalizationDialog
+            onApply={applyFilenameNormalization}
+            onClose={closeFilenameNormalization}
+            onReview={reviewFilenameNormalization}
+            onSelectionChange={updateFilenameNormalizationSelection}
+            state={filenameNormalizationState}
+          />
+        )}
+      </Dialog.Root>
       <Dialog.Root
         onOpenChange={(open) => {
           if (!open) {

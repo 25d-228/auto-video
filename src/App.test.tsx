@@ -1455,6 +1455,34 @@ beforeEach(() => {
           });
         case "scan_adult_library":
           return scanAdultLibraryMock().then((rows) => ["1", ...rows]);
+        case "load_library_filename_normalization_recovery":
+          return Promise.resolve(["none"]);
+        case "audit_library_filenames":
+          return Promise.resolve([
+            "filename-normalization-v1",
+            "a".repeat(40),
+            parameters?.category as string,
+            parameters?.scanGeneration as string,
+            "1",
+            "b".repeat(40),
+            "ready",
+            parameters?.category === "adult" ? "ADLT-123" : "MDVR-419",
+            "FANZA",
+            parameters?.category === "adult" ? "adlt00123" : "mdvr00419",
+            parameters?.category === "adult" ? "ADLT-0123" : "MDVR-0419",
+            "Exact FANZA item and maker code agree.",
+            "1",
+            parameters?.category === "adult" ? "ADLT-123.mp4" : "MDVR-419.mp4",
+            parameters?.category === "adult" ? "ADLT-0123.mp4" : "MDVR-0419.mp4",
+          ]);
+        case "apply_library_filename_normalization":
+          return Promise.resolve(
+            parameters?.category === "adult"
+              ? ["2", "/Adult/ADLT-0123.mp4", "ADLT-0123.mp4", "1"]
+              : ["2", "/VR/MDVR-0419.mp4", "1"],
+          );
+        case "dismiss_library_filename_normalization":
+          return Promise.resolve([]);
         case "query_adult_storage":
           return queryAdultStorageMock();
         case "open_adult_file":
@@ -3314,6 +3342,45 @@ describe("explicit TV Library TMDB show metadata matching", () => {
 });
 
 describe("parsed Adult Library and Dashboard", () => {
+  it("previews and confirms only the selected native filename plan", async () => {
+    loadAdultFolderMock.mockResolvedValue(["ready", "/Adult"]);
+    scanAdultLibraryMock.mockResolvedValue([
+      "/Adult/ADLT-123.mp4",
+      "ADLT-123.mp4",
+      "1",
+    ]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "Adult" }));
+    await screen.findByRole("heading", { level: 3, name: "ADLT-123" });
+    fireEvent.click(screen.getByRole("button", { name: "Normalize filenames" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Normalize filenames" });
+    expect(within(dialog).getByText("ADLT-123.mp4")).toBeTruthy();
+    expect(within(dialog).getByText("ADLT-0123.mp4")).toBeTruthy();
+    expect(within(dialog).getByText("adlt00123")).toBeTruthy();
+    const selection = within(dialog).getByRole("checkbox", {
+      name: "Select ADLT-123 for normalization",
+    });
+    expect((selection as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Review selected" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Confirm 1 rename" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Normalize filenames" })).toBeNull();
+    });
+    const applyCall = invokeMock.mock.calls.find(
+      ([command]) => command === "apply_library_filename_normalization",
+    );
+    expect(applyCall?.[1]).toEqual({
+      category: "adult",
+      planId: "a".repeat(40),
+      selectedEntryIds: ["b".repeat(40)],
+    });
+    expect(JSON.stringify(applyCall?.[1])).not.toContain("ADLT-123.mp4");
+  });
+
   it("distinguishes an unconfigured Adult Library without scanning or querying storage", async () => {
     render(<App />);
     selectLibrary();
@@ -4201,6 +4268,31 @@ describe("parsed Adult Library and Dashboard", () => {
 });
 
 describe("parsed VR Library and Dashboard", () => {
+  it("keeps the VR filename plan category-isolated and dismisses without mutation", async () => {
+    loadVrFolderMock.mockResolvedValue(["ready", "/VR"]);
+    scanVrLibraryMock.mockResolvedValue(["/VR/MDVR-419.mp4", "1"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    await screen.findByRole("heading", { level: 3, name: "MDVR-419" });
+    fireEvent.click(screen.getByRole("button", { name: "Normalize filenames" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Normalize filenames" });
+    expect(within(dialog).getByText("MDVR-419.mp4")).toBeTruthy();
+    expect(within(dialog).getByText("MDVR-0419.mp4")).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Normalize filenames" })).toBeNull();
+    });
+    expect(
+      invokeMock.mock.calls.filter(
+        ([command]) => command === "apply_library_filename_normalization",
+      ),
+    ).toHaveLength(0);
+    expect(invokeMock).toHaveBeenCalledWith("dismiss_library_filename_normalization");
+  });
+
   it("distinguishes VR folder loading from an unconfigured Library", async () => {
     const pendingFolder = createDeferred<string[]>();
     loadVrFolderMock.mockReturnValue(pendingFolder.promise);

@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::{
+    filename_normalization::{NormalizationCategory, NormalizationFile, NormalizationSnapshot},
     library_presentation::{LibraryItemAuthority, LibraryPresentationCategory},
     library_scan::{is_supported_library_media, scan_library_files},
     vr_torrent::{
@@ -104,7 +105,7 @@ fn olm_library_suffix_candidates(title: &str) -> Vec<(String, String)> {
     candidates
 }
 
-fn exact_file_product_code(path: &Path) -> Option<(String, String)> {
+pub(crate) fn exact_file_product_code(path: &Path) -> Option<(String, String)> {
     let title = path.file_stem()?.to_str()?;
     let mut candidates = product_code_candidates_with_display(title)
         .into_iter()
@@ -122,6 +123,46 @@ fn exact_file_product_code(path: &Path) -> Option<(String, String)> {
     identities.sort();
     identities.dedup();
     (identities.len() == 1).then(|| candidates[0].clone())
+}
+
+pub(crate) fn adult_normalization_snapshot(
+    state: &AdultLibraryState,
+    scan_generation: u64,
+) -> Result<NormalizationSnapshot, &'static str> {
+    let context = state.0.lock().map_err(|_| ADULT_LIBRARY_SCAN_FAILED)?;
+    let scan = context.completed_scan.as_ref().ok_or(ADULT_LIBRARY_STALE)?;
+    if scan.generation != scan_generation || context.folder.as_ref() != Some(&scan.folder) {
+        return Err(ADULT_LIBRARY_STALE);
+    }
+    let files = scan
+        .files
+        .iter()
+        .map(|file| {
+            let relative_path = file
+                .path
+                .strip_prefix(&scan.folder)
+                .ok()
+                .and_then(Path::to_str)
+                .filter(|value| !value.is_empty())
+                .ok_or(ADULT_LIBRARY_STALE)?
+                .to_owned();
+            let parsed = exact_file_product_code(&file.path);
+            Ok(NormalizationFile {
+                path: file.path.clone(),
+                relative_path,
+                size: file.size,
+                modified: file.modified,
+                local_identity: parsed.as_ref().map(|(identity, _)| identity.clone()),
+                local_display: parsed.map(|(_, display)| display),
+            })
+        })
+        .collect::<Result<Vec<_>, &'static str>>()?;
+    Ok(NormalizationSnapshot {
+        category: NormalizationCategory::Adult,
+        folder: scan.folder.clone(),
+        generation: scan.generation,
+        files,
+    })
 }
 
 pub(crate) fn adult_library_presentation_authority(
