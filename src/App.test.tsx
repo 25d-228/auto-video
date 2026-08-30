@@ -107,6 +107,9 @@ let loadFilenameNormalizationRecoveryMock: Mock<() => Promise<string[]>>;
 let applyFilenameNormalizationMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
+let reconcileFilenameNormalizationMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<string[]>
+>;
 let resolveLibraryCoverMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
@@ -1172,6 +1175,13 @@ beforeEach(() => {
         : ["2", "/VR/MDVR-0419.mp4", "1"],
     ),
   );
+  reconcileFilenameNormalizationMock = vi.fn().mockImplementation((parameters) =>
+    Promise.resolve(
+      parameters?.category === "adult"
+        ? ["2", "/Adult/ADLT-0123.mp4", "ADLT-0123.mp4", "1"]
+        : ["2", "/VR/DSVR-069.mp4", "1"],
+    ),
+  );
   resolveLibraryCoverMock = vi.fn().mockImplementation((parameters) =>
     Promise.resolve([
       "library-cover-v3",
@@ -1489,6 +1499,8 @@ beforeEach(() => {
           ]);
         case "apply_library_filename_normalization":
           return applyFilenameNormalizationMock(parameters);
+        case "reconcile_library_filename_normalization":
+          return reconcileFilenameNormalizationMock(parameters);
         case "dismiss_library_filename_normalization":
           return Promise.resolve([]);
         case "query_adult_storage":
@@ -3360,12 +3372,14 @@ describe("parsed Adult Library and Dashboard", () => {
     loadFilenameNormalizationRecoveryMock
       .mockResolvedValueOnce(["none"])
       .mockResolvedValue([
-        "attention",
+        "committed",
         "adult",
         "c".repeat(40),
         "1",
         "ADLT-0123.mp4",
         "ADLT-0123.mp4",
+        "1",
+        "ADLT-123",
       ]);
     applyFilenameNormalizationMock.mockRejectedValue(
       "filename_normalization_committed",
@@ -3396,6 +3410,60 @@ describe("parsed Adult Library and Dashboard", () => {
       ),
     ).toBeNull();
     expect(await screen.findAllByText("ADLT-0123.mp4")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Finish filename reconciliation" }),
+    );
+    expect(
+      await screen.findByText("Adult filename reconciliation finished."),
+    ).toBeTruthy();
+    expect(reconcileFilenameNormalizationMock).toHaveBeenCalledWith({
+      category: "adult",
+      planId: "c".repeat(40),
+    });
+    expect(applyFilenameNormalizationMock).toHaveBeenCalledTimes(1);
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "audit_library_filenames"),
+    ).toHaveLength(1);
+  });
+
+  it("restores an unavailable committed recovery and retries no filename mutation", async () => {
+    loadFilenameNormalizationRecoveryMock
+      .mockResolvedValueOnce([
+        "attention",
+        "vr",
+        "d".repeat(40),
+        "1",
+        "DSVR-69.mp4",
+        "DSVR-069.mp4",
+      ])
+      .mockResolvedValue([
+        "committed",
+        "vr",
+        "d".repeat(40),
+        "1",
+        "DSVR-069.mp4",
+        "DSVR-069.mp4",
+        "1",
+        "DSVR-69",
+      ]);
+    loadVrFolderMock.mockResolvedValue(["unavailable", "/VR"]);
+
+    render(<App />);
+    selectLibrary();
+    fireEvent.click(screen.getByRole("radio", { name: "VR" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Check recovery state" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Finish filename reconciliation" }),
+    );
+    expect(
+      await screen.findByText("VR filename reconciliation finished."),
+    ).toBeTruthy();
+    expect(reconcileFilenameNormalizationMock).toHaveBeenCalledTimes(1);
+    expect(applyFilenameNormalizationMock).not.toHaveBeenCalled();
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "audit_library_filenames"),
+    ).toHaveLength(0);
   });
 
   it("reports malformed recovery generically without inventing an Adult record", async () => {

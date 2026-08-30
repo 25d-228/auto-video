@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
@@ -14,7 +14,8 @@ use crate::{
     library_scan::is_supported_library_media,
     vr_download::{
         file_fingerprint, rename_without_overwrite, validate_portable_organization_component,
-        with_unowned_adult_library_path, with_unowned_vr_library_path, VrDownloadState,
+        with_unowned_adult_library_path, with_unowned_adult_library_paths,
+        with_unowned_vr_library_path, with_unowned_vr_library_paths, VrDownloadState,
         VrLibraryTrashOwnershipError,
     },
     vr_torrent::{hex_sha1, product_code_forms, JsonParser, JsonValue},
@@ -27,7 +28,7 @@ pub(crate) const NORMALIZATION_RECOVERY: &str = "filename_normalization_recovery
 pub(crate) const NORMALIZATION_COMMITTED: &str = "filename_normalization_committed";
 
 const RESPONSE_VERSION: &str = "filename-normalization-v1";
-const RECOVERY_VERSION: &str = "AUTO_VIDEO_FILENAME_NORMALIZATION_V1";
+const RECOVERY_VERSION: &str = "AUTO_VIDEO_FILENAME_NORMALIZATION_V2";
 const RECOVERY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AUDIT_ITEMS: usize = 100_000;
 
@@ -381,14 +382,10 @@ fn multipart_label(title: &str, allow_pt: bool) -> Option<String> {
             {
                 continue;
             }
-            let mut continuation = cursor;
-            while continuation < bytes.len()
-                && (bytes[continuation].is_ascii_punctuation()
-                    || bytes[continuation].is_ascii_whitespace())
-            {
-                continuation += 1;
-            }
-            if bytes.get(continuation).is_some_and(u8::is_ascii_digit) {
+            let continuation = title[cursor..]
+                .chars()
+                .find(|character| character.is_alphanumeric());
+            if continuation.is_some_and(|character| character.is_ascii_digit()) {
                 return None;
             }
             let number = title[number_start..cursor].parse::<u64>().ok()?;
@@ -913,7 +910,7 @@ fn recovery_bytes(plan: &NormalizationPlan, entries: &[AuditEntry]) -> Vec<u8> {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default();
             lines.push(format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 hex_encode(&member.source_relative),
                 hex_encode(&member.destination_relative),
                 hex_encode(&staging_relative),
@@ -921,6 +918,7 @@ fn recovery_bytes(plan: &NormalizationPlan, entries: &[AuditEntry]) -> Vec<u8> {
                 modified.as_secs(),
                 modified.subsec_nanos(),
                 hex_encode(&member.fingerprint),
+                hex_encode(entry.local_code.as_deref().unwrap_or_default()),
             ));
         }
     }
@@ -1060,8 +1058,10 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         && fs::symlink_metadata(&folder)
             .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
     let mut paths = Vec::new();
+    let mut affected_codes = BTreeSet::new();
     let mut records = 0usize;
     let mut every_source = true;
+    let mut every_destination = true;
     for line in lines {
         let mut fields = line.split('\t');
         let source = fields.next().ok_or(NORMALIZATION_RECOVERY)?;
@@ -1083,9 +1083,13 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         let fingerprint = hex_decode(fields.next().ok_or(NORMALIZATION_RECOVERY)?)
             .filter(|value| !value.is_empty() && value.len() <= 256)
             .ok_or(NORMALIZATION_RECOVERY)?;
+        let local_code = hex_decode(fields.next().ok_or(NORMALIZATION_RECOVERY)?)
+            .filter(|value| value.len() <= 128 && product_code_forms(value).is_some())
+            .ok_or(NORMALIZATION_RECOVERY)?;
         if fields.next().is_some() {
             return Err(NORMALIZATION_RECOVERY);
         }
+        affected_codes.insert(local_code);
         let source = hex_decode(source)
             .filter(|value| safe_relative(value))
             .ok_or(NORMALIZATION_RECOVERY)?;
@@ -1123,6 +1127,8 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
                 });
         records += 1;
         every_source &= folder_available && !foreign && current.len() == 1 && current[0] == source;
+        every_destination &=
+            folder_available && !foreign && current.len() == 1 && current[0] == destination;
         if current.is_empty() {
             paths.push(source);
             paths.push(destination);
@@ -1140,6 +1146,18 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         remove_recovery(path).map_err(|_| NORMALIZATION_RECOVERY)?;
         return Ok(vec!["none".to_owned()]);
     }
+    if every_destination {
+        let mut response = vec![
+            "committed".to_owned(),
+            category,
+            plan,
+            (paths.len() / 2).to_string(),
+        ];
+        response.extend(paths);
+        response.push(affected_codes.len().to_string());
+        response.extend(affected_codes);
+        return Ok(response);
+    }
     let mut response = vec![
         "attention".to_owned(),
         category,
@@ -1150,34 +1168,55 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
     Ok(response)
 }
 
-fn finalize_committed_recovery(path: &Path, plan_id: &str) -> Result<(), ()> {
-    let bytes = fs::read(path).map_err(|_| ())?;
-    if u64::try_from(bytes.len()).map_err(|_| ())? > RECOVERY_MAX_BYTES {
-        return Err(());
-    }
-    let text = std::str::from_utf8(&bytes).map_err(|_| ())?;
-    let mut lines = text.lines();
-    if lines.next() != Some(RECOVERY_VERSION)
-        || hex_decode(lines.next().ok_or(())?)
-            .as_deref()
-            .and_then(NormalizationCategory::parse)
-            .is_none()
-        || hex_decode(lines.next().ok_or(())?).as_deref() != Some(plan_id)
+pub(crate) fn committed_recovery(
+    path: &Path,
+    expected_category: NormalizationCategory,
+    expected_plan_id: &str,
+) -> Result<Vec<String>, &'static str> {
+    let response = recovery_status(path)?;
+    if response.first().map(String::as_str) != Some("committed")
+        || response.get(1).map(String::as_str) != Some(expected_category.as_str())
+        || response.get(2).map(String::as_str) != Some(expected_plan_id)
     {
-        return Err(());
+        return Err(NORMALIZATION_RECOVERY);
     }
+    let path_count = response
+        .get(3)
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or(NORMALIZATION_RECOVERY)?;
+    let code_count_index = 4usize
+        .checked_add(path_count.checked_mul(2).ok_or(NORMALIZATION_RECOVERY)?)
+        .ok_or(NORMALIZATION_RECOVERY)?;
+    let code_count = response
+        .get(code_count_index)
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or(NORMALIZATION_RECOVERY)?;
+    if response.len() != code_count_index + 1 + code_count || code_count == 0 {
+        return Err(NORMALIZATION_RECOVERY);
+    }
+    Ok(response[code_count_index + 1..].to_vec())
+}
+
+fn finalize_committed_recovery(
+    path: &Path,
+    category: NormalizationCategory,
+    plan_id: &str,
+) -> Result<(), ()> {
+    committed_recovery(path, category, plan_id).map_err(|_| ())?;
     remove_recovery(path)
 }
 
 pub(crate) fn reconcile_committed_with<T, E>(
     recovery_path: &Path,
+    category: NormalizationCategory,
     plan_id: &str,
     prepare_cache: impl FnOnce() -> Result<(), E>,
     scan: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, &'static str> {
     prepare_cache().map_err(|_| NORMALIZATION_COMMITTED)?;
     let response = scan().map_err(|_| NORMALIZATION_COMMITTED)?;
-    finalize_committed_recovery(recovery_path, plan_id).map_err(|_| NORMALIZATION_COMMITTED)?;
+    finalize_committed_recovery(recovery_path, category, plan_id)
+        .map_err(|_| NORMALIZATION_COMMITTED)?;
     Ok(response)
 }
 
@@ -1188,13 +1227,24 @@ enum RenameExecution {
     RecoveryRequired,
 }
 
+fn rolled_back_error(
+    recovery_path: &Path,
+    remove: impl FnOnce(&Path) -> Result<(), ()>,
+) -> &'static str {
+    if remove(recovery_path).is_ok() {
+        NORMALIZATION_FAILED
+    } else {
+        NORMALIZATION_RECOVERY
+    }
+}
+
 #[cfg(test)]
 fn execute_rename_plan(
     plan: &NormalizationPlan,
     entries: &[AuditEntry],
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> RenameExecution {
-    execute_rename_plan_while_current(plan, entries, &mut rename, || true)
+    execute_rename_plan_while_current(plan, entries, &mut rename, || true, || true)
 }
 
 fn execute_rename_plan_while_current(
@@ -1202,13 +1252,17 @@ fn execute_rename_plan_while_current(
     entries: &[AuditEntry],
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
     is_current: impl Fn() -> bool,
+    ownership_is_current: impl Fn() -> bool,
 ) -> RenameExecution {
     let mut staged = Vec::<(PathBuf, RenameMember)>::new();
     let mut completed = Vec::<RenameMember>::new();
     let operation = (|| -> Result<(), ()> {
         for entry in entries {
             for member in &entry.members {
-                if !is_current() || !exact_current_member(member, &plan.folder) {
+                if !is_current()
+                    || !ownership_is_current()
+                    || !exact_current_member(member, &plan.folder)
+                {
                     return Err(());
                 }
                 let parent = member.source.parent().ok_or(())?;
@@ -1226,7 +1280,7 @@ fn execute_rename_plan_while_current(
             .map(|(temporary, _)| temporary.clone())
             .collect::<HashSet<_>>();
         for (temporary, member) in &staged {
-            if !is_current() {
+            if !is_current() || !ownership_is_current() {
                 return Err(());
             }
             let metadata = fs::symlink_metadata(temporary).map_err(|_| ())?;
@@ -1252,12 +1306,14 @@ fn execute_rename_plan_while_current(
     }
     let mut rollback_complete = true;
     for member in completed.iter().rev() {
-        if rename(&member.destination, &member.source).is_err() {
+        if !ownership_is_current() || rename(&member.destination, &member.source).is_err() {
             rollback_complete = false;
         }
     }
     for (temporary, member) in staged.iter().rev() {
-        if temporary.exists() && rename(temporary, &member.source).is_err() {
+        if temporary.exists()
+            && (!ownership_is_current() || rename(temporary, &member.source).is_err())
+        {
             rollback_complete = false;
         }
     }
@@ -1367,20 +1423,41 @@ pub(crate) fn apply_with_current(
             }
         }
     }
-    if !operation_is_current() {
-        return Err(NORMALIZATION_STALE);
+    let selected_paths = entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .members
+                .iter()
+                .flat_map(|member| [member.source.clone(), member.destination.clone()])
+        })
+        .collect::<Vec<_>>();
+    let execute = |configured_folder: Option<&Path>| {
+        if configured_folder != Some(plan.folder.as_path()) || !operation_is_current() {
+            return Err(NORMALIZATION_STALE);
+        }
+        write_recovery(recovery_path, &plan, &entries).map_err(|_| NORMALIZATION_RECOVERY)?;
+        Ok(execute_rename_plan_while_current(
+            &plan,
+            &entries,
+            rename_without_overwrite,
+            operation_is_current,
+            || true,
+        ))
+    };
+    let outcome = match category {
+        NormalizationCategory::Adult => {
+            with_unowned_adult_library_paths(download_state, &selected_paths, execute)
+        }
+        NormalizationCategory::Vr => {
+            with_unowned_vr_library_paths(download_state, &selected_paths, execute)
+        }
     }
-    write_recovery(recovery_path, &plan, &entries).map_err(|_| NORMALIZATION_RECOVERY)?;
-    match execute_rename_plan_while_current(
-        &plan,
-        &entries,
-        rename_without_overwrite,
-        operation_is_current,
-    ) {
+    .map_err(|_| NORMALIZATION_STALE)??;
+    match outcome {
         RenameExecution::Complete => {}
         RenameExecution::RolledBack => {
-            let _ = remove_recovery(recovery_path);
-            return Err(NORMALIZATION_FAILED);
+            return Err(rolled_back_error(recovery_path, remove_recovery));
         }
         RenameExecution::RecoveryRequired => return Err(NORMALIZATION_RECOVERY),
     }
@@ -1822,7 +1899,7 @@ mod tests {
             recovery.exists(),
             "committed renames retain reconciliation evidence"
         );
-        finalize_committed_recovery(&recovery, &plan.id)
+        finalize_committed_recovery(&recovery, plan.category, &plan.id)
             .expect("successful reconciliation must retire exact evidence");
         assert!(!recovery.exists());
         assert_eq!(
@@ -2139,9 +2216,19 @@ mod tests {
             assert_eq!(multipart_label("Feature Part 1&2", allow_pt), None);
             assert_eq!(multipart_label("Feature CD1,2", allow_pt), None);
             assert_eq!(multipart_label("Feature Disc 3:4", allow_pt), None);
+            assert_eq!(multipart_label("Feature Part 1・2", allow_pt), None);
+            assert_eq!(multipart_label("Feature CD1，2", allow_pt), None);
+            assert_eq!(multipart_label("Feature Part 1—2", allow_pt), None);
             assert_eq!(multipart_label("Feature Part 01 CD 01", allow_pt), None);
 
-            for ambiguous in ["Part 1&2", "CD1,2", "Disc 3:4"] {
+            for ambiguous in [
+                "Part 1&2",
+                "CD1,2",
+                "Disc 3:4",
+                "Part 1・2",
+                "CD1，2",
+                "Part 1—2",
+            ] {
                 let fixture = Fixture::new();
                 let first = normalization_file(
                     &fixture.0,
@@ -2365,6 +2452,7 @@ mod tests {
         assert_eq!(
             reconcile_committed_with(
                 &recovery,
+                plan.category,
                 &plan.id,
                 || Err::<(), ()>(()),
                 || Ok::<_, ()>(vec!["scan"]),
@@ -2377,11 +2465,16 @@ mod tests {
                 .expect("committed record must remain")
                 .first()
                 .map(String::as_str),
-            Some("attention")
+            Some("committed")
+        );
+        assert_eq!(
+            committed_recovery(&recovery, plan.category, &plan.id),
+            Ok(vec!["DSVR-69".to_owned()])
         );
         assert_eq!(
             reconcile_committed_with(
                 &recovery,
+                plan.category,
                 &plan.id,
                 || Ok::<_, ()>(()),
                 || Err::<Vec<String>, ()>(()),
@@ -2392,6 +2485,7 @@ mod tests {
         assert_eq!(
             reconcile_committed_with(
                 &recovery,
+                plan.category,
                 &plan.id,
                 || Ok::<_, ()>(()),
                 || Ok::<_, ()>(vec!["scan"]),
@@ -2444,6 +2538,73 @@ mod tests {
             assert!(recovery.exists());
             fs::rename(&unavailable, &library).expect("volume must be restored");
             assert_eq!(recovery_status(&recovery), Ok(vec!["none".to_owned()]));
+        }
+    }
+
+    #[test]
+    fn committed_recovery_survives_restart_with_an_unavailable_then_restored_volume() {
+        for category in [NormalizationCategory::Adult, NormalizationCategory::Vr] {
+            let fixture = Fixture::new();
+            let library = fixture.0.join(category.as_str());
+            fs::create_dir(&library).expect("library must exist");
+            let library = fs::canonicalize(library).expect("library must canonicalize");
+            let recovery = fixture.0.join(format!("{}-committed", category.as_str()));
+            let file = normalization_file(&library, "DSVR-69.mp4", Some("DSVR-69"));
+            let snapshot = NormalizationSnapshot {
+                category,
+                folder: library.clone(),
+                generation: 1,
+                files: vec![file.clone()],
+            };
+            let member = proposed_members(&snapshot, &[file], "DSVR-069")
+                .expect("proposal must resolve")
+                .remove(0);
+            let plan = NormalizationPlan {
+                id: hex_sha1(format!("{}-committed-plan", category.as_str()).as_bytes()),
+                category,
+                folder: library.clone(),
+                scan_generation: 1,
+                entries: Vec::new(),
+            };
+            let entry = AuditEntry {
+                id: hex_sha1(format!("{}-committed-entry", category.as_str()).as_bytes()),
+                status: "ready",
+                local_code: Some("DSVR-69".to_owned()),
+                proof: None,
+                reason: "fixture".to_owned(),
+                members: vec![member.clone()],
+            };
+            write_recovery(&recovery, &plan, &[entry]).expect("record must persist");
+            rename_without_overwrite(&member.source, &member.destination)
+                .expect("rename must commit");
+            let unavailable = fixture
+                .0
+                .join(format!("{}-committed-offline", category.as_str()));
+            fs::rename(&library, &unavailable).expect("volume must become unavailable");
+            assert_eq!(
+                recovery_status(&recovery)
+                    .expect("unavailable evidence must parse")
+                    .first()
+                    .map(String::as_str),
+                Some("attention")
+            );
+            fs::rename(&unavailable, &library).expect("volume must be restored");
+            assert_eq!(
+                committed_recovery(&recovery, category, &plan.id),
+                Ok(vec!["DSVR-69".to_owned()])
+            );
+            assert_eq!(
+                reconcile_committed_with(
+                    &recovery,
+                    category,
+                    &plan.id,
+                    || Ok::<_, ()>(()),
+                    || Ok::<_, ()>(vec!["scan"]),
+                ),
+                Ok(vec!["scan"])
+            );
+            assert!(!recovery.exists());
+            assert!(member.destination.exists());
         }
     }
 
@@ -2511,15 +2672,96 @@ mod tests {
         };
         let checks = Cell::new(0);
         assert_eq!(
-            execute_rename_plan_while_current(&plan, &[entry], rename_without_overwrite, || {
-                let current = checks.get() == 0;
-                checks.set(checks.get() + 1);
-                current
-            },),
+            execute_rename_plan_while_current(
+                &plan,
+                &[entry],
+                rename_without_overwrite,
+                || {
+                    let current = checks.get() == 0;
+                    checks.set(checks.get() + 1);
+                    current
+                },
+                || true
+            ),
             RenameExecution::RolledBack
         );
         assert!(member.source.exists());
         assert!(!member.destination.exists());
+    }
+
+    #[test]
+    fn ownership_claim_after_the_first_move_stops_later_mutation_with_exact_recovery() {
+        use std::cell::Cell;
+
+        let fixture = Fixture::new();
+        let recovery = fixture.0.join("recovery");
+        let first = normalization_file(&fixture.0, "DSVR-69 Part 1.mp4", Some("DSVR-69"));
+        let second = normalization_file(&fixture.0, "DSVR-69 Part 2.mp4", Some("DSVR-69"));
+        let snapshot = NormalizationSnapshot {
+            category: NormalizationCategory::Vr,
+            folder: fixture.0.clone(),
+            generation: 1,
+            files: vec![first.clone(), second.clone()],
+        };
+        let entry = AuditEntry {
+            id: hex_sha1(b"ownership-race-entry"),
+            status: "ready",
+            local_code: Some("DSVR-69".to_owned()),
+            proof: None,
+            reason: "fixture".to_owned(),
+            members: proposed_members(&snapshot, &[first.clone(), second.clone()], "DSVR-069")
+                .expect("multipart proposal must resolve"),
+        };
+        let plan = NormalizationPlan {
+            id: hex_sha1(b"ownership-race-plan"),
+            category: snapshot.category,
+            folder: snapshot.folder,
+            scan_generation: 1,
+            entries: Vec::new(),
+        };
+        write_recovery(&recovery, &plan, std::slice::from_ref(&entry))
+            .expect("exact recovery must precede mutation");
+        let ownership_checks = Cell::new(0);
+        let outcome = execute_rename_plan_while_current(
+            &plan,
+            std::slice::from_ref(&entry),
+            rename_without_overwrite,
+            || true,
+            || {
+                let clear = ownership_checks.get() == 0;
+                ownership_checks.set(ownership_checks.get() + 1);
+                clear
+            },
+        );
+        assert_eq!(outcome, RenameExecution::RecoveryRequired);
+        assert!(
+            !first.path.exists(),
+            "the first move remains exactly staged"
+        );
+        assert!(
+            second.path.exists(),
+            "the newly owned later path is not mutated"
+        );
+        let status = recovery_status(&recovery).expect("exact recovery must remain readable");
+        assert_eq!(status.first().map(String::as_str), Some("attention"));
+        assert!(status.iter().any(|path| path.ends_with(".pending")));
+    }
+
+    #[test]
+    fn failed_rollback_record_removal_requires_recovery_attention() {
+        let fixture = Fixture::new();
+        let recovery = fixture.0.join("recovery");
+        fs::write(&recovery, b"durable evidence").expect("fixture record must exist");
+        assert_eq!(
+            rolled_back_error(&recovery, |_| Err(())),
+            NORMALIZATION_RECOVERY
+        );
+        assert!(recovery.exists());
+        assert_eq!(
+            rolled_back_error(&recovery, remove_recovery),
+            NORMALIZATION_FAILED
+        );
+        assert!(!recovery.exists());
     }
 
     #[test]

@@ -125,6 +125,7 @@ import {
   auditLibraryFilenames,
   dismissLibraryFilenameNormalization,
   loadLibraryFilenameNormalizationRecovery,
+  reconcileLibraryFilenameNormalization,
   type FilenameNormalizationCategory,
   type FilenameNormalizationPlan,
   type FilenameNormalizationRecovery,
@@ -9461,6 +9462,8 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     useState<string | null>(null);
   const [filenameNormalizationRecovery, setFilenameNormalizationRecovery] =
     useState<FilenameNormalizationRecovery | null>(null);
+  const [filenameNormalizationReconciliationPending, setFilenameNormalizationReconciliationPending] =
+    useState(false);
   const [vrLibraryScanState, setVrLibraryScanState] =
     useState<VrLibraryScanState>({ status: "loading" });
   const [vrLibraryRefreshVersion, setVrLibraryRefreshVersion] = useState(0);
@@ -11992,6 +11995,71 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
     );
   };
 
+  const acceptFilenameNormalizationScan = (
+    category: FilenameNormalizationCategory,
+    value: unknown,
+  ) => {
+    if (category === "adult") {
+      const scan = parseAdultLibrary(value);
+      const scanState: AdultLibraryScanState =
+        scan.items.length === 0
+          ? { status: "empty", generation: scan.generation }
+          : { status: "ready", generation: scan.generation, items: scan.items };
+      currentAdultLibraryScanState.current = scanState;
+      setAdultLibraryScanState(scanState);
+      adultStorageRequestId.current += 1;
+      setAdultStorageState({ status: "loading" });
+      setAdultLibraryRatios(new Map());
+      setAdultStorageRefreshVersion((version) => version + 1);
+    } else {
+      const scan = parseVrLibrary(value);
+      const scanState: VrLibraryScanState =
+        scan.items.length === 0
+          ? { status: "empty", generation: scan.generation }
+          : { status: "ready", generation: scan.generation, items: scan.items };
+      currentVrLibraryScanState.current = scanState;
+      setVrLibraryScanState(scanState);
+      vrStorageRequestId.current += 1;
+      setVrStorageState({ status: "loading" });
+      setVrLibraryRatios(new Map());
+      setVrStorageRefreshVersion((version) => version + 1);
+    }
+  };
+
+  const reloadFilenameNormalizationRecovery = () => {
+    setFilenameNormalizationReconciliationPending(true);
+    void loadLibraryFilenameNormalizationRecovery()
+      .then(setFilenameNormalizationRecovery)
+      .catch(() => setFilenameNormalizationRecovery({ status: "error" }))
+      .finally(() => setFilenameNormalizationReconciliationPending(false));
+  };
+
+  const retryCommittedFilenameNormalization = () => {
+    const recovery = filenameNormalizationRecovery;
+    if (recovery?.status !== "committed" || filenameNormalizationReconciliationPending) {
+      return;
+    }
+    setFilenameNormalizationReconciliationPending(true);
+    void reconcileLibraryFilenameNormalization(recovery)
+      .then((value) => {
+        acceptFilenameNormalizationScan(recovery.category, value);
+        setFilenameNormalizationRecovery({ status: "none" });
+        setFilenameNormalizationState(null);
+        setFilenameNormalizationAnnouncement(
+          `${recovery.category === "adult" ? "Adult" : "VR"} filename reconciliation finished.`,
+        );
+      })
+      .catch(() => {
+        setFilenameNormalizationAnnouncement(
+          "The renamed files remain committed, but Library reconciliation did not finish. Retry when the Library folder is available.",
+        );
+        void loadLibraryFilenameNormalizationRecovery()
+          .then(setFilenameNormalizationRecovery)
+          .catch(() => setFilenameNormalizationRecovery({ status: "error" }));
+      })
+      .finally(() => setFilenameNormalizationReconciliationPending(false));
+  };
+
   const applyFilenameNormalization = () => {
     const current = filenameNormalizationState;
     if (current === null || current.status !== "confirm") return;
@@ -12003,31 +12071,7 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
           `${current.selectedEntryIds.length} ${categoryLabel} filename${current.selectedEntryIds.length === 1 ? " was" : "s were"} normalized.`,
         );
         setFilenameNormalizationState(null);
-        if (current.plan.category === "adult") {
-          const scan = parseAdultLibrary(value);
-          const scanState: AdultLibraryScanState =
-            scan.items.length === 0
-              ? { status: "empty", generation: scan.generation }
-              : { status: "ready", generation: scan.generation, items: scan.items };
-          currentAdultLibraryScanState.current = scanState;
-          setAdultLibraryScanState(scanState);
-          adultStorageRequestId.current += 1;
-          setAdultStorageState({ status: "loading" });
-          setAdultLibraryRatios(new Map());
-          setAdultStorageRefreshVersion((version) => version + 1);
-        } else {
-          const scan = parseVrLibrary(value);
-          const scanState: VrLibraryScanState =
-            scan.items.length === 0
-              ? { status: "empty", generation: scan.generation }
-              : { status: "ready", generation: scan.generation, items: scan.items };
-          currentVrLibraryScanState.current = scanState;
-          setVrLibraryScanState(scanState);
-          vrStorageRequestId.current += 1;
-          setVrStorageState({ status: "loading" });
-          setVrLibraryRatios(new Map());
-          setVrStorageRefreshVersion((version) => version + 1);
-        }
+        acceptFilenameNormalizationScan(current.plan.category, value);
       })
       .catch((error: unknown) => {
         const code = nativeErrorCode(error);
@@ -17454,6 +17498,43 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                       ))}
                     </ul>
                   )}
+                  <Button
+                    disabled={filenameNormalizationReconciliationPending}
+                    onClick={reloadFilenameNormalizationRecovery}
+                    type="button"
+                    variant="outline"
+                  >
+                    {filenameNormalizationReconciliationPending
+                      ? "Checking…"
+                      : "Check recovery state"}
+                  </Button>
+                </div>
+              ) : null}
+              {filenameNormalizationRecovery?.status === "committed" ? (
+                <div className="library-action-attention" role="alert">
+                  <p>
+                    The filenames were renamed. Finish the interrupted Library and
+                    cover reconciliation without renaming files again.
+                  </p>
+                  <ul className="filename-normalization__members">
+                    {filenameNormalizationRecovery.paths.map((path) => (
+                      <li key={`${path.current}\0${path.proposed}`}>
+                        <span>{path.current}</span>
+                        <span aria-hidden="true">→</span>
+                        <strong>{path.proposed}</strong>
+                      </li>
+                    ))}
+                  </ul>
+                  <Button
+                    disabled={filenameNormalizationReconciliationPending}
+                    onClick={retryCommittedFilenameNormalization}
+                    type="button"
+                    variant="outline"
+                  >
+                    {filenameNormalizationReconciliationPending
+                      ? "Finishing…"
+                      : "Finish filename reconciliation"}
+                  </Button>
                 </div>
               ) : null}
               {filenameNormalizationRecovery?.status === "error" ? (

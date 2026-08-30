@@ -507,6 +507,15 @@ fn with_unowned_library_path<T>(
         .0
         .lock()
         .map_err(|_| VrLibraryTrashOwnershipError::Unavailable)?;
+    ensure_library_path_is_unowned(&context, requested_path, category)?;
+    Ok(operation(configured_folder(&context, category)))
+}
+
+fn ensure_library_path_is_unowned(
+    context: &VrDownloadContext,
+    requested_path: &Path,
+    category: TransferCategory,
+) -> Result<(), VrLibraryTrashOwnershipError> {
     if !context.transfers_loaded || context.transfers_loading {
         return Err(VrLibraryTrashOwnershipError::Unavailable);
     }
@@ -522,7 +531,7 @@ fn with_unowned_library_path<T>(
             }
         }
     }
-    if organization_plan_owns_path(&context, requested_path)? {
+    if organization_plan_owns_path(context, requested_path)? {
         return Err(VrLibraryTrashOwnershipError::Owned);
     }
     let persistence_path = context
@@ -535,7 +544,7 @@ fn with_unowned_library_path<T>(
     if durable_cleanup_recovery_owns_path(persistence_path, requested_path)? {
         return Err(VrLibraryTrashOwnershipError::Owned);
     }
-    let folder = configured_folder(&context, category);
+    let folder = configured_folder(context, category);
     if let Some(folder) = folder {
         let folder_is_available = fs::canonicalize(folder).ok().as_deref() == Some(folder)
             && fs::metadata(folder).is_ok_and(|metadata| metadata.is_dir());
@@ -543,7 +552,26 @@ fn with_unowned_library_path<T>(
             return Err(VrLibraryTrashOwnershipError::Owned);
         }
     }
-    Ok(operation(folder))
+    Ok(())
+}
+
+fn with_unowned_library_paths<T>(
+    state: &VrDownloadState,
+    requested_paths: &[PathBuf],
+    category: TransferCategory,
+    operation: impl FnOnce(Option<&Path>) -> T,
+) -> Result<T, VrLibraryTrashOwnershipError> {
+    let context = state
+        .0
+        .lock()
+        .map_err(|_| VrLibraryTrashOwnershipError::Unavailable)?;
+    for requested_path in requested_paths {
+        ensure_library_path_is_unowned(&context, requested_path, category)?;
+    }
+    // Keep the native ownership lock for the complete filesystem transaction so
+    // no transfer, organization, recovery, or cleanup operation can claim a
+    // selected source or destination between its safety check and mutation.
+    Ok(operation(configured_folder(&context, category)))
 }
 
 pub(crate) fn with_unowned_vr_library_path<T>(
@@ -560,6 +588,22 @@ pub(crate) fn with_unowned_adult_library_path<T>(
     operation: impl FnOnce(Option<&Path>) -> T,
 ) -> Result<T, VrLibraryTrashOwnershipError> {
     with_unowned_library_path(state, requested_path, TransferCategory::Adult, operation)
+}
+
+pub(crate) fn with_unowned_vr_library_paths<T>(
+    state: &VrDownloadState,
+    requested_paths: &[PathBuf],
+    operation: impl FnOnce(Option<&Path>) -> T,
+) -> Result<T, VrLibraryTrashOwnershipError> {
+    with_unowned_library_paths(state, requested_paths, TransferCategory::Vr, operation)
+}
+
+pub(crate) fn with_unowned_adult_library_paths<T>(
+    state: &VrDownloadState,
+    requested_paths: &[PathBuf],
+    operation: impl FnOnce(Option<&Path>) -> T,
+) -> Result<T, VrLibraryTrashOwnershipError> {
+    with_unowned_library_paths(state, requested_paths, TransferCategory::Adult, operation)
 }
 
 #[cfg(test)]

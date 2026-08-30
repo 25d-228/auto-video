@@ -180,6 +180,13 @@ export type FilenameNormalizationRecovery =
   | { status: "none" }
   | { status: "error" }
   | {
+      status: "committed";
+      category: FilenameNormalizationCategory;
+      planId: string;
+      paths: { current: string; proposed: string }[];
+      affectedCodes: string[];
+    }
+  | {
       status: "attention";
       category: FilenameNormalizationCategory;
       planId: string;
@@ -197,16 +204,17 @@ export async function loadLibraryFilenameNormalizationRecovery(): Promise<Filena
   if (fields.length === 1 && fields[0] === "none") return { status: "none" };
   if (
     fields.length < 4 ||
-    fields[0] !== "attention" ||
+    (fields[0] !== "attention" && fields[0] !== "committed") ||
     (fields[1] !== "adult" && fields[1] !== "vr") ||
     !sha1Pattern.test(fields[2]) ||
     !/^\d{1,6}$/.test(fields[3]) ||
-    fields.length !== 4 + Number(fields[3]) * 2
+    fields.length < 4 + Number(fields[3]) * 2
   ) {
     throw new Error("The native filename recovery record returned invalid data.");
   }
   const paths = [];
   for (let index = 4; index < fields.length; index += 2) {
+    if (index >= 4 + Number(fields[3]) * 2) break;
     const current = requiredText(fields[index], 4_096);
     const proposed = requiredText(fields[index + 1], 4_096);
     if (current === null || proposed === null) {
@@ -214,10 +222,47 @@ export async function loadLibraryFilenameNormalizationRecovery(): Promise<Filena
     }
     paths.push({ current, proposed });
   }
+  if (fields[0] === "committed") {
+    const codeCountIndex = 4 + Number(fields[3]) * 2;
+    const codeCount = fields[codeCountIndex];
+    if (
+      !/^\d{1,6}$/.test(codeCount ?? "") ||
+      Number(codeCount) === 0 ||
+      fields.length !== codeCountIndex + 1 + Number(codeCount)
+    ) {
+      throw new Error("The native filename recovery record returned invalid data.");
+    }
+    const affectedCodes = fields.slice(codeCountIndex + 1);
+    if (affectedCodes.some((code) => requiredText(code, 128) === null)) {
+      throw new Error("The native filename recovery record returned invalid data.");
+    }
+    return {
+      status: "committed",
+      category: fields[1],
+      planId: fields[2],
+      paths,
+      affectedCodes,
+    };
+  }
+  if (fields.length !== 4 + Number(fields[3]) * 2) {
+    throw new Error("The native filename recovery record returned invalid data.");
+  }
   return {
     status: "attention",
     category: fields[1],
     planId: fields[2],
     paths,
   };
+}
+
+export async function reconcileLibraryFilenameNormalization(
+  recovery: Extract<FilenameNormalizationRecovery, { status: "committed" }>,
+) {
+  return window.__TAURI__.core.invoke<unknown>(
+    "reconcile_library_filename_normalization",
+    {
+      category: recovery.category,
+      planId: recovery.planId,
+    },
+  );
 }

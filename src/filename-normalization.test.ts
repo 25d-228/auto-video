@@ -5,6 +5,7 @@ import {
   auditLibraryFilenames,
   loadLibraryFilenameNormalizationRecovery,
   parseFilenameNormalizationPlan,
+  reconcileLibraryFilenameNormalization,
 } from "@/filename-normalization";
 
 const invokeMock = vi.fn();
@@ -104,5 +105,42 @@ describe("filename normalization native boundary", () => {
         },
       ],
     });
+  });
+
+  it("parses and resumes only an exact committed recovery identity", async () => {
+    invokeMock.mockResolvedValueOnce([
+      "committed",
+      "vr",
+      "d".repeat(40),
+      "1",
+      "Incoming/DSVR-069.MKV",
+      "Incoming/DSVR-069.MKV",
+      "1",
+      "DSVR-69",
+    ]);
+    const recovery = await loadLibraryFilenameNormalizationRecovery();
+    expect(recovery).toEqual({
+      status: "committed",
+      category: "vr",
+      planId: "d".repeat(40),
+      paths: [
+        {
+          current: "Incoming/DSVR-069.MKV",
+          proposed: "Incoming/DSVR-069.MKV",
+        },
+      ],
+      affectedCodes: ["DSVR-69"],
+    });
+    if (recovery.status !== "committed") throw new Error("fixture must be committed");
+    invokeMock.mockResolvedValueOnce(["8", "/VR/DSVR-069.MKV", "1"]);
+    await reconcileLibraryFilenameNormalization(recovery);
+    expect(invokeMock).toHaveBeenLastCalledWith(
+      "reconcile_library_filename_normalization",
+      {
+        category: "vr",
+        planId: "d".repeat(40),
+      },
+    );
+    expect(JSON.stringify(invokeMock.mock.calls.at(-1))).not.toContain("DSVR-069.MKV");
   });
 });
