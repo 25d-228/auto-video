@@ -101,7 +101,7 @@ function adultLibraryProductCode(title: string) {
   return identities.size === 1 ? candidates[0] : null;
 }
 
-function parseAdultLibrary(value: unknown): AdultLibraryScan {
+export function parseAdultLibrary(value: unknown): AdultLibraryScan {
   if (
     !Array.isArray(value) ||
     value.length === 0 ||

@@ -1389,7 +1389,7 @@ function vrLibraryProductCode(title: string) {
   return identities.size === 1 ? candidates[0] : null;
 }
 
-function parseVrLibrary(value: unknown): VrLibraryScan {
+export function parseVrLibrary(value: unknown): VrLibraryScan {
   if (
     !Array.isArray(value) ||
     value.length === 0 ||

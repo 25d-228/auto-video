@@ -507,6 +507,15 @@ fn with_unowned_library_path<T>(
         .0
         .lock()
         .map_err(|_| VrLibraryTrashOwnershipError::Unavailable)?;
+    ensure_library_path_is_unowned(&context, requested_path, category)?;
+    Ok(operation(configured_folder(&context, category)))
+}
+
+fn ensure_library_path_is_unowned(
+    context: &VrDownloadContext,
+    requested_path: &Path,
+    category: TransferCategory,
+) -> Result<(), VrLibraryTrashOwnershipError> {
     if !context.transfers_loaded || context.transfers_loading {
         return Err(VrLibraryTrashOwnershipError::Unavailable);
     }
@@ -522,7 +531,7 @@ fn with_unowned_library_path<T>(
             }
         }
     }
-    if organization_plan_owns_path(&context, requested_path)? {
+    if organization_plan_owns_path(context, requested_path)? {
         return Err(VrLibraryTrashOwnershipError::Owned);
     }
     let persistence_path = context
@@ -535,7 +544,7 @@ fn with_unowned_library_path<T>(
     if durable_cleanup_recovery_owns_path(persistence_path, requested_path)? {
         return Err(VrLibraryTrashOwnershipError::Owned);
     }
-    let folder = configured_folder(&context, category);
+    let folder = configured_folder(context, category);
     if let Some(folder) = folder {
         let folder_is_available = fs::canonicalize(folder).ok().as_deref() == Some(folder)
             && fs::metadata(folder).is_ok_and(|metadata| metadata.is_dir());
@@ -543,7 +552,26 @@ fn with_unowned_library_path<T>(
             return Err(VrLibraryTrashOwnershipError::Owned);
         }
     }
-    Ok(operation(folder))
+    Ok(())
+}
+
+fn with_unowned_library_paths<T>(
+    state: &VrDownloadState,
+    requested_paths: &[PathBuf],
+    category: TransferCategory,
+    operation: impl FnOnce(Option<&Path>) -> T,
+) -> Result<T, VrLibraryTrashOwnershipError> {
+    let context = state
+        .0
+        .lock()
+        .map_err(|_| VrLibraryTrashOwnershipError::Unavailable)?;
+    for requested_path in requested_paths {
+        ensure_library_path_is_unowned(&context, requested_path, category)?;
+    }
+    // Keep the native ownership lock for the complete filesystem transaction so
+    // no transfer, organization, recovery, or cleanup operation can claim a
+    // selected source or destination between its safety check and mutation.
+    Ok(operation(configured_folder(&context, category)))
 }
 
 pub(crate) fn with_unowned_vr_library_path<T>(
@@ -552,6 +580,40 @@ pub(crate) fn with_unowned_vr_library_path<T>(
     operation: impl FnOnce(Option<&Path>) -> T,
 ) -> Result<T, VrLibraryTrashOwnershipError> {
     with_unowned_library_path(state, requested_path, TransferCategory::Vr, operation)
+}
+
+pub(crate) fn with_unowned_adult_library_path<T>(
+    state: &VrDownloadState,
+    requested_path: &Path,
+    operation: impl FnOnce(Option<&Path>) -> T,
+) -> Result<T, VrLibraryTrashOwnershipError> {
+    with_unowned_library_path(state, requested_path, TransferCategory::Adult, operation)
+}
+
+pub(crate) fn with_unowned_vr_library_paths<T>(
+    state: &VrDownloadState,
+    requested_paths: &[PathBuf],
+    operation: impl FnOnce(Option<&Path>) -> T,
+) -> Result<T, VrLibraryTrashOwnershipError> {
+    with_unowned_library_paths(state, requested_paths, TransferCategory::Vr, operation)
+}
+
+pub(crate) fn with_unowned_adult_library_paths<T>(
+    state: &VrDownloadState,
+    requested_paths: &[PathBuf],
+    operation: impl FnOnce(Option<&Path>) -> T,
+) -> Result<T, VrLibraryTrashOwnershipError> {
+    with_unowned_library_paths(state, requested_paths, TransferCategory::Adult, operation)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_unowned_library_paths_for_test(
+    state: &VrDownloadState,
+    persistence_path: PathBuf,
+) {
+    let mut context = state.0.lock().expect("download test state must lock");
+    context.transfers_loaded = true;
+    context.persistence_path = Some(persistence_path);
 }
 
 pub(crate) fn with_unowned_tv_library_path<T>(
@@ -3521,7 +3583,7 @@ impl TorrentStorage for SelectedFileStorage {
 }
 
 #[cfg(unix)]
-fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
+pub(crate) fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = fs::symlink_metadata(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
@@ -4178,7 +4240,7 @@ pub(crate) fn open_file_fingerprint(file: &File) -> io::Result<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
+pub(crate) fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
     let metadata = fs::symlink_metadata(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(VR_DOWNLOAD_DESTINATION_CONFLICT);
@@ -4255,7 +4317,7 @@ fn delete_exact_windows_cleanup_file(
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
-fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
+pub(crate) fn file_fingerprint(path: &Path) -> Result<String, &'static str> {
     let metadata = fs::symlink_metadata(path).map_err(|_| VR_FOLDER_UNAVAILABLE)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(VR_DOWNLOAD_DESTINATION_CONFLICT);
@@ -5092,7 +5154,7 @@ fn validate_organization_component_length(value: &str) -> Result<(), &'static st
     }
 }
 
-fn validate_portable_organization_component(value: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_portable_organization_component(value: &str) -> Result<(), &'static str> {
     let reserved_base = value.split('.').next().unwrap_or(value);
     let reserved_name = reserved_base.to_ascii_uppercase();
     let is_reserved = matches!(
@@ -5547,7 +5609,7 @@ pub fn dismiss_organization(state: &VrDownloadState) -> Result<(), &'static str>
 }
 
 #[cfg(target_os = "macos")]
-fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
     unsafe extern "C" {
@@ -5569,7 +5631,7 @@ fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()>
 }
 
 #[cfg(target_os = "windows")]
-fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "Kernel32")]
@@ -5595,7 +5657,7 @@ fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()>
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_without_overwrite(source: &Path, destination: &Path) -> io::Result<()> {
     match fs::symlink_metadata(destination) {
         Ok(_) => {
             return Err(io::Error::new(

@@ -2,6 +2,7 @@
 
 mod adult_library;
 mod fanza_catalog;
+mod filename_normalization;
 mod javdb_catalog;
 mod library_presentation;
 mod library_scan;
@@ -27,11 +28,12 @@ use std::fs::File;
 use std::process::{Command, Stdio};
 
 use adult_library::{
-    adult_library_presentation_authority, clear_adult_folder as clear_trusted_adult_folder,
-    configured_adult_folder, load_adult_folder_with, open_adult_file_with, reveal_adult_file_with,
-    scan_adult_library_with, set_adult_folder, trash_adult_file_with, AdultLibraryState,
-    ADULT_FILE_OPEN_FAILED, ADULT_FILE_REVEAL_FAILED, ADULT_FILE_TRASH_FAILED,
-    ADULT_FOLDER_STORAGE_FAILED, ADULT_FOLDER_UNAVAILABLE, ADULT_LIBRARY_SCAN_FAILED,
+    adult_library_presentation_authority, adult_normalization_snapshot,
+    clear_adult_folder as clear_trusted_adult_folder, configured_adult_folder,
+    load_adult_folder_with, open_adult_file_with, reveal_adult_file_with, scan_adult_library_with,
+    set_adult_folder, trash_adult_file_with, AdultLibraryState, ADULT_FILE_OPEN_FAILED,
+    ADULT_FILE_REVEAL_FAILED, ADULT_FILE_TRASH_FAILED, ADULT_FOLDER_STORAGE_FAILED,
+    ADULT_FOLDER_UNAVAILABLE, ADULT_LIBRARY_SCAN_FAILED,
 };
 use fanza_catalog::{
     fetch_catalog_with as fetch_fanza_catalog_with, fetch_cover_bytes as fetch_fanza_cover_bytes,
@@ -41,6 +43,17 @@ use fanza_catalog::{
     fetch_preview_with as fetch_fanza_preview_with,
     invalidate_catalog as invalidate_fanza_catalog_with,
     invalidate_preview as invalidate_fanza_preview_with, FanzaCatalogRequest, FanzaCatalogState,
+};
+use filename_normalization::{
+    apply_with_current as apply_filename_normalization_with,
+    committed_recovery as committed_filename_normalization_recovery,
+    dismiss as dismiss_filename_normalization_with,
+    plan_scan_generation as filename_normalization_plan_scan_generation,
+    production_audit as audit_filename_normalization_with,
+    reconcile_committed_with as reconcile_filename_normalization_with,
+    recovery_status as filename_normalization_recovery_status,
+    retire_rolled_back_recovery as retire_filename_normalization_recovery,
+    FilenameNormalizationState, NormalizationCategory, NORMALIZATION_FAILED,
 };
 use javdb_catalog::{
     fetch_api_document as fetch_javdb_api_document, fetch_catalog_with as fetch_javdb_catalog_with,
@@ -58,6 +71,7 @@ use library_presentation::{
     cover_request_is_current as library_cover_request_is_current,
     fetch_cover as fetch_library_presentation_cover_with,
     invalidate_cover as invalidate_library_presentation_cover_with,
+    invalidate_filename_authority as invalidate_library_filename_authority,
     resolve_cover as resolve_library_cover_with, resolve_metadata as resolve_library_metadata_with,
     LibraryItemAuthority, LibraryPresentationCategory, LibraryPresentationState,
     LIBRARY_PRESENTATION_FAILED, LIBRARY_PRESENTATION_STALE,
@@ -102,8 +116,9 @@ use vr_download::{
 };
 use vr_library::{
     invalidate_vr_library, open_vr_file_with, reveal_vr_file_with, scan_vr_library_with,
-    trash_vr_file_with, vr_library_presentation_authority, VrLibraryState, VR_FILE_OPEN_FAILED,
-    VR_FILE_REVEAL_FAILED, VR_FILE_TRASH_FAILED, VR_LIBRARY_SCAN_FAILED,
+    trash_vr_file_with, vr_library_presentation_authority, vr_normalization_snapshot,
+    VrLibraryState, VR_FILE_OPEN_FAILED, VR_FILE_REVEAL_FAILED, VR_FILE_TRASH_FAILED,
+    VR_LIBRARY_SCAN_FAILED,
 };
 use vr_torrent::{
     canonical_imdb_id, fetch_artifact_response, hex_sha1, inspect_sukebei_adult_torrent_with,
@@ -129,6 +144,7 @@ const VR_DOWNLOADS_FILE_NAME: &str = ".vr-downloads";
 const VR_DOWNLOAD_LIMIT_FILE_NAME: &str = ".vr-download-limit";
 const VR_SESSION_FOLDER_NAME: &str = "vr-session";
 const LIBRARY_PRESENTATION_CACHE_FILE_NAME: &str = ".library-presentation-cache";
+const FILENAME_NORMALIZATION_RECOVERY_FILE_NAME: &str = ".filename-normalization-recovery";
 const MOVIES_FOLDER_UNAVAILABLE: &str = "movies_folder_unavailable";
 const MOVIES_FOLDER_STORAGE_FAILED: &str = "movies_folder_storage_failed";
 const MOVIES_STORAGE_FAILED: &str = "movies_storage_failed";
@@ -2330,6 +2346,13 @@ fn library_presentation_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, St
         .map_err(|_| LIBRARY_PRESENTATION_FAILED.to_owned())
 }
 
+fn filename_normalization_recovery_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join(FILENAME_NORMALIZATION_RECOVERY_FILE_NAME))
+        .map_err(|_| NORMALIZATION_FAILED.to_owned())
+}
+
 fn tmdb_cover_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_cache_dir()
@@ -2738,6 +2761,221 @@ async fn scan_adult_library(
     })
     .await
     .map_err(|_| ADULT_LIBRARY_SCAN_FAILED.to_owned())?
+}
+
+#[tauri::command]
+async fn audit_library_filenames(
+    category: String,
+    scan_generation: String,
+    adult_state: tauri::State<'_, AdultLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
+    vr_state: tauri::State<'_, VrLibraryState>,
+    normalization_state: tauri::State<'_, FilenameNormalizationState>,
+) -> Result<Vec<String>, String> {
+    let category = NormalizationCategory::parse(&category)
+        .ok_or_else(|| filename_normalization::NORMALIZATION_STALE.to_owned())?;
+    let scan_generation = scan_generation
+        .parse::<u64>()
+        .map_err(|_| filename_normalization::NORMALIZATION_STALE.to_owned())?;
+    let adult_state = adult_state.inner().clone();
+    let download_state = download_state.inner().clone();
+    let vr_state = vr_state.inner().clone();
+    let normalization_state = normalization_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = match category {
+            NormalizationCategory::Adult => {
+                adult_normalization_snapshot(&adult_state, scan_generation)
+            }
+            NormalizationCategory::Vr => {
+                let folder = configured_vr_folder(&download_state)
+                    .map_err(|_| vr_library::VR_LIBRARY_STALE)?
+                    .ok_or(vr_library::VR_LIBRARY_STALE)?;
+                vr_normalization_snapshot(&vr_state, scan_generation, &folder)
+            }
+        }
+        .map_err(str::to_owned)?;
+        audit_filename_normalization_with(&normalization_state, &download_state, snapshot)
+            .map_err(str::to_owned)
+    })
+    .await
+    .map_err(|_| NORMALIZATION_FAILED.to_owned())?
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn apply_library_filename_normalization(
+    app: tauri::AppHandle,
+    category: String,
+    plan_id: String,
+    selected_entry_ids: Vec<String>,
+    adult_state: tauri::State<'_, AdultLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
+    vr_state: tauri::State<'_, VrLibraryState>,
+    normalization_state: tauri::State<'_, FilenameNormalizationState>,
+    presentation_state: tauri::State<'_, LibraryPresentationState>,
+) -> Result<Vec<String>, String> {
+    let category = NormalizationCategory::parse(&category)
+        .ok_or_else(|| filename_normalization::NORMALIZATION_STALE.to_owned())?;
+    let recovery_path = filename_normalization_recovery_path(&app)?;
+    let presentation_cache_path = library_presentation_cache_path(&app)?;
+    let adult_state = adult_state.inner().clone();
+    let download_state = download_state.inner().clone();
+    let vr_state = vr_state.inner().clone();
+    let normalization_state = normalization_state.inner().clone();
+    let presentation_state = presentation_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let scan_generation =
+            filename_normalization_plan_scan_generation(&normalization_state, category, &plan_id)
+                .map_err(str::to_owned)?;
+        let normalization_folder = match category {
+            NormalizationCategory::Adult => {
+                adult_normalization_snapshot(&adult_state, scan_generation)
+                    .map_err(str::to_owned)?
+                    .folder
+            }
+            NormalizationCategory::Vr => {
+                let folder = configured_vr_folder(&download_state)
+                    .map_err(str::to_owned)?
+                    .ok_or_else(|| vr_library::VR_LIBRARY_STALE.to_owned())?;
+                vr_normalization_snapshot(&vr_state, scan_generation, &folder)
+                    .map_err(str::to_owned)?;
+                folder
+            }
+        };
+        let scan_is_current = || match category {
+            NormalizationCategory::Adult => {
+                adult_normalization_snapshot(&adult_state, scan_generation).is_ok()
+            }
+            NormalizationCategory::Vr => {
+                vr_normalization_snapshot(&vr_state, scan_generation, &normalization_folder).is_ok()
+            }
+        };
+        let (applied_category, _, _) = apply_filename_normalization_with(
+            &normalization_state,
+            &download_state,
+            &recovery_path,
+            category,
+            &plan_id,
+            &selected_entry_ids,
+            scan_is_current,
+        )
+        .map_err(str::to_owned)?;
+        reconcile_committed_filename_normalization(
+            applied_category,
+            &plan_id,
+            &recovery_path,
+            &presentation_cache_path,
+            &adult_state,
+            &download_state,
+            &vr_state,
+            &presentation_state,
+        )
+    })
+    .await
+    .map_err(|_| NORMALIZATION_FAILED.to_owned())?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_committed_filename_normalization(
+    category: NormalizationCategory,
+    plan_id: &str,
+    recovery_path: &Path,
+    presentation_cache_path: &Path,
+    adult_state: &AdultLibraryState,
+    download_state: &VrDownloadState,
+    vr_state: &VrLibraryState,
+    presentation_state: &LibraryPresentationState,
+) -> Result<Vec<String>, String> {
+    let affected_codes =
+        committed_filename_normalization_recovery(recovery_path, category, plan_id)
+            .map_err(str::to_owned)?;
+    reconcile_filename_normalization_with(
+        recovery_path,
+        category,
+        plan_id,
+        || {
+            invalidate_library_filename_authority(
+                presentation_state,
+                presentation_cache_path,
+                match category {
+                    NormalizationCategory::Adult => LibraryPresentationCategory::Adult,
+                    NormalizationCategory::Vr => LibraryPresentationCategory::Vr,
+                },
+                &affected_codes,
+            )
+        },
+        || match category {
+            NormalizationCategory::Adult => scan_adult_library_with(adult_state),
+            NormalizationCategory::Vr => scan_vr_library_with(download_state, vr_state),
+        },
+    )
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_library_filename_normalization(
+    app: tauri::AppHandle,
+    category: String,
+    plan_id: String,
+    adult_state: tauri::State<'_, AdultLibraryState>,
+    download_state: tauri::State<'_, VrDownloadState>,
+    vr_state: tauri::State<'_, VrLibraryState>,
+    presentation_state: tauri::State<'_, LibraryPresentationState>,
+) -> Result<Vec<String>, String> {
+    let category = NormalizationCategory::parse(&category)
+        .ok_or_else(|| filename_normalization::NORMALIZATION_RECOVERY.to_owned())?;
+    let recovery_path = filename_normalization_recovery_path(&app)?;
+    let presentation_cache_path = library_presentation_cache_path(&app)?;
+    let adult_state = adult_state.inner().clone();
+    let download_state = download_state.inner().clone();
+    let vr_state = vr_state.inner().clone();
+    let presentation_state = presentation_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        reconcile_committed_filename_normalization(
+            category,
+            &plan_id,
+            &recovery_path,
+            &presentation_cache_path,
+            &adult_state,
+            &download_state,
+            &vr_state,
+            &presentation_state,
+        )
+    })
+    .await
+    .map_err(|_| NORMALIZATION_FAILED.to_owned())?
+}
+
+#[tauri::command]
+fn retire_library_filename_normalization_recovery(
+    app: tauri::AppHandle,
+    category: String,
+    plan_id: String,
+) -> Result<(), String> {
+    let category = NormalizationCategory::parse(&category)
+        .ok_or_else(|| filename_normalization::NORMALIZATION_RECOVERY.to_owned())?;
+    retire_filename_normalization_recovery(
+        &filename_normalization_recovery_path(&app)?,
+        category,
+        &plan_id,
+    )
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn dismiss_library_filename_normalization(
+    state: tauri::State<'_, FilenameNormalizationState>,
+) -> Result<(), String> {
+    dismiss_filename_normalization_with(state.inner()).map_err(str::to_owned)
+}
+
+#[tauri::command]
+fn load_library_filename_normalization_recovery(
+    app: tauri::AppHandle,
+) -> Result<Vec<String>, String> {
+    filename_normalization_recovery_status(&filename_normalization_recovery_path(&app)?)
+        .map_err(str::to_owned)
 }
 
 #[tauri::command]
@@ -5036,6 +5274,7 @@ fn main() {
         .manage(AdultLibraryState::default())
         .manage(AdultTorrentState::default())
         .manage(FanzaCatalogState::default())
+        .manage(FilenameNormalizationState::default())
         .manage(JavdbCatalogState::default())
         .manage(LibraryPresentationState::default())
         .manage(TmdbCoverState::default())
@@ -5076,6 +5315,12 @@ fn main() {
             choose_adult_folder,
             clear_adult_folder,
             scan_adult_library,
+            audit_library_filenames,
+            apply_library_filename_normalization,
+            reconcile_library_filename_normalization,
+            retire_library_filename_normalization_recovery,
+            dismiss_library_filename_normalization,
+            load_library_filename_normalization_recovery,
             query_adult_storage,
             resolve_library_cover,
             resolve_library_metadata,
