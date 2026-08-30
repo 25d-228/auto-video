@@ -191,6 +191,12 @@ export type FilenameNormalizationRecovery =
       category: FilenameNormalizationCategory;
       planId: string;
       paths: { current: string; proposed: string }[];
+    }
+  | {
+      status: "cleanup-pending";
+      category: FilenameNormalizationCategory;
+      planId: string;
+      paths: { current: string; proposed: string }[];
     };
 
 export async function loadLibraryFilenameNormalizationRecovery(): Promise<FilenameNormalizationRecovery> {
@@ -204,7 +210,9 @@ export async function loadLibraryFilenameNormalizationRecovery(): Promise<Filena
   if (fields.length === 1 && fields[0] === "none") return { status: "none" };
   if (
     fields.length < 4 ||
-    (fields[0] !== "attention" && fields[0] !== "committed") ||
+    (fields[0] !== "attention" &&
+      fields[0] !== "cleanup-pending" &&
+      fields[0] !== "committed") ||
     (fields[1] !== "adult" && fields[1] !== "vr") ||
     !sha1Pattern.test(fields[2]) ||
     !/^\d{1,6}$/.test(fields[3]) ||
@@ -248,7 +256,7 @@ export async function loadLibraryFilenameNormalizationRecovery(): Promise<Filena
     throw new Error("The native filename recovery record returned invalid data.");
   }
   return {
-    status: "attention",
+    status: fields[0],
     category: fields[1],
     planId: fields[2],
     paths,
@@ -260,6 +268,18 @@ export async function reconcileLibraryFilenameNormalization(
 ) {
   return window.__TAURI__.core.invoke<unknown>(
     "reconcile_library_filename_normalization",
+    {
+      category: recovery.category,
+      planId: recovery.planId,
+    },
+  );
+}
+
+export async function retireLibraryFilenameNormalizationRecovery(
+  recovery: Extract<FilenameNormalizationRecovery, { status: "cleanup-pending" }>,
+) {
+  await window.__TAURI__.core.invoke(
+    "retire_library_filename_normalization_recovery",
     {
       category: recovery.category,
       planId: recovery.planId,

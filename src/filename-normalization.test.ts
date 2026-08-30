@@ -6,6 +6,7 @@ import {
   loadLibraryFilenameNormalizationRecovery,
   parseFilenameNormalizationPlan,
   reconcileLibraryFilenameNormalization,
+  retireLibraryFilenameNormalizationRecovery,
 } from "@/filename-normalization";
 
 const invokeMock = vi.fn();
@@ -142,5 +143,41 @@ describe("filename normalization native boundary", () => {
       },
     );
     expect(JSON.stringify(invokeMock.mock.calls.at(-1))).not.toContain("DSVR-069.MKV");
+  });
+
+  it("retires only the exact fully rolled-back recovery identity", async () => {
+    invokeMock.mockResolvedValueOnce([
+      "cleanup-pending",
+      "adult",
+      "e".repeat(40),
+      "1",
+      "Incoming/CAWB-1.mp4",
+      "Incoming/CAWB-001.mp4",
+    ]);
+    const recovery = await loadLibraryFilenameNormalizationRecovery();
+    expect(recovery).toEqual({
+      status: "cleanup-pending",
+      category: "adult",
+      planId: "e".repeat(40),
+      paths: [
+        {
+          current: "Incoming/CAWB-1.mp4",
+          proposed: "Incoming/CAWB-001.mp4",
+        },
+      ],
+    });
+    if (recovery.status !== "cleanup-pending") {
+      throw new Error("fixture must require cleanup");
+    }
+    invokeMock.mockResolvedValueOnce(undefined);
+    await retireLibraryFilenameNormalizationRecovery(recovery);
+    expect(invokeMock).toHaveBeenLastCalledWith(
+      "retire_library_filename_normalization_recovery",
+      {
+        category: "adult",
+        planId: "e".repeat(40),
+      },
+    );
+    expect(JSON.stringify(invokeMock.mock.calls.at(-1))).not.toContain("CAWB-1.mp4");
   });
 });

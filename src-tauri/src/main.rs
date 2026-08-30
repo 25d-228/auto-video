@@ -51,8 +51,9 @@ use filename_normalization::{
     plan_scan_generation as filename_normalization_plan_scan_generation,
     production_audit as audit_filename_normalization_with,
     reconcile_committed_with as reconcile_filename_normalization_with,
-    recovery_status as filename_normalization_recovery_status, FilenameNormalizationState,
-    NormalizationCategory, NORMALIZATION_FAILED,
+    recovery_status as filename_normalization_recovery_status,
+    retire_rolled_back_recovery as retire_filename_normalization_recovery,
+    FilenameNormalizationState, NormalizationCategory, NORMALIZATION_FAILED,
 };
 use javdb_catalog::{
     fetch_api_document as fetch_javdb_api_document, fetch_catalog_with as fetch_javdb_catalog_with,
@@ -2947,6 +2948,22 @@ async fn reconcile_library_filename_normalization(
 }
 
 #[tauri::command]
+fn retire_library_filename_normalization_recovery(
+    app: tauri::AppHandle,
+    category: String,
+    plan_id: String,
+) -> Result<(), String> {
+    let category = NormalizationCategory::parse(&category)
+        .ok_or_else(|| filename_normalization::NORMALIZATION_RECOVERY.to_owned())?;
+    retire_filename_normalization_recovery(
+        &filename_normalization_recovery_path(&app)?,
+        category,
+        &plan_id,
+    )
+    .map_err(str::to_owned)
+}
+
+#[tauri::command]
 fn dismiss_library_filename_normalization(
     state: tauri::State<'_, FilenameNormalizationState>,
 ) -> Result<(), String> {
@@ -5301,6 +5318,7 @@ fn main() {
             audit_library_filenames,
             apply_library_filename_normalization,
             reconcile_library_filename_normalization,
+            retire_library_filename_normalization_recovery,
             dismiss_library_filename_normalization,
             load_library_filename_normalization_recovery,
             query_adult_storage,

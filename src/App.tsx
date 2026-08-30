@@ -126,6 +126,7 @@ import {
   dismissLibraryFilenameNormalization,
   loadLibraryFilenameNormalizationRecovery,
   reconcileLibraryFilenameNormalization,
+  retireLibraryFilenameNormalizationRecovery,
   type FilenameNormalizationCategory,
   type FilenameNormalizationPlan,
   type FilenameNormalizationRecovery,
@@ -12060,6 +12061,33 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
       .finally(() => setFilenameNormalizationReconciliationPending(false));
   };
 
+  const retryFilenameNormalizationRecoveryCleanup = () => {
+    const recovery = filenameNormalizationRecovery;
+    if (
+      recovery?.status !== "cleanup-pending" ||
+      filenameNormalizationReconciliationPending
+    ) {
+      return;
+    }
+    setFilenameNormalizationReconciliationPending(true);
+    void retireLibraryFilenameNormalizationRecovery(recovery)
+      .then(() => {
+        setFilenameNormalizationRecovery({ status: "none" });
+        setFilenameNormalizationAnnouncement(
+          `${recovery.category === "adult" ? "Adult" : "VR"} rollback recovery cleanup finished.`,
+        );
+      })
+      .catch(() => {
+        setFilenameNormalizationAnnouncement(
+          "The original filenames remain verified, but the recovery record could not be retired. Retry cleanup without renaming files.",
+        );
+        void loadLibraryFilenameNormalizationRecovery()
+          .then(setFilenameNormalizationRecovery)
+          .catch(() => setFilenameNormalizationRecovery({ status: "error" }));
+      })
+      .finally(() => setFilenameNormalizationReconciliationPending(false));
+  };
+
   const applyFilenameNormalization = () => {
     const current = filenameNormalizationState;
     if (current === null || current.status !== "confirm") return;
@@ -17534,6 +17562,33 @@ export default function App({ adultCatalogItemsFixture }: AppProps = {}) {
                     {filenameNormalizationReconciliationPending
                       ? "Finishing…"
                       : "Finish filename reconciliation"}
+                  </Button>
+                </div>
+              ) : null}
+              {filenameNormalizationRecovery?.status === "cleanup-pending" ? (
+                <div className="library-action-attention" role="alert">
+                  <p>
+                    The original filenames were restored, but the verified recovery
+                    record still needs cleanup. Retrying cleanup will not rename files.
+                  </p>
+                  <ul className="filename-normalization__members">
+                    {filenameNormalizationRecovery.paths.map((path) => (
+                      <li key={`${path.current}\0${path.proposed}`}>
+                        <span>{path.current}</span>
+                        <span aria-hidden="true">→</span>
+                        <strong>{path.proposed}</strong>
+                      </li>
+                    ))}
+                  </ul>
+                  <Button
+                    disabled={filenameNormalizationReconciliationPending}
+                    onClick={retryFilenameNormalizationRecoveryCleanup}
+                    type="button"
+                    variant="outline"
+                  >
+                    {filenameNormalizationReconciliationPending
+                      ? "Cleaning up…"
+                      : "Retry recovery cleanup"}
                   </Button>
                 </div>
               ) : null}

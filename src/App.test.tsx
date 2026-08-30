@@ -110,6 +110,9 @@ let applyFilenameNormalizationMock: Mock<
 let reconcileFilenameNormalizationMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
+let retireFilenameNormalizationRecoveryMock: Mock<
+  (parameters?: Record<string, unknown>) => Promise<void>
+>;
 let resolveLibraryCoverMock: Mock<
   (parameters?: Record<string, unknown>) => Promise<string[]>
 >;
@@ -1182,6 +1185,7 @@ beforeEach(() => {
         : ["2", "/VR/DSVR-069.mp4", "1"],
     ),
   );
+  retireFilenameNormalizationRecoveryMock = vi.fn().mockResolvedValue(undefined);
   resolveLibraryCoverMock = vi.fn().mockImplementation((parameters) =>
     Promise.resolve([
       "library-cover-v3",
@@ -1501,6 +1505,8 @@ beforeEach(() => {
           return applyFilenameNormalizationMock(parameters);
         case "reconcile_library_filename_normalization":
           return reconcileFilenameNormalizationMock(parameters);
+        case "retire_library_filename_normalization_recovery":
+          return retireFilenameNormalizationRecoveryMock(parameters);
         case "dismiss_library_filename_normalization":
           return Promise.resolve([]);
         case "query_adult_storage":
@@ -3465,6 +3471,58 @@ describe("parsed Adult Library and Dashboard", () => {
       invokeMock.mock.calls.filter(([command]) => command === "audit_library_filenames"),
     ).toHaveLength(0);
   });
+
+  it.each([
+    ["adult", "Adult", "CAWB-1.mp4", "CAWB-001.mp4"],
+    ["vr", "VR", "DSVR-69.mp4", "DSVR-069.mp4"],
+  ] as const)(
+    "keeps exact %s rollback cleanup retryable across persistent failure",
+    async (category, categoryLabel, current, proposed) => {
+      loadFilenameNormalizationRecoveryMock.mockResolvedValue([
+        "cleanup-pending",
+        category,
+        "e".repeat(40),
+        "1",
+        current,
+        proposed,
+      ]);
+      retireFilenameNormalizationRecoveryMock
+        .mockRejectedValueOnce("filename_normalization_recovery")
+        .mockResolvedValueOnce(undefined);
+
+      render(<App />);
+      selectLibrary();
+      fireEvent.click(screen.getByRole("radio", { name: categoryLabel }));
+      expect(await screen.findByText(current)).toBeTruthy();
+      expect(screen.getByText(proposed)).toBeTruthy();
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry recovery cleanup" }));
+      expect(
+        await screen.findByText(
+          "The original filenames remain verified, but the recovery record could not be retired. Retry cleanup without renaming files.",
+        ),
+      ).toBeTruthy();
+      expect(await screen.findByText(current)).toBeTruthy();
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Retry recovery cleanup" }),
+      );
+      expect(
+        await screen.findByText(`${categoryLabel} rollback recovery cleanup finished.`),
+      ).toBeTruthy();
+      expect(retireFilenameNormalizationRecoveryMock).toHaveBeenNthCalledWith(1, {
+        category,
+        planId: "e".repeat(40),
+      });
+      expect(retireFilenameNormalizationRecoveryMock).toHaveBeenNthCalledWith(2, {
+        category,
+        planId: "e".repeat(40),
+      });
+      expect(applyFilenameNormalizationMock).not.toHaveBeenCalled();
+      expect(
+        invokeMock.mock.calls.filter(([command]) => command === "audit_library_filenames"),
+      ).toHaveLength(0);
+    },
+  );
 
   it("reports malformed recovery generically without inventing an Adult record", async () => {
     loadFilenameNormalizationRecoveryMock.mockRejectedValue(

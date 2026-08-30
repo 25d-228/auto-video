@@ -1018,7 +1018,11 @@ fn recovery_file_matches(
             .is_some_and(|canonical| canonical.starts_with(folder) && canonical == path)
 }
 
-pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> {
+fn recovery_status_with_source_retirement(
+    path: &Path,
+    expected_source: Option<(NormalizationCategory, &str)>,
+    retire_source: impl FnOnce(&Path) -> Result<(), ()>,
+) -> Result<Vec<String>, &'static str> {
     match fs::symlink_metadata(path) {
         Ok(metadata)
             if metadata.is_file()
@@ -1143,8 +1147,22 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
         return Err(NORMALIZATION_RECOVERY);
     }
     if every_source {
-        remove_recovery(path).map_err(|_| NORMALIZATION_RECOVERY)?;
-        return Ok(vec!["none".to_owned()]);
+        if expected_source.is_some_and(|(expected_category, expected_plan)| {
+            category != expected_category.as_str() || plan != expected_plan
+        }) {
+            return Err(NORMALIZATION_RECOVERY);
+        }
+        if retire_source(path).is_ok() {
+            return Ok(vec!["none".to_owned()]);
+        }
+        let mut response = vec![
+            "cleanup-pending".to_owned(),
+            category,
+            plan,
+            (paths.len() / 2).to_string(),
+        ];
+        response.extend(paths);
+        return Ok(response);
     }
     if every_destination {
         let mut response = vec![
@@ -1166,6 +1184,27 @@ pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> 
     ];
     response.extend(paths);
     Ok(response)
+}
+
+pub(crate) fn recovery_status(path: &Path) -> Result<Vec<String>, &'static str> {
+    recovery_status_with_source_retirement(path, None, remove_recovery)
+}
+
+pub(crate) fn retire_rolled_back_recovery(
+    path: &Path,
+    expected_category: NormalizationCategory,
+    expected_plan_id: &str,
+) -> Result<(), &'static str> {
+    let response = recovery_status_with_source_retirement(
+        path,
+        Some((expected_category, expected_plan_id)),
+        remove_recovery,
+    )?;
+    if response == ["none"] {
+        Ok(())
+    } else {
+        Err(NORMALIZATION_RECOVERY)
+    }
 }
 
 pub(crate) fn committed_recovery(
@@ -2762,6 +2801,85 @@ mod tests {
             NORMALIZATION_FAILED
         );
         assert!(!recovery.exists());
+    }
+
+    #[test]
+    fn exact_rolled_back_recovery_survives_restart_and_retries_cleanup_for_both_categories() {
+        for (category, source_name, destination_name, local_code) in [
+            (
+                NormalizationCategory::Adult,
+                "CAWB-1.mp4",
+                "CAWB-001.mp4",
+                "CAWB-1",
+            ),
+            (
+                NormalizationCategory::Vr,
+                "DSVR-69.mp4",
+                "DSVR-069.mp4",
+                "DSVR-69",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let recovery = fixture.0.join("recovery");
+            let file = normalization_file(&fixture.0, source_name, Some(local_code));
+            let plan = NormalizationPlan {
+                id: hex_sha1(format!("cleanup-{local_code}").as_bytes()),
+                category,
+                folder: fixture.0.clone(),
+                scan_generation: 1,
+                entries: Vec::new(),
+            };
+            let entry = AuditEntry {
+                id: hex_sha1(format!("cleanup-entry-{local_code}").as_bytes()),
+                status: "ready",
+                local_code: Some(local_code.to_owned()),
+                proof: None,
+                reason: "fixture".to_owned(),
+                members: vec![RenameMember {
+                    source: file.path.clone(),
+                    destination: fixture.0.join(destination_name),
+                    source_relative: source_name.to_owned(),
+                    destination_relative: destination_name.to_owned(),
+                    size: file.size,
+                    modified: file.modified,
+                    fingerprint: file_fingerprint(&file.path)
+                        .expect("source fingerprint must exist"),
+                }],
+            };
+            write_recovery(&recovery, &plan, &[entry]).expect("recovery must persist");
+
+            for _ in 0..2 {
+                assert_eq!(
+                    recovery_status_with_source_retirement(&recovery, None, |_| Err(()))
+                        .expect("exact rollback must remain readable"),
+                    vec![
+                        "cleanup-pending",
+                        category.as_str(),
+                        &plan.id,
+                        "1",
+                        source_name,
+                        destination_name,
+                    ]
+                );
+                assert!(recovery.exists(), "persistent failure keeps exact evidence");
+                assert!(file.path.exists(), "cleanup retry never renames the source");
+                assert!(!fixture.0.join(destination_name).exists());
+            }
+
+            assert_eq!(
+                retire_rolled_back_recovery(&recovery, category, &hex_sha1(b"wrong-plan")),
+                Err(NORMALIZATION_RECOVERY)
+            );
+            assert!(
+                recovery.exists(),
+                "wrong authority cannot retire the record"
+            );
+            retire_rolled_back_recovery(&recovery, category, &plan.id)
+                .expect("a later exact cleanup retry must succeed");
+            assert!(!recovery.exists());
+            assert!(file.path.exists());
+            assert!(!fixture.0.join(destination_name).exists());
+        }
     }
 
     #[test]
